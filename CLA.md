@@ -4,10 +4,11 @@
 
 The Nextcloud MCP Server project (the "Project") is offered to the public under
 the GNU Affero General Public License version 3 (AGPL-3.0). To allow the
-Project's maintainer ("We" or "Us"), a company established in The Netherlands,
-to sustain the Project's development — including through dual licensing or
-other commercial offerings — and to keep the Project's licensing flexible into
-the future, We ask each contributor to agree to the terms below.
+Project's maintainer, **Astrolabe Cloud** ("We" or "Us"), a company established
+in The Netherlands, to sustain the Project's development — including through
+dual licensing or other commercial offerings — and to keep the Project's
+licensing flexible into the future, We ask each contributor to agree to the
+terms below.
 
 You retain ownership of the copyright in Your Contributions. This Agreement
 grants Us a license that is broad enough to (a) continue distributing Your
@@ -137,7 +138,7 @@ Contributions and for any applicable limitation periods thereafter. Signatures
 collected through cla-assistant.io are processed by SAP SE on Our behalf in
 accordance with their privacy notice. You may exercise Your rights as a data
 subject (access, rectification, erasure where applicable, restriction,
-objection, portability) by contacting Us at [CONTACT EMAIL TO BE ADDED].
+objection, portability) by contacting Us at info@astrolabecloud.com.
 
 ## 10. Governing Law and Jurisdiction
 
