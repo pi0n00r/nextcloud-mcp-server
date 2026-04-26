@@ -72,7 +72,12 @@ class Table(BaseModel):
     title: str = Field(description="Table title")
     emoji: Optional[str] = Field(None, description="Table emoji")
     ownership: str = Field(description="Table ownership")
-    owner_display_name: str = Field(description="Display name of table owner")
+    # Tables app v2.0.1 stopped emitting owner_display_name at the top level
+    # (still present inside views via get_schema). Optional avoids a 100% failure
+    # rate on list_tables — see #728.
+    owner_display_name: Optional[str] = Field(
+        None, description="Display name of table owner"
+    )
     created_by: Optional[str] = Field(None, description="User who created the table")
     created_at: Optional[str] = Field(None, description="Table creation timestamp")
     last_edit_by: Optional[str] = Field(

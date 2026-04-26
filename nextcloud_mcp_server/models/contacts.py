@@ -1,8 +1,9 @@
 """Pydantic models for Contacts app responses."""
 
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .base import BaseResponse, StatusResponse
 
@@ -56,6 +57,21 @@ class Contact(BaseModel):
         default_factory=dict, description="Custom fields"
     )
     etag: Optional[str] = Field(None, description="ETag for versioning")
+
+    @field_validator("birthday", mode="before")
+    @classmethod
+    def _coerce_birthday(cls, value: Any) -> Any:
+        """Accept ``date``/``datetime`` from vobject and serialise to ISO string.
+
+        vobject parses BDAY into ``datetime.date`` (or ``datetime.datetime``);
+        the Pydantic model stores it as ``str``. Without this coercion any
+        contact with a populated BDAY blew up the entire ``list_contacts``
+        response (#704, #672). Strings and ``None`` pass through unchanged so
+        callers can still construct contacts with raw ISO input.
+        """
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        return value
 
     @property
     def primary_email(self) -> Optional[str]:

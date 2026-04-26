@@ -1,6 +1,6 @@
 """Unit tests for Pydantic response models."""
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -18,6 +18,7 @@ from nextcloud_mcp_server.models.semantic import (
     SamplingSearchResponse,
     SemanticSearchResult,
 )
+from nextcloud_mcp_server.models.tables import Table
 from nextcloud_mcp_server.server.calendar import _event_dict_to_summary
 from nextcloud_mcp_server.server.contacts import _raw_contact_to_model
 
@@ -677,3 +678,76 @@ def test_event_dict_to_summary_calendar_name_without_display_name():
 
     assert summary.calendar_name == "personal"
     assert summary.calendar_display_name == "personal"
+
+
+# ----------------------------------------------------------------------------
+# Direct Contact() construction with date-typed birthday — pins #704 / #672
+# ----------------------------------------------------------------------------
+# These bypass _raw_contact_to_model and hit the Pydantic validator directly,
+# so any future code path that constructs Contact from raw vobject output is
+# covered without depending on the upstream coercion in server/contacts.py.
+
+
+@pytest.mark.unit
+def test_contact_model_coerces_date_birthday_to_iso():
+    """Regression for #704: a datetime.date birthday must coerce to ISO str
+    rather than raise a Pydantic ValidationError.
+    """
+    contact = Contact(uid="c1", fn="Date BDay", birthday=date(2000, 1, 1))
+    assert contact.birthday == "2000-01-01"
+
+
+@pytest.mark.unit
+def test_contact_model_coerces_datetime_birthday_to_iso():
+    """A datetime.datetime input is also valid in vobject output and must coerce."""
+    contact = Contact(
+        uid="c2", fn="DateTime BDay", birthday=datetime(2000, 1, 1, 12, 30)
+    )
+    assert contact.birthday == "2000-01-01T12:30:00"
+
+
+@pytest.mark.unit
+def test_contact_model_string_birthday_passes_through():
+    """ISO strings must round-trip unchanged — the validator should be a no-op."""
+    contact = Contact(uid="c3", fn="String BDay", birthday="1990-05-15")
+    assert contact.birthday == "1990-05-15"
+
+
+@pytest.mark.unit
+def test_contact_model_none_birthday_is_allowed():
+    contact = Contact(uid="c4", fn="No BDay")
+    assert contact.birthday is None
+
+
+# ----------------------------------------------------------------------------
+# Table model parses without owner_display_name — pins #728
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_table_parses_without_owner_display_name():
+    """Tables app v2.0.1 dropped owner_display_name from the top-level payload.
+    Parsing must succeed (#728) — anything else 100%-fails nc_tables_list_tables.
+    """
+    raw = {
+        "id": 1,
+        "title": "Welcome to Nextcloud Tables!",
+        "ownership": "alice",
+        # owner_display_name intentionally absent
+    }
+    table = Table(**raw)
+    assert table.id == 1
+    assert table.owner_display_name is None
+
+
+@pytest.mark.unit
+def test_table_parses_with_owner_display_name():
+    """When the field is present we still capture it — Optional doesn't drop data."""
+    raw = {
+        "id": 2,
+        "title": "Old API Table",
+        "ownership": "bob",
+        "owner_display_name": "Bob the Builder",
+    }
+    table = Table(**raw)
+    assert table.owner_display_name == "Bob the Builder"
