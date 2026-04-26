@@ -1,5 +1,35 @@
 # Contributing to Nextcloud MCP Server
 
+Thank you for your interest in contributing! This project is licensed under
+AGPL-3.0 and welcomes contributions from the community.
+
+## Contributor License Agreement (CLA)
+
+> **DRAFT — NOT YET IN EFFECT.** The CLA process described below is a planned
+> change. Until the [CLA](./CLA.md) is finalized and the CLA Assistant workflow
+> is enabled on this repository, no signature is required.
+
+To keep the project's licensing flexible — including the ability to offer
+commercial licensing alongside AGPL-3.0 in the future — we ask all contributors
+to sign our [Contributor License Agreement](./CLA.md). The CLA gives the
+project maintainer the rights needed to relicense or dual-license the project
+while letting you retain copyright in your contributions.
+
+**How signing works:**
+
+1. Open a pull request as you normally would.
+2. The CLA Assistant bot ([cla-assistant.io](https://cla-assistant.io)) will
+   comment on your PR with a link inviting you to sign.
+3. Click the link, review the agreement, and sign in with your GitHub account
+   to record your signature.
+4. Your signature is recorded once per GitHub account. Subsequent PRs are
+   covered automatically.
+
+If you contribute on behalf of an employer, please confirm with your employer
+that you are permitted to contribute under the CLA. For larger organizations,
+a separate Corporate CLA may be required — open an issue if this applies to
+you.
+
 ## Version Management
 
 This project uses [commitizen](https://commitizen-tools.github.io/commitizen/) for version management following PEP 440 (`major_version_zero = true`, 0.x.x for pre-1.0).
