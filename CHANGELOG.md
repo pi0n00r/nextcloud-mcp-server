@@ -5,6 +5,12 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.72.6 (2026-04-26)
+
+### Fix
+
+- **models**: coerce Contact.birthday + relax Table.owner_display_name
+
 ## v0.72.5 (2026-04-23)
 
 ### Fix
