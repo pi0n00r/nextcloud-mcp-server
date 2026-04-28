@@ -99,6 +99,21 @@ class BaseNextcloudClient(ABC):
         """Helper to get the base WebDAV path for the authenticated user."""
         return f"/remote.php/dav/files/{self.username}"
 
+    @staticmethod
+    def _resolve_url(url: str) -> str:
+        """Prefix bare ``/apps/...`` paths with ``/index.php``.
+
+        Pretty URLs (URL rewriting that strips ``index.php``) are an opt-in
+        Nextcloud feature; without them, ``/apps/<app>/...`` returns 404 — see
+        issue #732. ``/index.php/apps/<app>/...`` is the universal entry point
+        and works on every Nextcloud install regardless of web-server config,
+        so we route all app-API calls through it. ``/remote.php/dav/...`` and
+        ``/ocs/...`` have their own dedicated entry points and are unaffected.
+        """
+        if url.startswith("/apps/"):
+            return "/index.php" + url
+        return url
+
     @retry_on_429
     async def _make_request(self, method: str, url: str, **kwargs):
         """Common request wrapper with logging, tracing, and error handling.
@@ -111,6 +126,7 @@ class BaseNextcloudClient(ABC):
         Returns:
             Response object
         """
+        url = self._resolve_url(url)
         logger.debug(f"Making {method} request to {url}")
 
         # Start timer for metrics

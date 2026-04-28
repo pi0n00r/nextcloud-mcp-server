@@ -9,6 +9,42 @@ from .webdav import WebDAVClient
 logger = logging.getLogger(__name__)
 
 
+def _expect_note_object(payload: Any, *, operation: str) -> Dict[str, Any]:
+    """Coerce a Notes API single-note response into a dict.
+
+    Notes v5.0.0 has a catch-all route (``notes_api#fail``) that returns ``[]``
+    as JSON for unmatched paths, and a few edge cases where the response is a
+    list-wrapped object instead of a bare object — see issue #730. Without this
+    guard, callers hit a cryptic Pydantic ``"argument after ** must be a mapping,
+    not list"`` from ``Note(**payload)``.
+
+    Returns the dict unchanged. If the payload is a single-element list, returns
+    the inner dict. Anything else (empty list, list of multiple, non-dict) raises
+    a clear ``ValueError`` so the failure mode is obvious in logs.
+    """
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        if len(payload) == 1 and isinstance(payload[0], dict):
+            logger.warning(
+                "Notes API returned a single-element list for %s; unwrapping. "
+                "This is a Notes app v5.0.0 quirk — see #730.",
+                operation,
+            )
+            return payload[0]
+        raise ValueError(
+            f"{operation}: Notes API returned a list-shaped payload "
+            f"({len(payload)} elements) where a single note object was expected. "
+            f"This typically means the request was routed to the catch-all "
+            f"notes_api#fail handler (e.g. unmatched URL or wrong API version). "
+            f"Verify the Notes app version and URL prefix (#732)."
+        )
+    raise ValueError(
+        f"{operation}: Notes API returned an unexpected payload type "
+        f"({type(payload).__name__}) where a single note object was expected."
+    )
+
+
 class NotesClient(BaseNextcloudClient):
     """Client for Nextcloud Notes app operations."""
 
@@ -79,7 +115,7 @@ class NotesClient(BaseNextcloudClient):
         response = await self._make_request(
             "GET", f"/apps/notes/api/v1/notes/{note_id}"
         )
-        return response.json()
+        return _expect_note_object(response.json(), operation="get_note")
 
     async def create_note(
         self,
@@ -99,7 +135,7 @@ class NotesClient(BaseNextcloudClient):
         response = await self._make_request(
             "POST", "/apps/notes/api/v1/notes", json=body
         )
-        return response.json()
+        return _expect_note_object(response.json(), operation="create_note")
 
     async def update(
         self,
@@ -146,7 +182,7 @@ class NotesClient(BaseNextcloudClient):
         logger.info(
             f"Update response for note {note_id}: Status {response.status_code}"
         )
-        updated_note = response.json()
+        updated_note = _expect_note_object(response.json(), operation="update_note")
 
         # Check for category change and cleanup old attachment directory if needed
         if (
