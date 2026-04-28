@@ -1,0 +1,88 @@
+From 693a7e67821e2726d131ceb9e444794c4d164f89 Mon Sep 17 00:00:00 2001
+From: pi0n00r <gary@ibajaj.com>
+Date: Mon, 27 Apr 2026 22:16:58 +0000
+Subject: [PATCH] fork-policy: extend LICENSE.md with AGPL invariant + CLA
+ non-participation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a 'What's NOT licensed in this fork' section to LICENSE.md making
+the fork's posture explicit for future readers. Five sub-sections:
+
+1. License is, and stays, AGPL-3.0-or-later — no dual-licensing.
+2. No Contributor License Agreement — divergence from the upstream
+   pattern (Astrolabe Cloud's CLA enabling future commercial dual-
+   licensing). Contributors retain copyright to their own changes; no
+   relicensing power transferred. Functional guarantee of permanent
+   AGPL status as contributors accumulate.
+3. No paid-tier features — no license check, no trial mode, no feature-
+   flag service.
+4. No telemetry, no beacon, no Enterprise Edition branch.
+5. What this means for upstream contributions — fork-only changes need
+   no CLA; upstream PRs would individually require Astrolabe CLA sign.
+
+Schema-versioned 'fork-license-posture-v1'; material changes (e.g. adding
+a CLA, switching license) require a major-version bump in the AI-NOTICE
+Schema-Version field across all source files.
+
+Authored after the v0.2 plan audit (2026-04-27) revealed that the
+upstream's CLA at CLA.md is the most ethically-relevant 'gate' on the
+project — runtime code is fully AGPL, but the CLA collects copyrights
+broad enough to enable Astrolabe Cloud's dual-licensing future. This
+fork opts out of that posture.
+
+Refs:
+- Audit details: Documents/Projects/NC/v0.2-plan.md § Gate 4
+- Upstream CLA: cbcoutinho/nextcloud-mcp-server/CLA.md
+- Triggering question (Gary, 2026-04-27): 'What functionality is
+  license-gated... what are the ethical considerations with AGPL 3.0?'
+---
+ LICENSE.md | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/LICENSE.md b/LICENSE.md
+index f2f3e99..dfad9d8 100644
+--- a/LICENSE.md
++++ b/LICENSE.md
+@@ -70,3 +70,37 @@ General Public License for more details.
+ 
+ You should have received a copy of the GNU Affero General Public License
+ along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++---
++
++## What's NOT licensed in this fork
++
++This section makes the fork's posture legible to future readers (human or AI agent).
++
++### License is, and stays, AGPL-3.0-or-later
++
++The fork is `AGPL-3.0-or-later`. It is NOT, and will not be, dual-licensed. There is no commercial alternative offered by this fork's maintainer (Gary Bajaj). Anyone using this fork — self-hosting, modifying, redistributing, or running it as a network service — operates under the terms of AGPL-3.0-or-later only. AGPL §13's network clause applies in full: forks running this software as a network service must offer source to users.
++
++### No Contributor License Agreement
++
++Unlike the upstream project (`cbcoutinho/nextcloud-mcp-server`), which collects a Contributor License Agreement granting the maintainer (Astrolabe Cloud) the right to relicense contributions under "alternative terms" for commercial offerings, **this fork solicits NO CLA from contributors**.
++
++Contributors to this fork retain copyright to their own changes. No relicensing power is transferred to the fork's maintainer or to any other party. The implication: the fork's licensing trajectory is bounded by what every individual contributor agrees to, not by any single party's commercial interests. To relicense the fork as a whole, every copyright holder of every accepted contribution would need to consent — which is functionally a guarantee of permanent AGPL-3.0-or-later status as the fork accumulates contributors.
++
++This posture is a deliberate divergence from the upstream's open-core / dual-license-ready architecture. It is not a criticism of upstream's choice (which is a legitimate pattern for a corporately-stewarded project), only a different ethical stance for this fork: the AGPL freedoms apply equally to the maintainer and to every downstream user, with no asymmetric escape hatch.
++
++### No paid-tier features
++
++There are no features in this fork that are gated behind a license check, a paid tier, a remote license-validation service, an expiring trial mode, a feature-flag service, or any other runtime restriction beyond the documented configuration surface (`MCP_DEPLOYMENT_MODE`, the various `ENABLE_*` flags, etc.). Everything in the source tree is functionally available to every user.
++
++### No telemetry, no beacon, no Enterprise Edition branch
++
++This fork does not phone home, does not transmit usage metrics to any external service (the optional Prometheus metrics endpoint is operator-controlled and does not phone home), does not differentiate "community" vs "enterprise" code paths, and has no separate Enterprise branch in any repository. The single `main` branch of `pi0n00r/nextcloud-mcp-server` is the entire offering.
++
++### What this means for upstream contributions
++
++If at any future point a fork-side change is upstreamed via PR to `cbcoutinho/nextcloud-mcp-server`, the contributor would need to sign Astrolabe's CLA at that point — not a bar to PR submission, but a load-bearing decision the contributor makes individually. Contributions that stay fork-only (most likely the rhetorical reframing in v0.2 — `docs/deployment-modes.md`, `docs/governance.md`, `docs/oidc-providers/`) need no CLA and will not be PR'd to upstream.
++
++### Schema-Version of this declaration
++
++`fork-license-posture-v1` (2026-04-27). Future revisions update this version string. Material changes (e.g. adding a CLA, switching license) require a major version bump in the AI-NOTICE `Schema-Version` field across all source files.
+-- 
+2.34.1
+
