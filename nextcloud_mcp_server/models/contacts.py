@@ -5,7 +5,7 @@ Updated 2026-04-27 (A.3 schema gaps fix):
   exported by tools like ``ez-vcard 0.12.1`` lacked UIDs entirely. The
   recovery merge sub-agent had to fall back to FN-based fuzzy matching at
   0.85 threshold because UIDs were universally absent in the backup.
-- ``Contact.fn`` falls back to ORG -> N -> opaque placeholder for FN-less
+- ``Contact.fn`` falls back to ORG → N → opaque placeholder for FN-less
   contacts (typical of ORG-only company/service entries).
 - All string fields used for matching/search/dedup are NFC-normalised.
 """
@@ -42,17 +42,22 @@ class AddressBook(BaseModel):
     """Model for a Nextcloud address book."""
 
     uri: str = Field(description="Address book URI")
-    displayname: Optional[str] = Field(None, description="Display name")
-    ctag: Optional[str] = Field(None, description="CTag for sync")
+    displayname: str = Field(description="Address book display name")
+    description: Optional[str] = Field(None, description="Address book description")
+    ctag: Optional[str] = Field(
+        None, description="Address book tag for synchronization"
+    )
 
 
 class ContactField(BaseModel):
     """Model for a contact field (email, phone, etc.)."""
 
-    type: str = Field(description="Field type (e.g., 'email', 'phone')")
+    type: str = Field(description="Field type (e.g., 'email', 'phone', 'address')")
     value: str = Field(description="Field value")
-    preferred: bool = Field(default=False, description="Whether this is the preferred field")
-    label: Optional[str] = Field(None, description="Optional label")
+    label: Optional[str] = Field(None, description="Field label (e.g., 'work', 'home')")
+    preferred: bool = Field(
+        default=False, description="Whether this is the preferred field of this type"
+    )
 
 
 class Contact(BaseModel):
@@ -63,8 +68,8 @@ class Contact(BaseModel):
     :meth:`synthesize_uid` from raw vCard bytes for a stable SHA1-derived UID.
 
     FN is also optional; the resolved display name is exposed via the
-    :attr:`display_name` property which falls back through ORG -> family/given
-    name -> opaque ``<unnamed UID:...>`` placeholder.
+    :attr:`display_name` property which falls back through ORG → family/given
+    name → opaque ``<unnamed UID:...>`` placeholder.
     """
 
     uid: Optional[str] = Field(
@@ -86,30 +91,20 @@ class Contact(BaseModel):
     family_name: Optional[str] = Field(None, description="Family name")
     organization: Optional[str] = Field(None, description="Organization")
     title: Optional[str] = Field(None, description="Job title")
-    birthday: Optional[str] = Field(None, description="Birthday (ISO format)")
     emails: List[ContactField] = Field(
         default_factory=list, description="Email addresses"
     )
     phones: List[ContactField] = Field(
         default_factory=list, description="Phone numbers"
     )
-    addresses: List[Dict[str, Any]] = Field(
-        default_factory=list, description="Physical addresses"
-    )
+    addresses: List[ContactField] = Field(default_factory=list, description="Addresses")
     urls: List[ContactField] = Field(default_factory=list, description="URLs")
-    note: Optional[str] = Field(None, description="Notes (vCard NOTE field)")
-    photo: Optional[str] = Field(
-        None,
-        description=(
-            "Photo (vCard PHOTO field). Either a URL or base64-encoded image "
-            "data with content-type prefix. Stored verbatim from the source "
-            "vCard for byte-preservation."
-        ),
-    )
+    note: Optional[str] = Field(None, description="Notes")
+    photo: Optional[str] = Field(None, description="Photo URL or base64 data")
+    birthday: Optional[str] = Field(None, description="Birthday (ISO date format)")
     categories: List[str] = Field(
-        default_factory=list, description="Contact categories (vCard CATEGORIES field)"
+        default_factory=list, description="Contact categories"
     )
-    notes: Optional[str] = Field(None, description="Notes (deprecated alias; prefer note)")
     custom_fields: Dict[str, Any] = Field(
         default_factory=dict, description="Custom fields"
     )
@@ -150,7 +145,7 @@ class Contact(BaseModel):
     def display_name(self) -> str:
         """Resolve a display name with fallback chain.
 
-        FN -> ORG -> "given family" -> "<unnamed UID:xxx>".
+        FN → ORG → "given family" → "<unnamed UID:xxx>".
         """
         if self.fn:
             return self.fn
@@ -194,7 +189,9 @@ def synthesize_uid(vcard_text: str) -> str:
 class ListAddressBooksResponse(BaseResponse):
     """Response model for listing address books."""
 
-    addressbooks: List[AddressBook] = Field(description="List of address books")
+    addressbooks: List[AddressBook] = Field(
+        description="List of available address books"
+    )
     total_count: int = Field(description="Total number of address books")
 
 
@@ -202,7 +199,7 @@ class ListContactsResponse(BaseResponse):
     """Response model for listing contacts."""
 
     contacts: List[Contact] = Field(description="List of contacts")
-    addressbook: str = Field(description="Address book the contacts belong to")
+    addressbook: str = Field(description="Address book name")
     total_count: int = Field(description="Total number of contacts")
 
 
@@ -221,7 +218,7 @@ class GetContactResponse(BaseResponse):
 class CreateContactResponse(BaseResponse):
     """Response model for contact creation."""
 
-    uid: str = Field(description="The UID of the created contact")
+    contact: Contact = Field(description="The created contact")
     addressbook: str = Field(description="Address book the contact was created in")
 
 
@@ -255,3 +252,22 @@ class UpdateContactResponse(BaseResponse):
 
     contact: Contact = Field(description="The updated contact")
     addressbook: str = Field(description="Address book the contact belongs to")
+
+
+class DeleteContactResponse(StatusResponse):
+    """Response model for contact deletion."""
+
+    deleted_uid: str = Field(description="UID of the deleted contact")
+    addressbook: str = Field(description="Address book the contact was deleted from")
+
+
+class CreateAddressBookResponse(BaseResponse):
+    """Response model for address book creation."""
+
+    addressbook: AddressBook = Field(description="The created address book")
+
+
+class DeleteAddressBookResponse(StatusResponse):
+    """Response model for address book deletion."""
+
+    deleted_name: str = Field(description="Name of the deleted address book")
