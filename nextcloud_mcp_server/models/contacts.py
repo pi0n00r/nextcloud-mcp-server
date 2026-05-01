@@ -96,7 +96,20 @@ class Contact(BaseModel):
     addresses: List[Dict[str, Any]] = Field(
         default_factory=list, description="Physical addresses"
     )
-    notes: Optional[str] = Field(None, description="Notes")
+    urls: List[ContactField] = Field(default_factory=list, description="URLs")
+    note: Optional[str] = Field(None, description="Notes (vCard NOTE field)")
+    photo: Optional[str] = Field(
+        None,
+        description=(
+            "Photo (vCard PHOTO field). Either a URL or base64-encoded image "
+            "data with content-type prefix. Stored verbatim from the source "
+            "vCard for byte-preservation."
+        ),
+    )
+    categories: List[str] = Field(
+        default_factory=list, description="Contact categories (vCard CATEGORIES field)"
+    )
+    notes: Optional[str] = Field(None, description="Notes (deprecated alias; prefer note)")
     custom_fields: Dict[str, Any] = Field(
         default_factory=dict, description="Custom fields"
     )
