@@ -1,6 +1,7 @@
 """CalDAV client for Nextcloud calendar and task operations using caldav library."""
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 import inspect
 import logging
 import uuid
@@ -676,18 +677,11 @@ class CalendarClient:
         all_day = event_data.get("all_day", False)
 
         if start_str:
-            if all_day:
-                start_date = dt.datetime.fromisoformat(start_str.split("T")[0]).date()
-                event.add("dtstart", start_date)
-                if end_str:
-                    end_date = dt.datetime.fromisoformat(end_str.split("T")[0]).date()
-                    event.add("dtend", end_date)
-            else:
-                start_dt = dt.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                event.add("dtstart", start_dt)
-                if end_str:
-                    end_dt = dt.datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                    event.add("dtend", end_dt)
+            start_value = self._parse_caldav_datetime(start_str, all_day=all_day)
+            event.add("dtstart", start_value)
+            if end_str:
+                end_value = self._parse_caldav_datetime(end_str, all_day=all_day)
+                event.add("dtend", end_value)
 
         # Add categories
         categories = event_data.get("categories", "")
@@ -897,34 +891,25 @@ class CalendarClient:
                             alarm.add("trigger", dt.timedelta(minutes=-minutes))
                             component.add_component(alarm)
 
-                    # Handle dates
+                    # Handle dates — vDDDTypes wrap is load-bearing for RFC 5545
+                    # serialization. icalendar's __setitem__ does NOT auto-coerce
+                    # raw datetimes (only Component.add() does), so wrapping is
+                    # required to avoid the "Python repr leak" mangle (P1.2).
                     if "start_datetime" in event_data:
                         start_str = event_data["start_datetime"]
                         all_day = event_data.get("all_day", False)
-                        if all_day:
-                            start_date = dt.datetime.fromisoformat(
-                                start_str.split("T")[0]
-                            ).date()
-                            component["DTSTART"] = start_date
-                        else:
-                            start_dt = dt.datetime.fromisoformat(
-                                start_str.replace("Z", "+00:00")
-                            )
-                            component["DTSTART"] = start_dt
+                        start_value = self._parse_caldav_datetime(
+                            start_str, all_day=all_day
+                        )
+                        component["DTSTART"] = vDDDTypes(start_value)
 
                     if "end_datetime" in event_data:
                         end_str = event_data["end_datetime"]
                         all_day = event_data.get("all_day", False)
-                        if all_day:
-                            end_date = dt.datetime.fromisoformat(
-                                end_str.split("T")[0]
-                            ).date()
-                            component["DTEND"] = end_date
-                        else:
-                            end_dt = dt.datetime.fromisoformat(
-                                end_str.replace("Z", "+00:00")
-                            )
-                            component["DTEND"] = end_dt
+                        end_value = self._parse_caldav_datetime(
+                            end_str, all_day=all_day
+                        )
+                        component["DTEND"] = vDDDTypes(end_value)
 
                     # Update timestamps
                     now = dt.datetime.now(dt.UTC)
@@ -940,6 +925,66 @@ class CalendarClient:
             return self._create_ical_event(event_data, event_uid)
 
     # ============= Helper Methods - Todo iCalendar =============
+
+    # ============= Helper: nc-time-policy-compliant datetime parsing =============
+
+    _TORONTO_TZ = ZoneInfo("America/Toronto")
+
+    def _parse_caldav_datetime(
+        self, value: str, *, all_day: bool = False
+    ) -> "dt.datetime | dt.date":
+        """Parse an ISO 8601 datetime string into a tz-aware datetime per nc-time-policy.
+
+        Per Documents/Projects/Isla/nc-time-policy.md:
+        - Wall-clock semantic: input with America/Toronto offset (-04:00 EDT or
+          -05:00 EST depending on date) is promoted from fixed-offset tzinfo to
+          ZoneInfo("America/Toronto") so icalendar serializes as
+          TZID=America/Toronto (preserves wall-clock across DST and viewer-TZ).
+        - Audit semantic: input with `Z` or `+00:00` produces UTC datetime
+          (icalendar serializes with `Z` suffix).
+        - All-day: returns date object (no time component).
+        - Naive input is forbidden per policy; raises ValueError.
+
+        This is the canonical entry point for any user-supplied datetime
+        going into a CalDAV property (DTSTART/DTEND/DUE/COMPLETED). The
+        legacy `_ensure_timezone_aware` helper silently coerced naive to UTC,
+        which violated wall-clock semantic; that helper is retained for
+        backwards compatibility but new code should use this one.
+        """
+        if all_day:
+            # Strip any time component, return date
+            return dt.datetime.fromisoformat(value.split("T")[0]).date()
+
+        # Normalize Z to explicit UTC offset for fromisoformat
+        normalized = value.replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(normalized)
+        except ValueError as e:
+            raise ValueError(
+                f"Datetime not parseable as ISO 8601: {value!r} ({e})"
+            ) from e
+
+        if parsed.tzinfo is None:
+            raise ValueError(
+                f"Datetime missing timezone offset (forbidden per nc-time-policy): "
+                f"{value!r}. Provide ISO 8601 with `Z`, `\u00b1HH:MM` offset, "
+                f"or via TZID-prefixed CalDAV form."
+            )
+
+        # Promote fixed-offset tzinfo to IANA ZoneInfo when offset matches
+        # America/Toronto on the target date (preserves wall-clock semantic
+        # across DST). Detection is offset-equality on the target naive datetime.
+        if isinstance(parsed.tzinfo, dt.timezone) and parsed.utcoffset() != dt.timedelta(0):
+            offset = parsed.utcoffset()
+            naive = parsed.replace(tzinfo=None)
+            if self._TORONTO_TZ.utcoffset(naive) == offset:
+                parsed = parsed.replace(tzinfo=self._TORONTO_TZ)
+            # else: leave as fixed-offset; icalendar emits TZID="UTC\u00b1HH:MM"
+            # which is RFC 5545-valid but non-IANA. Caller used a non-Toronto
+            # offset deliberately; preserve that semantic rather than impose
+            # Toronto.
+
+        return parsed
 
     def _ensure_timezone_aware(self, datetime_str: str) -> dt.datetime:
         """Parse datetime string and ensure it's timezone-aware.
@@ -991,19 +1036,19 @@ class CalendarClient:
         # Due date
         due = todo_data.get("due", "")
         if due:
-            due_dt = self._ensure_timezone_aware(due)
+            due_dt = self._parse_caldav_datetime(due)
             todo.add("due", vDDDTypes(due_dt))
 
         # Start date
         dtstart = todo_data.get("dtstart", "")
         if dtstart:
-            start_dt = self._ensure_timezone_aware(dtstart)
+            start_dt = self._parse_caldav_datetime(dtstart)
             todo.add("dtstart", vDDDTypes(start_dt))
 
         # Completed timestamp
         completed = todo_data.get("completed", "")
         if completed:
-            completed_dt = self._ensure_timezone_aware(completed)
+            completed_dt = self._parse_caldav_datetime(completed)
             todo.add("completed", vDDDTypes(completed_dt))
 
         # Categories
@@ -1095,7 +1140,7 @@ class CalendarClient:
                     if "due" in todo_data:
                         due_str = todo_data["due"]
                         if due_str:
-                            due_dt = self._ensure_timezone_aware(due_str)
+                            due_dt = self._parse_caldav_datetime(due_str)
                             component["DUE"] = vDDDTypes(due_dt)
                             logger.debug(f"Set DUE to {due_dt}")
 
@@ -1103,7 +1148,7 @@ class CalendarClient:
                     if "dtstart" in todo_data:
                         dtstart_str = todo_data["dtstart"]
                         if dtstart_str:
-                            dtstart_dt = self._ensure_timezone_aware(dtstart_str)
+                            dtstart_dt = self._parse_caldav_datetime(dtstart_str)
                             component["DTSTART"] = vDDDTypes(dtstart_dt)
                             logger.debug(f"Set DTSTART to {dtstart_dt}")
 
@@ -1111,7 +1156,7 @@ class CalendarClient:
                     if "completed" in todo_data:
                         completed_str = todo_data["completed"]
                         if completed_str:
-                            completed_dt = self._ensure_timezone_aware(completed_str)
+                            completed_dt = self._parse_caldav_datetime(completed_str)
                             component["COMPLETED"] = vDDDTypes(completed_dt)
                             logger.debug(f"Set COMPLETED to {completed_dt}")
 
