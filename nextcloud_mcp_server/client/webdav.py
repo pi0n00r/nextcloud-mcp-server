@@ -1,4 +1,4 @@
-"""WebDAV client for Nextcloud file operations.""
+"""WebDAV client for Nextcloud file operations."""
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
