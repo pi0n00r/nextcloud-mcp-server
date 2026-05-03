@@ -39,7 +39,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.client.contacts import EtagConflictError
-from nextcloud_mcp_server.core import get_client, require_scopes
+from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.contacts import (
     AddressBook,
     Contact,

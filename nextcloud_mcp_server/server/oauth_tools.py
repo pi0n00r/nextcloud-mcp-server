@@ -17,7 +17,21 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.auth.astrolabe_client import AstrolabeClient
+
+# astrolabe was removed from this fork; keep the import optional so the
+# module still loads when astrolabe_client.py is absent. Tools that touch
+# AstrolabeClient at runtime will surface a clearer error if invoked in
+# OAuth mode without astrolabe present.
+AstrolabeClient = None  # type: ignore[assignment]
+try:
+    from nextcloud_mcp_server.auth.astrolabe_client import (  # type: ignore[import-not-found]
+        AstrolabeClient as _AstrolabeClient,
+    )
+
+    AstrolabeClient = _AstrolabeClient
+except ModuleNotFoundError:
+    pass
+
 from nextcloud_mcp_server.auth.storage import RefreshTokenStorage
 from nextcloud_mcp_server.auth.token_broker import TokenBrokerService
 
