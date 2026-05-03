@@ -1,19 +1,19 @@
 """MCP tool surface for Nextcloud Contacts (CardDAV).
 
 Unified ``nc_contacts_*`` namespace, 8 ops total. Byte-preserving vCard
-substrate underneath every write — no JSON<->vCard round-trip on properties
+substrate underneath every write — no JSON↔vCard round-trip on properties
 not being modified.
 
 Ops:
   1. nc_contacts_list_addressbooks
-  2. nc_contacts_list_contacts (gains include_vcard / include_etag)
-  3. nc_contacts_get_contact NEW (vcard_text + etag + JSON)
-  4. nc_contacts_create_contact (accepts vcard_text or JSON)
-  5. nc_contacts_patch_contact NEW (surgical edit, If-Match)
-  6. nc_contacts_put_contact NEW (full vCard replace, If-Match)
-  7. nc_contacts_delete_contact (gains If-Match)
+  2. nc_contacts_list_contacts        (gains include_vcard / include_etag)
+  3. nc_contacts_get_contact          NEW  (vcard_text + etag + JSON)
+  4. nc_contacts_create_contact       (accepts vcard_text or JSON)
+  5. nc_contacts_patch_contact        NEW  (surgical edit, If-Match)
+  6. nc_contacts_put_contact          NEW  (full vCard replace, If-Match)
+  7. nc_contacts_delete_contact       (gains If-Match)
   8. nc_contacts_create_addressbook + nc_contacts_delete_addressbook
-     (counted as one — administrative)
+                                      (counted as one — administrative)
 
 nc_contacts_update_contact is DEPRECATED (kept as a thin shim that
 translates JSON-shape calls to nc_contacts_patch_contact and emits a
@@ -38,8 +38,8 @@ from typing import Any, Optional
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from nextcloud_mcp_server.client.contacts import EtagConflictError
-from nextcloud_mcp_server.core import get_client, require_scopes
+from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.contacts import (
     AddressBook,
     Contact,
@@ -66,18 +66,18 @@ def _parse_vcard_fields(
     fields: list[ContactField] = []
     for item in items:
         if isinstance(item, dict):
-            value = item.get("value", "")
+            value = str(item.get("value", ""))
             if not value:
                 continue
-            types = item.get("type", [])
-            if not isinstance(types, list):
-                types = [types]
-            preferred = any(t.upper() == "PREF" for t in types)
-            label_parts = [t for t in types if t.upper() != "PREF"]
-            label = ", ".join(label_parts).lower() if label_parts else None
+            raw_types: list[str] = item.get("type") or []
+            preferred = any(t.upper() == "PREF" for t in raw_types)
+            labels = [t.lower() for t in raw_types if t.upper() != "PREF"]
             fields.append(
                 ContactField(
-                    type=field_type, value=value, preferred=preferred, label=label
+                    type=field_type,
+                    value=value,
+                    label=", ".join(labels) if labels else None,
+                    preferred=preferred,
                 )
             )
         elif isinstance(item, str) and item:
@@ -118,7 +118,7 @@ def configure_contacts_tools(mcp: FastMCP):
     @require_scopes("contacts.read")
     @instrument_tool
     async def nc_contacts_list_addressbooks(ctx: Context) -> ListAddressBooksResponse:
-        """List all available address books."""
+        """List all addressbooks for the user."""
         client = await get_client(ctx)
         addressbooks_data = await client.contacts.list_addressbooks()
         addressbooks = [
@@ -262,10 +262,11 @@ def configure_contacts_tools(mcp: FastMCP):
         verify: bool = False,
         retry_on_conflict: bool = False,
     ) -> PatchContactResponse:
-        """Surgical edit. GET-with-ETag -> byte-preserve patch -> PUT-with-If-Match.
+        """Surgical edit. GET-with-ETag → byte-preserve patch → PUT-with-If-Match.
 
         Untouched properties (PHOTO, X-extensions, line-folded NOTEs, vendor
         fields) round-trip byte-equal. Only the touched lines regenerate.
+        This replaces the deprecated ``update_contact`` for byte-faithful work.
 
         Args:
             addressbook: URI slug.
@@ -274,10 +275,19 @@ def configure_contacts_tools(mcp: FastMCP):
                 ``list_contacts(include_etag=true)``.
             set_props: ``{selector: new_value}`` — replace single matching line.
                 Selectors: ``"FN"``, ``"NOTE"``, ``"TEL;TYPE=CELL"``, etc.
-            add_props: list of ``[name, value, params]`` — append a new line.
+                If property absent, it is added (DAVx5 ergonomic).
+            add_props: list of ``[name, value, params]`` — append a new line
+                without disturbing existing instances. ``params`` is a list of
+                ``[key, value]`` pairs. Use this for adding a TEL alongside
+                existing TELs.
             remove_props: list of selectors to remove (all matches).
-            verify: post-write GET to confirm the change reflects.
+            verify: post-write GET to confirm the change reflects (catches
+                structural-loss bugs in the substrate).
             retry_on_conflict: on 412, refetch and re-apply once before failing.
+
+        Returns:
+            ``{uid, addressbook, old_etag, new_etag, applied, verified}``.
+            On 412 raises EtagConflictError → MCP error response.
         """
         client = await get_client(ctx)
         result = await client.contacts.patch_contact(
@@ -310,7 +320,8 @@ def configure_contacts_tools(mcp: FastMCP):
         """Full vCard replace. Caller is responsible for byte-correctness.
 
         Use for recovery import or corrective rewrite — most callers want
-        ``patch_contact`` (surgical, byte-preserving) instead.
+        ``patch_contact`` (surgical, byte-preserving) instead. Same If-Match
+        discipline; 412 surfaces to caller.
 
         Args:
             addressbook: URI slug.
