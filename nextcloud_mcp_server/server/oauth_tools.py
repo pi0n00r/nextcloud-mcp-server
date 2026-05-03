@@ -17,7 +17,6 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.auth.astrolabe_client import AstrolabeClient
 from nextcloud_mcp_server.auth.storage import RefreshTokenStorage
 from nextcloud_mcp_server.auth.token_broker import TokenBrokerService
 
@@ -54,7 +53,7 @@ class ProvisioningResult(BaseModel):
 
     success: bool = Field(description="Whether provisioning was initiated")
     provisioning_url: Optional[str] = Field(
-        None, description="URL to Astrolabe settings for provisioning background sync"
+        None, description="URL to Nextcloud user-security settings for provisioning background sync"
     )
     message: str = Field(description="Status message for the user")
     already_provisioned: bool = Field(
@@ -83,7 +82,7 @@ async def get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningSta
     Check the provisioning status for Nextcloud access.
 
     Checks for both credential types:
-    1. App password from Astrolabe (works today)
+    1. App password (works today)
     2. OAuth refresh token from storage (for future)
 
     Args:
@@ -94,29 +93,6 @@ async def get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningSta
         ProvisioningStatus with current provisioning state
     """
     settings = get_settings()
-
-    # Check for app password first (interim solution)
-    if settings.oidc_client_id and settings.oidc_client_secret:
-        try:
-            astrolabe = AstrolabeClient(
-                nextcloud_host=settings.nextcloud_host or "",
-                client_id=settings.oidc_client_id,
-                client_secret=settings.oidc_client_secret,
-            )
-            status = await astrolabe.get_background_sync_status(user_id)
-
-            if status.get("has_access"):
-                logger.info(
-                    f"  get_provisioning_status: ✓ App password FOUND for user_id={user_id}"
-                )
-                provisioned_at_str = status.get("provisioned_at")
-                return ProvisioningStatus(
-                    is_provisioned=True,
-                    provisioned_at=provisioned_at_str,
-                    credential_type="app_password",
-                )
-        except Exception as e:
-            logger.debug(f"  App password check failed for {user_id}: {e}")
 
     # Check for OAuth refresh token (fallback)
     logger.info(
@@ -204,7 +180,7 @@ async def provision_nextcloud_access(
     """
     MCP Tool: Provision offline access to Nextcloud resources.
 
-    Returns URL to Astrolabe settings page where users can provision background
+    Returns URL to Nextcloud security settings where users can provision background
     sync access using either:
     - App password (works today, interim solution)
     - OAuth refresh token (future, when Nextcloud supports OAuth for app APIs)
@@ -214,7 +190,7 @@ async def provision_nextcloud_access(
         user_id: Optional user identifier (extracted from token if not provided)
 
     Returns:
-        ProvisioningResult with Astrolabe settings URL or status
+        ProvisioningResult with Nextcloud security-settings URL or status
     """
     try:
         # Extract user ID from the MCP access token (Flow 1 token)
@@ -246,15 +222,15 @@ async def provision_nextcloud_access(
                 ),
             )
 
-        # Return Astrolabe settings URL for background sync provisioning
+        # Return generic Nextcloud user-settings URL for provisioning
         nextcloud_host = os.getenv("NEXTCLOUD_HOST", "http://localhost:8080")
-        astrolabe_url = f"{nextcloud_host}/settings/user/astrolabe#background-sync"
+        provisioning_url = f"{nextcloud_host}/settings/user/security"
 
         return ProvisioningResult(
             success=True,
-            provisioning_url=astrolabe_url,
+            provisioning_url=provisioning_url,
             message=(
-                "Visit Astrolabe settings to provision background sync access.\n\n"
+                "Visit your Nextcloud security settings to provision an app password for background sync.\n\n"
                 "You can choose either:\n"
                 "- App password (works today, recommended for now)\n"
                 "- OAuth refresh token (future, when Nextcloud fully supports OAuth)\n\n"
