@@ -9,7 +9,6 @@ import logging
 import os
 import secrets
 from datetime import datetime, timezone
-from typing import Optional
 from urllib.parse import urlencode
 
 from mcp.server.fastmcp import Context
@@ -17,7 +16,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.auth.storage import RefreshTokenStorage
+from nextcloud_mcp_server.auth.storage import get_shared_storage
 from nextcloud_mcp_server.auth.token_broker import TokenBrokerService
 
 # Re-export for backward compatibility — canonical location is auth.token_utils
@@ -33,17 +32,17 @@ class ProvisioningStatus(BaseModel):
     """Status of Nextcloud provisioning for a user."""
 
     is_provisioned: bool = Field(description="Whether Nextcloud access is provisioned")
-    provisioned_at: Optional[str] = Field(
+    provisioned_at: str | None = Field(
         None, description="ISO timestamp when provisioned"
     )
-    credential_type: Optional[str] = Field(
+    credential_type: str | None = Field(
         None, description="Type of credential ('refresh_token' or 'app_password')"
     )
-    client_id: Optional[str] = Field(
+    client_id: str | None = Field(
         None, description="Client ID that initiated the original Flow 1"
     )
-    scopes: Optional[list[str]] = Field(None, description="Granted scopes")
-    flow_type: Optional[str] = Field(
+    scopes: list[str] | None = Field(None, description="Granted scopes")
+    flow_type: str | None = Field(
         None, description="Type of flow used ('hybrid', 'flow1', 'flow2')"
     )
 
@@ -52,7 +51,7 @@ class ProvisioningResult(BaseModel):
     """Result of provisioning attempt."""
 
     success: bool = Field(description="Whether provisioning was initiated")
-    provisioning_url: Optional[str] = Field(
+    provisioning_url: str | None = Field(
         None, description="URL to Nextcloud user-security settings for provisioning background sync"
     )
     message: str = Field(description="Status message for the user")
@@ -77,9 +76,14 @@ class LoginConfirmation(BaseModel):
     )
 
 
-async def get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningStatus:
+async def _get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningStatus:
     """
     Check the provisioning status for Nextcloud access.
+
+    Internal helper — leading underscore signals that ``user_id`` is a
+    trusted identity claim that callers MUST derive from the verified
+    access token. The MCP tool wrappers in ``register_oauth_tools`` are
+    the only legitimate callers (PR #758 round-3 finding 3).
 
     Checks for both credential types:
     1. App password (works today)
@@ -95,26 +99,25 @@ async def get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningSta
     settings = get_settings()
 
     # Check for OAuth refresh token (fallback)
-    logger.info(
-        f"  get_provisioning_status: Looking up refresh token for user_id={user_id}"
+    logger.debug(
+        "  get_provisioning_status: looking up refresh token for user_id=%s", user_id
     )
-    storage = RefreshTokenStorage.from_env()
-    await storage.initialize()
+    storage = await get_shared_storage()
 
     token_data = await storage.get_refresh_token(user_id)
 
     if not token_data:
-        logger.info(
-            f"  get_provisioning_status: ✗ No credentials found for user_id={user_id}"
+        logger.debug(
+            "  get_provisioning_status: no credentials found for user_id=%s", user_id
         )
         return ProvisioningStatus(is_provisioned=False)
 
-    logger.info(
-        f"  get_provisioning_status: ✓ Refresh token FOUND for user_id={user_id}"
-    )
-    logger.info(f"    flow_type: {token_data.get('flow_type')}")
-    logger.info(
-        f"    provisioning_client_id: {token_data.get('provisioning_client_id', 'N/A')}"
+    logger.debug(
+        "  get_provisioning_status: refresh token FOUND for user_id=%s "
+        "flow_type=%s provisioning_client_id=%s",
+        user_id,
+        token_data.get("flow_type"),
+        token_data.get("provisioning_client_id", "N/A"),
     )
 
     # Convert timestamp to ISO format if present
@@ -174,11 +177,9 @@ def generate_oauth_url_for_flow2(
     return f"{auth_endpoint}?{urlencode(params)}"
 
 
-async def provision_nextcloud_access(
-    ctx: Context, user_id: Optional[str] = None
-) -> ProvisioningResult:
+async def _provision_nextcloud_access(ctx: Context, user_id: str) -> ProvisioningResult:
     """
-    MCP Tool: Provision offline access to Nextcloud resources.
+    Internal helper for the ``provision_nextcloud_access`` MCP tool.
 
     Returns URL to Nextcloud security settings where users can provision background
     sync access using either:
@@ -187,18 +188,15 @@ async def provision_nextcloud_access(
 
     Args:
         ctx: MCP context with user's Flow 1 token
-        user_id: Optional user identifier (extracted from token if not provided)
+        user_id: Authenticated user identifier (must be derived from the
+            verified access token by the caller; never accept from MCP input).
 
     Returns:
         ProvisioningResult with Nextcloud security-settings URL or status
     """
     try:
-        # Extract user ID from the MCP access token (Flow 1 token)
-        if not user_id:
-            user_id = await extract_user_id_from_token(ctx)
-
         # Check if already provisioned
-        status = await get_provisioning_status(ctx, user_id)
+        status = await _get_provisioning_status(ctx, user_id)
         if status.is_provisioned:
             return ProvisioningResult(
                 success=True,
@@ -247,31 +245,24 @@ async def provision_nextcloud_access(
         )
 
 
-async def revoke_nextcloud_access(
-    ctx: Context, user_id: Optional[str] = None
-) -> RevocationResult:
+async def _revoke_nextcloud_access(ctx: Context, user_id: str) -> RevocationResult:
     """
-    MCP Tool: Revoke offline access to Nextcloud resources.
+    Internal helper for the ``revoke_nextcloud_access`` MCP tool.
 
     This tool removes the stored refresh token and revokes access
     that was granted via Flow 2.
 
     Args:
-        mcp: MCP context
-        user_id: Optional user identifier
+        ctx: MCP context
+        user_id: Authenticated user identifier (must be derived from the
+            verified access token by the caller; never accept from MCP input).
 
     Returns:
         RevocationResult with status
     """
     try:
-        # Get user ID from token if not provided
-        if not user_id:
-            logger.info("Extracting user_id from access token for revoke...")
-            user_id = await extract_user_id_from_token(ctx)
-            logger.info(f"  Revoke using user_id: {user_id}")
-
         # Check current status
-        status = await get_provisioning_status(ctx, user_id)
+        status = await _get_provisioning_status(ctx, user_id)
         if not status.is_provisioned:
             return RevocationResult(
                 success=True,
@@ -279,8 +270,7 @@ async def revoke_nextcloud_access(
             )
 
         # Initialize Token Broker to handle revocation
-        storage = RefreshTokenStorage.from_env()
-        await storage.initialize()
+        storage = await get_shared_storage()
 
         # Get OAuth client credentials from storage
         client_creds = await storage.get_oauth_client()
@@ -326,36 +316,27 @@ async def revoke_nextcloud_access(
         )
 
 
-async def check_provisioning_status(
-    ctx: Context, user_id: Optional[str] = None
-) -> ProvisioningStatus:
+async def _check_provisioning_status(ctx: Context, user_id: str) -> ProvisioningStatus:
     """
-    MCP Tool: Check the current provisioning status.
+    Internal helper for the ``check_provisioning_status`` MCP tool.
 
     This tool allows users to check whether they have provisioned
     Nextcloud access and see details about their current authorization.
 
     Args:
-        mcp: MCP context
-        user_id: Optional user identifier
+        ctx: MCP context
+        user_id: Authenticated user identifier (must be derived from the
+            verified access token by the caller; never accept from MCP input).
 
     Returns:
         ProvisioningStatus with current state
     """
-    # Get user ID from context if not provided
-    if not user_id:
-        user_id = (
-            ctx.context.get("user_id", "default_user")  # type: ignore
-            if hasattr(ctx, "context")
-            else "default_user"
-        )
-
-    return await get_provisioning_status(ctx, user_id)
+    return await _get_provisioning_status(ctx, user_id)
 
 
-async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
+async def _check_logged_in(ctx: Context, user_id: str) -> str:
     """
-    MCP Tool: Check if user is logged in and elicit login if needed.
+    Internal helper for the ``check_logged_in`` MCP tool.
 
     This tool checks whether the user has completed Flow 2 (resource provisioning)
     to grant offline access to Nextcloud. If not logged in, it uses MCP elicitation
@@ -363,35 +344,29 @@ async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
 
     Args:
         ctx: MCP context with user's Flow 1 token
-        user_id: Optional user identifier (extracted from token if not provided)
+        user_id: Authenticated user identifier (must be derived from the
+            verified access token by the caller; never accept from MCP input).
 
     Returns:
         "yes" if logged in, or elicitation prompting for login
     """
     try:
-        # Extract user ID from the MCP access token (Flow 1 token)
-        logger.info("=" * 60)
-        logger.info("check_logged_in: Starting user_id extraction")
-        logger.info("=" * 60)
-
-        if not user_id:
-            user_id = await extract_user_id_from_token(ctx)
-            logger.info(f"  Final user_id for check_logged_in: {user_id}")
-        else:
-            logger.info(f"  user_id provided as argument: {user_id}")
-
-        # Check if already logged in
-        logger.info(f"Checking provisioning status for user_id: {user_id}")
-        status = await get_provisioning_status(ctx, user_id)
-        logger.info(f"  Provisioning status: is_provisioned={status.is_provisioned}")
+        # Demoted to debug (PR #758 round-2 nit 4): per-user logging at INFO
+        # ends up in log aggregation on every check_logged_in call, which is
+        # noise in a hosted multi-tenant deployment.
+        logger.debug("Checking provisioning status for user_id=%s", user_id)
+        status = await _get_provisioning_status(ctx, user_id)
+        logger.debug(
+            "  Provisioning status for %s: is_provisioned=%s",
+            user_id,
+            status.is_provisioned,
+        )
 
         if status.is_provisioned:
-            logger.info(f"✓ User {user_id} is already logged in - returning 'yes'")
-            logger.info("=" * 60)
+            logger.debug("User %s already logged in", user_id)
             return "yes"
 
-        logger.info(f"✗ User {user_id} is NOT logged in - triggering elicitation")
-        logger.info("=" * 60)
+        logger.debug("User %s NOT logged in — triggering elicitation", user_id)
 
         # Not logged in - generate OAuth URL for Flow 2
         # Use settings (handles both ENABLE_BACKGROUND_OPERATIONS and ENABLE_OFFLINE_ACCESS)
@@ -427,21 +402,13 @@ async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
         state = secrets.token_urlsafe(32)
 
         # Store state in session for validation on callback
-        storage = RefreshTokenStorage.from_env()
-        await storage.initialize()
+        storage = await get_shared_storage()
 
-        # Create OAuth session for Flow 2
-        session_id = f"flow2_{user_id}_{secrets.token_hex(8)}"
+        # The canonical Flow 2 oauth_session row is written inside
+        # generate_oauth_url_for_flow2 (keyed by `state`, with the PKCE
+        # verifier and nonce); the unified callback looks it up by `state`.
+        # No additional row is needed here.
         redirect_uri = f"{os.getenv('NEXTCLOUD_MCP_SERVER_URL', 'http://localhost:8000')}/oauth/callback"
-
-        await storage.store_oauth_session(
-            session_id=session_id,
-            client_redirect_uri="",  # No client redirect for Flow 2
-            state=state,
-            flow_type="flow2",
-            is_provisioning=True,
-            ttl_seconds=600,  # 10 minute TTL
-        )
 
         # Define scopes for Nextcloud access
         # Note: offline_access is only included when enabled in settings.
@@ -473,8 +440,11 @@ async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
             scopes=scopes,
         )
 
-        # Use elicitation to prompt user to login
-        logger.info(f"Eliciting login for user {user_id} with URL: {auth_url}")
+        # Use elicitation to prompt user to login. Logged at debug (PR #758
+        # round-2 nit 4): the auth URL contains the per-request ``state``
+        # token, which is sensitive enough that it shouldn't land in
+        # multi-tenant log aggregation by default.
+        logger.debug("Eliciting login for user %s (URL omitted)", user_id)
 
         result = await ctx.elicit(
             message=f"Please log in to Nextcloud at the following URL:\n\n{auth_url}\n\nAfter completing the login, check the box below and click OK.",
@@ -483,10 +453,15 @@ async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
 
         if result.action == "accept":
             # Check if login was successful by looking for refresh token
-            # Strategy: Try multiple lookup methods to handle both flows
-            logger.info("User accepted login prompt, checking for refresh token")
-            logger.info(f"  State parameter: {state[:16]}...")
-            logger.info(f"  User ID: {user_id}")
+            # Strategy: Try multiple lookup methods to handle both flows.
+            # Demoted to debug (PR #758 round-2 nit 4): user_id + state
+            # appear here on every elicitation accept.
+            logger.debug(
+                "User accepted login prompt; looking up refresh token "
+                "(user_id=%s state=%s...)",
+                user_id,
+                state[:16],
+            )
 
             # First, try to find token by provisioning_client_id (Flow 2 from elicitation)
             refresh_token_data = (
@@ -494,45 +469,39 @@ async def check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
             )
 
             if refresh_token_data:
-                logger.info("✓ Refresh token found via provisioning_client_id lookup")
-                logger.info(
-                    f"  Flow type: {refresh_token_data.get('flow_type', 'unknown')}"
-                )
-                logger.info(
-                    f"  Provisioned at: {refresh_token_data.get('provisioned_at', 'unknown')}"
+                logger.debug(
+                    "Refresh token found via provisioning_client_id lookup "
+                    "(flow_type=%s provisioned_at=%s)",
+                    refresh_token_data.get("flow_type", "unknown"),
+                    refresh_token_data.get("provisioned_at", "unknown"),
                 )
                 return "yes"
 
             # Fallback: Try to find token by user_id (browser login or any other flow)
-            logger.info(f"✗ No token found with provisioning_client_id={state[:16]}...")
-            logger.info(f"  Trying fallback lookup by user_id: {user_id}")
+            logger.debug(
+                "No token via provisioning_client_id=%s...; falling back to user_id=%s",
+                state[:16],
+                user_id,
+            )
 
             refresh_token_data = await storage.get_refresh_token(user_id)
 
             if refresh_token_data:
-                logger.info("✓ Refresh token found via user_id lookup")
-                logger.info(
-                    f"  Flow type: {refresh_token_data.get('flow_type', 'unknown')}"
-                )
-                logger.info(
-                    f"  Provisioned at: {refresh_token_data.get('provisioned_at', 'unknown')}"
-                )
-                logger.info(
-                    f"  Provisioning client ID: {refresh_token_data.get('provisioning_client_id', 'NULL')}"
-                )
-                logger.info(
-                    "  Note: This token was created via browser login or different flow"
+                logger.debug(
+                    "Refresh token found via user_id lookup "
+                    "(flow_type=%s provisioned_at=%s provisioning_client_id=%s)",
+                    refresh_token_data.get("flow_type", "unknown"),
+                    refresh_token_data.get("provisioned_at", "unknown"),
+                    refresh_token_data.get("provisioning_client_id", "NULL"),
                 )
                 return "yes"
 
             # No token found by either method
-            logger.warning(f"✗ No refresh token found for user {user_id}")
             logger.warning(
-                f"  Checked provisioning_client_id={state[:16]}... - NOT FOUND"
-            )
-            logger.warning(f"  Checked user_id={user_id} - NOT FOUND")
-            logger.warning(
-                "  This may indicate the user completed login but token wasn't stored"
+                "No refresh token found for user_id=%s (checked provisioning_client_id=%s... and user_id) — "
+                "user completed elicitation but token wasn't stored",
+                user_id,
+                state[:16],
             )
 
             return (
@@ -567,11 +536,9 @@ def register_oauth_tools(mcp):
         ),
     )
     @require_scopes("openid")
-    async def tool_provision_access(
-        ctx: Context,
-        user_id: Optional[str] = None,
-    ) -> ProvisioningResult:
-        return await provision_nextcloud_access(ctx, user_id)
+    async def tool_provision_access(ctx: Context) -> ProvisioningResult:
+        user_id = await extract_user_id_from_token(ctx)
+        return await _provision_nextcloud_access(ctx, user_id)
 
     @mcp.tool(
         name="revoke_nextcloud_access",
@@ -584,10 +551,9 @@ def register_oauth_tools(mcp):
         ),
     )
     @require_scopes("openid")
-    async def tool_revoke_access(
-        ctx: Context, user_id: Optional[str] = None
-    ) -> RevocationResult:
-        return await revoke_nextcloud_access(ctx, user_id)
+    async def tool_revoke_access(ctx: Context) -> RevocationResult:
+        user_id = await extract_user_id_from_token(ctx)
+        return await _revoke_nextcloud_access(ctx, user_id)
 
     @mcp.tool(
         name="check_provisioning_status",
@@ -599,10 +565,9 @@ def register_oauth_tools(mcp):
         ),
     )
     @require_scopes("openid")
-    async def tool_check_status(
-        ctx: Context, user_id: Optional[str] = None
-    ) -> ProvisioningStatus:
-        return await check_provisioning_status(ctx, user_id)
+    async def tool_check_status(ctx: Context) -> ProvisioningStatus:
+        user_id = await extract_user_id_from_token(ctx)
+        return await _check_provisioning_status(ctx, user_id)
 
     @mcp.tool(
         name="check_logged_in",
@@ -617,5 +582,6 @@ def register_oauth_tools(mcp):
         ),
     )
     @require_scopes("openid")
-    async def tool_check_logged_in(ctx: Context, user_id: Optional[str] = None) -> str:
-        return await check_logged_in(ctx, user_id)
+    async def tool_check_logged_in(ctx: Context) -> str:
+        user_id = await extract_user_id_from_token(ctx)
+        return await _check_logged_in(ctx, user_id)
