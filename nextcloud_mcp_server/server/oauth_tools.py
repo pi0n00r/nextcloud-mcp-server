@@ -16,7 +16,13 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.auth.astrolabe_client import AstrolabeClient
+# Astrolabe removed in pi0n00r fork — lazy import so basic-auth usage still works
+AstrolabeClient = None
+try:
+    from nextcloud_mcp_server.auth.astrolabe_client import AstrolabeClient as _Astro
+    AstrolabeClient = _Astro
+except (ModuleNotFoundError, ImportError):
+    pass
 from nextcloud_mcp_server.auth.storage import get_shared_storage
 from nextcloud_mcp_server.auth.token_broker import TokenBrokerService
 
