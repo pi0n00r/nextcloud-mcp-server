@@ -1,17 +1,18 @@
 """CalDAV client for Nextcloud calendar and task operations using caldav library."""
 
 import datetime as dt
-from zoneinfo import ZoneInfo
 import inspect
 import logging
 import uuid
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anyio
+import recurring_ical_events
 from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent
 from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
-from icalendar import Alarm, Calendar, vDDDTypes, vRecur
+from icalendar import Alarm, Calendar, Timezone, vDDDTypes, vRecur
 from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]
@@ -130,23 +131,32 @@ class CalendarClient:
             max_attempts: Maximum polling attempts (default: 40)
             initial_delay_ms: Initial delay between attempts in ms (default: 100ms)
         """
-        logger.info(f"Waiting for calendar '{calendar_name}' to propagate...")
+        logger.info("Waiting for calendar '%s' to propagate...", calendar_name)
         delay_ms = initial_delay_ms
 
         for attempt in range(max_attempts):
             try:
                 logger.debug(
-                    f"Attempt {attempt + 1}/{max_attempts} to find calendar '{calendar_name}'..."
+                    "Attempt %s/%s to find calendar '%s'...",
+                    attempt + 1,
+                    max_attempts,
+                    calendar_name,
                 )
                 calendars = await self.list_calendars()
                 if any(cal["name"] == calendar_name for cal in calendars):
                     logger.info(
-                        f"Calendar '{calendar_name}' became available after {attempt + 1} attempts"
+                        "Calendar '%s' became available after %s attempts",
+                        calendar_name,
+                        attempt + 1,
                     )
                     return
             except Exception as e:
                 logger.warning(
-                    f"Attempt {attempt + 1}/{max_attempts} to verify calendar '{calendar_name}' failed: {e}"
+                    "Attempt %s/%s to verify calendar '%s' failed: %s",
+                    attempt + 1,
+                    max_attempts,
+                    calendar_name,
+                    e,
                 )
 
             if attempt < max_attempts - 1:
@@ -155,7 +165,9 @@ class CalendarClient:
                 delay_ms = min(delay_ms * 2, 2000)
 
         logger.error(
-            f"Calendar '{calendar_name}' did not become available after {max_attempts} attempts."
+            "Calendar '%s' did not become available after %s attempts.",
+            calendar_name,
+            max_attempts,
         )
 
     # ============= Calendar Operations =============
@@ -242,7 +254,7 @@ class CalendarClient:
                         }
                     )
 
-        logger.debug(f"Found {len(result)} calendars")
+        logger.debug("Found %s calendars", len(result))
         return result
 
     async def create_calendar(
@@ -284,7 +296,7 @@ class CalendarClient:
                 f"Failed to create calendar '{calendar_name}': HTTP {response.status}"
             )
 
-        logger.debug(f"Created calendar: {calendar_name}")
+        logger.debug("Created calendar: %s", calendar_name)
 
         # Wait for calendar to be queryable (Nextcloud eventual consistency)
         await self._wait_for_calendar_propagation(calendar_name)
@@ -305,7 +317,7 @@ class CalendarClient:
         )
         await self._dav_client.delete(calendar_url)
 
-        logger.debug(f"Deleted calendar: {calendar_name}")
+        logger.debug("Deleted calendar: %s", calendar_name)
         return {"status_code": 204}
 
     # ============= Event Operations =============
@@ -321,40 +333,87 @@ class CalendarClient:
         calendar = self._get_calendar(calendar_name)
 
         if start_datetime or end_datetime:
-            # Build CalDAV REPORT with time-range filter for server-side filtering
             events = await self._search_events_by_date(
                 calendar, start_datetime, end_datetime
             )
-            # Expand is only used when both bounds are provided
-            expanded = bool(start_datetime and end_datetime)
+            # Client-side recurrence expansion preserves DTSTART format
+            # (floating / TZID / UTC). RFC 4791 <C:expand> would normalize
+            # everything to UTC and erase the original timezone context.
+            do_expand = bool(start_datetime and end_datetime)
         else:
-            # No date filter — fetch all events
             events = await calendar.events()  # type: ignore[misc]  # dual-mode
-            expanded = False
+            do_expand = False
 
         result = []
         for event in events:
             await _maybe_await(event.load(only_if_unloaded=True))
-            if event.data:
-                if expanded:
-                    # Server-side expansion: each response resource may contain
-                    # multiple VEVENTs (one per recurrence occurrence)
-                    for event_dict in self._parse_all_ical_events(event.data):
-                        event_dict["href"] = str(event.url)
-                        event_dict["etag"] = ""
-                        result.append(event_dict)
-                else:
-                    event_dict = self._parse_ical_event(event.data)
-                    if event_dict:
-                        event_dict["href"] = str(event.url)
-                        event_dict["etag"] = ""
-                        result.append(event_dict)
+            if not event.data:
+                continue
+
+            try:
+                cal = Calendar.from_ical(event.data)
+            except Exception as e:
+                logger.error("Error parsing iCalendar event: %s", e)
+                continue
+
+            href = str(event.url)
+            event_dicts = self._expand_event_occurrences(
+                cal, start_datetime, end_datetime, do_expand
+            )
+            for event_dict in event_dicts:
+                event_dict["href"] = href
+                event_dict["etag"] = ""
+                result.append(event_dict)
+
+                if len(result) >= limit:
+                    break
 
             if len(result) >= limit:
                 break
 
-        logger.debug(f"Found {len(result)} events")
+        logger.debug("Found %d events", len(result))
         return result
+
+    def _expand_event_occurrences(
+        self,
+        cal: Any,
+        start_datetime: dt.datetime | None,
+        end_datetime: dt.datetime | None,
+        do_expand: bool,
+    ) -> list[dict[str, Any]]:
+        """Return one event dict per occurrence in [start, end), or one dict for the master VEVENT.
+
+        When ``do_expand`` is true and the resource has an RRULE, expand recurrences
+        client-side using ``recurring_ical_events`` so that TZID and floating-local
+        semantics are preserved on the wire (server-side ``<C:expand>`` would
+        UTC-normalize every DTSTART per RFC 4791 §9.6.5).
+        """
+        if not do_expand:
+            for component in cal.walk("VEVENT"):
+                return [self._extract_vevent_data(component)]
+            return []
+
+        has_rrule = any("rrule" in component for component in cal.walk("VEVENT"))
+        if not has_rrule:
+            for component in cal.walk("VEVENT"):
+                return [self._extract_vevent_data(component)]
+            return []
+
+        try:
+            assert start_datetime is not None and end_datetime is not None
+            occurrences = recurring_ical_events.of(cal).between(
+                start_datetime, end_datetime
+            )
+        except Exception as e:
+            logger.warning(
+                "Client-side recurrence expansion failed (%s); returning master event",
+                e,
+            )
+            return [
+                self._extract_vevent_data(component) for component in cal.walk("VEVENT")
+            ]
+
+        return [self._extract_vevent_data(occ) for occ in occurrences]
 
     async def _search_events_by_date(
         self,
@@ -362,8 +421,13 @@ class CalendarClient:
         start_datetime: dt.datetime | None = None,
         end_datetime: dt.datetime | None = None,
     ) -> list:
-        """Execute a CalDAV REPORT with time-range filter."""
-        # Ensure naive datetimes are treated as UTC
+        """Execute a CalDAV REPORT with time-range filter.
+
+        Returns raw VEVENT resources (no server-side ``<C:expand>``). The caller
+        is responsible for expanding recurring events client-side so that
+        TZID/floating semantics are preserved.
+        """
+        # Ensure naive datetimes are treated as UTC for the wire-level filter
         if start_datetime and start_datetime.tzinfo is None:
             start_datetime = start_datetime.replace(tzinfo=dt.UTC)
         if end_datetime and end_datetime.tzinfo is None:
@@ -375,13 +439,7 @@ class CalendarClient:
         outer_comp_filter = cdav.CompFilter(name="VCALENDAR") + inner_comp_filter
         filter_element = cdav.Filter() + outer_comp_filter
 
-        # When both bounds are provided, request server-side expansion of
-        # recurring events (RFC 4791 §9.6.5). Each occurrence is returned as
-        # a separate VEVENT with its own DTSTART, with RRULE stripped.
         data = cdav.CalendarData()
-        if start_datetime and end_datetime:
-            data += cdav.Expand(start_datetime, end_datetime)
-
         query = cdav.CalendarQuery() + [dav.Prop() + data] + filter_element
 
         body = etree.tostring(
@@ -420,7 +478,7 @@ class CalendarClient:
         # caldav v3's _async_put raises PutError on HTTP failure
         event = await calendar.save_event(ical=ical_content)  # type: ignore[misc]  # dual-mode
 
-        logger.debug(f"Created event {event_uid}")
+        logger.debug("Created event %s", event_uid)
 
         return {
             "uid": event_uid,
@@ -451,7 +509,7 @@ class CalendarClient:
 
         await _maybe_await(event.save())
 
-        logger.debug(f"Updated event {event_uid}")
+        logger.debug("Updated event %s", event_uid)
         return {
             "uid": event_uid,
             "href": str(event.url),
@@ -468,10 +526,10 @@ class CalendarClient:
                 calendar, event_uid, cdav.CompFilter("VEVENT")
             )
             await _maybe_await(event.delete())
-            logger.debug(f"Deleted event {event_uid}")
+            logger.debug("Deleted event %s", event_uid)
             return {"status_code": 204}
         except caldav_error.NotFoundError as e:
-            logger.debug(f"Event {event_uid} not found: {e}")
+            logger.debug("Event %s not found: %s", event_uid, e)
             return {"status_code": 404}
 
     async def get_event(
@@ -492,7 +550,7 @@ class CalendarClient:
         event_data["href"] = str(event.url)
         event_data["etag"] = ""
 
-        logger.debug(f"Retrieved event {event_uid}")
+        logger.debug("Retrieved event %s", event_uid)
         return event_data, ""
 
     async def search_events_across_calendars(
@@ -526,14 +584,14 @@ class CalendarClient:
                     all_events.extend(events)
                 except Exception as e:
                     logger.warning(
-                        f"Error getting events from calendar {calendar['name']}: {e}"
+                        "Error getting events from calendar %s: %s", calendar["name"], e
                     )
                     continue
 
             return all_events
 
         except Exception as e:
-            logger.error(f"Error searching events across calendars: {e}")
+            logger.error("Error searching events across calendars: %s", e)
             raise
 
     # ============= Todo/Task Operations (NEW) =============
@@ -564,7 +622,7 @@ class CalendarClient:
                 if not filters or self._todo_matches_filters(todo_dict, filters):
                     result.append(todo_dict)
 
-        logger.debug(f"Found {len(result)} todos")
+        logger.debug("Found %s todos", len(result))
         return result
 
     async def create_todo(
@@ -579,7 +637,7 @@ class CalendarClient:
         # caldav v3's _async_put raises PutError on HTTP failure
         todo = await calendar.save_todo(ical=ical_content)  # type: ignore[misc]  # dual-mode
 
-        logger.debug(f"Created todo {todo_uid}")
+        logger.debug("Created todo %s", todo_uid)
 
         return {
             "uid": todo_uid,
@@ -606,7 +664,7 @@ class CalendarClient:
             await _maybe_await(todo.load(only_if_unloaded=True))
 
             logger.debug(
-                f"Loaded todo {todo_uid}, current data length: {len(todo.data)}"  # type: ignore
+                "Loaded todo %s, current data length: %s", todo_uid, len(todo.data)
             )
 
             # Merge updates into existing iCal data
@@ -615,14 +673,14 @@ class CalendarClient:
                 todo_data,
                 todo_uid,
             )
-            logger.debug(f"Merged iCal data length: {len(updated_ical)}")
-            logger.debug(f"Updated iCal content:\n{updated_ical}")
+            logger.debug("Merged iCal data length: %s", len(updated_ical))
+            logger.debug("Updated iCal content:\\n%s", updated_ical)
 
             todo.data = updated_ical
 
             await _maybe_await(todo.save())
 
-            logger.debug(f"Updated todo {todo_uid}")
+            logger.debug("Updated todo %s", todo_uid)
             return {
                 "uid": todo_uid,
                 "href": str(todo.url),
@@ -630,7 +688,7 @@ class CalendarClient:
                 "status_code": 200,
             }
         except Exception as e:
-            logger.error(f"Error updating todo {todo_uid}: {e}", exc_info=True)
+            logger.error("Error updating todo %s: %s", todo_uid, e, exc_info=True)
             raise
 
     async def delete_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
@@ -642,10 +700,10 @@ class CalendarClient:
                 calendar, todo_uid, cdav.CompFilter("VTODO")
             )
             await _maybe_await(todo.delete())
-            logger.debug(f"Deleted todo {todo_uid}")
+            logger.debug("Deleted todo %s", todo_uid)
             return {"status_code": 204}
         except caldav_error.NotFoundError as e:
-            logger.debug(f"Todo {todo_uid} not found: {e}")
+            logger.debug("Todo %s not found: %s", todo_uid, e)
             return {"status_code": 404}
 
     async def search_todos_across_calendars(
@@ -670,17 +728,62 @@ class CalendarClient:
                     all_todos.extend(todos)
                 except Exception as e:
                     logger.warning(
-                        f"Error getting todos from calendar {calendar['name']}: {e}"
+                        "Error getting todos from calendar %s: %s", calendar["name"], e
                     )
                     continue
 
             return all_todos
 
         except Exception as e:
-            logger.error(f"Error searching todos across calendars: {e}")
+            logger.error("Error searching todos across calendars: %s", e)
             raise
 
     # ============= Helper Methods - Event iCalendar =============
+
+    @staticmethod
+    def _resolve_timezone(tz_name: str) -> ZoneInfo | None:
+        """Resolve an IANA timezone name to ZoneInfo, returning None for invalid input."""
+        if not tz_name:
+            return None
+        try:
+            return ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                "Unknown IANA timezone %r — falling back to floating local time",
+                tz_name,
+            )
+            return None
+
+    @classmethod
+    def _parse_event_datetime(
+        cls, dt_str: str, tz_name: str | None = None
+    ) -> tuple[dt.datetime, ZoneInfo | None]:
+        """Parse an ISO datetime string with optional TZID application.
+
+        Returns ``(parsed_dt, applied_zoneinfo)`` where ``applied_zoneinfo``
+        is non-None only when ``tz_name`` was applied to a naive input — the
+        caller uses this to know whether to emit a VTIMEZONE component.
+        """
+        parsed = dt.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        zi = cls._resolve_timezone(tz_name) if tz_name else None
+
+        if parsed.tzinfo is not None:
+            if zi is not None:
+                logger.warning(
+                    "Datetime %r has an explicit offset; ignoring timezone=%r",
+                    dt_str,
+                    tz_name,
+                )
+            return parsed, None
+
+        if zi is not None:
+            return parsed.replace(tzinfo=zi), zi
+
+        logger.warning(
+            "Datetime %r is naive and no timezone was supplied — storing as RFC 5545 floating local time",
+            dt_str,
+        )
+        return parsed, None
 
     def _create_ical_event(self, event_data: dict[str, Any], event_uid: str) -> str:
         """Create iCalendar content from event data."""
@@ -698,13 +801,26 @@ class CalendarClient:
         start_str = event_data.get("start_datetime", "")
         end_str = event_data.get("end_datetime", "")
         all_day = event_data.get("all_day", False)
+        tz_name = event_data.get("timezone", "")
+        used_timezones: set[ZoneInfo] = set()
 
         if start_str:
-            start_value = self._parse_caldav_datetime(start_str, all_day=all_day)
-            event.add("dtstart", start_value)
-            if end_str:
-                end_value = self._parse_caldav_datetime(end_str, all_day=all_day)
-                event.add("dtend", end_value)
+            if all_day:
+                start_date = dt.datetime.fromisoformat(start_str.split("T")[0]).date()
+                event.add("dtstart", start_date)
+                if end_str:
+                    end_date = dt.datetime.fromisoformat(end_str.split("T")[0]).date()
+                    event.add("dtend", end_date)
+            else:
+                start_dt, zi = self._parse_event_datetime(start_str, tz_name)
+                if zi is not None:
+                    used_timezones.add(zi)
+                event.add("dtstart", start_dt)
+                if end_str:
+                    end_dt, zi = self._parse_event_datetime(end_str, tz_name)
+                    if zi is not None:
+                        used_timezones.add(zi)
+                    event.add("dtend", end_dt)
 
         # Add categories
         categories = event_data.get("categories", "")
@@ -756,14 +872,14 @@ class CalendarClient:
         event.add("dtstamp", now)
         event.add("last-modified", now)
 
+        # VTIMEZONE must appear before the referencing VEVENT.
+        for zi in used_timezones:
+            cal.add_component(Timezone.from_tzinfo(zi))
         cal.add_component(event)
         return cal.to_ical().decode("utf-8")
 
     def _extract_vevent_data(self, component) -> dict[str, Any]:
-        """Extract event data from a single VEVENT component.
-
-        Shared helper used by both _parse_ical_event() and _parse_all_ical_events().
-        """
+        """Extract event data from a single VEVENT component."""
         event_data: dict[str, Any] = {
             "uid": str(component.get("uid", "")),
             "title": str(component.get("summary", "")),
@@ -775,24 +891,28 @@ class CalendarClient:
             "url": str(component.get("url", "")),
         }
 
-        # Handle dates
+        # Handle dates. The ``.isoformat()`` representation already encodes the
+        # storage semantics: no suffix for floating local, ``+00:00`` for UTC,
+        # and the offset (e.g. ``-04:00``) for TZID-bound datetimes. The IANA
+        # TZID name is surfaced separately as ``start_tz``/``end_tz`` so callers
+        # can distinguish "10am NY time" (recurs in local time across DST) from
+        # "14:00 UTC" (same UTC instant), which the offset alone cannot express.
         dtstart = component.get("dtstart")
         if dtstart:
-            if isinstance(dtstart.dt, dt.date) and not isinstance(
+            event_data["start_datetime"] = dtstart.dt.isoformat()
+            event_data["all_day"] = isinstance(dtstart.dt, dt.date) and not isinstance(
                 dtstart.dt, dt.datetime
-            ):
-                event_data["start_datetime"] = dtstart.dt.isoformat()
-                event_data["all_day"] = True
-            else:
-                event_data["start_datetime"] = dtstart.dt.isoformat()
-                event_data["all_day"] = False
+            )
+            tzid = dtstart.params.get("TZID") if dtstart.params else None
+            if tzid:
+                event_data["start_tz"] = str(tzid)
 
         dtend = component.get("dtend")
         if dtend:
-            if isinstance(dtend.dt, dt.date) and not isinstance(dtend.dt, dt.datetime):
-                event_data["end_datetime"] = dtend.dt.isoformat()
-            else:
-                event_data["end_datetime"] = dtend.dt.isoformat()
+            event_data["end_datetime"] = dtend.dt.isoformat()
+            tzid = dtend.params.get("TZID") if dtend.params else None
+            if tzid:
+                event_data["end_tz"] = str(tzid)
 
         # Handle categories
         categories = component.get("categories")
@@ -826,24 +946,8 @@ class CalendarClient:
                     return self._extract_vevent_data(component)
             return None
         except Exception as e:
-            logger.error(f"Error parsing iCalendar event: {e}")
+            logger.error("Error parsing iCalendar event: %s", e)
             return None
-
-    def _parse_all_ical_events(self, ical_text: str) -> list[dict[str, Any]]:
-        """Parse iCalendar text and extract ALL event occurrences.
-
-        Used with server-side expansion where a single VCALENDAR contains
-        multiple VEVENT components (one per recurrence occurrence).
-        """
-        results: list[dict[str, Any]] = []
-        try:
-            cal = Calendar.from_ical(ical_text)
-            for component in cal.walk():
-                if component.name == "VEVENT":
-                    results.append(self._extract_vevent_data(component))
-        except Exception as e:
-            logger.error(f"Error parsing iCalendar events: {e}")
-        return results
 
     def _merge_ical_properties(
         self, raw_ical: str, event_data: dict[str, Any], event_uid: str
@@ -914,100 +1018,63 @@ class CalendarClient:
                             alarm.add("trigger", dt.timedelta(minutes=-minutes))
                             component.add_component(alarm)
 
-                    # Handle dates — vDDDTypes wrap is load-bearing for RFC 5545
-                    # serialization. icalendar's __setitem__ does NOT auto-coerce
-                    # raw datetimes (only Component.add() does), so wrapping is
-                    # required to avoid the "Python repr leak" mangle (P1.2).
+                    # Handle dates
+                    tz_name = event_data.get("timezone", "")
+                    used_timezones: set[ZoneInfo] = set()
                     if "start_datetime" in event_data:
                         start_str = event_data["start_datetime"]
                         all_day = event_data.get("all_day", False)
-                        start_value = self._parse_caldav_datetime(
-                            start_str, all_day=all_day
-                        )
-                        component["DTSTART"] = vDDDTypes(start_value)
+                        if all_day:
+                            start_date = dt.datetime.fromisoformat(
+                                start_str.split("T")[0]
+                            ).date()
+                            component["DTSTART"] = start_date
+                        else:
+                            start_dt, zi = self._parse_event_datetime(
+                                start_str, tz_name
+                            )
+                            if zi is not None:
+                                used_timezones.add(zi)
+                            component["DTSTART"] = vDDDTypes(start_dt)
 
                     if "end_datetime" in event_data:
                         end_str = event_data["end_datetime"]
                         all_day = event_data.get("all_day", False)
-                        end_value = self._parse_caldav_datetime(
-                            end_str, all_day=all_day
-                        )
-                        component["DTEND"] = vDDDTypes(end_value)
+                        if all_day:
+                            end_date = dt.datetime.fromisoformat(
+                                end_str.split("T")[0]
+                            ).date()
+                            component["DTEND"] = end_date
+                        else:
+                            end_dt, zi = self._parse_event_datetime(end_str, tz_name)
+                            if zi is not None:
+                                used_timezones.add(zi)
+                            component["DTEND"] = vDDDTypes(end_dt)
 
                     # Update timestamps
                     now = dt.datetime.now(dt.UTC)
                     component["LAST-MODIFIED"] = vDDDTypes(now)
                     component["DTSTAMP"] = vDDDTypes(now)
 
+                    # Ensure VTIMEZONE definitions exist for any TZID we just attached.
+                    existing_tzids = {
+                        str(sub.get("TZID", ""))
+                        for sub in cal.subcomponents
+                        if sub.name == "VTIMEZONE"
+                    }
+                    for zi in used_timezones:
+                        if str(zi) not in existing_tzids:
+                            cal.add_component(Timezone.from_tzinfo(zi))
+
                     break
 
             return cal.to_ical().decode("utf-8")
 
         except Exception as e:
-            logger.error(f"Error merging iCal properties: {e}")
+            logger.error("Error merging iCal properties: %s", e)
             return self._create_ical_event(event_data, event_uid)
 
     # ============= Helper Methods - Todo iCalendar =============
-
-    # ============= Helper: nc-time-policy-compliant datetime parsing =============
-
-    _TORONTO_TZ = ZoneInfo("America/Toronto")
-
-    def _parse_caldav_datetime(
-        self, value: str, *, all_day: bool = False
-    ) -> "dt.datetime | dt.date":
-        """Parse an ISO 8601 datetime string into a tz-aware datetime per nc-time-policy.
-
-        Per Documents/Projects/Isla/nc-time-policy.md:
-        - Wall-clock semantic: input with America/Toronto offset (-04:00 EDT or
-          -05:00 EST depending on date) is promoted from fixed-offset tzinfo to
-          ZoneInfo("America/Toronto") so icalendar serializes as
-          TZID=America/Toronto (preserves wall-clock across DST and viewer-TZ).
-        - Audit semantic: input with `Z` or `+00:00` produces UTC datetime
-          (icalendar serializes with `Z` suffix).
-        - All-day: returns date object (no time component).
-        - Naive input is forbidden per policy; raises ValueError.
-
-        This is the canonical entry point for any user-supplied datetime
-        going into a CalDAV property (DTSTART/DTEND/DUE/COMPLETED). The
-        legacy `_ensure_timezone_aware` helper silently coerced naive to UTC,
-        which violated wall-clock semantic; that helper is retained for
-        backwards compatibility but new code should use this one.
-        """
-        if all_day:
-            # Strip any time component, return date
-            return dt.datetime.fromisoformat(value.split("T")[0]).date()
-
-        # Normalize Z to explicit UTC offset for fromisoformat
-        normalized = value.replace("Z", "+00:00")
-        try:
-            parsed = dt.datetime.fromisoformat(normalized)
-        except ValueError as e:
-            raise ValueError(
-                f"Datetime not parseable as ISO 8601: {value!r} ({e})"
-            ) from e
-
-        if parsed.tzinfo is None:
-            raise ValueError(
-                f"Datetime missing timezone offset (forbidden per nc-time-policy): "
-                f"{value!r}. Provide ISO 8601 with `Z`, `\u00b1HH:MM` offset, "
-                f"or via TZID-prefixed CalDAV form."
-            )
-
-        # Promote fixed-offset tzinfo to IANA ZoneInfo when offset matches
-        # America/Toronto on the target date (preserves wall-clock semantic
-        # across DST). Detection is offset-equality on the target naive datetime.
-        if isinstance(parsed.tzinfo, dt.timezone) and parsed.utcoffset() != dt.timedelta(0):
-            offset = parsed.utcoffset()
-            naive = parsed.replace(tzinfo=None)
-            if self._TORONTO_TZ.utcoffset(naive) == offset:
-                parsed = parsed.replace(tzinfo=self._TORONTO_TZ)
-            # else: leave as fixed-offset; icalendar emits TZID="UTC\u00b1HH:MM"
-            # which is RFC 5545-valid but non-IANA. Caller used a non-Toronto
-            # offset deliberately; preserve that semantic rather than impose
-            # Toronto.
-
-        return parsed
 
     def _ensure_timezone_aware(self, datetime_str: str) -> dt.datetime:
         """Parse datetime string and ensure it's timezone-aware.
@@ -1059,19 +1126,19 @@ class CalendarClient:
         # Due date
         due = todo_data.get("due", "")
         if due:
-            due_dt = self._parse_caldav_datetime(due)
+            due_dt = self._ensure_timezone_aware(due)
             todo.add("due", vDDDTypes(due_dt))
 
         # Start date
         dtstart = todo_data.get("dtstart", "")
         if dtstart:
-            start_dt = self._parse_caldav_datetime(dtstart)
+            start_dt = self._ensure_timezone_aware(dtstart)
             todo.add("dtstart", vDDDTypes(start_dt))
 
         # Completed timestamp
         completed = todo_data.get("completed", "")
         if completed:
-            completed_dt = self._parse_caldav_datetime(completed)
+            completed_dt = self._ensure_timezone_aware(completed)
             todo.add("completed", vDDDTypes(completed_dt))
 
         # Categories
@@ -1128,7 +1195,7 @@ class CalendarClient:
             return None
 
         except Exception as e:
-            logger.error(f"Error parsing iCalendar todo: {e}")
+            logger.error("Error parsing iCalendar todo: %s", e)
             return None
 
     def _merge_ical_todo_properties(
@@ -1137,7 +1204,7 @@ class CalendarClient:
         """Merge new todo data into existing raw iCal while preserving all properties."""
         try:
             logger.debug(
-                f"Merging todo properties for {todo_uid}: {list(todo_data.keys())}"
+                "Merging todo properties for %s: %s", todo_uid, list(todo_data.keys())
             )
             cal = Calendar.from_ical(raw_ical)
 
@@ -1151,37 +1218,37 @@ class CalendarClient:
                     if "status" in todo_data:
                         status_value = todo_data["status"].upper()
                         component["STATUS"] = status_value
-                        logger.debug(f"Set STATUS to {status_value}")
+                        logger.debug("Set STATUS to %s", status_value)
                     if "priority" in todo_data:
                         component["PRIORITY"] = todo_data["priority"]
                     if "percent_complete" in todo_data:
                         percent_value = todo_data["percent_complete"]
                         component["PERCENT-COMPLETE"] = percent_value
-                        logger.debug(f"Set PERCENT-COMPLETE to {percent_value}")
+                        logger.debug("Set PERCENT-COMPLETE to %s", percent_value)
 
                     # Handle due date
                     if "due" in todo_data:
                         due_str = todo_data["due"]
                         if due_str:
-                            due_dt = self._parse_caldav_datetime(due_str)
+                            due_dt = self._ensure_timezone_aware(due_str)
                             component["DUE"] = vDDDTypes(due_dt)
-                            logger.debug(f"Set DUE to {due_dt}")
+                            logger.debug("Set DUE to %s", due_dt)
 
                     # Handle start date
                     if "dtstart" in todo_data:
                         dtstart_str = todo_data["dtstart"]
                         if dtstart_str:
-                            dtstart_dt = self._parse_caldav_datetime(dtstart_str)
+                            dtstart_dt = self._ensure_timezone_aware(dtstart_str)
                             component["DTSTART"] = vDDDTypes(dtstart_dt)
-                            logger.debug(f"Set DTSTART to {dtstart_dt}")
+                            logger.debug("Set DTSTART to %s", dtstart_dt)
 
                     # Handle completed date
                     if "completed" in todo_data:
                         completed_str = todo_data["completed"]
                         if completed_str:
-                            completed_dt = self._parse_caldav_datetime(completed_str)
+                            completed_dt = self._ensure_timezone_aware(completed_str)
                             component["COMPLETED"] = vDDDTypes(completed_dt)
-                            logger.debug(f"Set COMPLETED to {completed_dt}")
+                            logger.debug("Set COMPLETED to %s", completed_dt)
 
                     # Handle categories
                     if "categories" in todo_data:
@@ -1190,7 +1257,7 @@ class CalendarClient:
                             component["CATEGORIES"] = [
                                 c.strip() for c in categories_str.split(",")
                             ]
-                            logger.debug(f"Set CATEGORIES to {categories_str}")
+                            logger.debug("Set CATEGORIES to %s", categories_str)
 
                     # Update timestamps
                     now = dt.datetime.now(dt.UTC)
@@ -1202,7 +1269,7 @@ class CalendarClient:
             return cal.to_ical().decode("utf-8")
 
         except Exception as e:
-            logger.error(f"Error merging iCal todo properties: {e}", exc_info=True)
+            logger.error("Error merging iCal todo properties: %s", e, exc_info=True)
             return self._create_ical_todo(todo_data, todo_uid)
 
     # ============= Helper Methods - Filtering =============
@@ -1234,7 +1301,7 @@ class CalendarClient:
                     return categories_obj.to_ical().decode("utf-8")
                 return str(categories_obj)
         except Exception as e:
-            logger.warning(f"Error extracting categories: {e}")
+            logger.warning("Error extracting categories: %s", e)
             return str(categories_obj)
 
     def _apply_event_filters(
@@ -1381,7 +1448,7 @@ class CalendarClient:
             }
 
         except Exception as e:
-            logger.error(f"Error in bulk update: {e}")
+            logger.error("Error in bulk update: %s", e)
             raise
 
     async def find_availability(

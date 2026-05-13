@@ -18,11 +18,11 @@ from pathlib import Path
 import anyio
 import numpy as np
 from jinja2 import Environment, FileSystemLoader
-from qdrant_client.models import FieldCondition, Filter, MatchValue
 from starlette.authentication import requires
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
+from nextcloud_mcp_server.api.management import _parse_int_param
 from nextcloud_mcp_server.auth.userinfo_routes import (
     _get_authenticated_client_for_userinfo,
 )
@@ -33,13 +33,16 @@ from nextcloud_mcp_server.search import (
     BM25HybridSearchAlgorithm,
     SemanticSearchAlgorithm,
 )
-from nextcloud_mcp_server.search.context import get_chunk_with_context
+from nextcloud_mcp_server.search.context import (
+    get_chunk_bbox_and_page_from_qdrant,
+    get_chunk_with_context,
+)
+from nextcloud_mcp_server.utils.validation import is_valid_nextcloud_doc_id
 from nextcloud_mcp_server.vector.oauth_sync import (
     NotProvisionedError,
     get_user_client_basic_auth,
 )
 from nextcloud_mcp_server.vector.pca import PCA
-from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
 logger = logging.getLogger(__name__)
@@ -137,8 +140,13 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
     doc_types = doc_types_param.split(",") if doc_types_param else None
 
     logger.info(
-        f"Viz search: user={username}, query='{query}', "
-        f"algorithm={algorithm}, fusion={fusion}, limit={limit}, doc_types={doc_types}"
+        "Viz search: user=%s, query='%s', algorithm=%s, fusion=%s, limit=%s, doc_types=%s",
+        username,
+        query,
+        algorithm,
+        fusion,
+        limit,
+        doc_types,
     )
 
     try:
@@ -227,8 +235,9 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
                 score_range = max_score - min_score if max_score > min_score else 1.0
 
                 logger.info(
-                    f"Normalizing scores for viz: original range [{min_score:.3f}, {max_score:.3f}] "
-                    f"→ [0.0, 1.0]"
+                    "Normalizing scores for viz: original range [%s, %s] → [0.0, 1.0]",
+                    format(min_score, ".3f"),
+                    format(max_score, ".3f"),
                 )
 
                 # Store original score and rescale to 0-1 for visualization
@@ -285,7 +294,11 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
                         vector = point.vector
 
                     if vector is not None and point.payload:
-                        doc_id = point.payload.get("doc_id")
+                        # SearchResult.id is str; coerce payload doc_id to match
+                        # so the tuple lookup below succeeds even on legacy
+                        # int-typed payloads written before normalization.
+                        raw_doc_id = point.payload.get("doc_id")
+                        doc_id = None if raw_doc_id is None else str(raw_doc_id)
                         chunk_start = point.payload.get("chunk_start_offset")
                         chunk_end = point.payload.get("chunk_end_offset")
                         chunk_key = (doc_id, chunk_start, chunk_end)
@@ -331,7 +344,7 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
                 status_code=500,
             )
 
-        logger.info(f"Detected embedding dimension: {embedding_dim}")
+        logger.info("Detected embedding dimension: %s", embedding_dim)
 
         # Build chunk vectors array in search_results order (1:1 mapping)
         chunk_vectors = []
@@ -342,7 +355,8 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
             else:
                 # Chunk not found in vectors (shouldn't happen)
                 logger.warning(
-                    f"Chunk {chunk_key} not found in fetched vectors, using zero vector"
+                    "Chunk %s not found in fetched vectors, using zero vector",
+                    chunk_key,
                 )
                 # Use zero vector as fallback
                 chunk_vectors.append(np.zeros(embedding_dim))
@@ -354,14 +368,16 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
         if search_algo.query_embedding is not None:
             query_embedding = search_algo.query_embedding
             logger.info(
-                f"Reusing query embedding from search algorithm "
-                f"(dimension={len(query_embedding)})"
+                "Reusing query embedding from search algorithm (dimension=%s)",
+                len(query_embedding),
             )
         else:
             # Fallback: generate embedding if not available from search
             embedding_service = get_embedding_service()
             query_embedding = await embedding_service.embed(query)
-            logger.info(f"Generated query embedding (dimension={len(query_embedding)})")
+            logger.info(
+                "Generated query embedding (dimension=%s)", len(query_embedding)
+            )
         query_embed_duration = time.perf_counter() - query_embed_start
 
         # Combine query vector with chunk vectors for PCA
@@ -380,16 +396,19 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
         if zero_norm_mask.any():
             zero_indices = np.where(zero_norm_mask)[0]
             logger.warning(
-                f"Found {zero_norm_mask.sum()} zero-norm vectors at indices {zero_indices.tolist()}. "
-                "Replacing with small epsilon to avoid division by zero."
+                "Found %s zero-norm vectors at indices %s. Replacing with small epsilon to avoid division by zero.",
+                zero_norm_mask.sum(),
+                zero_indices.tolist(),
             )
             # Replace zero norms with small epsilon to avoid NaN
             norms[zero_norm_mask] = 1e-10
 
         all_vectors_normalized = all_vectors / norms
         logger.info(
-            f"Normalized vectors: query_norm={norms[-1][0]:.3f}, "
-            f"doc_norm_range=[{norms[:-1].min():.3f}, {norms[:-1].max():.3f}]"
+            "Normalized vectors: query_norm=%s, doc_norm_range=[%s, %s]",
+            format(norms[-1][0], ".3f"),
+            format(norms[:-1].min(), ".3f"),
+            format(norms[:-1].max(), ".3f"),
         )
 
         # Apply PCA dimensionality reduction (768-dim → 3D) on normalized vectors
@@ -421,8 +440,9 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
         if nan_mask.any():
             nan_rows = np.where(nan_mask.any(axis=1))[0]
             logger.error(
-                f"Found NaN values in PCA output at {len(nan_rows)} points: {nan_rows.tolist()[:10]}. "
-                "Replacing NaN with 0.0 to prevent JSON serialization error."
+                "Found NaN values in PCA output at %s points: %s. Replacing NaN with 0.0 to prevent JSON serialization error.",
+                len(nan_rows),
+                nan_rows.tolist()[:10],
             )
             # Replace NaN with 0 to allow JSON serialization
             coords_3d = np.nan_to_num(coords_3d, nan=0.0)
@@ -435,13 +455,16 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
         chunk_coords_3d = coords_3d[:-1]  # All but last are chunks
 
         logger.info(
-            f"PCA explained variance: PC1={pca.explained_variance_ratio_[0]:.3f}, "
-            f"PC2={pca.explained_variance_ratio_[1]:.3f}, "
-            f"PC3={pca.explained_variance_ratio_[2]:.3f}"
+            "PCA explained variance: PC1=%s, PC2=%s, PC3=%s",
+            format(pca.explained_variance_ratio_[0], ".3f"),
+            format(pca.explained_variance_ratio_[1], ".3f"),
+            format(pca.explained_variance_ratio_[2], ".3f"),
         )
         logger.info(
-            f"Embedding stats: chunks={len(chunk_vectors)}, "
-            f"query_dim={len(query_embedding)}, chunk_vector_dim={chunk_vectors.shape[1] if chunk_vectors.size > 0 else 0}"
+            "Embedding stats: chunks=%s, query_dim=%s, chunk_vector_dim=%s",
+            len(chunk_vectors),
+            len(query_embedding),
+            chunk_vectors.shape[1] if chunk_vectors.size > 0 else 0,
         )
 
         # Coordinates already match search_results order (1:1 mapping)
@@ -472,12 +495,18 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
 
         # Log comprehensive timing metrics
         logger.info(
-            f"Viz search timing: total={total_duration * 1000:.1f}ms, "
-            f"search={search_duration * 1000:.1f}ms ({search_duration / total_duration * 100:.1f}%), "
-            f"vector_fetch={vector_fetch_duration * 1000:.1f}ms ({vector_fetch_duration / total_duration * 100:.1f}%), "
-            f"query_embed={query_embed_duration * 1000:.1f}ms ({query_embed_duration / total_duration * 100:.1f}%), "
-            f"pca={pca_duration * 1000:.1f}ms ({pca_duration / total_duration * 100:.1f}%), "
-            f"results={len(search_results)}, chunk_vectors={len(chunk_vectors)}"
+            "Viz search timing: total=%sms, search=%sms (%s%%), vector_fetch=%sms (%s%%), query_embed=%sms (%s%%), pca=%sms (%s%%), results=%s, chunk_vectors=%s",
+            format(total_duration * 1000, ".1f"),
+            format(search_duration * 1000, ".1f"),
+            format(search_duration / total_duration * 100, ".1f"),
+            format(vector_fetch_duration * 1000, ".1f"),
+            format(vector_fetch_duration / total_duration * 100, ".1f"),
+            format(query_embed_duration * 1000, ".1f"),
+            format(query_embed_duration / total_duration * 100, ".1f"),
+            format(pca_duration * 1000, ".1f"),
+            format(pca_duration / total_duration * 100, ".1f"),
+            len(search_results),
+            len(chunk_vectors),
         )
 
         return JSONResponse(
@@ -504,7 +533,7 @@ async def vector_visualization_search(request: Request) -> JSONResponse:
         )
 
     except Exception as e:
-        logger.error(f"Viz search error: {e}", exc_info=True)
+        logger.error("Viz search error: %s", e, exc_info=True)
         return JSONResponse(
             {"success": False, "error": str(e)},
             status_code=500,
@@ -535,7 +564,8 @@ async def chunk_context_endpoint(request: Request) -> JSONResponse:
         doc_id = request.query_params.get("doc_id")
         start_str = request.query_params.get("start")
         end_str = request.query_params.get("end")
-        context_chars = int(request.query_params.get("context", "500"))
+        chunk_index_str = request.query_params.get("chunk_index")
+        total_chunks_str = request.query_params.get("total_chunks")
 
         # Validate required parameters
         if not all([doc_type, doc_id, start_str, end_str]):
@@ -553,10 +583,39 @@ async def chunk_context_endpoint(request: Request) -> JSONResponse:
         assert start_str is not None
         assert end_str is not None
 
-        start = int(start_str)
-        end = int(end_str)
-        # Convert doc_id to int (all document types use int IDs)
-        doc_id_int = int(doc_id)
+        # Same numeric-doc_id gate as ``api/visualization.py`` — see the
+        # canonical TODO and rationale there. Kept in sync so both
+        # OAuth-protected and direct-access handlers reject malformed
+        # IDs at the boundary instead of bottoming out as a 404 from
+        # deep inside ``get_chunk_with_context``.
+        if not is_valid_nextcloud_doc_id(doc_id):
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": f"doc_id must be numeric, got {doc_id!r}",
+                },
+                status_code=400,
+            )
+
+        context_chars = _parse_int_param(
+            request.query_params.get("context"),
+            500,
+            0,
+            10000,
+            "context_chars",
+        )
+        start = _parse_int_param(start_str, 0, 0, 10000000, "start")
+        end = _parse_int_param(end_str, 0, 0, 10000000, "end")
+        if end <= start:
+            raise ValueError("end must be greater than start")
+        chunk_index: int | None = None
+        if chunk_index_str is not None:
+            chunk_index = _parse_int_param(
+                chunk_index_str, 0, 0, 1000000, "chunk_index"
+            )
+        total_chunks = _parse_int_param(total_chunks_str, 1, 1, 1000000, "total_chunks")
+        # doc_id is keyword-indexed in Qdrant as str — pass through verbatim
+        # (no int coercion; producers always stringify on write).
 
         user_id = request.user.display_name
         settings = get_settings()
@@ -580,10 +639,12 @@ async def chunk_context_endpoint(request: Request) -> JSONResponse:
             chunk_context = await get_chunk_with_context(
                 nc_client=nc_client,
                 user_id=user_id,
-                doc_id=doc_id_int,
+                doc_id=doc_id,
                 doc_type=doc_type,
                 chunk_start=start,
                 chunk_end=end,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
                 context_chars=context_chars,
             )
 
@@ -598,59 +659,32 @@ async def chunk_context_endpoint(request: Request) -> JSONResponse:
             )
 
         logger.info(
-            f"Fetched chunk context for {doc_type}_{doc_id}: "
-            f"chunk_len={len(chunk_context.chunk_text)}, "
-            f"before_len={len(chunk_context.before_context)}, "
-            f"after_len={len(chunk_context.after_context)}"
+            "Fetched chunk context for %s_%s: chunk_len=%s, before_len=%s, after_len=%s",
+            doc_type,
+            doc_id,
+            len(chunk_context.chunk_text),
+            len(chunk_context.before_context),
+            len(chunk_context.after_context),
         )
 
-        # For PDF files, also fetch the highlighted page image from Qdrant
-        highlighted_page_image = None
-        page_number = None
+        # For PDF files, also fetch the chunk bbox from Qdrant so the client
+        # can overlay a highlight on top of a render-on-demand page image
+        # (Deck #76). Qdrant's page_number is trusted over the
+        # context-expansion fallback when present.
+        chunk_bbox = None
+        page_number = chunk_context.page_number
         if doc_type == "file":
-            try:
-                settings = get_settings()
-                qdrant_client = await get_qdrant_client()
-                username = request.user.display_name
-
-                # Query for this specific chunk's highlighted image
-                points_response = await qdrant_client.scroll(
-                    collection_name=settings.get_collection_name(),
-                    scroll_filter=Filter(
-                        must=[
-                            get_placeholder_filter(),
-                            FieldCondition(
-                                key="doc_id", match=MatchValue(value=doc_id_int)
-                            ),
-                            FieldCondition(
-                                key="user_id", match=MatchValue(value=username)
-                            ),
-                            FieldCondition(
-                                key="chunk_start_offset", match=MatchValue(value=start)
-                            ),
-                            FieldCondition(
-                                key="chunk_end_offset", match=MatchValue(value=end)
-                            ),
-                        ]
-                    ),
-                    limit=1,
-                    with_vectors=False,
-                    with_payload=["highlighted_page_image", "page_number"],
-                )
-
-                points = points_response[0]
-                if points and points[0].payload:
-                    highlighted_page_image = points[0].payload.get(
-                        "highlighted_page_image"
-                    )
-                    page_number = points[0].payload.get("page_number")
-                    if highlighted_page_image:
-                        logger.info(
-                            f"Found highlighted image for chunk: "
-                            f"page={page_number}, image_size={len(highlighted_page_image)}"
-                        )
-            except Exception as e:
-                logger.warning(f"Failed to fetch highlighted image: {e}")
+            qdrant_bbox, qdrant_page = await get_chunk_bbox_and_page_from_qdrant(
+                user_id=user_id,
+                doc_id=doc_id,
+                chunk_index=chunk_index,
+                chunk_start=start,
+                chunk_end=end,
+            )
+            if qdrant_bbox is not None:
+                chunk_bbox = qdrant_bbox
+            if qdrant_page is not None:
+                page_number = qdrant_page
 
         # Return response compatible with frontend expectations
         response_data: dict = {
@@ -660,23 +694,25 @@ async def chunk_context_endpoint(request: Request) -> JSONResponse:
             "after_context": chunk_context.after_context,
             "has_more_before": chunk_context.has_before_truncation,
             "has_more_after": chunk_context.has_after_truncation,
+            "page_number": page_number,
+            "chunk_index": chunk_context.chunk_index,
+            "total_chunks": chunk_context.total_chunks,
         }
 
-        # Add image data if available
-        if highlighted_page_image:
-            response_data["highlighted_page_image"] = highlighted_page_image
-            response_data["page_number"] = page_number
+        if chunk_bbox:
+            response_data["chunk_bbox"] = chunk_bbox
 
         return JSONResponse(response_data)
 
     except ValueError as e:
-        logger.error(f"Invalid parameter format: {e}")
+        # User-supplied bad input → 400, not a server error.
+        logger.warning("Invalid parameter format: %s", e)
         return JSONResponse(
             {"success": False, "error": f"Invalid parameter format: {e}"},
             status_code=400,
         )
     except Exception as e:
-        logger.error(f"Chunk context error: {e}", exc_info=True)
+        logger.error("Chunk context error: %s", e, exc_info=True)
         return JSONResponse(
             {"success": False, "error": str(e)},
             status_code=500,

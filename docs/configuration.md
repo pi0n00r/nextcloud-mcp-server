@@ -38,12 +38,12 @@ The server supports three deployment modes. See [Authentication](authentication.
 |------|-------------|
 | `single_user_basic` | Personal use, dev — credentials in env vars |
 | `multi_user_basic` | Internal deployments — clients send credentials via `Authorization: Basic` header |
-| `login_flow_v2` | Hosted / OAuth-based MCP clients (claude.ai, Astrolabe Cloud) — recommended for multi-user |
+| `login_flow` | Hosted / OAuth-based MCP clients (claude.ai, Astrolabe Cloud) — recommended for multi-user |
 
 You can declare the mode explicitly:
 
 ```dotenv
-MCP_DEPLOYMENT_MODE=login_flow_v2
+MCP_DEPLOYMENT_MODE=login_flow
 ```
 
 If `MCP_DEPLOYMENT_MODE` is not set, the server auto-detects from the other env vars below.
@@ -74,7 +74,7 @@ Each MCP client sends its own Nextcloud credentials in an `Authorization: Basic`
 
 ```dotenv
 NEXTCLOUD_HOST=https://your.nextcloud.instance.com
-ENABLE_MULTI_USER_BASIC_AUTH=true
+MCP_DEPLOYMENT_MODE=multi_user_basic
 
 # Optional: enable per-user app-password storage for background sync
 TOKEN_ENCRYPTION_KEY=<fernet-key>
@@ -91,7 +91,7 @@ The recommended multi-user mode. MCP clients authenticate to the MCP server via 
 
 ```dotenv
 NEXTCLOUD_HOST=https://your.nextcloud.instance.com
-ENABLE_LOGIN_FLOW=true
+MCP_DEPLOYMENT_MODE=login_flow
 
 # App-password storage (required)
 TOKEN_ENCRYPTION_KEY=<fernet-key>
@@ -105,7 +105,7 @@ NEXTCLOUD_PUBLIC_ISSUER_URL=https://your.nextcloud.instance.com
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `NEXTCLOUD_HOST` | ✅ Yes | Internal URL of your Nextcloud instance (server-to-server) |
-| `ENABLE_LOGIN_FLOW` | ✅ Yes | Set to `true` to enable Login Flow v2 |
+| `MCP_DEPLOYMENT_MODE` | ✅ Yes | Set to `login_flow` to select this mode. The Login Flow v2 browser-app-password layer is derived from the mode automatically — no separate flag needed. |
 | `TOKEN_ENCRYPTION_KEY` | ✅ Yes | Fernet key for app-password encryption — generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `TOKEN_STORAGE_DB` | ✅ Yes | Path to SQLite DB for stored app passwords (use a persistent volume) |
 | `NEXTCLOUD_MCP_SERVER_URL` | ✅ Yes | Public URL of the MCP server (used as the audience claim and for browser redirects) |
@@ -197,8 +197,7 @@ OLLAMA_BASE_URL=http://ollama:11434
 **Multi-User Login Flow v2 Mode:**
 ```dotenv
 NEXTCLOUD_HOST=https://nextcloud.example.com
-MCP_DEPLOYMENT_MODE=login_flow_v2
-ENABLE_LOGIN_FLOW=true
+MCP_DEPLOYMENT_MODE=login_flow
 
 # Enable semantic search
 # In multi-user modes, this AUTOMATICALLY enables background operations!
@@ -329,6 +328,50 @@ OLLAMA_EMBEDDING_MODEL=all-minilm
 - **Switching models requires re-embedding** all documents (may take time for large note collections)
 - **Old collection remains** in Qdrant and can be deleted manually if no longer needed
 
+#### Startup migrations on existing collections
+
+On the first call to `get_qdrant_client()` against an existing collection, the
+server runs two idempotent migrations:
+
+1. **Payload-index creation** — adds `KEYWORD` payload indexes for `doc_id`,
+   `user_id`, and `doc_type`. Required by Qdrant for any `FieldCondition`
+   filter. Cheap; runs even on healthy collections.
+2. **`doc_id` backfill** — scans the collection once and rewrites any
+   legacy integer `doc_id` payloads to strings so they match the keyword
+   index. Idempotent: on a clean collection (all `doc_id` values already
+   `str`), the scroll runs but emits zero writes. On the first start after
+   the upgrade, expect a delay proportional to total point count for the
+   scroll itself, plus an additional delay proportional to any `int`-typed
+   `doc_id` points found while their payloads are rewritten.
+
+Both steps emit INFO-level log lines so operators can track progress.
+
+> **Operator note:** if the server logs `TypeError: SemanticSearchResult.id
+> must be int-convertible` after upgrading, this indicates a `doc_type`
+> with non-numeric ids has been indexed but the public response model
+> (`SemanticSearchResult.id: int`) has not been widened to accept strings.
+> Semantic search itself is not broken — the boundary cast in
+> `server/semantic.py` is failing loudly on purpose so the discrepancy is
+> caught early. Either widen the public model's `id` field or convert the
+> id at the verifier layer.
+
+> **Degraded-migration signals:** both startup steps swallow non-fatal
+> failures so the server still starts, but each leaves a distinct ERROR
+> log line that operators should treat as a "restart needed" signal:
+>
+> - `Unexpected error creating payload index on '<field>' (status 5xx)` —
+>   the index was not created. Searches filtering on that field will keep
+>   returning HTTP 400 (`Index required but not found`) until a subsequent
+>   restart succeeds in creating it.
+> - `doc_id backfill scroll failed on '<collection>'; will retry on next restart` —
+>   the migration sentinel was not written. Legacy integer `doc_id`
+>   payloads remain invisible to the keyword index in the meantime; the
+>   scroll re-runs from scratch on the next process start.
+>
+> Neither prevents the server from accepting requests, but both indicate
+> that vector search is operating in a degraded state on the affected
+> collection until the next clean restart.
+
 #### Explicit Override
 
 Set `QDRANT_COLLECTION` to use a specific collection name:
@@ -410,9 +453,16 @@ DOCUMENT_CHUNK_OVERLAP=50             # Overlapping words between chunks (defaul
 
 ### Embedding Service Configuration
 
-The server uses an embedding service to generate vector representations. Two options are available:
+The server picks an embedding provider via auto-detection. Priority order
+(see `nextcloud_mcp_server/providers/registry.py`):
 
-#### Ollama (Recommended)
+1. **Bedrock** — if `AWS_REGION` or `BEDROCK_EMBEDDING_MODEL` is set
+2. **OpenAI** — if `OPENAI_API_KEY` is set
+3. **Mistral** — if `MISTRAL_API_KEY` is set
+4. **Ollama** — if `OLLAMA_BASE_URL` is set
+5. **Simple** — fallback when nothing else is configured
+
+#### Ollama (Recommended for self-hosted)
 
 Use a local Ollama instance for embeddings:
 
@@ -422,9 +472,52 @@ OLLAMA_EMBEDDING_MODEL=nomic-embed-text  # Default model
 OLLAMA_VERIFY_SSL=true                   # Verify SSL certificates
 ```
 
+#### OpenAI
+
+Hosted OpenAI embeddings (or any OpenAI-compatible API via `OPENAI_BASE_URL`):
+
+```dotenv
+OPENAI_API_KEY=sk-...
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small  # default
+# OPENAI_BASE_URL=https://models.github.ai/inference  # optional
+```
+
+#### Mistral
+
+Hosted Mistral embeddings. Requires a Mistral API key from
+[console.mistral.ai](https://console.mistral.ai). Currently embeddings only
+(no text generation).
+
+```dotenv
+MISTRAL_API_KEY=...
+MISTRAL_EMBEDDING_MODEL=mistral-embed   # default; produces 1024-dim vectors
+# MISTRAL_BASE_URL=https://api.mistral.ai  # optional override (proxies, on-prem)
+```
+
+Switching to or from Mistral forces a new Qdrant collection because the
+collection name encodes the model (see "Qdrant Collection Naming" above).
+
+#### Amazon Bedrock
+
+Bedrock provides hosted embedding models (Titan, Cohere) and uses the AWS
+credential chain (env vars, profiles, or IAM role):
+
+```dotenv
+AWS_REGION=us-east-1
+BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are optional — boto3 will use
+# the standard credential chain if not set.
+```
+
 #### Simple Embedding Provider (Fallback)
 
-If `OLLAMA_BASE_URL` is not set, the server uses a simple random embedding provider for testing. This is **not suitable for production** as it generates random embeddings with no semantic meaning.
+If no provider env var is set, the server falls back to a simple deterministic
+embedding provider for testing. This is **not suitable for production** as
+its embeddings have no semantic meaning.
+
+```dotenv
+SIMPLE_EMBEDDING_DIMENSION=384  # optional; default 384
+```
 
 ### Document Chunking Configuration
 
@@ -533,7 +626,21 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `VECTOR_SYNC_QUEUE_MAX_SIZE` | ⚠️ Optional | `10000` | Max queued documents |
 | `OLLAMA_BASE_URL` | ⚠️ Optional | - | Ollama API endpoint for embeddings |
 | `OLLAMA_EMBEDDING_MODEL` | ⚠️ Optional | `nomic-embed-text` | Embedding model to use |
+| `OLLAMA_GENERATION_MODEL` | ⚠️ Optional | - | Ollama model for text generation |
 | `OLLAMA_VERIFY_SSL` | ⚠️ Optional | `true` | Verify SSL certificates |
+| `OPENAI_API_KEY` | ⚠️ Optional | - | OpenAI API key (selects OpenAI provider) |
+| `OPENAI_BASE_URL` | ⚠️ Optional | - | OpenAI base URL override (for compatible APIs) |
+| `OPENAI_EMBEDDING_MODEL` | ⚠️ Optional | `text-embedding-3-small` | OpenAI embedding model |
+| `OPENAI_GENERATION_MODEL` | ⚠️ Optional | - | OpenAI model for text generation |
+| `MISTRAL_API_KEY` | ⚠️ Optional | - | Mistral API key (selects Mistral provider) |
+| `MISTRAL_EMBEDDING_MODEL` | ⚠️ Optional | `mistral-embed` | Mistral embedding model (1024-dim) |
+| `MISTRAL_BASE_URL` | ⚠️ Optional | - | Mistral base URL override (proxies, on-prem) |
+| `AWS_REGION` | ⚠️ Optional | - | AWS region (selects Bedrock provider) |
+| `AWS_ACCESS_KEY_ID` | ⚠️ Optional | - | AWS access key (boto3 credential chain fallback) |
+| `AWS_SECRET_ACCESS_KEY` | ⚠️ Optional | - | AWS secret key (boto3 credential chain fallback) |
+| `BEDROCK_EMBEDDING_MODEL` | ⚠️ Optional | - | Bedrock embedding model ID |
+| `BEDROCK_GENERATION_MODEL` | ⚠️ Optional | - | Bedrock generation model ID |
+| `SIMPLE_EMBEDDING_DIMENSION` | ⚠️ Optional | `384` | Dimension for the fallback Simple provider |
 | `DOCUMENT_CHUNK_SIZE` | ⚠️ Optional | `512` | Words per chunk for document embedding |
 | `DOCUMENT_CHUNK_OVERLAP` | ⚠️ Optional | `50` | Overlapping words between chunks (must be < chunk size) |
 

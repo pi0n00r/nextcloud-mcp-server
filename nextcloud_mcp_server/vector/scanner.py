@@ -9,17 +9,23 @@ import random
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
+from typing import cast
 
 import anyio
 from anyio.abc import TaskStatus
 from anyio.streams.memory import MemoryObjectSendStream
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue, Record
 
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.client.news import NewsItemType
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.observability.metrics import record_vector_sync_scan
 from nextcloud_mcp_server.observability.tracing import trace_operation
+from nextcloud_mcp_server.server.tag_exclusion import (
+    get_excluded_file_paths,
+    is_path_excluded,
+)
 from nextcloud_mcp_server.vector.placeholder import (
     query_document_metadata,
     write_placeholder_point,
@@ -39,12 +45,62 @@ INDEXED_DOC_TYPES: frozenset[str] = frozenset(
 )
 
 
+# Page size for paginated deletion-tracking scrolls. Chosen to keep per-page
+# memory bounded while making the round-trip count manageable in the typical
+# < 100 k point per (user_id, doc_type) case. The previous single-page
+# ``limit=10_000`` silently truncated deletion sets for any user past the
+# cap, so anything indexed beyond the first 10 k was never reconciled.
+#
+# Intentionally larger than the ``batch_size = 256`` used by
+# ``_backfill_doc_id_to_string`` in ``vector/qdrant_client.py``: this is a
+# read-only scroll that just collects payloads (no write round-trip per
+# point), so the per-page memory budget is the only relevant constraint.
+# The 256 there is sized for read-write upsert batches where Qdrant
+# accepts ~256-point chunks comfortably without timing out under load.
+_DELETION_TRACKING_PAGE_SIZE: int = 1024
+
+
+async def _scroll_all_points(
+    qdrant_client: AsyncQdrantClient,
+    *,
+    collection_name: str,
+    scroll_filter: Filter,
+    payload_fields: list[str],
+    page_size: int = _DELETION_TRACKING_PAGE_SIZE,
+) -> list[Record]:
+    """Scroll every point matching the filter, paginating until exhausted.
+
+    Replaces the prior single-page ``limit=10_000`` calls that silently
+    dropped points beyond the first page. Pagination follows Qdrant's
+    documented contract: ``scroll`` returns ``(points, next_page_offset)``
+    and ``next_page_offset`` is ``None`` once the cursor reaches the end.
+    Errors propagate to the caller — the scanner's outer ``try`` already
+    handles them by skipping the deletion-tracking pass for this scan
+    (worse: extra-scan latency; never: bad data).
+    """
+    all_points: list[Record] = []
+    offset = None
+    while True:
+        points, offset = await qdrant_client.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            with_payload=payload_fields,
+            with_vectors=False,
+            limit=page_size,
+            offset=offset,
+        )
+        all_points.extend(points)
+        if offset is None:
+            break
+    return all_points
+
+
 @dataclass
 class DocumentTask:
     """Document task for processing queue."""
 
     user_id: str
-    doc_id: int | str  # int for files/notes, str for legacy
+    doc_id: str  # Always str — see vector/qdrant_client.py keyword index
     doc_type: str  # "note", "file", "calendar"
     operation: str  # "index" or "delete"
     modified_at: int
@@ -72,11 +128,22 @@ async def get_last_indexed_timestamp(user_id: str) -> int | None:
     Returns:
         Unix timestamp of most recently indexed note, or None if no notes indexed yet
     """
+    # TODO: This is O(N) over a user's indexed notes on every incremental
+    # sync tick. Was accidentally bounded at 10 k before this PR (single-
+    # page scroll silently truncated); paginating fixed correctness but
+    # made the unbounded cost visible. Track the max ``indexed_at`` as
+    # collection metadata or a dedicated sentinel point so this becomes
+    # O(1). Out of scope for the current PR — see the chunk-context /
+    # vector-sync follow-up tracker (referenced by the canonical TODO at
+    # ``api/visualization.py``).
     try:
         qdrant_client = await get_qdrant_client()
 
-        # Query for user's notes, ordered by indexed_at descending, limit 1
-        scroll_result = await qdrant_client.scroll(
+        # Scroll across every indexed note for this user — paginated so users
+        # with > 10 k indexed notes still produce a correct max (the prior
+        # single-page ``limit=10_000`` would have silently undercounted).
+        points = await _scroll_all_points(
+            qdrant_client,
             collection_name=get_settings().get_collection_name(),
             scroll_filter=Filter(
                 must=[
@@ -84,31 +151,30 @@ async def get_last_indexed_timestamp(user_id: str) -> int | None:
                     FieldCondition(key="doc_type", match=MatchValue(value="note")),
                 ]
             ),
-            with_payload=["indexed_at"],
-            with_vectors=False,
-            limit=10000,  # Get all to find max
+            payload_fields=["indexed_at"],
         )
 
-        # Find max indexed_at across all results
-        num_points = len(scroll_result[0]) if scroll_result[0] else 0
-        logger.info(f"Found {num_points} indexed notes in Qdrant for user {user_id}")
+        num_points = len(points)
+        logger.info("Found %s indexed notes in Qdrant for user %s", num_points, user_id)
 
-        if scroll_result[0]:
+        if points:
             timestamps = [
                 point.payload.get("indexed_at", 0)
-                for point in scroll_result[0]
+                for point in points
                 if point.payload is not None
             ]
             max_timestamp = max(timestamps) if timestamps else 0
             logger.info(
-                f"Max indexed_at: {max_timestamp}, timestamps sample: {timestamps[:3]}"
+                "Max indexed_at: %s, timestamps sample: %s",
+                max_timestamp,
+                timestamps[:3],
             )
             return int(max_timestamp) if max_timestamp > 0 else None
 
-        logger.info(f"No indexed notes found for user {user_id}")
+        logger.info("No indexed notes found for user %s", user_id)
         return None
     except Exception as e:
-        logger.warning(f"Failed to get last indexed timestamp: {e}", exc_info=True)
+        logger.warning("Failed to get last indexed timestamp: %s", e, exc_info=True)
         return None
 
 
@@ -134,7 +200,7 @@ async def scanner_task(
         user_id: User to scan
         task_status: Status object for signaling task readiness
     """
-    logger.info(f"Scanner task started for user: {user_id}")
+    logger.info("Scanner task started for user: %s", user_id)
     settings = get_settings()
 
     # Signal that the task has started and is ready
@@ -151,7 +217,7 @@ async def scanner_task(
                 )
 
             except Exception as e:
-                logger.error(f"Scanner error: {e}", exc_info=True)
+                logger.error("Scanner error: %s", e, exc_info=True)
 
             # Sleep until next interval or wake event
             try:
@@ -183,7 +249,10 @@ async def scan_user_documents(
 
     scan_id = random.randint(1000, 9999)
     logger.info(
-        f"[SCAN-{scan_id}] Starting scan for user: {user_id}, initial_sync={initial_sync}"
+        "[SCAN-%s] Starting scan for user: %s, initial_sync=%s",
+        scan_id,
+        user_id,
+        initial_sync,
     )
 
     with trace_operation(
@@ -202,15 +271,29 @@ async def scan_user_documents(
         )
         if prune_before:
             logger.info(
-                f"[SCAN-{scan_id}] Using pruneBefore={prune_before} to optimize data transfer"
+                "[SCAN-%s] Using pruneBefore=%s to optimize data transfer",
+                scan_id,
+                prune_before,
             )
 
         # For deletion tracking, get all doc_ids in Qdrant (for incremental sync)
-        # Note: We no longer bulk-query indexed_at, instead check per-document
+        # Note: We no longer bulk-query indexed_at, instead check per-document.
+        # Hoisted to function scope so the file-scroll block below doesn't
+        # depend on a name bound inside the notes-scroll block; future
+        # refactors that add an early return between the two blocks would
+        # otherwise hit an UnboundLocalError. get_qdrant_client is a
+        # singleton call, so the cost is identical.
+        qdrant_client = await get_qdrant_client() if not initial_sync else None
         indexed_doc_ids = set()
         if not initial_sync:
-            qdrant_client = await get_qdrant_client()
-            scroll_result = await qdrant_client.scroll(
+            # ``assert ... is not None`` would also narrow but raises an
+            # opaque AssertionError under ``-O`` and at runtime — ``cast``
+            # is the conventional zero-cost narrower for branches the type
+            # checker can't infer from the surrounding ``if not
+            # initial_sync`` (the ternary above ties the two together).
+            qdrant_client = cast(AsyncQdrantClient, qdrant_client)
+            points = await _scroll_all_points(
+                qdrant_client,
                 collection_name=get_settings().get_collection_name(),
                 scroll_filter=Filter(
                     must=[
@@ -218,18 +301,16 @@ async def scan_user_documents(
                         FieldCondition(key="doc_type", match=MatchValue(value="note")),
                     ]
                 ),
-                with_payload=["doc_id"],
-                with_vectors=False,
-                limit=10000,
+                payload_fields=["doc_id"],
             )
 
             indexed_doc_ids = {
-                point.payload["doc_id"]
-                for point in (scroll_result[0] or [])
-                if point.payload is not None
+                str(point.payload["doc_id"])
+                for point in points
+                if point.payload is not None and "doc_id" in point.payload
             }
 
-            logger.debug(f"Found {len(indexed_doc_ids)} indexed documents in Qdrant")
+            logger.debug("Found %s indexed documents in Qdrant", len(indexed_doc_ids))
 
         # Stream notes from Nextcloud and process immediately
         note_count = 0
@@ -267,7 +348,8 @@ async def scan_user_documents(
                 doc_key = (user_id, doc_id)
                 if doc_key in _potentially_deleted:
                     logger.debug(
-                        f"Document {doc_id} reappeared, removing from deletion grace period"
+                        "Document %s reappeared, removing from deletion grace period",
+                        doc_id,
                     )
                     del _potentially_deleted[doc_key]
 
@@ -294,14 +376,17 @@ async def scan_user_documents(
                     stale_threshold = get_settings().vector_sync_scan_interval * 5
                     if placeholder_age > stale_threshold:
                         logger.debug(
-                            f"Found stale placeholder for note {doc_id} "
-                            f"(age={placeholder_age:.1f}s), requeuing"
+                            "Found stale placeholder for note %s (age=%ss), requeuing",
+                            doc_id,
+                            format(placeholder_age, ".1f"),
                         )
                         needs_indexing = True
                     else:
                         logger.debug(
-                            f"Skipping note {doc_id} with recent placeholder "
-                            f"(age={placeholder_age:.1f}s < {stale_threshold:.1f}s)"
+                            "Skipping note %s with recent placeholder (age=%ss < %ss)",
+                            doc_id,
+                            format(placeholder_age, ".1f"),
+                            format(stale_threshold, ".1f"),
                         )
 
                 if needs_indexing:
@@ -325,11 +410,11 @@ async def scan_user_documents(
                     queued += 1
 
         # Log and record metrics after streaming
-        logger.info(f"[SCAN-{scan_id}] Found {note_count} notes for {user_id}")
+        logger.info("[SCAN-%s] Found %s notes for %s", scan_id, note_count, user_id)
         record_vector_sync_scan(note_count)
 
         if initial_sync:
-            logger.info(f"Sent {queued} documents for initial sync: {user_id}")
+            logger.info("Sent %s documents for initial sync: %s", queued, user_id)
             return
 
         # Check for deleted documents (in Qdrant but not in Nextcloud)
@@ -352,8 +437,10 @@ async def scan_user_documents(
                     if time_missing >= grace_period:
                         # Grace period elapsed, send for deletion
                         logger.info(
-                            f"Document {doc_id} missing for {time_missing:.1f}s "
-                            f"(>{grace_period:.1f}s grace period), sending deletion"
+                            "Document %s missing for %ss (>%ss grace period), sending deletion",
+                            doc_id,
+                            format(time_missing, ".1f"),
+                            format(grace_period, ".1f"),
                         )
                         await send_stream.send(
                             DocumentTask(
@@ -369,13 +456,16 @@ async def scan_user_documents(
                         del _potentially_deleted[doc_key]
                     else:
                         logger.debug(
-                            f"Document {doc_id} still missing "
-                            f"({time_missing:.1f}s/{grace_period:.1f}s grace period)"
+                            "Document %s still missing (%ss/%ss grace period)",
+                            doc_id,
+                            format(time_missing, ".1f"),
+                            format(grace_period, ".1f"),
                         )
                 else:
                     # First time missing, add to grace period tracking
                     logger.debug(
-                        f"Document {doc_id} missing for first time, starting grace period"
+                        "Document %s missing for first time, starting grace period",
+                        doc_id,
                     )
                     _potentially_deleted[doc_key] = current_time
 
@@ -383,7 +473,9 @@ async def scan_user_documents(
         # Get indexed file IDs from Qdrant (for deletion tracking)
         indexed_file_ids = set()
         if not initial_sync:
-            file_scroll_result = await qdrant_client.scroll(
+            assert qdrant_client is not None  # narrow for the type checker
+            points = await _scroll_all_points(
+                qdrant_client,
                 collection_name=settings.get_collection_name(),
                 scroll_filter=Filter(
                     must=[
@@ -391,18 +483,16 @@ async def scan_user_documents(
                         FieldCondition(key="doc_type", match=MatchValue(value="file")),
                     ]
                 ),
-                limit=10000,  # Reasonable limit for file count
-                with_payload=["doc_id"],
-                with_vectors=False,
+                payload_fields=["doc_id"],
             )
 
             indexed_file_ids = {
-                point.payload["doc_id"]
-                for point in (file_scroll_result[0] or [])
-                if point.payload is not None
+                str(point.payload["doc_id"])
+                for point in points
+                if point.payload is not None and "doc_id" in point.payload
             }
 
-            logger.debug(f"Found {len(indexed_file_ids)} indexed files in Qdrant")
+            logger.debug("Found %s indexed files in Qdrant", len(indexed_file_ids))
 
         # Scan for tagged PDF files
         file_count = 0
@@ -410,19 +500,51 @@ async def scan_user_documents(
         nextcloud_file_ids = set()
 
         try:
-            # Find files with vector-index tag using OCS Tags API
+            # Find files with vector-index tag using OCS Tags API.
+            # find_files_by_tag also expands tagged directories into their
+            # PDF descendants (Depth: infinity SEARCH), so a tag on a
+            # folder applies to every PDF beneath it.
             settings = get_settings()
             tag_name = os.getenv("VECTOR_SYNC_PDF_TAG", "vector-index")
-            # Use NextcloudClient.find_files_by_tag() which uses proper OCS API
-            # and filters by PDF MIME type
             tagged_files = await nc_client.find_files_by_tag(
                 tag_name, mime_type_filter="application/pdf"
             )
 
+            # Apply EXCLUDED_TAGS as defense-in-depth: a folder marked
+            # off-limits via the exclusion tag must not be indexed even if
+            # it (or an ancestor) also carries the include tag. Mirrors the
+            # "exclusion wins" contract enforced by the MCP file tools.
+            try:
+                excluded_paths = await get_excluded_file_paths(nc_client.webdav)
+            except Exception as e:
+                logger.warning(
+                    "[SCAN-%s] EXCLUDED_TAGS lookup failed (%s); "
+                    "proceeding without exclusion filter",
+                    scan_id,
+                    e,
+                )
+                excluded_paths = set()
+            if excluded_paths:
+                before = len(tagged_files)
+                tagged_files = [
+                    f
+                    for f in tagged_files
+                    if not is_path_excluded(f.get("path", ""), excluded_paths)
+                ]
+                skipped = before - len(tagged_files)
+                if skipped:
+                    logger.info(
+                        "[SCAN-%s] Skipped %d tagged file(s) under EXCLUDED_TAGS paths",
+                        scan_id,
+                        skipped,
+                    )
+
             for file_info in tagged_files:
                 # Files are already filtered by MIME type in find_files_by_tag()
                 file_count += 1
-                file_id = file_info["id"]  # Use numeric file ID, not path
+                # Normalize file ID to str — Qdrant doc_id payload is keyword-indexed
+                # and producers across doc_types must agree on a single type.
+                file_id = str(file_info["id"])
                 file_path = file_info["path"]  # Keep path for logging
                 nextcloud_file_ids.add(file_id)
 
@@ -448,11 +570,11 @@ async def scan_user_documents(
                     await send_stream.send(
                         DocumentTask(
                             user_id=user_id,
-                            doc_id=file_id,  # Use numeric file ID
+                            doc_id=file_id,
                             doc_type="file",
                             operation="index",
                             modified_at=modified_at,
-                            file_path=file_path,  # Pass file path for content retrieval
+                            file_path=file_path,
                         )
                     )
                     file_queued += 1
@@ -462,7 +584,9 @@ async def scan_user_documents(
                     file_key = (user_id, file_id)
                     if file_key in _potentially_deleted:
                         logger.debug(
-                            f"File {file_path} (ID: {file_id}) reappeared, removing from deletion grace period"
+                            "File %s (ID: %s) reappeared, removing from deletion grace period",
+                            file_path,
+                            file_id,
                         )
                         del _potentially_deleted[file_key]
 
@@ -489,14 +613,19 @@ async def scan_user_documents(
                         stale_threshold = get_settings().vector_sync_scan_interval * 5
                         if placeholder_age > stale_threshold:
                             logger.debug(
-                                f"Found stale placeholder for file {file_path} (ID: {file_id}) "
-                                f"(age={placeholder_age:.1f}s), requeuing"
+                                "Found stale placeholder for file %s (ID: %s) (age=%ss), requeuing",
+                                file_path,
+                                file_id,
+                                format(placeholder_age, ".1f"),
                             )
                             needs_indexing = True
                         else:
                             logger.debug(
-                                f"Skipping file {file_path} (ID: {file_id}) with recent placeholder "
-                                f"(age={placeholder_age:.1f}s < {stale_threshold:.1f}s)"
+                                "Skipping file %s (ID: %s) with recent placeholder (age=%ss < %ss)",
+                                file_path,
+                                file_id,
+                                format(placeholder_age, ".1f"),
+                                format(stale_threshold, ".1f"),
                             )
 
                     if needs_indexing:
@@ -511,17 +640,17 @@ async def scan_user_documents(
                         await send_stream.send(
                             DocumentTask(
                                 user_id=user_id,
-                                doc_id=file_id,  # Use numeric file ID
+                                doc_id=file_id,
                                 doc_type="file",
                                 operation="index",
                                 modified_at=modified_at,
-                                file_path=file_path,  # Pass file path for content retrieval
+                                file_path=file_path,
                             )
                         )
                         file_queued += 1
 
             logger.info(
-                f"[SCAN-{scan_id}] Found {file_count} tagged PDFs for {user_id}"
+                "[SCAN-%s] Found %s tagged PDFs for %s", scan_id, file_count, user_id
             )
             record_vector_sync_scan(file_count)
 
@@ -539,13 +668,15 @@ async def scan_user_documents(
                             if time_missing >= grace_period:
                                 # Grace period elapsed, send for deletion
                                 logger.info(
-                                    f"File ID {file_id} missing for {time_missing:.1f}s "
-                                    f"(>{grace_period:.1f}s grace period), sending deletion"
+                                    "File ID %s missing for %ss (>%ss grace period), sending deletion",
+                                    file_id,
+                                    format(time_missing, ".1f"),
+                                    format(grace_period, ".1f"),
                                 )
                                 await send_stream.send(
                                     DocumentTask(
                                         user_id=user_id,
-                                        doc_id=file_id,  # Use numeric file ID
+                                        doc_id=file_id,
                                         doc_type="file",
                                         operation="delete",
                                         modified_at=0,
@@ -556,12 +687,13 @@ async def scan_user_documents(
                         else:
                             # First time missing, add to grace period tracking
                             logger.debug(
-                                f"File ID {file_id} missing for first time, starting grace period"
+                                "File ID %s missing for first time, starting grace period",
+                                file_id,
                             )
                             _potentially_deleted[file_key] = current_time
 
         except Exception as e:
-            logger.warning(f"Failed to scan tagged files for {user_id}: {e}")
+            logger.warning("Failed to scan tagged files for %s: %s", user_id, e)
 
         queued += file_queued
 
@@ -577,7 +709,7 @@ async def scan_user_documents(
             )
             queued += news_queued
         except Exception as e:
-            logger.warning(f"Failed to scan news items for {user_id}: {e}")
+            logger.warning("Failed to scan news items for %s: %s", user_id, e)
 
         # Scan Deck cards
         deck_queued = 0
@@ -591,14 +723,19 @@ async def scan_user_documents(
             )
             queued += deck_queued
         except Exception as e:
-            logger.warning(f"Failed to scan deck cards for {user_id}: {e}")
+            logger.warning("Failed to scan deck cards for %s: %s", user_id, e)
 
         if queued > 0:
             logger.info(
-                f"Sent {queued} documents ({file_queued} files, {news_queued} news items, {deck_queued} deck cards) for incremental sync: {user_id}"
+                "Sent %s documents (%s files, %s news items, %s deck cards) for incremental sync: %s",
+                queued,
+                file_queued,
+                news_queued,
+                deck_queued,
+                user_id,
             )
         else:
-            logger.debug(f"No changes detected for {user_id}")
+            logger.debug("No changes detected for %s", user_id)
 
 
 async def scan_news_items(
@@ -632,7 +769,8 @@ async def scan_news_items(
     indexed_item_ids: set[str] = set()
     if not initial_sync:
         qdrant_client = await get_qdrant_client()
-        scroll_result = await qdrant_client.scroll(
+        points = await _scroll_all_points(
+            qdrant_client,
             collection_name=settings.get_collection_name(),
             scroll_filter=Filter(
                 must=[
@@ -640,16 +778,14 @@ async def scan_news_items(
                     FieldCondition(key="doc_type", match=MatchValue(value="news_item")),
                 ]
             ),
-            with_payload=["doc_id"],
-            with_vectors=False,
-            limit=10000,
+            payload_fields=["doc_id"],
         )
         indexed_item_ids = {
-            point.payload["doc_id"]
-            for point in (scroll_result[0] or [])
-            if point.payload is not None
+            str(point.payload["doc_id"])
+            for point in points
+            if point.payload is not None and "doc_id" in point.payload
         }
-        logger.debug(f"Found {len(indexed_item_ids)} indexed news items in Qdrant")
+        logger.debug("Found %s indexed news items in Qdrant", len(indexed_item_ids))
 
     # Fetch all items (News app caps at ~200 per feed via auto-purge)
     all_items = await nc_client.news.get_items(
@@ -657,7 +793,7 @@ async def scan_news_items(
         type_=NewsItemType.ALL,
         get_read=True,
     )
-    logger.debug(f"[SCAN-{scan_id}] Found {len(all_items)} news items")
+    logger.debug("[SCAN-%s] Found %s news items", scan_id, len(all_items))
 
     item_count = len(all_items)
     nextcloud_item_ids: set[str] = set()
@@ -695,7 +831,8 @@ async def scan_news_items(
             doc_key = (user_id, doc_id)
             if doc_key in _potentially_deleted:
                 logger.debug(
-                    f"News item {doc_id} reappeared, removing from deletion grace period"
+                    "News item %s reappeared, removing from deletion grace period",
+                    doc_id,
                 )
                 del _potentially_deleted[doc_key]
 
@@ -715,8 +852,9 @@ async def scan_news_items(
                 stale_threshold = settings.vector_sync_scan_interval * 5
                 if placeholder_age > stale_threshold:
                     logger.debug(
-                        f"Found stale placeholder for news item {doc_id} "
-                        f"(age={placeholder_age:.1f}s), requeuing"
+                        "Found stale placeholder for news item %s (age=%ss), requeuing",
+                        doc_id,
+                        format(placeholder_age, ".1f"),
                     )
                     needs_indexing = True
 
@@ -739,7 +877,10 @@ async def scan_news_items(
                 queued += 1
 
     logger.info(
-        f"[SCAN-{scan_id}] Found {item_count} news items (starred+unread) for {user_id}"
+        "[SCAN-%s] Found %s news items (starred+unread) for %s",
+        scan_id,
+        item_count,
+        user_id,
     )
     record_vector_sync_scan(item_count)
 
@@ -759,8 +900,10 @@ async def scan_news_items(
 
                     if time_missing >= grace_period:
                         logger.info(
-                            f"News item {doc_id} missing for {time_missing:.1f}s "
-                            f"(>{grace_period:.1f}s grace period), sending deletion"
+                            "News item %s missing for %ss (>%ss grace period), sending deletion",
+                            doc_id,
+                            format(time_missing, ".1f"),
+                            format(grace_period, ".1f"),
                         )
                         await send_stream.send(
                             DocumentTask(
@@ -775,7 +918,8 @@ async def scan_news_items(
                         del _potentially_deleted[doc_key]
                 else:
                     logger.debug(
-                        f"News item {doc_id} missing for first time, starting grace period"
+                        "News item %s missing for first time, starting grace period",
+                        doc_id,
                     )
                     _potentially_deleted[doc_key] = current_time
 
@@ -811,7 +955,8 @@ async def scan_deck_cards(
     indexed_card_ids: set[str] = set()
     if not initial_sync:
         qdrant_client = await get_qdrant_client()
-        scroll_result = await qdrant_client.scroll(
+        points = await _scroll_all_points(
+            qdrant_client,
             collection_name=settings.get_collection_name(),
             scroll_filter=Filter(
                 must=[
@@ -819,20 +964,18 @@ async def scan_deck_cards(
                     FieldCondition(key="doc_type", match=MatchValue(value="deck_card")),
                 ]
             ),
-            with_payload=["doc_id"],
-            with_vectors=False,
-            limit=10000,
+            payload_fields=["doc_id"],
         )
         indexed_card_ids = {
-            point.payload["doc_id"]
-            for point in (scroll_result[0] or [])
-            if point.payload is not None
+            str(point.payload["doc_id"])
+            for point in points
+            if point.payload is not None and "doc_id" in point.payload
         }
-        logger.debug(f"Found {len(indexed_card_ids)} indexed deck cards in Qdrant")
+        logger.debug("Found %s indexed deck cards in Qdrant", len(indexed_card_ids))
 
     # Fetch all boards
     boards = await nc_client.deck.get_boards()
-    logger.debug(f"[SCAN-{scan_id}] Found {len(boards)} deck boards")
+    logger.debug("[SCAN-%s] Found %s deck boards", scan_id, len(boards))
 
     card_count = 0
     nextcloud_card_ids: set[str] = set()
@@ -845,7 +988,7 @@ async def scan_deck_cards(
 
         # Skip deleted boards (soft delete: deletedAt > 0)
         if board.deletedAt > 0:
-            logger.debug(f"[SCAN-{scan_id}] Skipping deleted board {board.id}")
+            logger.debug("[SCAN-%s] Skipping deleted board %s", scan_id, board.id)
             continue
 
         # Get stacks for this board
@@ -894,7 +1037,8 @@ async def scan_deck_cards(
                     doc_key = (user_id, doc_id)
                     if doc_key in _potentially_deleted:
                         logger.debug(
-                            f"Deck card {doc_id} reappeared, removing from deletion grace period"
+                            "Deck card %s reappeared, removing from deletion grace period",
+                            doc_id,
                         )
                         del _potentially_deleted[doc_key]
 
@@ -914,8 +1058,9 @@ async def scan_deck_cards(
                         stale_threshold = settings.vector_sync_scan_interval * 5
                         if placeholder_age > stale_threshold:
                             logger.debug(
-                                f"Found stale placeholder for deck card {doc_id} "
-                                f"(age={placeholder_age:.1f}s), requeuing"
+                                "Found stale placeholder for deck card %s (age=%ss), requeuing",
+                                doc_id,
+                                format(placeholder_age, ".1f"),
                             )
                             needs_indexing = True
 
@@ -939,7 +1084,10 @@ async def scan_deck_cards(
                         queued += 1
 
     logger.info(
-        f"[SCAN-{scan_id}] Found {card_count} deck cards (non-archived) for {user_id}"
+        "[SCAN-%s] Found %s deck cards (non-archived) for %s",
+        scan_id,
+        card_count,
+        user_id,
     )
     record_vector_sync_scan(card_count)
 
@@ -958,8 +1106,10 @@ async def scan_deck_cards(
 
                     if time_missing >= grace_period:
                         logger.info(
-                            f"Deck card {doc_id} missing for {time_missing:.1f}s "
-                            f"(>{grace_period:.1f}s grace period), sending deletion"
+                            "Deck card %s missing for %ss (>%ss grace period), sending deletion",
+                            doc_id,
+                            format(time_missing, ".1f"),
+                            format(grace_period, ".1f"),
                         )
                         await send_stream.send(
                             DocumentTask(
@@ -974,7 +1124,8 @@ async def scan_deck_cards(
                         del _potentially_deleted[doc_key]
                 else:
                     logger.debug(
-                        f"Deck card {doc_id} missing for first time, starting grace period"
+                        "Deck card %s missing for first time, starting grace period",
+                        doc_id,
                     )
                     _potentially_deleted[doc_key] = current_time
 

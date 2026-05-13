@@ -14,7 +14,6 @@ import logging
 from typing import Any
 
 import pymupdf
-from qdrant_client.models import FieldCondition, Filter, MatchValue
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -31,13 +30,15 @@ from nextcloud_mcp_server.search import (
     BM25HybridSearchAlgorithm,
     SemanticSearchAlgorithm,
 )
-from nextcloud_mcp_server.search.context import get_chunk_with_context
+from nextcloud_mcp_server.search.context import (
+    get_chunk_bbox_and_page_from_qdrant,
+    get_chunk_with_context,
+)
+from nextcloud_mcp_server.utils.validation import is_valid_nextcloud_doc_id
 from nextcloud_mcp_server.vector.oauth_sync import (
     NotProvisionedError,
     get_user_client_basic_auth,
 )
-from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
-from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 from nextcloud_mcp_server.vector.visualization import compute_pca_coordinates
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,7 @@ async def unified_search(request: Request) -> JSONResponse:
     try:
         user_id, _validated = await validate_token_and_get_user(request)
     except Exception as e:
-        logger.warning(f"Unauthorized access to /api/v1/search: {e}")
+        logger.warning("Unauthorized access to /api/v1/search: %s", e)
         return JSONResponse(
             {
                 "error": "Unauthorized",
@@ -267,12 +268,12 @@ async def unified_search(request: Request) -> JSONResponse:
                 )
                 response_data["pca_data"] = pca_data
             except Exception as e:
-                logger.warning(f"Failed to compute PCA for unified search: {e}")
+                logger.warning("Failed to compute PCA for unified search: %s", e)
 
         return JSONResponse(response_data)
 
     except Exception as e:
-        logger.error(f"Error in unified search: {e}")
+        logger.error("Error in unified search: %s", e)
         return JSONResponse(
             {
                 "error": "Internal error",
@@ -310,7 +311,7 @@ async def vector_search(request: Request) -> JSONResponse:
     try:
         user_id, _validated = await validate_token_and_get_user(request)
     except Exception as e:
-        logger.warning(f"Unauthorized access to /api/v1/vector-viz/search: {e}")
+        logger.warning("Unauthorized access to /api/v1/vector-viz/search: %s", e)
         return JSONResponse(
             {
                 "error": "Unauthorized",
@@ -427,7 +428,7 @@ async def vector_search(request: Request) -> JSONResponse:
                 if "pca_variance" in pca_data:
                     response_data["pca_variance"] = pca_data["pca_variance"]
             except Exception as e:
-                logger.warning(f"Failed to compute PCA coordinates: {e}")
+                logger.warning("Failed to compute PCA coordinates: %s", e)
                 response_data["coordinates_3d"] = []
                 response_data["query_coords"] = []
         elif include_pca:
@@ -464,7 +465,7 @@ async def get_chunk_context(request: Request) -> JSONResponse:
         # Validate OAuth token and extract user
         user_id, validated = await validate_token_and_get_user(request)
     except Exception as e:
-        logger.warning(f"Unauthorized access to /api/v1/chunk-context: {e}")
+        logger.warning("Unauthorized access to /api/v1/chunk-context: %s", e)
         return JSONResponse(
             {
                 "error": "Unauthorized",
@@ -479,6 +480,8 @@ async def get_chunk_context(request: Request) -> JSONResponse:
         doc_id = request.query_params.get("doc_id")
         start_str = request.query_params.get("start")
         end_str = request.query_params.get("end")
+        chunk_index_str = request.query_params.get("chunk_index")
+        total_chunks_str = request.query_params.get("total_chunks")
 
         # Validate required parameters
         if not all([doc_type, doc_id, start_str, end_str]):
@@ -496,6 +499,30 @@ async def get_chunk_context(request: Request) -> JSONResponse:
         assert doc_id is not None
         assert doc_type is not None
 
+        # Validate doc_id at the handler boundary: a malformed doc_id would
+        # otherwise pass through to get_chunk_with_context and bottom out as a
+        # 404 from deep inside, not a clear 400. Nextcloud IDs are unsigned
+        # ints from MySQL auto_increment; doc_id stays a str downstream
+        # (Qdrant payload index is keyword-typed). is_valid_nextcloud_doc_id
+        # rejects "0", leading zeros, and Unicode digits that pass isdigit().
+        #
+        # Canonical TODO (referenced by ``auth/viz_routes.py`` and
+        # ``vector/scanner.py:get_last_indexed_timestamp``): when chunk-
+        # context support extends to non-numeric doc_types (calendar VEVENT
+        # UIDs, CardDAV hrefs, …), relax this gate or make it doc_type-
+        # aware. Today every indexed doc_type is numeric. The follow-up
+        # tracker also covers the O(N) → O(1) migration of
+        # ``get_last_indexed_timestamp`` (currently re-scans every
+        # ``indexed_at`` on each tick).
+        if not is_valid_nextcloud_doc_id(doc_id):
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": f"doc_id must be numeric, got {doc_id!r}",
+                },
+                status_code=400,
+            )
+
         # Parse and validate integer parameters with bounds checking
         try:
             context_chars = _parse_int_param(
@@ -509,10 +536,18 @@ async def get_chunk_context(request: Request) -> JSONResponse:
             end = _parse_int_param(end_str, 0, 0, 10000000, "end")
             if end <= start:
                 raise ValueError("end must be greater than start")
+            chunk_index: int | None = None
+            if chunk_index_str is not None:
+                chunk_index = _parse_int_param(
+                    chunk_index_str, 0, 0, 1000000, "chunk_index"
+                )
+            total_chunks = _parse_int_param(
+                total_chunks_str, 1, 1, 1000000, "total_chunks"
+            )
         except ValueError as e:
             return JSONResponse({"success": False, "error": str(e)}, status_code=400)
-        # Convert doc_id to int if possible (most IDs are int)
-        doc_id_val: str | int = int(doc_id) if doc_id.isdigit() else doc_id
+        # doc_id is keyword-indexed in Qdrant as str — pass through verbatim
+        # (no int coercion; producers always stringify on write).
 
         # Get Nextcloud host from OAuth context
         oauth_ctx = request.app.state.oauth_context
@@ -537,10 +572,12 @@ async def get_chunk_context(request: Request) -> JSONResponse:
             chunk_context = await get_chunk_with_context(
                 nc_client=nc_client,
                 user_id=user_id,
-                doc_id=doc_id_val,
+                doc_id=doc_id,
                 doc_type=doc_type,
                 chunk_start=start,
                 chunk_end=end,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
                 context_chars=context_chars,
             )
 
@@ -553,51 +590,25 @@ async def get_chunk_context(request: Request) -> JSONResponse:
                 status_code=404,
             )
 
-        # For PDF files, also fetch the highlighted page image from Qdrant if available
-        # This is useful for clients that want to show a pre-rendered image
-        highlighted_page_image = None
+        # For PDF files, also fetch the chunk's bounding box from Qdrant if
+        # available so the client can overlay a highlight on top of a
+        # render-on-demand page image (Deck #76). Qdrant's page_number is
+        # trusted over the context-expansion fallback when present.
+        chunk_bbox = None
         page_number = chunk_context.page_number
 
         if doc_type == "file":
-            try:
-                settings = get_settings()
-                qdrant_client = await get_qdrant_client()
-
-                # Query for this specific chunk's highlighted image
-                points_response = await qdrant_client.scroll(
-                    collection_name=settings.get_collection_name(),
-                    scroll_filter=Filter(
-                        must=[
-                            get_placeholder_filter(),
-                            FieldCondition(
-                                key="doc_id", match=MatchValue(value=doc_id_val)
-                            ),
-                            FieldCondition(
-                                key="user_id", match=MatchValue(value=user_id)
-                            ),
-                            FieldCondition(
-                                key="chunk_start_offset", match=MatchValue(value=start)
-                            ),
-                            FieldCondition(
-                                key="chunk_end_offset", match=MatchValue(value=end)
-                            ),
-                        ]
-                    ),
-                    limit=1,
-                    with_vectors=False,
-                    with_payload=["highlighted_page_image", "page_number"],
-                )
-
-                if points_response[0]:
-                    payload = points_response[0][0].payload
-                    if payload:
-                        highlighted_page_image = payload.get("highlighted_page_image")
-                        # Trust Qdrant page number if available (might be more accurate than context expansion logic)
-                        if payload.get("page_number") is not None:
-                            page_number = payload.get("page_number")
-
-            except Exception as e:
-                logger.warning(f"Failed to fetch highlighted image: {e}")
+            qdrant_bbox, qdrant_page = await get_chunk_bbox_and_page_from_qdrant(
+                user_id=user_id,
+                doc_id=doc_id,
+                chunk_index=chunk_index,
+                chunk_start=start,
+                chunk_end=end,
+            )
+            if qdrant_bbox is not None:
+                chunk_bbox = qdrant_bbox
+            if qdrant_page is not None:
+                page_number = qdrant_page
 
         # Build response
         response_data = {
@@ -612,8 +623,8 @@ async def get_chunk_context(request: Request) -> JSONResponse:
             "total_chunks": chunk_context.total_chunks,
         }
 
-        if highlighted_page_image:
-            response_data["highlighted_page_image"] = highlighted_page_image
+        if chunk_bbox:
+            response_data["chunk_bbox"] = chunk_bbox
 
         return JSONResponse(response_data)
 
@@ -650,14 +661,16 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
     # Log incoming request
     file_path_param = request.query_params.get("file_path", "<not provided>")
     page_param = request.query_params.get("page", "1")
-    logger.info(f"PDF preview request: file_path={file_path_param}, page={page_param}")
+    logger.info(
+        "PDF preview request: file_path=%s, page=%s", file_path_param, page_param
+    )
 
     try:
         # Validate OAuth token and extract user
         user_id, validated = await validate_token_and_get_user(request)
-        logger.info(f"PDF preview authenticated for user: {user_id}")
+        logger.info("PDF preview authenticated for user: %s", user_id)
     except Exception as e:
-        logger.warning(f"Unauthorized access to /api/v1/pdf-preview: {e}")
+        logger.warning("Unauthorized access to /api/v1/pdf-preview: %s", e)
         return JSONResponse(
             {
                 "success": False,
@@ -752,8 +765,11 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
         image_b64 = base64.b64encode(png_bytes).decode("ascii")
 
         logger.info(
-            f"Rendered PDF preview: {file_path} page {page_num}/{total_pages}, "
-            f"{len(png_bytes):,} bytes"
+            "Rendered PDF preview: %s page %s/%s, %s bytes",
+            file_path,
+            page_num,
+            total_pages,
+            format(len(png_bytes), ","),
         )
 
         return JSONResponse(
@@ -766,19 +782,19 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
         )
 
     except FileNotFoundError:
-        logger.warning(f"PDF file not found: {file_path_param}")
+        logger.warning("PDF file not found: %s", file_path_param)
         return JSONResponse(
             {"success": False, "error": "PDF file not found"},
             status_code=404,
         )
     except (pymupdf.FileDataError, pymupdf.EmptyFileError):
-        logger.warning(f"Invalid or corrupted PDF file: {file_path_param}")
+        logger.warning("Invalid or corrupted PDF file: %s", file_path_param)
         return JSONResponse(
             {"success": False, "error": "Invalid or corrupted PDF file"},
             status_code=400,
         )
     except Exception as e:
-        logger.error(f"PDF preview error: {e}", exc_info=True)
+        logger.error("PDF preview error: %s", e, exc_info=True)
         error_msg = _sanitize_error_for_client(e, "get_pdf_preview")
         return JSONResponse(
             {"success": False, "error": error_msg},

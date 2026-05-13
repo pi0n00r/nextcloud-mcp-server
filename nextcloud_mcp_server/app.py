@@ -125,12 +125,13 @@ from nextcloud_mcp_server.server import (
 )
 from nextcloud_mcp_server.server.auth_tools import register_auth_tools
 from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
-from nextcloud_mcp_server.vector import processor_task, scanner_task
 from nextcloud_mcp_server.vector.oauth_sync import (
     oauth_processor_task,
     user_manager_task,
 )
+from nextcloud_mcp_server.vector.processor import processor_task
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
+from nextcloud_mcp_server.vector.scanner import scanner_task
 from nextcloud_mcp_server.vector.webhook_receiver import handle_nextcloud_webhook
 
 logger = logging.getLogger(__name__)
@@ -168,10 +169,10 @@ def initialize_document_processors():
                 progress_interval=unst_config.get("progress_interval", 10),
             )
             registry.register(processor, priority=10)
-            logger.info(f"Registered Unstructured processor: {unst_config['api_url']}")
+            logger.info("Registered Unstructured processor: %s", unst_config["api_url"])
             registered_count += 1
         except Exception as e:
-            logger.warning(f"Failed to register Unstructured processor: {e}")
+            logger.warning("Failed to register Unstructured processor: %s", e)
 
     # Register Tesseract processor
     if "tesseract" in config["processors"]:
@@ -186,10 +187,10 @@ def initialize_document_processors():
                 default_lang=tess_config["lang"],
             )
             registry.register(processor, priority=5)
-            logger.info(f"Registered Tesseract processor: lang={tess_config['lang']}")
+            logger.info("Registered Tesseract processor: lang=%s", tess_config["lang"])
             registered_count += 1
         except Exception as e:
-            logger.warning(f"Failed to register Tesseract processor: {e}")
+            logger.warning("Failed to register Tesseract processor: %s", e)
 
     # Register PyMuPDF processor (high priority, local, no API required)
     if "pymupdf" in config["processors"]:
@@ -205,11 +206,12 @@ def initialize_document_processors():
             )
             registry.register(processor, priority=15)  # Higher than unstructured
             logger.info(
-                f"Registered PyMuPDF processor: extract_images={pymupdf_config.get('extract_images', True)}"
+                "Registered PyMuPDF processor: extract_images=%s",
+                pymupdf_config.get("extract_images", True),
             )
             registered_count += 1
         except Exception as e:
-            logger.warning(f"Failed to register PyMuPDF processor: {e}")
+            logger.warning("Failed to register PyMuPDF processor: %s", e)
 
     # Register custom processor
     if "custom" in config["processors"]:
@@ -228,16 +230,19 @@ def initialize_document_processors():
             )
             registry.register(processor, priority=1)
             logger.info(
-                f"Registered Custom processor '{custom_config['name']}': {custom_config['api_url']}"
+                "Registered Custom processor '%s': %s",
+                custom_config["name"],
+                custom_config["api_url"],
             )
             registered_count += 1
         except Exception as e:
-            logger.warning(f"Failed to register Custom processor: {e}")
+            logger.warning("Failed to register Custom processor: %s", e)
 
     if registered_count > 0:
         logger.info(
-            f"Document processing initialized with {registered_count} processor(s): "
-            f"{', '.join(registry.list_processors())}"
+            "Document processing initialized with %s processor(s): %s",
+            registered_count,
+            ", ".join(registry.list_processors()),
         )
     else:
         logger.warning("Document processing enabled but no processors registered")
@@ -408,10 +413,10 @@ class BasicAuthMiddleware:
                         "password": password,
                     }
                     logger.debug(
-                        f"BasicAuth credentials extracted for user: {username}"
+                        "BasicAuth credentials extracted for user: %s", username
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to extract BasicAuth credentials: {e}")
+                    logger.warning("Failed to extract BasicAuth credentials: %s", e)
 
         await self.app(scope, receive, send)
 
@@ -450,7 +455,7 @@ async def load_oauth_client_credentials(
         client_data = await storage.get_oauth_client()
         if client_data:
             logger.info(
-                f"Loaded OAuth client from SQLite: {client_data['client_id'][:16]}..."
+                "Loaded OAuth client from SQLite: %s...", client_data["client_id"][:16]
             )
             return (client_data["client_id"], client_data["client_secret"])
     except ValueError:
@@ -495,7 +500,7 @@ async def load_oauth_client_credentials(
             dcr_scopes = f"{dcr_scopes} offline_access"
             logger.info("✓ offline_access scope enabled for refresh tokens")
 
-        logger.info(f"MCP server DCR scopes (resource server): {dcr_scopes}")
+        logger.info("MCP server DCR scopes (resource server): %s", dcr_scopes)
 
         # Get token type from environment (Bearer or jwt)
         # Note: Must be lowercase "jwt" to match OIDC app's check
@@ -503,7 +508,7 @@ async def load_oauth_client_credentials(
         # Special case: "bearer" should remain capitalized for compatibility
         if token_type != "jwt":
             token_type = "Bearer"
-        logger.info(f"Requesting token type: {token_type}")
+        logger.info("Requesting token type: %s", token_type)
 
         # Ensure OAuth client in SQLite storage
         storage = RefreshTokenStorage.from_env()
@@ -524,7 +529,7 @@ async def load_oauth_client_credentials(
             resource_url=resource_url,  # RFC 9728 Protected Resource URL
         )
 
-        logger.info(f"OAuth client ready: {client_info.client_id[:16]}...")
+        logger.info("OAuth client ready: %s...", client_info.client_id[:16])
         return (client_info.client_id, client_info.client_secret)
 
     # No credentials available
@@ -554,7 +559,8 @@ async def app_lifespan_basic(server: FastMCP) -> AsyncIterator[AppContext]:
     is_multi_user = settings.enable_multi_user_basic_auth
 
     logger.info(
-        f"Starting MCP session in {'multi-user' if is_multi_user else 'single-user'} BasicAuth mode"
+        "Starting MCP session in %s BasicAuth mode",
+        "multi-user" if is_multi_user else "single-user",
     )
 
     # Only create shared client for single-user mode
@@ -632,7 +638,7 @@ async def setup_oauth_config():
     discovery_url = os.getenv(
         "OIDC_DISCOVERY_URL", f"{nextcloud_host}/.well-known/openid-configuration"
     )
-    logger.info(f"Performing OIDC discovery: {discovery_url}")
+    logger.info("Performing OIDC discovery: %s", discovery_url)
 
     # Perform OIDC discovery
     async with nextcloud_httpx_client(follow_redirects=True) as client:
@@ -653,12 +659,12 @@ async def setup_oauth_config():
     registration_endpoint = discovery.get("registration_endpoint")
 
     logger.info("OIDC endpoints discovered:")
-    logger.info(f"  Issuer: {issuer}")
-    logger.info(f"  Userinfo: {userinfo_uri}")
+    logger.info("  Issuer: %s", issuer)
+    logger.info("  Userinfo: %s", userinfo_uri)
     if jwks_uri:
-        logger.info(f"  JWKS: {jwks_uri}")
+        logger.info("  JWKS: %s", jwks_uri)
     if introspection_uri:
-        logger.info(f"  Introspection: {introspection_uri}")
+        logger.info("  Introspection: %s", introspection_uri)
 
     # Auto-detect provider mode based on issuer
     # External IdP mode: issuer doesn't match Nextcloud host
@@ -684,7 +690,9 @@ async def setup_oauth_config():
     if is_external_idp:
         oauth_provider = "external"  # Could be Keycloak, Auth0, Okta, etc.
         logger.info(
-            f"✓ Detected external IdP mode (issuer: {issuer} != Nextcloud: {nextcloud_host})"
+            "✓ Detected external IdP mode (issuer: %s != Nextcloud: %s)",
+            issuer,
+            nextcloud_host,
         )
         logger.info("  Tokens will be validated via Nextcloud user_oidc app")
     else:
@@ -715,7 +723,7 @@ async def setup_oauth_config():
                     "✓ Refresh token storage initialized (offline_access enabled)"
                 )
         except Exception as e:
-            logger.error(f"Failed to initialize refresh token storage: {e}")
+            logger.error("Failed to initialize refresh token storage: %s", e)
             logger.warning(
                 "Continuing without refresh token storage - users will need to re-authenticate after token expiration"
             )
@@ -725,7 +733,7 @@ async def setup_oauth_config():
     client_secret = os.getenv("NEXTCLOUD_OIDC_CLIENT_SECRET")
 
     if client_id and client_secret:
-        logger.info(f"Using static OIDC client credentials: {client_id}")
+        logger.info("Using static OIDC client credentials: %s", client_id)
     elif registration_endpoint:
         logger.info(
             "NEXTCLOUD_OIDC_CLIENT_ID not set, attempting Dynamic Client Registration"
@@ -752,13 +760,13 @@ async def setup_oauth_config():
     # Warn if resource URIs are not configured (required for ADR-005 compliance)
     if not os.getenv("NEXTCLOUD_MCP_SERVER_URL"):
         logger.warning(
-            f"NEXTCLOUD_MCP_SERVER_URL not set, defaulting to: {mcp_server_url}. "
-            "This should be set explicitly for proper audience validation."
+            "NEXTCLOUD_MCP_SERVER_URL not set, defaulting to: %s. This should be set explicitly for proper audience validation.",
+            mcp_server_url,
         )
     if not os.getenv("NEXTCLOUD_RESOURCE_URI"):
         logger.warning(
-            f"NEXTCLOUD_RESOURCE_URI not set, defaulting to: {nextcloud_resource_uri}. "
-            "This should be set explicitly for proper audience validation."
+            "NEXTCLOUD_RESOURCE_URI not set, defaulting to: %s. This should be set explicitly for proper audience validation.",
+            nextcloud_resource_uri,
         )
 
     # Create settings for UnifiedTokenVerifier (use same settings instance from start of function)
@@ -789,8 +797,8 @@ async def setup_oauth_config():
     logger.info(
         "✓ Multi-audience mode enabled (ADR-005) - tokens must contain both MCP and Nextcloud audiences"
     )
-    logger.info(f"  Required MCP audience: {client_id} or {mcp_server_url}")
-    logger.info(f"  Required Nextcloud audience: {nextcloud_resource_uri}")
+    logger.info("  Required MCP audience: %s or %s", client_id, mcp_server_url)
+    logger.info("  Required Nextcloud audience: %s", nextcloud_resource_uri)
 
     if introspection_uri:
         logger.info("✓ Opaque token introspection enabled (RFC 7662)")
@@ -880,7 +888,8 @@ async def setup_oauth_config_for_multi_user_basic(
         f"{nextcloud_host}/.well-known/openid-configuration",
     )
     logger.info(
-        f"Performing OIDC discovery for multi-user BasicAuth hybrid mode: {discovery_url}"
+        "Performing OIDC discovery for multi-user BasicAuth hybrid mode: %s",
+        discovery_url,
     )
 
     # Perform OIDC discovery
@@ -893,20 +902,22 @@ async def setup_oauth_config_for_multi_user_basic(
             discovery = response.json()
     except httpx.HTTPStatusError as e:
         logger.error(
-            f"OIDC discovery failed: HTTP {e.response.status_code} from {discovery_url}"
+            "OIDC discovery failed: HTTP %s from %s",
+            e.response.status_code,
+            discovery_url,
         )
         raise ValueError(
             f"OIDC discovery failed: HTTP {e.response.status_code} from {discovery_url}. "
             "Ensure Nextcloud OIDC (user_oidc app) is installed and configured."
         ) from e
     except httpx.RequestError as e:
-        logger.error(f"OIDC discovery failed: {e}")
+        logger.error("OIDC discovery failed: %s", e)
         raise ValueError(
             f"OIDC discovery failed: Cannot connect to {discovery_url}. Error: {e}"
         ) from e
     except (KeyError, ValueError) as e:
         logger.error(
-            f"OIDC discovery failed: Invalid response from {discovery_url}: {e}"
+            "OIDC discovery failed: Invalid response from %s: %s", discovery_url, e
         )
         raise ValueError(
             f"OIDC discovery failed: Invalid response from {discovery_url}. "
@@ -922,10 +933,10 @@ async def setup_oauth_config_for_multi_user_basic(
     introspection_uri = discovery.get("introspection_endpoint")
 
     logger.info("OIDC endpoints configured for management API:")
-    logger.info(f"  Issuer: {issuer}")
-    logger.info(f"  Userinfo: {userinfo_uri}")
-    logger.info(f"  JWKS: {jwks_uri}")
-    logger.info(f"  Introspection: {introspection_uri}")
+    logger.info("  Issuer: %s", issuer)
+    logger.info("  Userinfo: %s", userinfo_uri)
+    logger.info("  JWKS: %s", jwks_uri)
+    logger.info("  Introspection: %s", introspection_uri)
 
     # Get MCP server URL for audience validation
     mcp_server_url = os.getenv("NEXTCLOUD_MCP_SERVER_URL", "http://localhost:8000")
@@ -981,8 +992,8 @@ async def setup_oauth_config_for_multi_user_basic(
                     "✓ Refresh token storage initialized for background operations (hybrid mode)"
                 )
         except Exception as e:
-            logger.error(f"Failed to initialize refresh token storage: {e}")
-            logger.debug(f"Full traceback:\n{traceback.format_exc()}")
+            logger.error("Failed to initialize refresh token storage: %s", e)
+            logger.debug("Full traceback:\\n%s", traceback.format_exc())
             logger.warning(
                 "Continuing without refresh token storage - webhook management may be limited"
             )
@@ -1011,11 +1022,14 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    logger.info(f"✅ Configuration validated successfully for {mode.value} mode")
-    logger.debug(f"Mode details:\n{get_mode_summary(mode)}")
+    logger.info("✅ Configuration validated successfully for %s mode", mode.value)
+    logger.debug("Mode details:\\n%s", get_mode_summary(mode))
 
-    # Derive helper variables for backward compatibility with existing code
-    oauth_enabled = mode == AuthMode.OAUTH_SINGLE_AUDIENCE
+    # Derive helper variables for backward compatibility with existing code.
+    # `oauth_enabled` is True for the LOGIN_FLOW (formerly OAUTH_SINGLE_AUDIENCE)
+    # multi-user OAuth mode — in this mode the MCP server is an OIDC relying
+    # party and Login Flow v2 acquires per-user Nextcloud app passwords.
+    oauth_enabled = mode == AuthMode.LOGIN_FLOW
     # Log hybrid authentication status for multi-user BasicAuth with offline access
     if mode == AuthMode.MULTI_USER_BASIC and settings.enable_offline_access:
         logger.info(
@@ -1029,7 +1043,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
     if settings.metrics_enabled:
         setup_metrics(port=settings.metrics_port)
         logger.info(
-            f"Prometheus metrics enabled on dedicated port {settings.metrics_port}"
+            "Prometheus metrics enabled on dedicated port %s", settings.metrics_port
         )
 
     # Setup OpenTelemetry tracing (optional)
@@ -1041,7 +1055,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             sampling_rate=settings.otel_traces_sampler_arg,
         )
         logger.info(
-            f"OpenTelemetry tracing enabled (endpoint: {settings.otel_exporter_otlp_endpoint})"
+            "OpenTelemetry tracing enabled (endpoint: %s)",
+            settings.otel_exporter_otlp_endpoint,
         )
     else:
         logger.info(
@@ -1089,7 +1104,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 # This avoids relying on discovery doc which may use public URLs unreachable from containers
                 registration_endpoint = f"{settings.nextcloud_host}/apps/oidc/register"
                 logger.info(
-                    f"Attempting Dynamic Client Registration at: {registration_endpoint}"
+                    "Attempting Dynamic Client Registration at: %s",
+                    registration_endpoint,
                 )
 
                 # Perform DCR
@@ -1104,13 +1120,13 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         registration_endpoint=registration_endpoint,
                     )
                     logger.info(
-                        f"✓ Dynamic Client Registration successful for background operations "
-                        f"(client_id: {client_id[:16]}...)"
+                        "✓ Dynamic Client Registration successful for background operations (client_id: %s...)",
+                        client_id[:16],
                     )
                     return (client_id, client_secret)
                 except Exception as e:
-                    logger.error(f"Dynamic Client Registration failed: {e}")
-                    logger.debug(f"Full traceback:\n{traceback.format_exc()}")
+                    logger.error("Dynamic Client Registration failed: %s", e)
+                    logger.debug("Full traceback:\\n%s", traceback.format_exc())
                     logger.warning("Background vector sync will be disabled.")
                     return None
 
@@ -1147,8 +1163,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 # - httpx.HTTPError: Network issues, OIDC discovery failures
                 # - ValueError: Missing required configuration (NEXTCLOUD_HOST)
                 # - KeyError: Missing required fields in OIDC discovery response
-                logger.error(f"Failed to setup OAuth infrastructure: {e}")
-                logger.debug(f"Full traceback:\n{traceback.format_exc()}")
+                logger.error("Failed to setup OAuth infrastructure: %s", e)
+                logger.debug("Full traceback:\\n%s", traceback.format_exc())
                 logger.warning(
                     "Management API will be unavailable. "
                     "Webhook management from Astrolabe admin UI will not work."
@@ -1159,14 +1175,14 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             except Exception as e:
                 # Unexpected error - this is a programming error, re-raise it
                 logger.error(
-                    f"Unexpected error during OAuth infrastructure setup: {e}. "
-                    "This is likely a programming error that should be fixed."
+                    "Unexpected error during OAuth infrastructure setup: %s. This is likely a programming error that should be fixed.",
+                    e,
                 )
                 raise
 
     # Create MCP server based on detected mode
-    if mode == AuthMode.OAUTH_SINGLE_AUDIENCE:
-        logger.info("Configuring MCP server for OAuth mode")
+    if mode == AuthMode.LOGIN_FLOW:
+        logger.info("Configuring MCP server for %s mode", mode.value)
         # Asynchronously get the OAuth configuration
 
         (
@@ -1187,7 +1203,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             Lifespan context for OAuth mode - captures OAuth configuration from outer scope.
             """
             logger.info("Starting MCP server in OAuth mode")
-            logger.info(f"Using OAuth provider: {oauth_provider}")
+            logger.info("Using OAuth provider: %s", oauth_provider)
             if refresh_token_storage:
                 logger.info("Refresh token storage is available")
             if oauth_client:
@@ -1219,7 +1235,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     try:
                         await oauth_client.close()
                     except Exception as e:
-                        logger.warning(f"Error closing OAuth client: {e}")
+                        logger.warning("Error closing OAuth client: %s", e)
                 logger.info("MCP server shutdown complete")
 
         mcp = FastMCP(
@@ -1235,7 +1251,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         )
     else:
         # BasicAuth modes (single-user or multi-user)
-        logger.info(f"Configuring MCP server for {mode.value} mode")
+        logger.info("Configuring MCP server for %s mode", mode.value)
         mcp = FastMCP(
             "Nextcloud MCP",
             lifespan=app_lifespan_basic,
@@ -1260,11 +1276,13 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
     # Configure only the enabled apps
     for app_name in enabled_apps:
         if app_name in AVAILABLE_APPS:
-            logger.info(f"Configuring {app_name} tools")
+            logger.info("Configuring %s tools", app_name)
             AVAILABLE_APPS[app_name](mcp)
         else:
             logger.warning(
-                f"Unknown app: {app_name}. Available apps: {list(AVAILABLE_APPS.keys())}"
+                "Unknown app: %s. Available apps: %s",
+                app_name,
+                list(AVAILABLE_APPS.keys()),
             )
 
     # Register semantic search tools (cross-app feature)
@@ -1300,8 +1318,9 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             user_scopes = get_access_token_scopes()
             is_jwt = is_jwt_token()
             logger.info(
-                f"🔍 list_tools called - Token type: {'JWT' if is_jwt else 'opaque/none'}, "
-                f"User scopes: {user_scopes}"
+                "🔍 list_tools called - Token type: %s, User scopes: %s",
+                "JWT" if is_jwt else "opaque/none",
+                user_scopes,
             )
 
             # Get all tools
@@ -1319,14 +1338,17 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 ]
                 token_type = "JWT" if is_jwt else "Bearer"
                 logger.info(
-                    f"✂️ {token_type} scope filtering: {len(allowed_tools)}/{len(all_tools)} tools "
-                    f"available for scopes: {user_scopes}"
+                    "✂️ %s scope filtering: %s/%s tools available for scopes: %s",
+                    token_type,
+                    len(allowed_tools),
+                    len(all_tools),
+                    user_scopes,
                 )
             else:
                 # BasicAuth mode or no token - show all tools
                 allowed_tools = all_tools
                 logger.info(
-                    f"📋 Showing all {len(all_tools)} tools (no token/BasicAuth)"
+                    "📋 Showing all %s tools (no token/BasicAuth)", len(all_tools)
                 )
 
             # Return the Tool objects directly (they're already in the correct format)
@@ -1453,7 +1475,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     break
 
             logger.info(
-                f"OAuth context initialized for login routes (client_id={client_id[:16]}...)"
+                "OAuth context initialized for login routes (client_id=%s...)",
+                client_id[:16],
             )
         else:
             # BasicAuth mode - initialize storage for webhook management
@@ -1501,7 +1524,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     }
                     app.state.oauth_context = oauth_context_dict
                     logger.info(
-                        f"✓ OAuth context initialized for management APIs (hybrid mode, client_id={sync_client_id[:16]}...)"
+                        "✓ OAuth context initialized for management APIs (hybrid mode, client_id=%s...)",
+                        sync_client_id[:16],
                     )
                 elif multi_user_basic_oauth_creds and multi_user_token_verifier is None:
                     logger.warning(
@@ -1569,7 +1593,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 await get_qdrant_client()  # Triggers collection creation if needed
                 logger.info("Qdrant collection ready")
             except Exception as e:
-                logger.error(f"Failed to initialize Qdrant collection: {e}")
+                logger.error("Failed to initialize Qdrant collection: %s", e)
                 raise RuntimeError(
                     f"Cannot start vector sync - Qdrant initialization failed: {e}"
                 ) from e
@@ -1635,8 +1659,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 _vector_sync_state.eviction_task_group = tg
 
                 logger.info(
-                    f"Background sync tasks started: 1 scanner + "
-                    f"{settings.vector_sync_processor_workers} processors"
+                    "Background sync tasks started: 1 scanner + %s processors",
+                    settings.vector_sync_processor_workers,
                 )
 
                 # Run MCP session manager and yield
@@ -1660,7 +1684,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             # OAuth mode with background operations - multi-user sync
             # Also used for multi-user BasicAuth mode (client auth is BasicAuth, background sync uses app passwords or OAuth)
             mode_desc = "OAuth mode" if oauth_enabled else "Multi-user BasicAuth mode"
-            logger.info(f"Starting background vector sync tasks for {mode_desc}")
+            logger.info("Starting background vector sync tasks for %s", mode_desc)
 
             # Get nextcloud_host (from settings - already validated)
             nextcloud_host_for_sync = settings.nextcloud_host
@@ -1731,7 +1755,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     await get_qdrant_client()  # Triggers collection creation if needed
                     logger.info("Qdrant collection ready")
                 except Exception as e:
-                    logger.error(f"Failed to initialize Qdrant collection: {e}")
+                    logger.error("Failed to initialize Qdrant collection: %s", e)
                     raise RuntimeError(
                         f"Cannot start vector sync - Qdrant initialization failed: {e}"
                     ) from e
@@ -1744,10 +1768,12 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         )
                         if removed:
                             logger.info(
-                                f"Cleaned up {len(removed)} stale app password(s): {removed}"
+                                "Cleaned up %s stale app password(s): %s",
+                                len(removed),
+                                removed,
                             )
                     except Exception as e:
-                        logger.warning(f"App password cleanup failed (non-fatal): {e}")
+                        logger.warning("App password cleanup failed (non-fatal): %s", e)
 
                 # Initialize shared state
                 send_stream, receive_stream = anyio.create_memory_object_stream(
@@ -1785,12 +1811,14 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         )
                         break
 
-                # Determine authentication mode for background sync
-                # Login Flow v2 and multi-user BasicAuth: use app passwords
-                # OAuth mode (without Login Flow): use OAuth refresh tokens
-                use_basic_auth = not oauth_enabled or settings.enable_login_flow
-
-                # Start background tasks using anyio TaskGroup
+                # Background sync authenticates as each provisioned user via
+                # locally-stored Nextcloud app passwords (Login Flow v2 /
+                # multi-user BasicAuth). The earlier OAuth refresh-token
+                # path in vector/oauth_sync.py was removed in the ADR-022
+                # cleanup — it relied on unmerged user_oidc patches and was
+                # never reachable from any supported deployment mode. The
+                # `token_broker` constructed above is still used by the
+                # management API revoke endpoint (via app.state.oauth_context).
                 async with anyio.create_task_group() as tg:
                     # Start user manager task (supervises per-user scanners)
                     await tg.start(
@@ -1798,12 +1826,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         send_stream,
                         shutdown_event,
                         scanner_wake_event,
-                        token_broker if not use_basic_auth else None,
-                        token_storage,  # Use token_storage (works for both OAuth and multi-user BasicAuth)
+                        token_storage,
                         nextcloud_host_for_sync,
                         user_states,
                         tg,
-                        use_basic_auth,  # Pass as positional arg (before task_status)
                     )
 
                     # Start processor pool (each gets a cloned receive stream)
@@ -1813,9 +1839,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                             i,
                             receive_stream.clone(),
                             shutdown_event,
-                            token_broker if not use_basic_auth else None,
                             nextcloud_host_for_sync,
-                            use_basic_auth,  # Pass as positional arg (before task_status)
                         )
 
                     # Expose this long-lived task group to request-path code
@@ -1825,8 +1849,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     _vector_sync_state.eviction_task_group = tg
 
                     logger.info(
-                        f"Background sync tasks started: 1 user manager + "
-                        f"{settings.vector_sync_processor_workers} processors"
+                        "Background sync tasks started: 1 user manager + %s processors",
+                        settings.vector_sync_processor_workers,
                     )
 
                     # Run MCP session manager and yield
@@ -1931,7 +1955,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         # Check authentication configuration
         # Report the deployment mode, not just whether OAuth is enabled
         # This helps clients (like Astrolabe) determine which auth flow to use
-        if mode == AuthMode.OAUTH_SINGLE_AUDIENCE:
+        if mode == AuthMode.LOGIN_FLOW:
             checks["auth_mode"] = "oauth"
             checks["auth_configured"] = "ok"
         elif mode == AuthMode.MULTI_USER_BASIC:
@@ -1959,9 +1983,21 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
         if vector_sync_enabled and qdrant_url:
             start_time = time.time()
+            # Self-hosted Qdrant exposes /readyz unauthenticated, but
+            # Qdrant Cloud's auth gateway returns 403 for any
+            # unauthenticated request — so we have to forward the same
+            # api-key the configured AsyncQdrantClient uses (see
+            # vector/qdrant_client.py). Without this header, every
+            # readiness probe against a Cloud cluster returns 503,
+            # blocking the Pod from reaching Ready.
+            qdrant_headers = (
+                {"api-key": settings.qdrant_api_key} if settings.qdrant_api_key else {}
+            )
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
-                    response = await client.get(f"{qdrant_url}/readyz")
+                    response = await client.get(
+                        f"{qdrant_url}/readyz", headers=qdrant_headers
+                    )
                     duration = time.time() - start_time
                     if response.status_code == 200:
                         checks["qdrant"] = "ok"
@@ -2121,8 +2157,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
     if oauth_provisioning_available:
         logger.info(
-            f"OAuth provisioning routes enabled for mode: {mode.value} "
-            f"(oauth_enabled={oauth_enabled}, hybrid_mode={not oauth_enabled})"
+            "OAuth provisioning routes enabled for mode: %s (oauth_enabled=%s, hybrid_mode=%s)",
+            mode.value,
+            oauth_enabled,
+            not oauth_enabled,
         )
 
         def oauth_protected_resource_metadata(request):
@@ -2314,7 +2352,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         browser_routes.append(
             Mount("/static", StaticFiles(directory=static_dir), name="static")
         )
-        logger.info(f"Mounted static files from {static_dir}")
+        logger.info("Mounted static files from %s", static_dir)
 
     browser_app = Starlette(routes=browser_routes)
     browser_app.add_middleware(
@@ -2365,13 +2403,14 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 token_preview = (
                     auth_header[:50] + "..." if len(auth_header) > 50 else auth_header
                 )
-                logger.info(f"🔑 /mcp request with Authorization: {token_preview}")
+                logger.info("🔑 /mcp request with Authorization: %s", token_preview)
             else:
                 # Only warn about missing Authorization in OAuth mode
                 # In BasicAuth mode, /mcp requests without Authorization are expected
                 if oauth_enabled:
                     logger.warning(
-                        f"⚠️  /mcp request WITHOUT Authorization header from {request.client}"
+                        "⚠️  /mcp request WITHOUT Authorization header from %s",
+                        request.client,
                     )
 
             # Log client capabilities on initialize request
@@ -2388,8 +2427,9 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         client_info = params.get("clientInfo", {})
 
                         logger.info(
-                            f"🔌 MCP client connected: {client_info.get('name', 'unknown')} "
-                            f"v{client_info.get('version', 'unknown')}"
+                            "🔌 MCP client connected: %s v%s",
+                            client_info.get("name", "unknown"),
+                            client_info.get("version", "unknown"),
                         )
 
                         # Log capabilities in a structured way
@@ -2405,16 +2445,17 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                             )
 
                         logger.info(
-                            f"📋 Client capabilities: {', '.join(cap_summary) if cap_summary else 'none'}"
+                            "📋 Client capabilities: %s",
+                            ", ".join(cap_summary) if cap_summary else "none",
                         )
                         # Log full capabilities at INFO level to diagnose capability issues
                         logger.info(
-                            f"Full capabilities JSON: {json.dumps(capabilities)}"
+                            "Full capabilities JSON: %s", json.dumps(capabilities)
                         )
                 except Exception as e:
                     # Don't fail the request if logging fails
                     logger.debug(
-                        f"Failed to parse MCP request for capability logging: {e}"
+                        "Failed to parse MCP request for capability logging: %s", e
                     )
 
         response = await call_next(request)

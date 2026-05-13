@@ -10,7 +10,11 @@ from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_service
 from nextcloud_mcp_server.observability.metrics import record_qdrant_operation
 from nextcloud_mcp_server.observability.tracing import trace_operation
-from nextcloud_mcp_server.search.algorithms import SearchAlgorithm, SearchResult
+from nextcloud_mcp_server.search.algorithms import (
+    SearchAlgorithm,
+    SearchResult,
+    build_search_result_from_point,
+)
 from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
@@ -96,9 +100,13 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
         score_threshold = kwargs.get("score_threshold", self.score_threshold)
 
         logger.info(
-            f"BM25 hybrid search: query='{query}', user={user_id}, "
-            f"limit={limit}, score_threshold={score_threshold}, doc_type={doc_type}, "
-            f"fusion={self.fusion_name}"
+            "BM25 hybrid search: query='%s', user=%s, limit=%s, score_threshold=%s, doc_type=%s, fusion=%s",
+            query,
+            user_id,
+            limit,
+            score_threshold,
+            doc_type,
+            self.fusion_name,
         )
 
         # Generate dense embedding for semantic search
@@ -108,7 +116,7 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
             dense_embedding = await embedding_service.embed(query)
         # Store for reuse by callers (e.g., viz_routes PCA visualization)
         self.query_embedding = dense_embedding
-        logger.debug(f"Generated dense embedding (dimension={len(dense_embedding)})")
+        logger.debug("Generated dense embedding (dimension=%s)", len(dense_embedding))
 
         # Generate sparse embedding for BM25 keyword search
         with trace_operation("search.get_bm25_service"):
@@ -116,8 +124,8 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
         with trace_operation("search.sparse_embedding_bm25"):
             sparse_embedding = await bm25_service.encode_async(query)
         logger.debug(
-            f"Generated sparse embedding "
-            f"({len(sparse_embedding['indices'])} non-zero terms)"
+            "Generated sparse embedding (%s non-zero terms)",
+            len(sparse_embedding["indices"]),
         )
 
         # Build Qdrant filter
@@ -185,15 +193,16 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
             raise
 
         logger.info(
-            f"Qdrant {self.fusion_name.upper()} fusion returned {len(search_response.points)} results "
-            f"(before deduplication)"
+            "Qdrant %s fusion returned %s results (before deduplication)",
+            self.fusion_name.upper(),
+            len(search_response.points),
         )
 
         if search_response.points:
             # Log top 3 fusion scores to help with threshold tuning
             top_scores = [p.score for p in search_response.points[:3]]
             logger.debug(
-                f"Top 3 {self.fusion_name.upper()} fusion scores: {top_scores}"
+                "Top 3 %s fusion scores: %s", self.fusion_name.upper(), top_scores
             )
 
         # Deduplicate by (doc_id, doc_type, chunk_start, chunk_end)
@@ -202,74 +211,39 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
             "search.deduplicate",
             attributes={"dedupe.num_points": len(search_response.points)},
         ):
-            seen_chunks = set()
-            results = []
+            seen_chunks: set[tuple[str, str, Any, Any]] = set()
+            results: list[SearchResult] = []
+            metadata_extras = {
+                "search_method": f"bm25_hybrid_{self.fusion_name}",
+            }
 
-            for result in search_response.points:
-                if result.payload is None:
+            for point in search_response.points:
+                sr = build_search_result_from_point(
+                    point, metadata_extras=metadata_extras
+                )
+                if sr is None:
                     continue
-                # doc_id can be int (files) or str (notes/news_items/deck_cards) — see scanner.py
-                doc_id = result.payload["doc_id"]
-                doc_type = result.payload.get("doc_type", "note")
-                chunk_start = result.payload.get("chunk_start_offset")
-                chunk_end = result.payload.get("chunk_end_offset")
-                chunk_key = (doc_id, doc_type, chunk_start, chunk_end)
 
-                # Skip if we've already seen this exact chunk
+                chunk_key = (
+                    sr.id,
+                    sr.doc_type,
+                    sr.chunk_start_offset,
+                    sr.chunk_end_offset,
+                )
                 if chunk_key in seen_chunks:
                     continue
-
                 seen_chunks.add(chunk_key)
 
-                # Build metadata dict with common fields
-                metadata = {
-                    "chunk_index": result.payload.get("chunk_index"),
-                    "total_chunks": result.payload.get("total_chunks"),
-                    "search_method": f"bm25_hybrid_{self.fusion_name}",
-                }
-
-                # Add file-specific metadata for PDF viewer
-                if doc_type == "file" and (path := result.payload.get("file_path")):
-                    metadata["path"] = path
-
-                # Add deck_card-specific metadata for frontend URL construction
-                # and verify-on-read (ADR-019) — both board_id and stack_id are
-                # required to call deck.get_card without an O(boards × stacks)
-                # iteration fallback.
-                if doc_type == "deck_card":
-                    if board_id := result.payload.get("board_id"):
-                        metadata["board_id"] = board_id
-                    if stack_id := result.payload.get("stack_id"):
-                        metadata["stack_id"] = stack_id
-
-                # Return unverified results (verification happens at output stage)
-                results.append(
-                    SearchResult(
-                        id=doc_id,
-                        doc_type=doc_type,
-                        title=result.payload.get("title", "Untitled"),
-                        excerpt=result.payload.get("excerpt", ""),
-                        score=result.score,  # Fusion score (RRF or DBSF)
-                        metadata=metadata,
-                        chunk_start_offset=result.payload.get("chunk_start_offset"),
-                        chunk_end_offset=result.payload.get("chunk_end_offset"),
-                        page_number=result.payload.get("page_number"),
-                        page_count=result.payload.get("page_count"),
-                        chunk_index=result.payload.get("chunk_index", 0),
-                        total_chunks=result.payload.get("total_chunks", 1),
-                        point_id=str(result.id),  # Qdrant point ID for batch retrieval
-                    )
-                )
-
+                results.append(sr)
                 if len(results) >= limit:
                     break
 
-        logger.info(f"Returning {len(results)} unverified results after deduplication")
+        logger.info("Returning %s unverified results after deduplication", len(results))
         if results:
             result_details = [
                 f"{r.doc_type}_{r.id} (score={r.score:.3f}, title='{r.title}')"
                 for r in results[:5]  # Show top 5
             ]
-            logger.debug(f"Top results: {', '.join(result_details)}")
+            logger.debug("Top results: %s", ", ".join(result_details))
 
         return results

@@ -3,7 +3,6 @@
 Processes documents from stream: fetches content, generates embeddings, stores in Qdrant.
 """
 
-import base64
 import logging
 import time
 import uuid
@@ -101,7 +100,7 @@ async def processor_task(
         user_id: User being processed
         task_status: Status object for signaling task readiness
     """
-    logger.info(f"Processor {worker_id} started")
+    logger.info("Processor %s started", worker_id)
 
     # Signal that the task has started and is ready
     task_status.started()
@@ -131,18 +130,21 @@ async def processor_task(
 
         except anyio.EndOfStream:
             # Scanner finished and closed stream, exit gracefully
-            logger.info(f"Processor {worker_id}: Scanner finished, exiting")
+            logger.info("Processor %s: Scanner finished, exiting", worker_id)
             break
 
         except Exception as e:
             logger.error(
-                f"Processor {worker_id} error processing "
-                f"{doc_task.doc_type}_{doc_task.doc_id}: {e}",
+                "Processor %s error processing %s_%s: %s",
+                worker_id,
+                doc_task.doc_type,
+                doc_task.doc_id,
+                e,
                 exc_info=True,
             )
             # Continue to next document (no task_done() needed with streams)
 
-    logger.info(f"Processor {worker_id} stopped")
+    logger.info("Processor %s stopped", worker_id)
 
 
 async def process_document(doc_task: DocumentTask, nc_client: NextcloudClient):
@@ -158,8 +160,11 @@ async def process_document(doc_task: DocumentTask, nc_client: NextcloudClient):
     start_time = time.time()
 
     logger.debug(
-        f"Processing {doc_task.doc_type}_{doc_task.doc_id} "
-        f"for {doc_task.user_id} ({doc_task.operation})"
+        "Processing %s_%s for %s (%s)",
+        doc_task.doc_type,
+        doc_task.doc_id,
+        doc_task.user_id,
+        doc_task.operation,
     )
 
     with trace_operation(
@@ -198,7 +203,10 @@ async def process_document(doc_task: DocumentTask, nc_client: NextcloudClient):
                     ),
                 )
                 logger.info(
-                    f"Deleted {doc_task.doc_type}_{doc_task.doc_id} for {doc_task.user_id}"
+                    "Deleted %s_%s for %s",
+                    doc_task.doc_type,
+                    doc_task.doc_id,
+                    doc_task.user_id,
                 )
 
                 # Record successful deletion metrics
@@ -224,15 +232,22 @@ async def process_document(doc_task: DocumentTask, nc_client: NextcloudClient):
                 except (HTTPStatusError, Exception) as e:
                     if attempt < max_retries - 1:
                         logger.warning(
-                            f"Retry {attempt + 1}/{max_retries} for "
-                            f"{doc_task.doc_type}_{doc_task.doc_id}: {e}"
+                            "Retry %s/%s for %s_%s: %s",
+                            attempt + 1,
+                            max_retries,
+                            doc_task.doc_type,
+                            doc_task.doc_id,
+                            e,
                         )
                         await anyio.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                     else:
                         logger.error(
-                            f"Failed to index {doc_task.doc_type}_{doc_task.doc_id} "
-                            f"after {max_retries} retries: {e}"
+                            "Failed to index %s_%s after %s retries: %s",
+                            doc_task.doc_type,
+                            doc_task.doc_id,
+                            max_retries,
+                            e,
                         )
                         # Record failed processing metrics
                         duration = time.time() - start_time
@@ -349,7 +364,11 @@ async def _index_document(
                             break
                 except Exception as e:
                     logger.warning(
-                        f"Failed to fetch card with metadata (board_id={board_id}, stack_id={stack_id}, card_id={doc_task.doc_id}): {e}, falling back to iteration"
+                        "Failed to fetch card with metadata (board_id=%s, stack_id=%s, card_id=%s): %s, falling back to iteration",
+                        board_id,
+                        stack_id,
+                        doc_task.doc_id,
+                        e,
                     )
 
             # Fallback: Iterate through all boards/stacks (for legacy data or if fast path failed)
@@ -455,27 +474,32 @@ async def _index_document(
                 if "page_boundaries" in file_metadata:
                     page_boundaries = file_metadata["page_boundaries"]
                     logger.info(
-                        f"Page boundaries for {file_path}: "
-                        f"{len(page_boundaries)} pages, text length: {len(content)}"
+                        "Page boundaries for %s: %s pages, text length: %s",
+                        file_path,
+                        len(page_boundaries),
+                        len(content),
                     )
                     # Log first 3 page boundaries for debugging
                     for boundary in page_boundaries[:3]:
                         logger.debug(
-                            f"  Page {boundary['page']}: "
-                            f"offsets [{boundary['start_offset']}:{boundary['end_offset']}]"
+                            "  Page %s: offsets [%s:%s]",
+                            boundary["page"],
+                            boundary["start_offset"],
+                            boundary["end_offset"],
                         )
                     # Verify last boundary matches text length
                     if page_boundaries:
                         last_boundary = page_boundaries[-1]
                         if last_boundary["end_offset"] != len(content):
                             logger.warning(
-                                f"Text length mismatch: content={len(content)}, "
-                                f"last_boundary_end={last_boundary['end_offset']}"
+                                "Text length mismatch: content=%s, last_boundary_end=%s",
+                                len(content),
+                                last_boundary["end_offset"],
                             )
                 else:
-                    logger.debug(f"No page_boundaries in metadata for {file_path}")
+                    logger.debug("No page_boundaries in metadata for %s", file_path)
             except Exception as e:
-                logger.error(f"Failed to process file {file_path}: {e}")
+                logger.error("Failed to process file %s: %s", file_path, e)
                 raise
 
     # Tokenize and chunk (using configured chunk size and overlap)
@@ -510,26 +534,32 @@ async def _index_document(
             # Diagnostic: Verify page number assignment
             assigned_count = sum(1 for c in chunks if c.page_number is not None)
             logger.info(
-                f"Assigned page numbers to {assigned_count}/{len(chunks)} chunks "
-                f"for {file_path}"
+                "Assigned page numbers to %s/%s chunks for %s",
+                assigned_count,
+                len(chunks),
+                file_path,
             )
 
             # Log first 3 chunks to see their page assignments
             for i, chunk in enumerate(chunks[:3]):
                 logger.debug(
-                    f"  Chunk {i}: page={chunk.page_number}, "
-                    f"offsets=[{chunk.start_offset}:{chunk.end_offset}]"
+                    "  Chunk %s: page=%s, offsets=[%s:%s]",
+                    i,
+                    chunk.page_number,
+                    chunk.start_offset,
+                    chunk.end_offset,
                 )
 
             # Warning if NO page numbers were assigned
             if assigned_count == 0:
                 logger.warning(
-                    f"NO page numbers assigned! "
-                    f"Text length: {len(content)}, "
-                    f"Chunks: {len(chunks)}, "
-                    f"Chunk offset range: [{chunks[0].start_offset}:{chunks[-1].end_offset}], "
-                    f"Page boundaries: {len(page_boundaries_list)} pages, "
-                    f"First boundary: {page_boundaries_list[0] if page_boundaries_list else 'None'}"
+                    "NO page numbers assigned! Text length: %s, Chunks: %s, Chunk offset range: [%s:%s], Page boundaries: %s pages, First boundary: %s",
+                    len(content),
+                    len(chunks),
+                    chunks[0].start_offset,
+                    chunks[-1].end_offset,
+                    len(page_boundaries_list),
+                    page_boundaries_list[0] if page_boundaries_list else "None",
                 )
 
     # Extract chunk texts for embedding
@@ -538,7 +568,11 @@ async def _index_document(
     # Initialize results containers
     dense_embeddings: list = []
     sparse_embeddings: list = []
-    chunk_images: dict[int, dict] = {}
+    # chunk_index -> list[(x0, y0, x1, y1)] of normalized rectangles
+    # in [0, 1] relative to page width/height. The page is taken from
+    # `chunk.page_number` (offset-based) and stored as `page_number`
+    # in the Qdrant payload, so we don't carry an `actual_page_num` here.
+    chunk_bboxes: dict[int, list[tuple[float, float, float, float]]] = {}
 
     # Determine if we need PDF highlighting
     is_pdf = doc_task.doc_type == "file" and content_type == "application/pdf"
@@ -570,8 +604,8 @@ async def _index_document(
             sparse_embeddings = await bm25_service.encode_batch(chunk_texts)
 
     async def generate_highlights():
-        """Generate highlighted page images for PDF chunks (CPU-bound)."""
-        nonlocal chunk_images
+        """Compute chunk bounding boxes for PDF chunks (CPU-bound, no rendering)."""
+        nonlocal chunk_bboxes
         if not is_pdf:
             return
 
@@ -579,63 +613,43 @@ async def _index_document(
         assert content_bytes is not None
 
         with trace_operation(
-            "vector_sync.generate_highlights",
+            "vector_sync.compute_chunk_bboxes",
             attributes={
                 "vector_sync.chunk_count": len(chunks),
                 "vector_sync.pdf_size": len(content_bytes),
             },
         ):
-            # Build chunk data for batch processing
-            # Format: (chunk_index, start_offset, end_offset, page_number, chunk_text)
             chunk_data: list[tuple[int, int, int, int | None, str]] = [
                 (i, chunk.start_offset, chunk.end_offset, chunk.page_number, chunk.text)
                 for i, chunk in enumerate(chunks)
                 if chunk.page_number is not None
             ]
 
-            # Get pre-computed page boundaries from document processor
             page_boundaries = file_metadata.get("page_boundaries")
             if not page_boundaries:
-                logger.warning("No page boundaries available, skipping highlighting")
+                logger.warning(
+                    "No page boundaries available, skipping bbox computation"
+                )
                 return
 
-            # Type narrowing: page_boundaries is guaranteed to be list[dict] here
             page_boundaries_list = cast(list[dict[str, Any]], page_boundaries)
 
-            logger.info(
-                f"Batch generating highlighted page images for {len(chunk_data)} PDF chunks"
-            )
+            logger.info("Computing chunk bboxes for %s PDF chunks", len(chunk_data))
 
-            # Run CPU-bound highlighting in thread pool
-            # Pass pre-computed page boundaries and full text to avoid re-processing the PDF
             batch_results = await anyio.to_thread.run_sync(  # type: ignore[attr-defined]
-                lambda: PDFHighlighter.highlight_chunks_batch(
+                lambda: PDFHighlighter.compute_chunk_bboxes_batch(
                     pdf_bytes=content_bytes,
                     chunks=chunk_data,
                     page_boundaries=page_boundaries_list,
                     full_text=content,
-                    color="yellow",
-                    zoom=2.0,
                 )
             )
 
-            # Convert results to storage format
-            for chunk_index, (
-                png_bytes,
-                actual_page_num,
-                highlight_count,
-            ) in batch_results.items():
-                image_base64 = base64.b64encode(png_bytes).decode("utf-8")
-                chunk_images[chunk_index] = {
-                    "image": image_base64,
-                    "page": actual_page_num,
-                    "highlights": highlight_count,
-                    "size": len(png_bytes),
-                }
+            for chunk_index, (bboxes, _) in batch_results.items():
+                chunk_bboxes[chunk_index] = bboxes
 
             logger.info(
-                f"Generated {len(chunk_images)}/{len(chunks)} highlighted page images "
-                f"(avg {sum(img['size'] for img in chunk_images.values()) // max(len(chunk_images), 1):,} bytes)"
+                "Computed bboxes for %s/%s chunks", len(chunk_bboxes), len(chunks)
             )
 
     # Run all embedding/highlighting operations in parallel
@@ -752,16 +766,11 @@ async def _index_document(
                         if doc_task.doc_type == "deck_card"
                         else {}
                     ),
-                    # Highlighted page image (PDF only)
-                    **(
-                        {
-                            "highlighted_page_image": chunk_images[i]["image"],
-                            "highlighted_page_number": chunk_images[i]["page"],
-                            "highlight_count": chunk_images[i]["highlights"],
-                        }
-                        if i in chunk_images
-                        else {}
-                    ),
+                    # Chunk bbox (PDF only) — normalized rectangles in [0,1]
+                    # relative to page width/height. Replaces the legacy
+                    # `highlighted_page_image` (Deck #76). The page number
+                    # comes from `page_number` (set above for PDF chunks).
+                    **({"chunk_bbox": chunk_bboxes[i]} if i in chunk_bboxes else {}),
                 },
             )
         )
@@ -777,18 +786,22 @@ async def _index_document(
     except Exception as e:
         # Log but don't fail indexing if placeholder deletion fails
         logger.warning(
-            f"Failed to delete placeholder for {doc_task.doc_type}_{doc_task.doc_id}: {e}"
+            "Failed to delete placeholder for %s_%s: %s",
+            doc_task.doc_type,
+            doc_task.doc_id,
+            e,
         )
 
-    # Upsert to Qdrant in batches to avoid timeout with large payloads
-    # Each batch is limited to avoid WriteTimeout when sending large image payloads
-    BATCH_SIZE = 10  # ~2MB per batch with images
+    # Upsert to Qdrant in batches. Now that we no longer embed PNG payloads,
+    # per-point payloads are small (chunk text + small metadata), so we can
+    # safely use a larger batch size.
+    BATCH_SIZE = 100
     with trace_operation(
         "vector_sync.qdrant_upsert",
         attributes={
             "vector_sync.point_count": len(points),
             "vector_sync.collection": settings.get_collection_name(),
-            "vector_sync.images_count": len(chunk_images),
+            "vector_sync.bboxes_count": len(chunk_bboxes),
             "vector_sync.batch_size": BATCH_SIZE,
         },
     ):
@@ -802,10 +815,15 @@ async def _index_document(
             )
             if batch_end < len(points):
                 logger.debug(
-                    f"Upserted batch {batch_start // BATCH_SIZE + 1}/{(len(points) + BATCH_SIZE - 1) // BATCH_SIZE}"
+                    "Upserted batch %s/%s",
+                    batch_start // BATCH_SIZE + 1,
+                    (len(points) + BATCH_SIZE - 1) // BATCH_SIZE,
                 )
 
     logger.info(
-        f"Indexed {doc_task.doc_type}_{doc_task.doc_id} for {doc_task.user_id} "
-        f"({len(chunks)} chunks)"
+        "Indexed %s_%s for %s (%s chunks)",
+        doc_task.doc_type,
+        doc_task.doc_id,
+        doc_task.user_id,
+        len(chunks),
     )

@@ -38,6 +38,8 @@ def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
         summary=event.get("title", ""),
         start=start,
         end=event.get("end_datetime"),
+        start_tz=event.get("start_tz"),
+        end_tz=event.get("end_tz"),
         all_day=event.get("all_day", False),
         location=event.get("location") or None,
         description=event.get("description") or None,
@@ -92,13 +94,23 @@ def configure_calendar_tools(mcp: FastMCP):
         attendees: str = "",
         url: str = "",
         color: str = "",
+        timezone: str = "",
     ):
-        """Create a comprehensive calendar event with full feature support
+        """Create a comprehensive calendar event with full feature support.
 
         Args:
             calendar_name: Name of the calendar to create the event in
             title: Event title
-            start_datetime: ISO format: "2025-01-15T14:00:00" or "2025-01-15" for all-day
+            start_datetime: ISO format. Three modes:
+                - ``"2025-01-15T14:00:00Z"`` or ``"2025-01-15T14:00:00+00:00"``
+                  → stored as UTC.
+                - ``"2025-01-15T14:00:00"`` with ``timezone="America/New_York"``
+                  → stored as TZID-bound (server emits ``DTSTART;TZID=...:...``
+                  plus a VTIMEZONE component).
+                - ``"2025-01-15T14:00:00"`` alone → stored as RFC 5545 floating
+                  local time (interpreted by viewers in their own zone). A
+                  warning is logged so the choice is visible.
+                - ``"2025-01-15"`` for all-day events.
             ctx: MCP context
             end_datetime: ISO format end time, empty for all-day events
             all_day: Whether this is an all-day event
@@ -116,6 +128,10 @@ def configure_calendar_tools(mcp: FastMCP):
             attendees: Comma-separated email addresses
             url: Related URL for the event
             color: Event color (hex or name)
+            timezone: Optional IANA timezone name (e.g. ``"America/New_York"``).
+                Applied only when ``start_datetime``/``end_datetime`` are naive
+                (no offset, no ``Z``). Ignored — with a warning — when the
+                inputs already carry an explicit offset.
 
         Returns:
             Dict with event creation result
@@ -141,6 +157,7 @@ def configure_calendar_tools(mcp: FastMCP):
             "attendees": attendees,
             "url": url,
             "color": color,
+            "timezone": timezone,
         }
 
         return await client.calendar.create_event(calendar_name, event_data)
@@ -198,7 +215,7 @@ def configure_calendar_tools(mcp: FastMCP):
                 try:
                     start_datetime = dt.datetime.fromisoformat(start_date)
                 except ValueError:
-                    logger.warning(f"Invalid start_date format: {start_date}")
+                    logger.warning("Invalid start_date format: %s", start_date)
 
         if end_date:
             try:
@@ -211,7 +228,7 @@ def configure_calendar_tools(mcp: FastMCP):
                 try:
                     end_datetime = dt.datetime.fromisoformat(end_date)
                 except ValueError:
-                    logger.warning(f"Invalid end_date format: {end_date}")
+                    logger.warning("Invalid end_date format: %s", end_date)
 
         # Build filters dictionary
         filters = {}
@@ -312,9 +329,16 @@ def configure_calendar_tools(mcp: FastMCP):
         attendees: str | None = None,
         url: str | None = None,
         color: str | None = None,
+        timezone: str | None = None,
         etag: str = "",
     ):
-        """Update any aspect of an existing event"""
+        """Update any aspect of an existing event.
+
+        Pass ``timezone`` (IANA name, e.g. ``"America/New_York"``) together
+        with a naive ``start_datetime`` / ``end_datetime`` to rewrite DTSTART
+        / DTEND as TZID-bound. See ``nc_calendar_create_event`` for the full
+        encoding rules.
+        """
         client = await get_client(ctx)
 
         # Build update data with only non-None values
@@ -353,6 +377,8 @@ def configure_calendar_tools(mcp: FastMCP):
             event_data["url"] = url
         if color is not None:
             event_data["color"] = color
+        if timezone is not None:
+            event_data["timezone"] = timezone
 
         return await client.calendar.update_event(
             calendar_name, event_uid, event_data, etag
@@ -493,7 +519,7 @@ def configure_calendar_tools(mcp: FastMCP):
                     all_events.extend(cal_events)
                 except Exception as e:
                     logger.warning(
-                        f"Error getting events from calendar {calendar['name']}: {e}"
+                        "Error getting events from calendar %s: %s", calendar["name"], e
                     )
                     continue
 
@@ -567,7 +593,7 @@ def configure_calendar_tools(mcp: FastMCP):
             try:
                 start_datetime = dt.datetime.strptime(date_range_start, "%Y-%m-%d")
             except ValueError:
-                logger.warning(f"Invalid date_range_start format: {date_range_start}")
+                logger.warning("Invalid date_range_start format: %s", date_range_start)
 
         if date_range_end:
             try:
@@ -575,7 +601,7 @@ def configure_calendar_tools(mcp: FastMCP):
                     hour=23, minute=59, second=59
                 )
             except ValueError:
-                logger.warning(f"Invalid date_range_end format: {date_range_end}")
+                logger.warning("Invalid date_range_end format: %s", date_range_end)
 
         # Build constraints
         constraints = {
@@ -660,7 +686,7 @@ def configure_calendar_tools(mcp: FastMCP):
             try:
                 start_datetime = dt.datetime.strptime(start_date, "%Y-%m-%d")
             except ValueError:
-                logger.warning(f"Invalid start_date format: {start_date}")
+                logger.warning("Invalid start_date format: %s", start_date)
 
         if end_date:
             try:
@@ -668,7 +694,7 @@ def configure_calendar_tools(mcp: FastMCP):
                     hour=23, minute=59, second=59
                 )
             except ValueError:
-                logger.warning(f"Invalid end_date format: {end_date}")
+                logger.warning("Invalid end_date format: %s", end_date)
 
         # Build filter criteria
         filter_criteria = {}

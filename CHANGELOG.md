@@ -5,6 +5,178 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.86.3 (2026-05-12)
+
+### Refactor
+
+- convert f-string logging to lazy %-style format (G004)
+
+## v0.86.2 (2026-05-12)
+
+### Refactor
+
+- drop OAuth-refresh background-sync path from oauth_sync.py
+
+## v0.86.1 (2026-05-12)
+
+### Refactor
+
+- prune dead pre-LOGIN_FLOW config/runtime branches
+
+## v0.86.0 (2026-05-12)
+
+### BREAKING CHANGE
+
+- ENABLE_MULTI_USER_BASIC_AUTH is no longer read from
+the environment, and setting it now raises a startup ValueError with
+a migration message. Replace `ENABLE_MULTI_USER_BASIC_AUTH=true` with
+`MCP_DEPLOYMENT_MODE=multi_user_basic`. The same loud-deprecation
+check is also applied to the recently-removed ENABLE_LOGIN_FLOW —
+replace with `MCP_DEPLOYMENT_MODE=login_flow` (or drop both;
+`login_flow` is the auto-detect default when no other auth env vars
+are set).
+- `ENABLE_LOGIN_FLOW` is no longer read from the
+environment. Anyone who relied on `ENABLE_LOGIN_FLOW=true` to activate
+Login Flow v2 should set `MCP_DEPLOYMENT_MODE=login_flow` instead (or
+rely on it being the default when no other auth env vars are set).
+- MCP_DEPLOYMENT_MODE=oauth_single_audience is no longer
+accepted. Set MCP_DEPLOYMENT_MODE=login_flow (and keep
+ENABLE_LOGIN_FLOW=true) for the same deployment. The un-augmented
+OAuth path is no longer supported; if you previously ran the broken
+path, you can either configure Login Flow v2 (recommended) or switch
+to multi_user_basic / single_user_basic.
+
+### Fix
+
+- **config**: derive mode flags in Settings.__post_init__; address review round 2
+
+### Refactor
+
+- **config**: drop ENABLE_MULTI_USER_BASIC_AUTH env var, fail loud on legacy aliases
+- **config**: derive enable_login_flow from mode, remove ENABLE_LOGIN_FLOW env var
+- **config**: rename OAUTH_SINGLE_AUDIENCE to LOGIN_FLOW, gate on ENABLE_LOGIN_FLOW
+
+## v0.85.1 (2026-05-11)
+
+### Fix
+
+- **calendar**: preserve floating/TZID semantics across CalDAV roundtrip (#782)
+
+## v0.85.0 (2026-05-10)
+
+### Feat
+
+- **deck**: add file/note attachment MCP tools
+
+### Fix
+
+- **deck**: address review — notesPath key, scopes, modernize types
+
+## v0.84.2 (2026-05-10)
+
+### Fix
+
+- **health**: forward api-key to Qdrant /readyz so Cloud probes work
+
+## v0.84.1 (2026-05-10)
+
+### Fix
+
+- **vector**: address PR review round 17 + local-mode collection-creation regression
+- **vector**: address PR review round 16 — type-aware index check, comments
+- **vector**: address PR review round 15 — concurrency, pagination, stale coercion
+- **vector**: address PR review round 14 — accurate offset-skip comment + news_item doc_id guard
+- **vector**: address PR review round 13 — index offset fields + tighten test
+- **vector**: address PR review round 12 — bool guard + strict doc_id validation
+- **vector**: address PR review round 11 — broaden offset-skip gate, clarify ordering
+- **vector**: address PR review round 10 — index chunk_index, harden index loop, lazy-init lock
+- **api**: validate doc_id at chunk-context handler boundary
+- **vector**: address PR review round 9 — drop redundant guard, add init lock, test float doc_id path
+- **vector**: guard _group_int_doc_ids against non-int doc_id values
+- **vector**: tighten get_chunk_bbox_and_page_from_qdrant doc_id to str
+- **login-flow**: allow Astrolabe's OAuth client on the management API
+- **vector**: address PR review round 8 — anyio convention + cosine-safe sentinel + dedup get_collection
+- **vector**: add BOOL index for is_placeholder + correct wait=True docstring
+- **vector**: address PR review round 6 + SonarCloud findings
+- **vector**: address PR review round 5 — progress logging, summary visibility, sentinel split
+- **vector**: address PR review round 4 — backfill resilience + degraded-mode docs
+- **vector**: address PR review round 3 — sentinel guard, skip indexed fields, narrow types
+- **vector**: address PR review round 2 — status branching, doc_id guard, doc restore
+- **vector**: address PR review — wait=True backfill, batched writes, search helper
+- **vector**: normalize doc_id to str + add Qdrant keyword payload indexes
+
+## v0.84.0 (2026-05-10)
+
+### Feat
+
+- **contacts**: add nc_contacts_search_contacts free-text search tool
+
+## v0.83.4 (2026-05-10)
+
+### Fix
+
+- **qdrant**: use get_collection for startup probe (multi-tenant safe, take 2)
+
+## v0.83.3 (2026-05-10)
+
+### Fix
+
+- **qdrant**: use collection_exists for startup probe (multi-tenant safe)
+
+## v0.83.2 (2026-05-09)
+
+### Fix
+
+- **chunk-context**: address PR #767 review — extract bbox helper, fix page_number overwrite
+- **chunk-context**: address PR #767 review — drop dead PDF branch, redundant alias, add boundary tests
+- **chunk-context**: address PR #767 round-3 review — gate readability + legacy-fallback comment
+- **chunk-context**: propagate chunk_index=None through ChunkContext
+- **chunk-context**: address PR #767 round-2 review — gate, parity, doc
+- **chunk-context**: address PR #767 review — doc_type filter parity + tests
+- **viz_routes**: address PR #767 review — param parity + always-on page_number
+- **viz_routes**: validate chunk_index/total_chunks bounds in OAuth route
+- **chunk-context**: use indexed chunk_index lookup, fix close-after-use bug
+
+## v0.83.1 (2026-05-09)
+
+### Fix
+
+- **webdav**: decode percent-encoded names in PROPFIND/SEARCH responses
+
+## v0.83.0 (2026-05-08)
+
+### Feat
+
+- **vector**: replace inline page-image payloads with chunk_bbox (Deck #76)
+
+### Refactor
+
+- **vector**: address PR #775 review round 3 — fix unused var, harden boundary lookup, rename trace span
+- **vector**: address PR #775 review round 2 — drop dead page field, add omission tests
+- **vector**: address PR #775 review — drop unused payload key, fix resource leaks
+
+## v0.82.0 (2026-05-08)
+
+### Feat
+
+- **providers**: add Mistral embedding provider, route registry through dynaconf
+
+### Refactor
+
+- **providers**: address PR #772 review round 3 — hermetic test, lazy logging, defensive-guard tests
+- **providers**: address PR #772 review round 2 — guard, naming, docs, tests
+- **providers**: address PR #772 review — shared retry, cleaner imports, no-op close
+
+## v0.81.0 (2026-05-07)
+
+### Feat
+
+- **vector**: expand tagged directories for include + apply EXCLUDED_TAGS in scanner
+
+### Fix
+
+- **webdav**: include fileid in find_by_type SEARCH + address PR #765 review
+
 ## v0.80.0 (2026-05-06)
 
 ### Feat

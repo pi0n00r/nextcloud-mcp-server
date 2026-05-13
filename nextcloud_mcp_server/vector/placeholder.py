@@ -31,7 +31,7 @@ from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 logger = logging.getLogger(__name__)
 
 
-def _generate_placeholder_id(doc_type: str, doc_id: str | int) -> str:
+def _generate_placeholder_id(doc_type: str, doc_id: str) -> str:
     """Generate deterministic UUID for placeholder point.
 
     Args:
@@ -46,7 +46,7 @@ def _generate_placeholder_id(doc_type: str, doc_id: str | int) -> str:
 
 
 async def write_placeholder_point(
-    doc_id: str | int,
+    doc_id: str,
     doc_type: str,
     user_id: str,
     modified_at: int,
@@ -60,7 +60,7 @@ async def write_placeholder_point(
     processing completes.
 
     Args:
-        doc_id: Document ID (int for notes/files)
+        doc_id: Document ID (always str — see DocumentTask)
         doc_type: Document type (note, file, etc.)
         user_id: User ID who owns the document
         modified_at: Document modification timestamp
@@ -122,20 +122,26 @@ async def write_placeholder_point(
         )
 
         logger.debug(
-            f"Wrote placeholder for {doc_type}_{doc_id} (user={user_id}, "
-            f"modified_at={modified_at})"
+            "Wrote placeholder for %s_%s (user=%s, modified_at=%s)",
+            doc_type,
+            doc_id,
+            user_id,
+            modified_at,
         )
 
     except Exception as e:
         logger.error(
-            f"Failed to write placeholder for {doc_type}_{doc_id}: {e}",
+            "Failed to write placeholder for %s_%s: %s",
+            doc_type,
+            doc_id,
+            e,
             exc_info=True,
         )
         raise
 
 
 async def query_document_metadata(
-    doc_id: str | int,
+    doc_id: str,
     doc_type: str,
     user_id: str,
 ) -> dict | None:
@@ -180,12 +186,14 @@ async def query_document_metadata(
         return None
 
     except Exception as e:
-        logger.warning(f"Error querying document metadata for {doc_type}_{doc_id}: {e}")
+        logger.warning(
+            "Error querying document metadata for %s_%s: %s", doc_type, doc_id, e
+        )
         return None
 
 
 async def delete_placeholder_point(
-    doc_id: str | int,
+    doc_id: str,
     doc_type: str,
     user_id: str,
 ) -> None:
@@ -219,18 +227,23 @@ async def delete_placeholder_point(
             ),
         )
 
-        logger.debug(f"Deleted placeholder for {doc_type}_{doc_id} (user={user_id})")
+        logger.debug(
+            "Deleted placeholder for %s_%s (user=%s)", doc_type, doc_id, user_id
+        )
 
     except Exception as e:
         logger.error(
-            f"Failed to delete placeholder for {doc_type}_{doc_id}: {e}",
+            "Failed to delete placeholder for %s_%s: %s",
+            doc_type,
+            doc_id,
+            e,
             exc_info=True,
         )
         raise
 
 
 async def update_placeholder_status(
-    doc_id: str | int,
+    doc_id: str,
     doc_type: str,
     user_id: str,
     status: str,
@@ -271,13 +284,16 @@ async def update_placeholder_status(
         )
 
         logger.debug(
-            f"Updated placeholder status for {doc_type}_{doc_id} to '{status}' "
-            f"(user={user_id})"
+            "Updated placeholder status for %s_%s to '%s' (user=%s)",
+            doc_type,
+            doc_id,
+            status,
+            user_id,
         )
 
     except Exception as e:
         logger.warning(
-            f"Failed to update placeholder status for {doc_type}_{doc_id}: {e}"
+            "Failed to update placeholder status for %s_%s: %s", doc_type, doc_id, e
         )
         # Don't raise - status updates are non-critical
 
