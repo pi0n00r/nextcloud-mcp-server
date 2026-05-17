@@ -5,6 +5,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from nextcloud_mcp_server.client.webdav import EtagConflictError
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models import DirectoryListing, FileInfo, SearchFilesResponse
@@ -101,7 +102,7 @@ def configure_webdav_tools(mcp: FastMCP):
             path: Full path to the file to read
 
         Returns:
-            Dict with path, content, content_type, size, and optional parsing metadata
+            Dict with path, content, content_type, size, etag (None if not returned by server), and optional parsing metadata
             - Text files are decoded to UTF-8
             - Documents (PDF, DOCX, etc.) are parsed and text is extracted
             - Other binary files are base64 encoded
@@ -113,7 +114,7 @@ def configure_webdav_tools(mcp: FastMCP):
         if is_path_excluded(path, excluded):
             raise ToolError(f"Access denied: {path!r} is tagged with an excluded tag")
 
-        content, content_type = await client.webdav.read_file(path)
+        content, content_type, etag = await client.webdav.read_file(path)
 
         # Check if this is a parseable document (PDF, DOCX, etc.)
         # is_parseable_document() checks if document processing is enabled
@@ -131,6 +132,7 @@ def configure_webdav_tools(mcp: FastMCP):
                     "content": parsed_text,
                     "content_type": content_type,
                     "size": len(content),
+                    "etag": etag,
                     "parsed": True,
                     "parsing_metadata": metadata,
                 }
@@ -151,6 +153,7 @@ def configure_webdav_tools(mcp: FastMCP):
                     "content": decoded_content,
                     "content_type": content_type,
                     "size": len(content),
+                    "etag": etag,
                 }
             except UnicodeDecodeError:
                 pass
@@ -175,7 +178,11 @@ def configure_webdav_tools(mcp: FastMCP):
     @require_scopes("files.write")
     @instrument_tool
     async def nc_webdav_write_file(
-        path: str, content: str, ctx: Context, content_type: str | None = None
+        path: str,
+        content: str,
+        ctx: Context,
+        content_type: str | None = None,
+        if_match: str | None = None,
     ):
         """Write content to a file in NextCloud.
 
@@ -186,9 +193,15 @@ def configure_webdav_tools(mcp: FastMCP):
             path: Full path where to write the file
             content: File content (text or base64 for binary)
             content_type: MIME type (auto-detected if not provided, use 'type;base64' for binary)
+            if_match: Optional ETag from a prior read_file response. When set,
+                the PUT carries an HTTP If-Match precondition. Closes P1.1.
 
         Returns:
-            Dict with status_code indicating success
+            On success: Dict with status_code (and bytes_written, plus etag if
+            the server returned one on the PUT response).
+            On 412 Precondition Failed (If-Match mismatch): Dict with
+            status_code=412, error_kind='precondition_failed', and server_etag
+            (the current server ETag, if surfaceable).
         """
         client = await get_client(ctx)
 
@@ -204,7 +217,17 @@ def configure_webdav_tools(mcp: FastMCP):
         else:
             content_bytes = content.encode("utf-8")
 
-        return await client.webdav.write_file(path, content_bytes, content_type)
+        try:
+            return await client.webdav.write_file(
+                path, content_bytes, content_type, if_match=if_match
+            )
+        except EtagConflictError as e:
+            return {
+                "status_code": 412,
+                "error_kind": "precondition_failed",
+                "server_etag": e.current_etag,
+                "message": str(e),
+            }
 
     @mcp.tool(
         title="Create Directory",
