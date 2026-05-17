@@ -24,6 +24,19 @@ from .base import BaseNextcloudClient
 logger = logging.getLogger(__name__)
 
 
+class EtagConflictError(Exception):
+    """Raised when a WebDAV PUT/MOVE returns 412 Precondition Failed (If-Match mismatch).
+
+    Carries the current server ETag (if available) so callers can refetch
+    and re-apply, mirroring client/contacts.py::EtagConflictError pattern.
+    """
+
+    def __init__(self, message: str, current_etag: "Optional[str]" = None):
+        super().__init__(message)
+        self.current_etag = current_etag
+
+
+
 class WebDAVClient(BaseNextcloudClient):
     """Client for Nextcloud WebDAV operations."""
 
@@ -326,8 +339,13 @@ class WebDAVClient(BaseNextcloudClient):
             logger.error(f"Unexpected error listing directory '{webdav_path}': {e}")
             raise e
 
-    async def read_file(self, path: str) -> Tuple[bytes, str]:
-        """Read a file's content via WebDAV GET."""
+    async def read_file(self, path: str) -> Tuple[bytes, str, Optional[str]]:
+        """Read a file's content via WebDAV GET. Returns (content, content_type, etag).
+
+        The etag is surfaced (None if upstream didn't include one) so callers can
+        pass it to write_file(if_match=...) for race-safe read-modify-write
+        sequences. Closes P1.1 backlog item — see nc-mcp-backlog.md.
+        """
         webdav_path = f"{self._get_webdav_base_path()}/{path.lstrip('/')}"
 
         logger.debug(f"Reading file: {path}")
@@ -340,9 +358,14 @@ class WebDAVClient(BaseNextcloudClient):
             content_type = response.headers.get(
                 "content-type", "application/octet-stream"
             )
+            etag = response.headers.get("etag") or response.headers.get("ETag")
+            if etag and etag.startswith('"') and etag.endswith('"'):
+                etag = etag[1:-1]
 
-            logger.debug(f"Successfully read file '{path}' ({len(content)} bytes)")
-            return content, content_type
+            logger.debug(
+                f"Successfully read file '{path}' ({len(content)} bytes, etag={etag!r})"
+            )
+            return content, content_type, etag
 
         except HTTPStatusError as e:
             logger.error(f"HTTP error reading file '{path}': {e}")
@@ -360,10 +383,21 @@ class WebDAVClient(BaseNextcloudClient):
     CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
     async def write_file(
-        self, path: str, content: bytes, content_type: Optional[str] = None
+        self,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+        if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Write content to a file via WebDAV PUT.
+
         For content above CHUNK_THRESHOLD bytes, routes through NC chunked-upload v2.
+
+        Args:
+            if_match: Optional ETag for conditional PUT/MOVE. When set, the write
+                carries an If-Match precondition; on 412 Precondition Failed,
+                raises EtagConflictError with the server's current etag (if
+                surfaceable). Closes P1.1 backlog item.
         """
         if not content_type:
             content_type, _ = mimetypes.guess_type(path)
@@ -371,28 +405,63 @@ class WebDAVClient(BaseNextcloudClient):
                 content_type = "application/octet-stream"
 
         if len(content) <= self.CHUNK_THRESHOLD:
-            return await self._write_file_simple(path, content, content_type)
-        return await self._write_file_chunked(path, content, content_type)
+            return await self._write_file_simple(
+                path, content, content_type, if_match=if_match
+            )
+        return await self._write_file_chunked(
+            path, content, content_type, if_match=if_match
+        )
 
     async def _write_file_simple(
-        self, path: str, content: bytes, content_type: str
+        self,
+        path: str,
+        content: bytes,
+        content_type: str,
+        if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Single-PUT write for small files."""
         webdav_path = f"{self._get_webdav_base_path()}/{path.lstrip('/')}"
         logger.debug(f"Writing file (simple PUT, {len(content)} bytes): {path}")
         headers = {"Content-Type": content_type, "OCS-APIRequest": "true"}
+        if if_match is not None:
+            # NC expects quoted etags per RFC 7232; pass through if already quoted
+            # or wildcard, else add quotes
+            headers["If-Match"] = (
+                if_match
+                if (if_match == "*" or (if_match.startswith('"') and if_match.endswith('"')))
+                else f'"{if_match}"'
+            )
         try:
             response = await self._make_request(
                 "PUT", webdav_path, content=content, headers=headers
             )
             response.raise_for_status()
-            return {"status_code": response.status_code, "bytes_written": len(content)}
+            result = {"status_code": response.status_code, "bytes_written": len(content)}
+            new_etag = response.headers.get("etag") or response.headers.get("ETag")
+            if new_etag:
+                if new_etag.startswith('"') and new_etag.endswith('"'):
+                    new_etag = new_etag[1:-1]
+                result["etag"] = new_etag
+            return result
         except HTTPStatusError as e:
+            if e.response.status_code == 412:
+                server_etag = e.response.headers.get("etag") or e.response.headers.get("ETag")
+                if server_etag and server_etag.startswith('"') and server_etag.endswith('"'):
+                    server_etag = server_etag[1:-1]
+                raise EtagConflictError(
+                    f"412 Precondition Failed on PUT {path}: If-Match {if_match!r} "
+                    f"did not match server (server_etag={server_etag!r})",
+                    current_etag=server_etag,
+                )
             logger.error(f"HTTP error writing file '{path}': {e}")
             raise
 
     async def _write_file_chunked(
-        self, path: str, content: bytes, content_type: str
+        self,
+        path: str,
+        content: bytes,
+        content_type: str,
+        if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Chunked write via NC v2 chunked-upload.
 
@@ -439,16 +508,35 @@ class WebDAVClient(BaseNextcloudClient):
         # 3. Assemble via MOVE on .file pseudo-resource.
         host_url = str(self._client.base_url).rstrip("/")
         destination = f"{host_url}{final_dest_path}"
+        move_headers = {
+            "Destination": destination,
+            "OC-Total-Length": str(len(content)),
+            "Content-Type": content_type,
+        }
+        if if_match is not None:
+            move_headers["If-Match"] = (
+                if_match
+                if (if_match == "*" or (if_match.startswith('"') and if_match.endswith('"')))
+                else f'"{if_match}"'
+            )
         move_resp = await self._make_request(
             "MOVE",
             f"{upload_root}/.file",
-            headers={
-                "Destination": destination,
-                "OC-Total-Length": str(len(content)),
-                "Content-Type": content_type,
-            },
+            headers=move_headers,
         )
-        move_resp.raise_for_status()
+        try:
+            move_resp.raise_for_status()
+        except HTTPStatusError as e:
+            if e.response.status_code == 412:
+                server_etag = e.response.headers.get("etag") or e.response.headers.get("ETag")
+                if server_etag and server_etag.startswith('"') and server_etag.endswith('"'):
+                    server_etag = server_etag[1:-1]
+                raise EtagConflictError(
+                    f"412 Precondition Failed on MOVE {path}: If-Match {if_match!r} "
+                    f"did not match server (server_etag={server_etag!r})",
+                    current_etag=server_etag,
+                )
+            raise
         return {
             "status_code": move_resp.status_code,
             "bytes_written": bytes_written,
