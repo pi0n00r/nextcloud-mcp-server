@@ -1,10 +1,4 @@
-<p align="center">
-  <img src="astrolabe.svg" alt="Nextcloud MCP Server" width="128" height="128">
-</p>
-
 # Nextcloud MCP Server
-
-[![Docker Image](https://img.shields.io/badge/docker-ghcr.io/cbcoutinho/nextcloud--mcp--server-blue)](https://github.com/cbcoutinho/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 
 **A production-ready MCP server that connects AI assistants to your Nextcloud instance.**
 
@@ -14,9 +8,6 @@ This is a **dedicated standalone MCP server** designed for external MCP clients 
 
 > [!NOTE]
 > **Looking for AI features inside Nextcloud?** Nextcloud also provides [Context Agent](https://github.com/nextcloud/context_agent), which powers the Assistant app and runs as an ExApp inside Nextcloud. See [docs/comparison-context-agent.md](docs/comparison-context-agent.md) for a detailed comparison of use cases.
-
-> [!TIP]
-> **Don't want to self-host?** [Astrolabe Cloud](https://astrolabecloud.com) is a managed hosting service for this MCP server, aimed at users and teams who want advanced features like background sync and semantic search without operating the infrastructure themselves. The service is currently under development — sign up on the landing page to join the early-adopter list.
 
 ## Quick Start
 
@@ -94,7 +85,7 @@ For Kubernetes, see [cbcoutinho/helm-charts](https://github.com/cbcoutinho/helm-
 | **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
 | **Semantic Search** | 2+ | Vector search for Notes, Files, News items, and Deck cards (experimental, opt-in, requires infrastructure) |
 
-Want to see another Nextcloud app supported? [Open an issue](https://github.com/cbcoutinho/nextcloud-mcp-server/issues) or contribute a pull request!
+Want to see another Nextcloud app supported? [Open an issue](https://github.com/pi0n00r/nextcloud-mcp-server/issues) or contribute a pull request!
 
 ## Authentication
 
@@ -114,9 +105,6 @@ See [docs/authentication.md](docs/authentication.md) for setup instructions.
 
 An experimental RAG pipeline that lets MCP clients find Nextcloud content by **meaning** rather than keywords — a query for "car" also surfaces notes about "vehicle" or "transportation". Disabled by default (`ENABLE_SEMANTIC_SEARCH=false`); requires a vector database and embedding service. See [docs/semantic-search-architecture.md](docs/semantic-search-architecture.md) and [docs/configuration.md](docs/configuration.md).
 
-> [!TIP]
-> **Don't want to run Qdrant and an embedding service?** [Astrolabe Cloud](https://astrolabecloud.com) (under development) provides semantic search and background sync as a managed service.
-
 ## Documentation
 
 - **[Installation](docs/installation.md)** — Docker, Compose profiles, local, VM
@@ -132,23 +120,17 @@ An experimental RAG pipeline that lets MCP clients find Nextcloud content by **m
 
 Contributions are welcome!
 
-- Report bugs or request features: [GitHub Issues](https://github.com/cbcoutinho/nextcloud-mcp-server/issues)
-- Submit improvements: [Pull Requests](https://github.com/cbcoutinho/nextcloud-mcp-server/pulls)
+- Report bugs or request features: [GitHub Issues](https://github.com/pi0n00r/nextcloud-mcp-server/issues)
+- Submit improvements: [Pull Requests](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
 - Development guidelines: [CLAUDE.md](CLAUDE.md)
 
 ## Security
 
-[![MseeP.ai Security Assessment](https://mseep.net/pr/cbcoutinho-nextcloud-mcp-server-badge.png)](https://mseep.ai/app/cbcoutinho-nextcloud-mcp-server)
-
-Found a security issue? **Do not open a public GitHub issue.** Use GitHub's [private vulnerability reporting](https://github.com/cbcoutinho/nextcloud-mcp-server/security/advisories/new), or email **security@astrolabecloud.com** if you can't use GitHub. See [SECURITY.md](./SECURITY.md) for details.
+Found a security issue? **Do not open a public GitHub issue.** Use GitHub's [private vulnerability reporting](https://github.com/pi0n00r/nextcloud-mcp-server/security/advisories/new). See [SECURITY.md](./SECURITY.md) for details.
 
 ## License
 
 This project is licensed under the AGPL-3.0 License. See [LICENSE](./LICENSE) for details.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=cbcoutinho/nextcloud-mcp-server&type=Date)](https://www.star-history.com/#cbcoutinho/nextcloud-mcp-server&Date)
 
 ## References
 
