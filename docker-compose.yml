@@ -19,11 +19,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.6.2-alpine@sha256:81b6f81d6a6c5b9019231a2e8eb10085e3a139a34f833dcc965a8a959b040b72
+    image: docker.io/library/redis:8.8.0-alpine@sha256:09160599abd229764c0fb44cb6be640294e1d360a54b19985ab4843dcf2d90f1
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.9@sha256:a6faf7f884036fc754fbeef0a88177463df39f11ce699fb19edc4c2b7e481a47}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.10@sha256:611669115cccef3f96aa8eb47bd07c4d57452d894ebcfc1d81f5e8ce368e7d2d}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -65,7 +65,7 @@ services:
       - ./tests/fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
 
   unstructured:
-    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.2@sha256:986bc7e5d6c24916c22d45d925db366f55bf4d2ebb0079a7b5d38b48fbc6fb1d
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.7@sha256:ee89a87a545b6a7d56609607aced71b5b1acf0211400bf2d11a8f70f209a93bd
     restart: always
     ports:
       - 127.0.0.1:8005:8000
@@ -181,7 +181,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.5.4@sha256:ae8efb0d218d8921334b03a2dbee7069a0b868240691c50a3ffc9f42fabba8b4
+    image: quay.io/keycloak/keycloak:26.6.2@sha256:f9ba7b2af90db8dc749a57ca9aedca51e840cb9224441ab546a968da941da900
     command:
       - "start-dev"
       - "--import-realm"
@@ -306,7 +306,7 @@ services:
   # Usage: docker compose --profile login-flow --profile claude-funnel up --build -d
   # Requires: TS_AUTHKEY in .env file (see env.sample.claude-funnel)
   tailscale-mcp:
-    image: docker.io/tailscale/tailscale:v1.94.2@sha256:95e528798bebe75f39b10e74e7051cf51188ee615934f232ba7ad06a3390ffa1
+    image: docker.io/tailscale/tailscale:v1.98.4@sha256:25cde9ad76020b0e29229136d0c38b5962e9a0e1774ffac9b0df68e4a37d6cf0
     hostname: nextcloud-mcp-dev
     restart: always
     environment:

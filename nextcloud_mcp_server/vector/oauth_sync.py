@@ -24,16 +24,14 @@ from dataclasses import dataclass, field
 
 import anyio
 from anyio.abc import TaskGroup, TaskStatus
-from anyio.streams.memory import (
-    MemoryObjectReceiveStream,
-    MemoryObjectSendStream,
-)
+from anyio.streams.memory import MemoryObjectReceiveStream
 from httpx import BasicAuth, HTTPStatusError
 
 from nextcloud_mcp_server.auth.storage import RefreshTokenStorage
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.vector.processor import process_document
+from nextcloud_mcp_server.vector.queue.ports import TaskProducer
 from nextcloud_mcp_server.vector.scanner import DocumentTask, scan_user_documents
 
 logger = logging.getLogger(__name__)
@@ -43,6 +41,38 @@ class NotProvisionedError(Exception):
     """User has not provisioned offline access or has revoked it."""
 
     pass
+
+
+# Process-wide app-password storage for the BasicAuth client path.
+#
+# get_user_client_basic_auth is on the search hot path (Unified Search and the
+# /api/v1 viz endpoints call it per request). Creating a fresh
+# RefreshTokenStorage and running ``initialize()`` — a full Alembic upgrade in
+# a worker thread — on every call is both wasteful and unsafe: concurrent
+# upgrades race on Alembic's non-thread-safe module-global EnvironmentContext
+# proxy, surfacing as ``KeyError: 'script'``. Cache one initialized instance,
+# guarded by a lock so the one-time migration runs exactly once. The lock is
+# created lazily inside an async context (anyio primitives must not be built at
+# import time — trio compatibility), mirroring vector/qdrant_client.py.
+_basic_auth_storage: "RefreshTokenStorage | None" = None
+_basic_auth_storage_lock: anyio.Lock | None = None
+
+
+async def _get_initialized_basic_auth_storage() -> "RefreshTokenStorage":
+    """Return the process-wide, already-initialized app-password storage."""
+    global _basic_auth_storage, _basic_auth_storage_lock
+    if _basic_auth_storage is not None:
+        return _basic_auth_storage
+    # Safe under cooperative scheduling: no await between the None-check and the
+    # assignment, so two coroutines cannot both create a lock.
+    if _basic_auth_storage_lock is None:
+        _basic_auth_storage_lock = anyio.Lock()
+    async with _basic_auth_storage_lock:
+        if _basic_auth_storage is None:
+            storage = RefreshTokenStorage.from_env()
+            await storage.initialize()
+            _basic_auth_storage = storage
+    return _basic_auth_storage
 
 
 @dataclass
@@ -76,32 +106,41 @@ async def get_user_client_basic_auth(
     Raises:
         NotProvisionedError: If user has not provisioned an app password
     """
-    # Get or create storage instance
+    # Get or create storage instance. Reuse a process-wide initialized instance
+    # rather than building one (and running an Alembic upgrade) per call — see
+    # _get_initialized_basic_auth_storage for why (hot path + Alembic race).
     if storage is None:
-        storage = RefreshTokenStorage.from_env()
-        await storage.initialize()
+        storage = await _get_initialized_basic_auth_storage()
 
-    # Retrieve app password from local storage
-    app_password = await storage.get_app_password(user_id)
+    # Retrieve app password (and the stored Nextcloud loginName) from local
+    # storage. Nextcloud authenticates app passwords against the loginName,
+    # which differs from the UID for OIDC-provisioned users; authenticate as
+    # the loginName while keeping the UID for DAV/API path construction. Falls
+    # back to the UID for legacy rows stored without a loginName.
+    app_data = await storage.get_app_password_with_scopes(user_id)
 
-    if not app_password:
+    if not app_data:
         raise NotProvisionedError(
             f"User {user_id} has not provisioned an app password. "
             f"User must configure background sync in Astrolabe personal settings."
         )
 
+    app_password = app_data["app_password"]
+    login_name = app_data.get("username") or user_id
+
     logger.info("Using app password for background sync: %s", user_id)
     return NextcloudClient(
         base_url=nextcloud_host,
         username=user_id,
-        auth=BasicAuth(user_id, app_password),
+        auth_username=login_name,
+        auth=BasicAuth(login_name, app_password),
         password=app_password,
     )
 
 
 async def user_scanner_task(
     user_id: str,
-    send_stream: MemoryObjectSendStream[DocumentTask],
+    send_stream: TaskProducer,
     shutdown_event: anyio.Event,
     wake_event: anyio.Event,
     nextcloud_host: str,
@@ -330,7 +369,7 @@ oauth_processor_task = multi_user_processor_task
 async def _run_user_scanner_with_scope(
     user_id: str,
     cancel_scope: anyio.CancelScope,
-    send_stream: MemoryObjectSendStream[DocumentTask],
+    send_stream: TaskProducer,
     shutdown_event: anyio.Event,
     wake_event: anyio.Event,
     nextcloud_host: str,
@@ -358,7 +397,7 @@ async def _run_user_scanner_with_scope(
 
 
 async def user_manager_task(
-    send_stream: MemoryObjectSendStream[DocumentTask],
+    send_stream: TaskProducer,
     shutdown_event: anyio.Event,
     wake_event: anyio.Event,
     refresh_token_storage: "RefreshTokenStorage",

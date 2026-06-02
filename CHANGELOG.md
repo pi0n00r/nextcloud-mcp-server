@@ -5,6 +5,99 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.93.0 (2026-06-01)
+
+### BREAKING CHANGE
+
+- deck list tools now default to detail="summary" and
+status="open". The include_archived_cards parameter is replaced by status
+(use status="all" to include archived cards); pass detail="full" to restore
+the previous per-card shape.
+
+### Feat
+
+- **deck**: compact card/comment retrieval (summaries, filters, board overview)
+
+### Refactor
+
+- **deck**: address PR #826 review feedback
+
+## v0.92.1 (2026-06-01)
+
+### Fix
+
+- **embedding**: normalize gateway base_url to the /v1 base path
+
+## v0.92.0 (2026-06-01)
+
+### Feat
+
+- **embedding**: gateway provider discovers dimension via GET /v1/models
+
+## v0.91.3 (2026-06-01)
+
+### Fix
+
+- **api**: distinguish Nextcloud 5xx from auth failure; tighten body parse (#824)
+- **api**: block cross-user delete and address review feedback (#824)
+- **api**: return 401 not 500 on failed app-password OCS validation (#824)
+
+## v0.91.2 (2026-05-31)
+
+### Fix
+
+- **auth**: authenticate stored app passwords with loginName, not UID
+
+## v0.91.1 (2026-05-31)
+
+### Fix
+
+- **vector**: make NATS status subscriber resilient at startup
+
+## v0.91.0 (2026-05-31)
+
+### Feat
+
+- add opt-in MCP decomposition hook points (design §10)
+
+### Fix
+
+- stop S7632 flagging NOSONAR mentioned in prose comments
+- well-form NOSONAR suppressions (SonarCloud S7632/S7503)
+- address PR #814 reviewer follow-ups
+- address PR #814 review + SonarCloud gate
+
+## v0.90.2 (2026-05-30)
+
+### Fix
+
+- **vector-sync**: isolate per-app scans so a disabled Notes app can't abort sync
+
+## v0.90.1 (2026-05-30)
+
+### Fix
+
+- **api**: validate app password against Nextcloud using loginName, not UID
+
+## v0.90.0 (2026-05-29)
+
+### Feat
+
+- **search**: ACL-aware vector filter via Nextcloud Shares lookup
+
+### Fix
+
+- PR #813 review — cap unified_search multi-type pool; document deck self-only
+- cache app-password storage to avoid per-request Alembic upgrade race
+- PR #813 review — shared-file context in MCP tool path + viz over-fetch cap
+- address PR #813 review round 4 (log leak, cross-user chunk ctx, algo, overlap)
+- address PR #813 latest review (ACL-aware doc-type discovery, robustness)
+- address PR #813 review (owner_id index, cache bound, explicit param)
+- **search**: address PR #813 review (viz verify-on-read, owners cache, docs)
+- **auth**: make provision/revoke consistent with the app-password store
+- **auth**: login-flow provisioning — public login_url + session app passwords
+- **search**: verify shared files by global file id (ACL-aware)
+
 ## v0.89.0 (2026-05-24)
 
 ### Feat
