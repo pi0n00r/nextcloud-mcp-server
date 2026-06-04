@@ -1,22 +1,22 @@
 """BM25 hybrid search algorithm using Qdrant native RRF fusion."""
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from qdrant_client import models
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import Filter
 
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_service
 from nextcloud_mcp_server.observability.metrics import record_qdrant_operation
 from nextcloud_mcp_server.observability.tracing import trace_operation
-from nextcloud_mcp_server.search.access_filter import build_ownership_filter
+from nextcloud_mcp_server.search.access_filter import build_base_filter_conditions
 from nextcloud_mcp_server.search.algorithms import (
     SearchAlgorithm,
     SearchResult,
     build_search_result_from_point,
 )
-from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,10 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
         doc_type: str | None = None,
         *,
         accessible_owners: list[str] | None = None,
+        modified_after: int | None = None,
+        modified_before: int | None = None,
+        path_prefix: str | None = None,
+        path_prefixes: Iterable[str] | None = None,
         **kwargs: Any,
     ) -> list[SearchResult]:
         """
@@ -94,6 +98,15 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
             accessible_owners: Owner UIDs the user can read (self + share
                 senders), pre-computed by the caller from the OCS Sharing API.
                 Defaults to ``[user_id]`` (self-only) when ``None``.
+            modified_after: Inclusive lower bound on ``modified_at`` (Unix
+                seconds, UTC); ``None`` ⇒ open-ended (ADR-027).
+            modified_before: Inclusive upper bound on ``modified_at`` (Unix
+                seconds, UTC); ``None`` ⇒ open-ended (ADR-027).
+            path_prefix: Deprecated single folder filter; folded into
+                ``path_prefixes`` (ADR-027 Phase 2).
+            path_prefixes: Folder/path filters on ``file_path`` (files only),
+                OR-ed together; ``None``/empty ⇒ no path filter (ADR-027
+                Phase 2).
             **kwargs: Additional parameters (score_threshold override)
 
         Returns:
@@ -134,20 +147,18 @@ class BM25HybridSearchAlgorithm(SearchAlgorithm):
             len(sparse_embedding["indices"]),
         )
 
-        # Build Qdrant filter
-        filter_conditions = [
-            get_placeholder_filter(),  # Always exclude placeholders from user-facing queries
-            build_ownership_filter(user_id, accessible_owners),
-        ]
-
-        # Add doc_type filter if specified
-        if doc_type:
-            filter_conditions.append(
-                FieldCondition(
-                    key="doc_type",
-                    match=MatchValue(value=doc_type),
-                )
-            )
+        # Build Qdrant filter (placeholder + ACL + doc_type + modified_at range).
+        # Shared with the dense-only SemanticSearchAlgorithm via the common
+        # ADR-027 helper so every search surface applies one filter contract.
+        filter_conditions = build_base_filter_conditions(
+            user_id=user_id,
+            accessible_owners=accessible_owners,
+            doc_type=doc_type,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            path_prefix=path_prefix,
+            path_prefixes=path_prefixes,
+        )
 
         query_filter = Filter(must=filter_conditions)
 

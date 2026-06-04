@@ -645,10 +645,12 @@ This adds Nextcloud round-trips to the search path that operators should be
 aware of:
 
 - **Per-search cost**: one Nextcloud round-trip per *unique* `(doc_id, doc_type)`
-  in the result set. Chunking means a 10-result page typically references 3-5
-  unique documents, so verification adds 3-5 round-trips. With the default
-  20-way concurrency this is one parallel batch — usually under 100 ms on a
-  healthy connection.
+  in the result set — except `file` and `news_item`, which each batch into a
+  single call per search regardless of how many results they contribute (see
+  the Files and News caveats below). Chunking means a 10-result page typically
+  references 3-5 unique documents, so verification adds 3-5 round-trips. With
+  the default 20-way concurrency this is one parallel batch — usually under
+  100 ms on a healthy connection.
 - **Concurrency**: all verifications fan out under a shared semaphore.
   Tunable via the `VERIFICATION_CONCURRENCY` env var (settings field
   `verification_concurrency`, default 20) — lower it if your Nextcloud
@@ -664,14 +666,45 @@ aware of:
   search that surfaces news results. Disabling News in the indexer or running
   with a smaller backlog mitigates this; per-item paginated verification is
   tracked as a future improvement.
-- **Eviction**: when verification finds a definitive miss (404 / 403), the
-  corresponding Qdrant points are deleted in the background on a lifespan-owned
-  task group — fire-and-forget, does **not** block the search response.
-  Eviction failures are logged but never propagated; the next query will
-  re-verify and re-attempt (self-healing).
+- **Files caveat**: `file` results are gated on current **`vector-index` tag
+  membership**, not bare access — the verifier issues a single
+  `find_files_by_tag(<tag>, mime_type_filter="application/pdf")` REPORT per
+  search that contains any file result (plus a one-shot `EXCLUDED_TAGS`
+  lookup), then keeps only files in that set. This matches exactly what the
+  scanner indexes, so a file removed from the tag (or deleted, or moved under
+  an excluded folder) drops out of results immediately rather than waiting for
+  the scanner sweep. The REPORT expands tagged folders via a `Depth: infinity`
+  SEARCH, so deployments that tag whole directory trees pay that walk once per
+  search; configure `VECTOR_SYNC_PDF_TAG` to change the tag name. The `file`
+  verifier's latency therefore scales with **both** the `Depth: infinity` folder
+  expansion **and** the `EXCLUDED_TAGS` lookup: that lookup fans out ~2 WebDAV
+  calls (1 PROPFIND + 1 REPORT) *per excluded tag*, concurrently, while holding
+  a single verification slot — so a deployment with a long `EXCLUDED_TAGS` list
+  and/or deeply tagged trees issues many parallel Nextcloud requests per search.
+  Operators in that situation may want to **lower `VERIFICATION_CONCURRENCY`** so
+  the file verifier's internal fan-out does not overwhelm the backend.
+- **Shared files**: a file an owner tagged and shared with the searcher only
+  survives verification if the owner's **`userVisible`** tag surfaces in the
+  *searcher's* tag REPORT. The MCP server's own tag-creation path
+  (`WebDAVClient.get_or_create_tag`) defaults to `user_visible=True`, so tags it
+  creates are fine. **Migration caveat**: if the `vector-index` tag was created
+  some other way — manually via `occ tag:add … --user-visible=false`, or in a
+  deployment predating this release — it may be `user_visible=False` (the
+  Nextcloud default for system-managed tags). In that case an owner's tag will
+  **not** surface in a recipient's systemtag REPORT, so every shared-file result
+  is *silently dropped* for recipients after upgrading — no error, just a
+  narrower result set. Verify the tag's visibility (Administration → *Collaborative
+  tags*, or `occ tag:list`) and, if it is not user-visible, recreate it as
+  user-visible so shared search keeps working.
+- **Eviction**: when verification finds a definitive miss (a 404 / 403, or — for
+  files — absence from the tag set), the corresponding Qdrant points are deleted
+  in the background on a lifespan-owned task group — fire-and-forget, does
+  **not** block the search response. Eviction failures are logged but never
+  propagated; the next query will re-verify and re-attempt (self-healing).
 - **Failure modes**: transient errors (5xx, network) keep results visible
   (fail open) so a flaky link does not silently shrink result pages; only
-  *definitive* 404 / 403 drops them.
+  *definitive* misses (404 / 403, or a file no longer in the tag set) drop them.
+  If the file tag REPORT itself errors, all file results are kept (fail open).
 
 If eviction ever needs to be disabled (debugging, benchmarking), the
 `evict_on_missing=False` keyword argument on `verify_search_results()` skips
@@ -752,9 +785,9 @@ docker-compose up
 
 ## Decomposition Hook Points (Optional, Advanced)
 
-The server can optionally offload document processing and embeddings to external
-services (the Astrolabe Cloud document-processor and embedding-gateway). These
-are **opt-in**; every default reproduces the in-process monolith behavior, so
+The server can optionally offload embeddings to an external gateway and split
+ingest into a separate scale-to-zero worker process (Deck #183). These are
+**opt-in**; every default reproduces the in-process monolith behavior, so
 self-hosters can ignore this section.
 
 ```bash
@@ -766,21 +799,54 @@ EMBEDDING_GATEWAY_TOKEN_URL=...
 EMBEDDING_GATEWAY_CLIENT_ID=...
 EMBEDDING_GATEWAY_CLIENT_SECRET=...
 
-# External ingest: publish to NATS instead of the in-process processor pool
-INGEST_MODE=external          # local (default) | external
-STATUS_BACKEND=bus            # local (default) | bus — REQUIRED with external
-INGEST_BUS_URL=nats://nats:4222
-TENANT_ID=<uuid>              # NATS per-tenant subject token
+# Ingest queue backend. Default (unset) is "memory" — the in-process anyio
+# queue — *regardless of DATABASE_URL*. procrastinate is strictly opt-in: set
+# INGEST_QUEUE=postgres to split ingest into a separate worker (requires a
+# PostgreSQL DATABASE_URL). A Postgres DATABASE_URL alone never enables it.
+INGEST_QUEUE=postgres         # memory | postgres
+# Process role (informational; the worker is launched via the `worker` command):
+MCP_ROLE=all                  # api | worker | all (default)
+TENANT_ID=<uuid>              # per-tenant identity (used in collection naming)
+```
+
+### Postgres ingest queue + worker (api/worker split)
+
+This is **opt-in**. By default (`INGEST_QUEUE=memory`) the scanner processes
+changed documents in-process via anyio task groups in the API pod — no
+procrastinate, no separate worker, even when `DATABASE_URL` is Postgres.
+
+When you explicitly set `INGEST_QUEUE=postgres` (against a PostgreSQL
+`DATABASE_URL`), the scanner instead **defers** one job per changed document
+into the app's Postgres via
+[procrastinate](https://procrastinate.readthedocs.io); a separate **worker**
+process drains the queue (fetch → chunk → embed → upsert Qdrant). Run the two
+roles as separate Deployments from the same image:
+
+```bash
+# API pod (always-on): serves MCP/query + runs the scanner (defers jobs)
+nextcloud-mcp-server run
+
+# Ingest worker (scale-to-zero on queue depth via KEDA): drains the queue
+nextcloud-mcp-server worker -c 4
 ```
 
 Notes:
-- `STATUS_BACKEND=local` with `INGEST_MODE=external` is rejected at startup
-  (the in-process job state is empty for externally-dispatched work).
-- **`nats-py` ships as a core dependency** (small, pure-Python) and is imported
-  lazily — only when `INGEST_MODE=external`. Self-hosters who never enable
-  external ingest pay no runtime cost.
-- `INGEST_MODE=external` + `STATUS_BACKEND=bus` opens **two** NATS connections
-  per pod (the ingest producer and the status subscriber are separate roles).
+
+- **procrastinate manages its own tables** (`procrastinate_jobs`, …) in the same
+  database. They are created on a fresh DB by the API pod at startup and by
+  `nextcloud-mcp-server db upgrade` — a migration lineage independent of the
+  app's Alembic schema. procrastinate is Postgres-only (psycopg3); it ships in
+  the `[postgres]` extra and is imported lazily.
+- KEDA scales the worker on
+  `SELECT count(*) FROM procrastinate_jobs WHERE queue_name='ingest' AND status='todo'`.
+- `INGEST_QUEUE=postgres` with a SQLite `DATABASE_URL` is rejected at startup.
+- **Teardown:** because procrastinate's schema is a separate lineage,
+  `nextcloud-mcp-server db downgrade` (Alembic) does **not** drop the
+  `procrastinate_*` tables. To fully revert (e.g. back to NATS or SQLite-only),
+  drop them manually after downgrading:
+  `DROP TABLE IF EXISTS procrastinate_jobs, procrastinate_events,
+  procrastinate_periodic_defers, procrastinate_workers CASCADE;` (plus the
+  `procrastinate_*` types/functions if removing the extension entirely).
 
 ---
 

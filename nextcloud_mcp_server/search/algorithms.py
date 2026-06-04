@@ -2,6 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -73,6 +74,14 @@ class NextcloudClientProtocol(Protocol):
     @property
     def news(self) -> Any:
         """News client for accessing news item documents."""
+        ...
+
+    # Top-level client helper (not a sub-client) used by verify-on-read to
+    # gate file results on current vector-index tag membership.
+    async def find_files_by_tag(
+        self, tag_name: str, mime_type_filter: str | None = None
+    ) -> list[dict]:
+        """Return files carrying ``tag_name`` (folders expanded by MIME)."""
         ...
 
 
@@ -289,6 +298,10 @@ class SearchAlgorithm(ABC):
         doc_type: str | None = None,
         *,
         accessible_owners: list[str] | None = None,
+        modified_after: int | None = None,
+        modified_before: int | None = None,
+        path_prefix: str | None = None,
+        path_prefixes: Iterable[str] | None = None,
         **kwargs: Any,
     ) -> list[SearchResult]:
         """Execute search with the given parameters.
@@ -304,6 +317,19 @@ class SearchAlgorithm(ABC):
                 buried in ``**kwargs`` — so a misspelled keyword is a type error
                 instead of a silent fall back to self-only scope. ``None`` means
                 self-only (``[user_id]``).
+            modified_after: Optional inclusive lower bound on the document's
+                ``modified_at`` payload field (Unix seconds, UTC). Declared
+                explicitly for the same discoverability/type-safety reason as
+                ``accessible_owners`` (ADR-027). ``None`` ⇒ open-ended.
+            modified_before: Optional inclusive upper bound on ``modified_at``
+                (Unix seconds, UTC). ``None`` ⇒ open-ended.
+            path_prefix: Deprecated single folder/path filter; folded into
+                ``path_prefixes``. Kept for backward compatibility.
+            path_prefixes: Optional folder/path filters on the ``file_path``
+                payload field (ADR-027 Phase 2), OR-ed together. Only
+                ``doc_type == "file"`` points carry ``file_path``, so any
+                non-empty value implicitly restricts results to files. ``None``
+                or empty ⇒ no path filter.
             **kwargs: Algorithm-specific parameters
 
         Returns:

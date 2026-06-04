@@ -5,6 +5,87 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.98.1 (2026-06-04)
+
+### Fix
+
+- make procrastinate ingest queue opt-in (default to in-process anyio)
+
+## v0.98.0 (2026-06-03)
+
+### BREAKING CHANGE
+
+- the external-NATS-ingest env vars are removed
+(INGEST_MODE, STATUS_BACKEND, INGEST_BUS_URL, INGEST_BUS_NUM_REPLICAS,
+FACT_EVENT_EMITTER). Use INGEST_QUEUE (memory|postgres) and the `worker`
+command instead. TENANT_ID is retained (no longer NATS-subject-charset-validated).
+
+### Feat
+
+- replace NATS ingest with procrastinate Postgres queue (#183)
+
+### Fix
+
+- initialize document processors in the ingest worker (PR #836 round-5)
+- address PR #836 round-3 review (lock-key invariant, single open)
+- address PR #836 round-2 review (connect/timeout/observability)
+- address PR #836 review — forward task_producer to MCP contexts + cleanups
+- **ci**: install procrastinate in the dev group so ty + unit tests resolve it
+
+## v0.97.0 (2026-06-03)
+
+### Feat
+
+- **search**: support multiple folders in the semantic-search path filter
+
+### Fix
+
+- **search**: cap path_prefixes server-side; unify Iterable typing
+- **search**: cap path_prefixes at the MCP tool; widen path filter tests
+- **search**: address review feedback on multi-folder path filter
+
+## v0.96.0 (2026-06-03)
+
+### Feat
+
+- **observability**: astrolabe_* metrics + traces for the document pipeline
+
+### Fix
+
+- **observability**: address third review round
+- **observability**: address second review round
+- **observability**: address PR review + SonarCloud findings
+
+## v0.95.0 (2026-06-03)
+
+### Feat
+
+- add Claude Desktop extension (.mcpb) for single-user stdio mode
+
+### Fix
+
+- **mcpb**: add Windows support via platform_overrides and run.cmd
+- **mcpb**: address review feedback on manifest and run.sh
+
+## v0.94.1 (2026-06-03)
+
+### Fix
+
+- **search**: address PR #834 re-review (403/404 coverage + docs)
+- **search**: address PR #834 review findings
+- **search**: gate verify-on-read file results on vector-index tag membership
+
+### Perf
+
+- **search**: skip exclusion lookup on empty tag set; fix semaphore comment
+
+## v0.94.0 (2026-06-02)
+
+### Feat
+
+- **search**: ADR-027 Phase 2 — file-path filter
+- **search**: ADR-027 Phase 1 — modified-date range filter
+
 ## v0.93.0 (2026-06-01)
 
 ### BREAKING CHANGE

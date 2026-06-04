@@ -27,11 +27,28 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Any, Protocol
 
-from qdrant_client.models import Condition, FieldCondition, Filter, MatchAny, MatchValue
+from qdrant_client.models import (
+    Condition,
+    FieldCondition,
+    Filter,
+    MatchAny,
+    MatchText,
+    MatchValue,
+    Range,
+)
+
+from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on the number of folder filters a single search may apply. Caps
+# the width of the ``Filter(should=[...])`` OR-clause built from path_prefixes
+# so no caller can degrade query latency with a huge folder list. Mirrored by
+# the ``Field(max_length=...)`` on the MCP tool and the Astrolabe PHP cap.
+MAX_PATH_PREFIXES = 20
 
 # Short-lived per-user cache for the OCS shares lookup, which otherwise runs on
 # every search/viz request. Trades up to this many seconds of share-visibility
@@ -177,3 +194,146 @@ def build_ownership_filter(
             0, FieldCondition(key="owner_id", match=MatchAny(any=other_owners))
         )
     return Filter(should=conditions)
+
+
+def normalize_path_prefixes(
+    path_prefix: str | None = None,
+    path_prefixes: Iterable[str] | None = None,
+) -> list[str]:
+    """Merge the legacy single ``path_prefix`` and list ``path_prefixes`` into
+    one clean, de-duplicated, bounded list of folder filters.
+
+    Blank/whitespace entries are dropped (an empty UI field must mean "no
+    filter", not "match everything"), surrounding whitespace is stripped, and
+    order is preserved while removing duplicates. Accepting both inputs keeps
+    the pre-ADR-027-Phase-2 single-value contract working while callers migrate
+    to the multi-folder list.
+
+    The result is capped at ``MAX_PATH_PREFIXES`` so no caller — the MCP tool,
+    the REST/viz endpoints, or a misbehaving client — can build an unbounded
+    ``Filter(should=[...])`` OR-clause that would widen every Qdrant query.
+    This is the single server-side enforcement point (the MCP tool also
+    declares ``Field(max_length=...)`` for an earlier, clearer validation
+    error, and the Astrolabe PHP controller caps before forwarding).
+
+    Args:
+        path_prefix: Legacy single folder filter (deprecated; folded into the
+            returned list).
+        path_prefixes: Zero or more folder filters.
+
+    Returns:
+        Ordered, de-duplicated list of non-empty folder filters, capped at
+        ``MAX_PATH_PREFIXES`` (possibly empty).
+    """
+    raw: list[str] = []
+    if path_prefix:
+        raw.append(path_prefix)
+    if path_prefixes:
+        raw.extend(path_prefixes)
+
+    # Two-pass on purpose: the ``if path_prefix:`` guard above is truthy for a
+    # whitespace-only string like ``"   "``, so the strip-and-drop pass below is
+    # what actually removes it — collecting first keeps the dedup order stable.
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for value in raw:
+        stripped = value.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            cleaned.append(stripped)
+    return cleaned[:MAX_PATH_PREFIXES]
+
+
+def build_base_filter_conditions(
+    user_id: str,
+    accessible_owners: list[str] | None = None,
+    doc_type: str | None = None,
+    modified_after: int | None = None,
+    modified_before: int | None = None,
+    path_prefix: str | None = None,
+    path_prefixes: Iterable[str] | None = None,
+) -> list[Condition]:
+    """Build the common ``must`` conditions shared by every search algorithm.
+
+    This is the single place the structured-filter contract (ADR-027) lives, so
+    both the BM25-hybrid (MCP tool) and dense-only (visualization/API) algorithms
+    apply identical placeholder/ACL/doc_type/date filtering. Each algorithm wraps
+    the returned list in ``Filter(must=...)`` and may append its own additive
+    conditions afterward (e.g. the dense algorithm's opt-in ACL pre-filter).
+
+    The conditions, in order:
+
+    1. ``get_placeholder_filter()`` — exclude in-flight placeholder points.
+    2. ``build_ownership_filter(...)`` — ACL-aware ``owner_id``/``user_id`` scope.
+    3. ``doc_type`` exact match — only when ``doc_type`` is truthy.
+    4. ``modified_at`` range — only when at least one bound is given.
+    5. ``file_path`` text match — only when a path filter is given. One folder
+       adds a single ``MatchText`` to ``must``; multiple folders are OR-ed via a
+       nested ``Filter(should=[...])`` so a file under *any* selected folder
+       matches.
+
+    Args:
+        user_id: Querying user.
+        accessible_owners: Owner UIDs the user can read (see
+            ``build_ownership_filter``). ``None`` ⇒ self-only.
+        doc_type: Optional single document-type filter.
+        modified_after: Inclusive lower bound on ``modified_at`` (Unix seconds).
+        modified_before: Inclusive upper bound on ``modified_at`` (Unix seconds).
+        path_prefix: Deprecated single folder/path filter; folded into
+            ``path_prefixes``. Kept for backward compatibility.
+        path_prefixes: Optional folder/path filters on the ``file_path`` payload
+            field (ADR-027 Phase 2). Each is implemented with ``MatchText``
+            against the text-indexed ``file_path`` and multiple folders are
+            OR-ed together. ``file_path`` is only written for
+            ``doc_type == "file"`` points, so any non-empty path filter
+            implicitly restricts results to files. NOTE the match semantics
+            differ by backend: server Qdrant tokenizes (AND-of-tokens, so
+            ``"/Projects/Reports"`` matches files whose path contains both the
+            ``Projects`` and ``Reports`` tokens), while the local/embedded
+            qdrant-client matches by substring containment. Both serve folder
+            scoping; neither is a strict left-anchored prefix.
+
+    Returns:
+        A list of Qdrant ``Condition`` objects for a parent ``must`` clause.
+    """
+    conditions: list[Condition] = [
+        get_placeholder_filter(),
+        build_ownership_filter(user_id, accessible_owners),
+    ]
+
+    if doc_type:
+        conditions.append(
+            FieldCondition(key="doc_type", match=MatchValue(value=doc_type))
+        )
+
+    # ``Range`` treats ``None`` bounds as open-ended, so the same condition serves
+    # after-only, before-only, and both-bounds queries. Appended only when at
+    # least one bound is set so unfiltered searches add no condition.
+    if modified_after is not None or modified_before is not None:
+        conditions.append(
+            FieldCondition(
+                key="modified_at",
+                range=Range(gte=modified_after, lte=modified_before),
+            )
+        )
+
+    # One folder ⇒ a single ``must`` condition (the original Phase 2 shape).
+    # Multiple folders ⇒ OR them in a nested ``Filter(should=...)`` so a file
+    # under any selected folder matches, while still AND-ing against the other
+    # ``must`` conditions (ACL, doc_type, date).
+    folders = normalize_path_prefixes(path_prefix, path_prefixes)
+    if len(folders) == 1:
+        conditions.append(
+            FieldCondition(key="file_path", match=MatchText(text=folders[0]))
+        )
+    elif len(folders) > 1:
+        conditions.append(
+            Filter(
+                should=[
+                    FieldCondition(key="file_path", match=MatchText(text=folder))
+                    for folder in folders
+                ]
+            )
+        )
+
+    return conditions
