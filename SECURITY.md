@@ -19,15 +19,9 @@ and confirm the issue still reproduces on the latest release where possible.
 
 Use GitHub's built-in private reporting workflow:
 
-➡️ **[Report a vulnerability](https://github.com/cbcoutinho/nextcloud-mcp-server/security/advisories/new)**
+➡️ **[Report a vulnerability](https://github.com/pi0n00r/nextcloud-mcp-server/security/advisories/new)**
 
 This opens a private draft security advisory visible only to the repository maintainers. You can also reach the same form from the **Security** tab → **Report a vulnerability**.
-
-### Fallback: Email
-
-If you cannot use GitHub's private reporting (for example, you don't have a GitHub account), email:
-
-**security@astrolabecloud.com**
 
 ### What to include
 

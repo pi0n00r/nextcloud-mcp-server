@@ -41,29 +41,13 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 > [!TIP]
 > Generate an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) in Nextcloud under **Settings > Security > Devices & sessions** instead of using your login password.
 
-### Docker
-
-For full features including semantic search, run with Docker:
-
-```bash
-docker run -p 127.0.0.1:8000:8000 --rm \
-  -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
-  -e NEXTCLOUD_USERNAME=your_username \
-  -e NEXTCLOUD_PASSWORD=your_app_password \
-  ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
-```
-
-Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
-
-For Kubernetes, see [cbcoutinho/helm-charts](https://github.com/cbcoutinho/helm-charts). For other deployment options and Compose profiles, see [docs/installation.md](docs/installation.md).
-
 ## Key Features
 
 - **110+ MCP Tools** - Comprehensive API coverage across 10 Nextcloud apps
 - **MCP Resources** - Structured data URIs for browsing Nextcloud data
 - **Semantic Search (Experimental)** - Optional vector-powered search for Notes, Files, News items, and Deck cards (requires Qdrant + Ollama)
 - **Document Processing** - OCR and text extraction from PDFs, DOCX, images with progress notifications
-- **Flexible Deployment** - Docker, Kubernetes ([Helm chart](https://github.com/cbcoutinho/helm-charts)), VM, or local installation
+- **Flexible Deployment** - Docker, Kubernetes, VM, or local installation
 - **Production-Ready Auth** - Basic Auth with app passwords; multi-user via Login Flow v2 — MCP clients authenticate via OAuth, the server handles Nextcloud app passwords transparently
 - **Tag-Based File Exclusion** - Hide sensitive files/folders from MCP file tools by tagging them with a configured Nextcloud system tag (`EXCLUDED_TAGS`). See [docs/configuration.md](docs/configuration.md#tag-based-file-exclusion-optional)
 - **Multiple Transports** - streamable-http (default) and stdio
