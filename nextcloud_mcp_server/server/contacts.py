@@ -95,6 +95,7 @@ def _raw_contact_to_model(raw: dict) -> Contact:
         custom_fields["nickname"] = nickname
     return Contact(
         uid=raw["vcard_id"],
+        resource_path=raw.get("object_path"),
         fn=contact_info.get("fullname", ""),
         etag=raw.get("getetag"),
         vcard_text=raw.get("vcard_text"),

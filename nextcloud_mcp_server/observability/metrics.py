@@ -166,6 +166,30 @@ vector_sync_queue_size = Gauge(
     "Current number of documents in processing queue",
 )
 
+# Outstanding ingest work (queued + in-flight), backend-agnostic. Published by
+# the periodic vector_sync_metrics_task from ingest_status.get_ingest_pending(),
+# so it is correct on every consumer path (single-user processor_task AND
+# multi-user oauth_processor_task) and every queue backend (anyio buffer depth
+# or procrastinate todo+doing) — unlike the per-loop update of
+# ``vector_sync_queue_size``, which only ran on the single-user path.
+vector_sync_pending_documents = Gauge(
+    "mcp_vector_sync_pending_documents",
+    "Outstanding ingest documents (queued or in-flight, not yet processed)",
+)
+
+# Corpus size in the vector store. ``indexed_documents`` counts distinct
+# documents (one chunk_index=0 point per document); ``indexed_chunks`` counts
+# every non-placeholder point. The two differ by the chunk fan-out (~N chunks
+# per document), which is why a single "indexed" figure is ambiguous.
+vector_sync_indexed_documents = Gauge(
+    "mcp_vector_sync_indexed_documents",
+    "Distinct documents indexed in the vector store (non-placeholder)",
+)
+vector_sync_indexed_chunks = Gauge(
+    "mcp_vector_sync_indexed_chunks",
+    "Total indexed chunks (non-placeholder points) in the vector store",
+)
+
 qdrant_operations_total = Counter(
     "mcp_qdrant_operations_total",
     "Total Qdrant vector database operations",
@@ -237,6 +261,56 @@ document_escalation_total = Counter(
     ["from_tier", "to_tier", "reason"],
 )
 
+# Hard parse failures: the parse now runs in an isolated subprocess, so a
+# timeout/OOM that kills the worker is caught here. This is distinct from
+# ``document_parse_total{status="error"}`` (an in-process exception): a hard
+# OOM previously killed the pod before any except ran, so it incremented
+# nothing -- this counter makes those failures visible.
+document_parse_failed_total = Counter(
+    "bridgette_document_parse_failed_total",
+    "Document parses that failed in the isolated worker (process killed)",
+    ["reason"],  # reason: timeout | oom | error
+)
+
+# --- Tier-0 classifier (shadow mode) -----------------------------------------
+#
+# The classifier runs a cheap pre-pass per PDF and recommends a starting tier.
+# In shadow mode it changes no routing -- these metrics gather the per-tenant
+# doc-mix needed to tune the thresholds before routing is enabled.
+
+document_classified_total = Counter(
+    "bridgette_document_classified_total",
+    "Documents classified by tier-0, by recommended starting tier",
+    ["recommended_tier"],  # fast | ocr
+)
+
+document_classifier_flag_total = Counter(
+    # Diagnostic flags, independent of the routing verdict: image_heavy fires if
+    # ANY page is image-heavy whereas the ocr route needs a fraction of pages,
+    # so flag{image_heavy} is expected to exceed classified{recommended_tier=ocr}.
+    "bridgette_document_classifier_flag_total",
+    "Tier-0 classifier flags raised on documents",
+    ["flag"],  # image_heavy | scanned | bad_text_layer
+)
+
+document_text_quality = Histogram(
+    "bridgette_document_text_quality",
+    "Tier-0 mean text-layer quality per document (0=junk, 1=clean prose)",
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+
+# Per-document fraction of OCR-worthy pages (near-empty / junk-quality / scanned).
+# This is the value the DOCUMENT_OCR_PAGE_FRACTION threshold acts on, so its
+# distribution per tenant is the lever for tuning OCR escalation (quality vs
+# cost): how many docs sit just below/above the cutoff. Pair with
+# document_text_quality (where to set the per-page quality floor) and
+# document_escalation_total (realized OCR volume).
+document_ocr_page_fraction = Histogram(
+    "bridgette_document_ocr_page_fraction",
+    "Tier-0 fraction of OCR-worthy pages per document (0=all-clean, 1=all-bad)",
+    buckets=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+
 # --- Embedding stages ---------------------------------------------------------
 
 embedding_duration_seconds = Histogram(
@@ -264,6 +338,22 @@ embedding_chars_total = Counter(
     ["kind", "provider"],
 )
 
+# Token consumption — the billed cost unit (mirrors the tokens_embedded billing
+# measure, Deck #67). On a dedicated counter (not folded into the chunk/request
+# metrics above) so query embeds don't inflate indexing dashboards; labelled by
+# operation = index | query. Always emitted, independent of USAGE_METERING_ENABLED.
+#
+# Dashboard note: operation="query" is recorded at embed time (before Qdrant /
+# verify-on-read), whereas the billing-store tokens_embedded row is written only
+# after the search fully succeeds. So this counter can legitimately exceed the
+# billing aggregate when a search fails post-embed — don't alert on that gap as
+# a divergence bug.
+embedding_tokens_total = Counter(
+    "bridgette_embedding_tokens_total",
+    "Total embedding tokens consumed (provider-reported or estimated)",
+    ["provider", "operation"],  # operation: index | query
+)
+
 # --- Chunking & indexed-by-type -----------------------------------------------
 
 document_chunks_total = Counter(
@@ -276,6 +366,18 @@ documents_indexed_total = Counter(
     "bridgette_documents_indexed_total",
     "Total documents indexed, by source type",
     ["source", "status"],  # source: note | file | deck_card | news_item
+)
+
+# --- Document discovery / coverage ------------------------------------------
+#
+# Fires when a paged WebDAV SEARCH (folder-expansion during a scan) hits the
+# WEBDAV_SEARCH_MAX_RESULTS ceiling, meaning the discovered file set was capped
+# and some tagged documents may never be queued for indexing. This is the
+# alertable signal that prevents the old *silent* 100-result truncation from
+# recurring. Tenant is the Kubernetes ``namespace`` label, as elsewhere.
+document_scan_truncated_total = Counter(
+    "bridgette_document_scan_truncated_total",
+    "Times a folder-expansion SEARCH hit the result ceiling (coverage truncated)",
 )
 
 # =============================================================================
@@ -508,6 +610,21 @@ def update_vector_sync_queue_size(size: int) -> None:
     vector_sync_queue_size.set(size)
 
 
+def update_vector_sync_pending_documents(count: int) -> None:
+    """Set the outstanding-ingest-work gauge (queued + in-flight documents)."""
+    vector_sync_pending_documents.set(count)
+
+
+def update_vector_sync_indexed_documents(count: int) -> None:
+    """Set the distinct-indexed-documents gauge."""
+    vector_sync_indexed_documents.set(count)
+
+
+def update_vector_sync_indexed_chunks(count: int) -> None:
+    """Set the total-indexed-chunks gauge."""
+    vector_sync_indexed_chunks.set(count)
+
+
 def record_document_parse(
     processor: str,
     tier: str,
@@ -566,6 +683,35 @@ def record_document_escalation(from_tier: str, to_tier: str, reason: str) -> Non
     ).inc()
 
 
+def record_document_parse_failed(reason: str) -> None:
+    """Record a hard parse failure from the isolated worker.
+
+    Args:
+        reason: ``timeout`` | ``oom`` | ``error``
+    """
+    document_parse_failed_total.labels(reason=reason).inc()
+
+
+def record_document_classification(
+    recommended_tier: str,
+    flags: set[str],
+    mean_text_quality: float,
+    ocr_page_fraction: float = 0.0,
+) -> None:
+    """Record a tier-0 classification result.
+
+    Primitive args (not the DocClassification object) keep the observability
+    layer free of a dependency on document_processors. ``mean_text_quality`` and
+    ``ocr_page_fraction`` feed the two histograms operators use to tune the OCR
+    escalation thresholds per tenant (quality vs cost).
+    """
+    document_classified_total.labels(recommended_tier=recommended_tier).inc()
+    for flag in flags:
+        document_classifier_flag_total.labels(flag=flag).inc()
+    document_text_quality.observe(mean_text_quality)
+    document_ocr_page_fraction.observe(ocr_page_fraction)
+
+
 def record_embedding(
     kind: str,
     provider: str,
@@ -595,6 +741,25 @@ def record_embedding(
             embedding_chunks_total.labels(kind=kind, provider=provider).inc(chunks)
         if chars > 0:
             embedding_chars_total.labels(kind=kind, provider=provider).inc(chars)
+
+
+def record_embedding_tokens(provider: str, operation: str, tokens: int) -> None:
+    """Export embedding token consumption to Prometheus.
+
+    Mirrors the ``tokens_embedded`` billing measure (Deck #67) as an always-on
+    observability signal — emitted regardless of ``USAGE_METERING_ENABLED`` so
+    OSS/self-host deployments still see token cost in Grafana.
+
+    Args:
+        provider: Provider family (mistral | openai | bedrock | ollama | simple).
+        operation: ``"index"`` (chunk-batch embedding) or ``"query"`` (search
+            query embedding).
+        tokens: Token count for this embedding request (no-op when ``<= 0``).
+    """
+    if tokens > 0:
+        embedding_tokens_total.labels(provider=provider, operation=operation).inc(
+            tokens
+        )
 
 
 def record_document_chunks(doc_type: str, count: int) -> None:

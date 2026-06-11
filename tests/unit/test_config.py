@@ -97,6 +97,26 @@ class TestGetSettings:
 
     @patch.dict(
         os.environ,
+        {
+            "NEXTCLOUD_OIDC_TOKEN_TYPE": "jwt",
+            "NEXTCLOUD_OIDC_SCOPES": "openid profile",
+        },
+        clear=True,
+    )
+    def test_get_settings_oidc_token_type_and_scopes_from_env(self):
+        """NEXTCLOUD_OIDC_TOKEN_TYPE / _SCOPES must reach settings (regression).
+
+        The settings migration first registered these under _DEFAULTS keys that
+        uppercased to OIDC_* instead of NEXTCLOUD_OIDC_*, so dynaconf silently
+        ignored the env vars and always returned the defaults.
+        """
+        _reload_config()
+        settings = get_settings()
+        assert settings.oidc_token_type == "jwt"
+        assert settings.oidc_scopes == "openid profile"
+
+    @patch.dict(
+        os.environ,
         {"QDRANT_LOCATION": "/app/data/qdrant"},
         clear=True,
     )
@@ -157,6 +177,18 @@ class TestGetSettings:
         assert settings.vector_sync_processor_workers == 5
         assert settings.vector_sync_queue_max_size == 5000
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_usage_metering_disabled_by_default(self):
+        """USAGE_METERING_ENABLED defaults to False (OSS doesn't self-monitor)."""
+        _reload_config()
+        assert get_settings().usage_metering_enabled is False
+
+    @patch.dict(os.environ, {"USAGE_METERING_ENABLED": "true"}, clear=True)
+    def test_usage_metering_enabled_via_env(self):
+        """USAGE_METERING_ENABLED=true maps to settings.usage_metering_enabled."""
+        _reload_config()
+        assert get_settings().usage_metering_enabled is True
+
 
 class TestChunkConfigValidation:
     """Test document chunking configuration validation."""
@@ -166,6 +198,20 @@ class TestChunkConfigValidation:
         settings = Settings()
         assert settings.document_chunk_size == 2048
         assert settings.document_chunk_overlap == 200
+
+    def test_page_aware_enabled_by_default(self):
+        """Page-aware chunking is on by default."""
+        assert Settings().document_chunk_page_aware is True
+
+    @patch.dict(
+        os.environ,
+        {"DOCUMENT_CHUNK_PAGE_AWARE": "false"},
+        clear=True,
+    )
+    def test_page_aware_disabled_via_env(self):
+        """DOCUMENT_CHUNK_PAGE_AWARE=false disables page-aware chunking."""
+        _reload_config()
+        assert get_settings().document_chunk_page_aware is False
 
     def test_valid_chunk_settings(self):
         """Test valid chunk size and overlap configuration."""
@@ -379,6 +425,30 @@ class TestDynaconfValidators:
         from dynaconf import ValidationError
 
         with pytest.raises(ValidationError, match="LOG_FORMAT"):
+            _reload_config()
+
+    @patch.dict(os.environ, {"DOCUMENT_OCR_MIN_TEXT_QUALITY": "1.5"}, clear=True)
+    def test_ocr_min_text_quality_out_of_range(self):
+        """DOCUMENT_OCR_MIN_TEXT_QUALITY must be in [0, 1]."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="DOCUMENT_OCR_MIN_TEXT_QUALITY"):
+            _reload_config()
+
+    @patch.dict(os.environ, {"DOCUMENT_OCR_PAGE_FRACTION": "2"}, clear=True)
+    def test_ocr_page_fraction_out_of_range(self):
+        """DOCUMENT_OCR_PAGE_FRACTION must be in [0, 1]."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="DOCUMENT_OCR_PAGE_FRACTION"):
+            _reload_config()
+
+    @patch.dict(os.environ, {"DOCUMENT_OCR_MIN_PAGE_CHARS": "-1"}, clear=True)
+    def test_ocr_min_page_chars_negative(self):
+        """DOCUMENT_OCR_MIN_PAGE_CHARS must be non-negative."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="DOCUMENT_OCR_MIN_PAGE_CHARS"):
             _reload_config()
 
     @patch.dict(os.environ, {"LOG_LEVEL": "VERBOSE"}, clear=True)

@@ -11,28 +11,43 @@ from typing import Any, cast
 import anyio
 from anyio.abc import TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream
-from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
+from qdrant_client.models import PointStruct
 
 from nextcloud_mcp_server.acl_hash import compute_acl_hash
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.config import get_settings
-from nextcloud_mcp_server.document_processors import get_registry
 from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_service
+from nextcloud_mcp_server.models.deck import DeckCard
 from nextcloud_mcp_server.observability.metrics import (
     record_document_chunks,
+    record_document_parse_failed,
     record_embedding,
+    record_embedding_tokens,
     record_qdrant_operation,
     record_vector_sync_processing,
     update_vector_sync_queue_size,
 )
 from nextcloud_mcp_server.observability.tracing import trace_operation
 from nextcloud_mcp_server.search.pdf_highlighter import PDFHighlighter
+from nextcloud_mcp_server.usage import UsageEventStore
 from nextcloud_mcp_server.vector import payload_keys
-from nextcloud_mcp_server.vector.document_chunker import DocumentChunker
+from nextcloud_mcp_server.vector.document_chunker import (
+    DocumentChunker,
+    PageAwareChunker,
+)
 from nextcloud_mcp_server.vector.html_processor import html_to_markdown
-from nextcloud_mcp_server.vector.placeholder import delete_placeholder_point
+from nextcloud_mcp_server.vector.placeholder import (
+    delete_placeholder_point,
+    update_placeholder_status,
+)
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 from nextcloud_mcp_server.vector.scanner import DocumentTask
+from nextcloud_mcp_server.vector.sharing_state import (
+    claim_existing_index,
+    existing_principals,
+    file_title_from_path,
+    release_document_for_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +91,114 @@ def assign_page_numbers(chunks, page_boundaries):
 
         if assigned_page is not None:
             chunk.page_number = assigned_page
+
+
+def should_use_page_aware(
+    *, page_aware_enabled: bool, doc_type: str, page_boundaries: Any
+) -> bool:
+    """Decide whether the page-aware chunker applies to this document.
+
+    Page-aware chunking applies only to paginated files (PDFs) that actually
+    carry page boundaries. ``page_boundaries`` is tested for truthiness, not
+    just ``is not None``: an empty list carries no pages, so it routes through
+    the char-based path rather than the page-aware chunker's no-boundaries
+    fallback.
+
+    Args:
+        page_aware_enabled: ``settings.document_chunk_page_aware``.
+        doc_type: The document type (only ``"file"`` is paginated).
+        page_boundaries: The extractor's page-boundary list (or ``None``).
+    """
+    return page_aware_enabled and doc_type == "file" and bool(page_boundaries)
+
+
+async def record_indexing_usage(
+    *,
+    enabled: bool,
+    provider: str,
+    model: str,
+    doc_type: str,
+    user_id: str,
+    chunk_count: int,
+    token_count: int,
+    total_chars: int,
+    page_count: int | None,
+) -> None:
+    """Record the billable usage events for one embedded document.
+
+    Two metered dimensions (Deck #67), recorded independently:
+
+    - ``tokens_embedded`` — the embedding request's token count, recorded for
+      *every* embedded document. The same metric search records, so the meter
+      bills embedding tokens whether they were incurred indexing a document or
+      embedding a query.
+    - ``pages_embedded`` — a charge for **parsing** (PDF page extraction / OCR),
+      not a normalized content size. ``page_count`` is the real number of pages
+      the document processor parsed. Text content (notes, deck cards, news
+      items) is never parsed, carries no ``page_count``, and accrues **no**
+      ``pages_embedded`` row — only ``tokens_embedded``. There is deliberately
+      no chars/tokens-per-page constant: pages map 1:1 to parsed document pages
+      (card #282).
+
+    Best-effort and flag-gated: a metering failure is logged and never breaks
+    indexing. ``chunk_count`` is the empty-batch no-op guard — a document that
+    produced no chunks embedded nothing, so both events are skipped rather than
+    writing zero-value rows. ``pages_embedded`` is additionally skipped when
+    ``page_count`` is absent or not strictly positive — gating on the page count
+    itself (not the ``doc_type``) keeps this correct if a future non-PDF parsed
+    type starts reporting pages, and a malformed non-positive count meters as
+    "no pages" rather than emitting a zero/negative billing row.
+
+    Privacy note: ``user_id`` stays tenant-local — the CP rollup aggregates
+    GROUP BY (day, metric) into ``usage_daily`` (no metadata column), so nothing
+    here reaches Stripe; it is retained only to keep Deck #67's future per-user
+    attribution derivable from the app DB without a re-migration.
+    """
+    if not enabled or chunk_count == 0:
+        return
+
+    metadata = {
+        "provider": provider,
+        "model": model,
+        "doc_type": doc_type,
+        "user_id": user_id,
+        "total_chars": total_chars,
+    }
+    try:
+        store = await UsageEventStore.shared()
+        # enabled=True: the guard above already confirmed the flag, so the store
+        # skips a second uncached Settings build per record (ADR-024).
+        # record_usage_event swallows its own write failures, so the records are
+        # independent; one raising never blocks the other — acceptable under the
+        # (day, metric) SUM-aggregation billing model.
+
+        # tokens_embedded first (intentional ordering): it is recorded for every
+        # embedded document, so the embedding cost is always captured before the
+        # conditional parsing cost — don't reverse this in a refactor.
+        await store.record_usage_event(
+            metric="tokens_embedded",
+            value=token_count,
+            metadata=metadata,
+            enabled=True,
+        )
+        # pages_embedded: parsed pages only, and only a strictly positive count.
+        # Text content has no page_count; a zero/negative count is skipped rather
+        # than writing a row that would misrepresent a no-parse document as
+        # billable parsing work.
+        if page_count and page_count > 0:
+            await store.record_usage_event(
+                metric="pages_embedded",
+                value=page_count,
+                metadata=metadata,
+                enabled=True,
+            )
+    except Exception:
+        # Reached only when shared()/store construction itself raises
+        # (record_usage_event swallows its own write failures). Metering is on,
+        # so warn rather than hide the "enabled but no billing data" case.
+        logger.warning(
+            "usage metering hook (indexing embeddings) skipped", exc_info=True
+        )
 
 
 async def processor_task(
@@ -154,6 +277,58 @@ async def processor_task(
     logger.info("Processor %s stopped", worker_id)
 
 
+async def _reconcile_tag_event(
+    doc_task: DocumentTask, nc_client: NextcloudClient
+) -> None:
+    """Resolve a tag-webhook file task into a concrete index or delete.
+
+    A SystemTag ``MapperEvent`` only tells us a fileid's tags changed — not the
+    path, nor whether our ``vector-index`` tag is (still) on it. Look up the
+    user's current ``vector-index`` PDFs (the same call the scanner uses, which
+    also expands tagged folders into their PDF descendants) and reconcile the
+    task in place:
+
+    - fileid present -> index it; fill path/etag/mtime from the tag listing.
+    - fileid absent  -> it isn't a tagged PDF (anymore); flip ``operation`` to
+      ``delete`` so any existing points are released for this user.
+
+    A tagged *folder*'s own fileid won't appear in the file-level listing, so it
+    resolves to a harmless no-op delete here; the hourly scanner still expands
+    tagged folders into their descendants.
+    """
+    tag_name = get_settings().vector_sync_pdf_tag
+    tagged = await nc_client.find_files_by_tag(
+        tag_name, mime_type_filter="application/pdf"
+    )
+    match = next(
+        (f for f in tagged if str(f.get("id")) == str(doc_task.doc_id)),
+        None,
+    )
+
+    if match is None:
+        doc_task.operation = "delete"
+        logger.info(
+            "Tag reconcile: file %s is not a %r PDF; releasing for %s",
+            doc_task.doc_id,
+            tag_name,
+            doc_task.user_id,
+        )
+        return
+
+    doc_task.file_path = match["path"]
+    if not doc_task.etag:
+        doc_task.etag = match.get("etag")
+    last_modified = match.get("last_modified_timestamp")
+    if last_modified:
+        doc_task.modified_at = int(last_modified)
+    logger.info(
+        "Tag reconcile: indexing %s (file %s) for %s",
+        doc_task.file_path,
+        doc_task.doc_id,
+        doc_task.user_id,
+    )
+
+
 async def process_document(
     doc_task: DocumentTask, nc_client: NextcloudClient, *, max_retries: int = 3
 ):
@@ -192,28 +367,27 @@ async def process_document(
     ):
         try:
             qdrant_client = await get_qdrant_client()
-            settings = get_settings()
+
+            # Tag-webhook reconcile: a SystemTag MapperEvent enqueues a file task
+            # carrying only a fileid (file_path is None — see
+            # webhook_parser._parse_tag_event). Resolve the file's current
+            # vector-index membership into a concrete index (path/etag filled) or
+            # a delete before dispatching below.
+            if (
+                doc_task.doc_type == "file"
+                and doc_task.operation == "index"
+                and doc_task.file_path is None
+            ):
+                await _reconcile_tag_event(doc_task, nc_client)
 
             # Handle deletion
             if doc_task.operation == "delete":
-                await qdrant_client.delete(
-                    collection_name=settings.get_collection_name(),
-                    points_selector=Filter(
-                        must=[
-                            FieldCondition(
-                                key="user_id",
-                                match=MatchValue(value=doc_task.user_id),
-                            ),
-                            FieldCondition(
-                                key="doc_id",
-                                match=MatchValue(value=doc_task.doc_id),
-                            ),
-                            FieldCondition(
-                                key="doc_type",
-                                match=MatchValue(value=doc_task.doc_type),
-                            ),
-                        ]
-                    ),
+                # Release this user rather than blind-delete: a file shared across
+                # users has one user-agnostic point set referenced by multiple
+                # principals, so the points are removed only once the last reader
+                # is gone (see vector/sharing_state.release_document_for_user).
+                await release_document_for_user(
+                    doc_task.doc_id, doc_task.doc_type, doc_task.user_id
                 )
                 logger.info(
                     "Deleted %s_%s for %s",
@@ -240,7 +414,18 @@ async def process_document(
 
             for attempt in range(max_retries):
                 try:
-                    await _index_document(doc_task, nc_client, qdrant_client)
+                    indexed = await _index_document(doc_task, nc_client, qdrant_client)
+
+                    # A permanent parse failure returns False: it was already
+                    # recorded (document_parse_failed_total + the registry's
+                    # document_parse_total{error}) and the placeholder marked
+                    # "failed". It is not an indexing event and not retryable, so
+                    # don't count it as a successful upsert/indexed document.
+                    # Identity check, not `if not indexed`: a successful index
+                    # (including a dedup hit) returns None, which must NOT be
+                    # treated as a parse failure.
+                    if indexed is False:
+                        return
 
                     # Record successful processing metrics
                     duration = time.time() - start_time
@@ -306,9 +491,12 @@ async def process_document(
 
 async def _index_document(
     doc_task: DocumentTask, nc_client: NextcloudClient, qdrant_client
-):
+) -> bool | None:
     """
     Index a single document (called by process_document with retry).
+
+    Returns ``False`` when a permanent parse failure means nothing was indexed
+    (the caller must then skip the success metrics); ``None`` otherwise.
 
     Args:
         doc_task: Document task to index
@@ -429,7 +617,10 @@ async def _index_document(
                         if card_found:
                             break
                         if s.cards:
-                            for c in s.cards:
+                            # get_stacks() always yields full DeckCard objects;
+                            # the DeckCardSummary projection only happens in the
+                            # tool layer, never on freshly-fetched stacks.
+                            for c in cast(list[DeckCard], s.cards):
                                 if c.id == int(doc_task.doc_id):
                                     card = c
                                     board = b
@@ -479,6 +670,36 @@ async def _index_document(
                 )
             file_path = doc_task.file_path
 
+            # Cross-worker dedup race-guard: two users' tasks for the same shared
+            # file can be enqueued before either finishes. If another worker has
+            # already indexed this exact content (fileid + etag + embedding model)
+            # in the tenant, claim it for this user (observed-access ACL) and skip
+            # the expensive fetch/parse/embed entirely.
+            if doc_task.etag and await claim_existing_index(
+                doc_task.doc_id,
+                "file",
+                doc_task.etag,
+                doc_task.user_id,
+                current_path=doc_task.file_path,
+            ):
+                await delete_placeholder_point(
+                    doc_id=doc_task.doc_id,
+                    doc_type="file",
+                    user_id=doc_task.user_id,
+                )
+                # No embedding ran, so no usage is recorded here — stated
+                # explicitly so a "fewer tokens_embedded rows than expected"
+                # audit lands on the dedup path rather than reconstructing it
+                # from Qdrant claim logs.
+                logger.info(
+                    "Dedup hit for file %s (etag=%s); claimed for user %s "
+                    "without reprocessing (no embedding/usage recorded)",
+                    doc_task.doc_id,
+                    doc_task.etag,
+                    doc_task.user_id,
+                )
+                return
+
             # Read file content via WebDAV
             content_bytes, content_type = await nc_client.webdav.read_file(file_path)
         else:
@@ -498,7 +719,14 @@ async def _index_document(
                 "vector_sync.file_size": len(content_bytes),
             },
         ):
-            # Use document processor registry to extract text
+            # The registry runs the tiered PDF pipeline (tier-0 classify ->
+            # tier-1 fast -> OCR escalation) and records classification metrics.
+            # Imported lazily so module import doesn't pull in the document stack
+            # (document_processors -> _isolation, Unix-only ``resource``; see #877).
+            from nextcloud_mcp_server.document_processors import (  # noqa: PLC0415
+                get_registry,
+            )
+
             registry = get_registry()
 
             try:
@@ -507,28 +735,60 @@ async def _index_document(
                     content_type=content_type,
                     filename=file_path,
                 )
+
+                # A permanent parse failure (e.g. an isolated-worker OOM/timeout
+                # on a pathological PDF) returns success=False rather than
+                # raising -- there is nothing to index and retrying would just
+                # fail again. Mark the placeholder "failed" so the scanner stops
+                # re-queuing it (until the file changes) and return False so the
+                # caller skips the success metrics (it was not indexed).
+                if not result.success:
+                    reason = result.metadata.get("parse_failed_reason", "error")
+                    record_document_parse_failed(reason)
+                    logger.warning(
+                        "Permanent parse failure for %s (reason=%s); marking "
+                        "failed and skipping index",
+                        file_path,
+                        reason,
+                    )
+                    try:
+                        await update_placeholder_status(
+                            doc_id=doc_task.doc_id,
+                            doc_type=doc_task.doc_type,
+                            user_id=doc_task.user_id,
+                            status="failed",
+                        )
+                    except Exception:
+                        # Best-effort: a transient Qdrant error here only means
+                        # the placeholder isn't marked, so the scanner retries
+                        # the (still un-indexable) file later -- not fatal.
+                        logger.debug(
+                            "Could not mark placeholder failed for %s",
+                            doc_task.doc_id,
+                            exc_info=True,
+                        )
+                    return False
+
                 content = result.text
                 file_metadata = result.metadata
-                title = file_metadata.get("title") or file_path.split("/")[-1]
-                etag = ""  # WebDAV read_file doesn't return etag
+                # Favour the Nextcloud filename over any embedded document title
+                # (e.g. a PDF's /Title), which often disagrees with how the user
+                # named the file and is confusing in the UI.
+                title = file_title_from_path(file_path)
+                # etag comes from the scanner's tag REPORT (threaded via the
+                # DocumentTask); read_file itself returns no etag. It is the
+                # tenant-wide content-dedup key, so it must be persisted.
+                etag = doc_task.etag or ""
 
                 # Diagnostic: Log page boundary information if available
                 if "page_boundaries" in file_metadata:
                     page_boundaries = file_metadata["page_boundaries"]
-                    logger.info(
+                    logger.debug(
                         "Page boundaries for %s: %s pages, text length: %s",
                         file_path,
                         len(page_boundaries),
                         len(content),
                     )
-                    # Log first 3 page boundaries for debugging
-                    for boundary in page_boundaries[:3]:
-                        logger.debug(
-                            "  Page %s: offsets [%s:%s]",
-                            boundary["page"],
-                            boundary["start_offset"],
-                            boundary["end_offset"],
-                        )
                     # Verify last boundary matches text length
                     if page_boundaries:
                         last_boundary = page_boundaries[-1]
@@ -544,27 +804,44 @@ async def _index_document(
                 logger.error("Failed to process file %s: %s", file_path, e)
                 raise
 
-    # Tokenize and chunk (using configured chunk size and overlap)
+    # Tokenize and chunk (using configured chunk size and overlap). Paginated
+    # files (PDFs with page_boundaries) use the page-aware chunker when enabled,
+    # which assigns page numbers inline; everything else uses the char-based
+    # chunker followed by post-hoc page assignment.
+    page_boundaries = file_metadata.get("page_boundaries")
+    use_page_aware = should_use_page_aware(
+        page_aware_enabled=settings.document_chunk_page_aware,
+        doc_type=doc_task.doc_type,
+        page_boundaries=page_boundaries,
+    )
     with trace_operation(
         "vector_sync.chunk_text",
         attributes={
             "vector_sync.input_chars": len(content),
             "vector_sync.chunk_size": settings.document_chunk_size,
             "vector_sync.overlap": settings.document_chunk_overlap,
+            "vector_sync.page_aware": use_page_aware,
         },
     ) as chunk_span:
-        chunker = DocumentChunker(
-            chunk_size=settings.document_chunk_size,
-            overlap=settings.document_chunk_overlap,
-        )
-        chunks = await chunker.chunk_text(content)
+        if use_page_aware:
+            page_boundaries_list = cast(list[dict[str, Any]], page_boundaries)
+            chunks = await PageAwareChunker(
+                chunk_size=settings.document_chunk_size,
+                overlap=settings.document_chunk_overlap,
+            ).chunk_text(content, page_boundaries_list)
+        else:
+            chunks = await DocumentChunker(
+                chunk_size=settings.document_chunk_size,
+                overlap=settings.document_chunk_overlap,
+            ).chunk_text(content)
         record_document_chunks(doc_task.doc_type, len(chunks))
         if chunk_span is not None:
             chunk_span.set_attribute(_ATTR_CHUNK_COUNT, len(chunks))
 
-    # Assign page numbers to chunks if page boundaries are available (PDFs)
-    page_boundaries = file_metadata.get("page_boundaries")
-    if doc_task.doc_type == "file" and page_boundaries is not None:
+    # Assign page numbers for the char-based path (page-aware already sets them).
+    # Truthy guard (not "is not None"): an empty boundary list has nothing to
+    # assign, so skip the span and the "NO page numbers assigned" warning.
+    if not use_page_aware and doc_task.doc_type == "file" and page_boundaries:
         # Type narrowing: page_boundaries is guaranteed to be list[dict] here
         page_boundaries_list = cast(list[dict[str, Any]], page_boundaries)
         with trace_operation(
@@ -578,22 +855,12 @@ async def _index_document(
 
             # Diagnostic: Verify page number assignment
             assigned_count = sum(1 for c in chunks if c.page_number is not None)
-            logger.info(
+            logger.debug(
                 "Assigned page numbers to %s/%s chunks for %s",
                 assigned_count,
                 len(chunks),
                 file_path,
             )
-
-            # Log first 3 chunks to see their page assignments
-            for i, chunk in enumerate(chunks[:3]):
-                logger.debug(
-                    "  Chunk %s: page=%s, offsets=[%s:%s]",
-                    i,
-                    chunk.page_number,
-                    chunk.start_offset,
-                    chunk.end_offset,
-                )
 
             # Warning if NO page numbers were assigned
             if assigned_count == 0:
@@ -641,7 +908,10 @@ async def _index_document(
             embedding_service = get_embedding_service()
             embed_start = time.time()
             try:
-                dense_embeddings = await embedding_service.embed_batch(chunk_texts)
+                (
+                    dense_embeddings,
+                    embed_tokens,
+                ) = await embedding_service.embed_batch_with_usage(chunk_texts)
             except Exception:
                 record_embedding(
                     "dense", provider, time.time() - embed_start, status="error"
@@ -653,6 +923,39 @@ async def _index_document(
                 time.time() - embed_start,
                 chunks=len(chunk_texts),
                 chars=total_chars,
+            )
+            # Export token consumption to Prometheus (always-on, independent of
+            # the billing flag) so Grafana sees indexing token cost.
+            record_embedding_tokens(provider, "index", embed_tokens)
+            # Usage metering (Deck #67): record the embedding-token count (all
+            # docs) and, for parsed files, the real parsed-page count. Best-
+            # effort and flag-gated; placed after the embedding succeeds so it
+            # can never affect the indexing path. ``page_count`` is set by the
+            # document processors for PDFs and absent for text types, so text
+            # content meters tokens only. See record_indexing_usage for the
+            # metric/privacy details.
+            #
+            # Narrow defensively: file_metadata values are loosely typed, so a
+            # malformed page_count meters as "no pages" rather than erroring on
+            # the indexing path.
+            # bool is an int subclass, so exclude it explicitly — a stray
+            # page_count=True in metadata must not slip through as pages=1.
+            raw_page_count = file_metadata.get("page_count")
+            await record_indexing_usage(
+                enabled=settings.usage_metering_enabled,
+                provider=provider,
+                model=settings.get_embedding_model_name(),
+                doc_type=doc_task.doc_type,
+                user_id=doc_task.user_id,
+                chunk_count=len(chunk_texts),
+                token_count=embed_tokens,
+                total_chars=total_chars,
+                page_count=(
+                    raw_page_count
+                    if isinstance(raw_page_count, int)
+                    and not isinstance(raw_page_count, bool)
+                    else None
+                ),
             )
 
     async def generate_sparse_embeddings():
@@ -763,6 +1066,28 @@ async def _index_document(
     _embedding_identity = settings.get_embedding_model_name()
     _acl_hash = compute_acl_hash([("user", doc_task.user_id)])
 
+    # Observed-access ACL principals (computed once per document, not per chunk).
+    # Seed with the indexer (and owner, if distinct). For files — the only type
+    # with cross-user dedup and globally-unique IDs (Nextcloud fileid) — union in
+    # any principals already recorded so re-indexing after a content change
+    # preserves visibility for readers who had previously claimed the file. For
+    # note/news_item/deck_card, IDs are per-user (not globally unique) and point
+    # IDs are user-agnostic, so merging another user's principals on an ID
+    # collision would wrongly cross-surface their content; those types are
+    # seeded with the indexer only.
+    _prior_principals = (
+        await existing_principals(doc_task.doc_id, doc_task.doc_type)
+        if doc_task.doc_type == "file"
+        else []
+    )
+    _acl_principals = sorted(
+        set(_prior_principals)
+        | {
+            f"user:{doc_task.user_id}",
+            f"user:{doc_task.owner_id or doc_task.user_id}",
+        }
+    )
+
     # Surface deck card data quality issues at indexing time rather than
     # only at verification time (where _verify_deck_cards falls through to
     # legacy-data pass-through when board_id/stack_id are missing). This is
@@ -807,6 +1132,13 @@ async def _index_document(
                     # crawl shared-with-them content can set owner_id to the
                     # true owner without losing the "who indexed this" trail.
                     "owner_id": doc_task.owner_id or doc_task.user_id,
+                    # Observed-access ACL set: every user whose scanner has seen
+                    # (hence can read) this document. Seeded with the indexer (and
+                    # owner, if distinct); grown lazily as other readers' scanners
+                    # hit the tenant-wide dedup path. Search ORs a
+                    # MatchAny(acl_principals, ["user:<me>"]) branch so a
+                    # deduplicated shared file stays findable by every reader.
+                    "acl_principals": _acl_principals,
                     "doc_id": doc_task.doc_id,
                     "doc_type": doc_task.doc_type,
                     "is_placeholder": False,  # Real indexed document (not placeholder)
@@ -823,7 +1155,11 @@ async def _index_document(
                     # Decomposition payload keys (design §10.2), additive.
                     payload_keys.PROCESSOR_VERSION: "monolith-v1",
                     payload_keys.PARSED_AT: indexed_at,
-                    payload_keys.PIPELINE_TIER: "fast",
+                    # Actual tier that produced this doc (registry stamps it on
+                    # the result metadata); non-PDF doc types stay "fast".
+                    payload_keys.PIPELINE_TIER: file_metadata.get(
+                        "pipeline_tier", "fast"
+                    ),
                     payload_keys.EMBEDDING_IDENTITY: _embedding_identity,
                     payload_keys.ACL_HASH: _acl_hash,
                     # File-specific metadata (PDF, etc.)

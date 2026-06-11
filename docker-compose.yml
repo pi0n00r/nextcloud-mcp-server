@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:11.8.8-noble@sha256:7974b628cbb4a37c4108d82f1e1d1123d1857ae3d94ab6fb20b8ad8580c271c8
+    image: docker.io/library/mariadb:11.8.8-noble@sha256:be1ef4fe5f14589325c08a41c76334097ce66c86264b75e1d28342c742782a61
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -23,7 +23,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.10@sha256:611669115cccef3f96aa8eb47bd07c4d57452d894ebcfc1d81f5e8ce368e7d2d}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.11@sha256:3ae4045d53e890680ec35e3e4349332123d959c72808aceb44930e79f1be9b9b}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -160,7 +160,21 @@ services:
       - TOKEN_STORAGE_DB=/app/data/tokens.db
 
       - ENABLE_SEMANTIC_SEARCH=true
-      - VECTOR_SYNC_SCAN_INTERVAL=60
+      # Tuned cadence for the multi-user background-sync integration suite,
+      # which provisions a user, creates a note, then waits ~90s for it to be
+      # indexed. Two independent knobs matter here:
+      #   * USER_POLL_INTERVAL gates how fast the background-sync user manager
+      #     *discovers* a freshly-provisioned user (its scanner runs an initial
+      #     scan immediately on start). The 60s default left too little of the
+      #     90s budget, so drop it to 5s for prompt discovery.
+      #   * SCAN_INTERVAL gates *re-scan* churn. Each scan re-queues the user's
+      #     whole corpus, so a very short interval (e.g. 5s) floods the single
+      #     processor worker faster than it drains on slower CI runners
+      #     (pending climbs, indexed stays 0). Keep it moderate: the immediate
+      #     initial scan already indexes the corpus once; 30s re-scans avoid
+      #     the flood while still catching a note created just after that scan.
+      - VECTOR_SYNC_USER_POLL_INTERVAL=5
+      - VECTOR_SYNC_SCAN_INTERVAL=30
       - VECTOR_SYNC_PROCESSOR_WORKERS=1
 
       # OAuth credentials for background sync (optional - uses DCR if not provided)
@@ -181,7 +195,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.6.2@sha256:f9ba7b2af90db8dc749a57ca9aedca51e840cb9224441ab546a968da941da900
+    image: quay.io/keycloak/keycloak:26.6.3@sha256:5fdbf2dbb5897cc34e82de49d13e23db011f9925089dbc555fc095f2c8bc1dac
     command:
       - "start-dev"
       - "--import-realm"
@@ -335,7 +349,7 @@ services:
       - claude-funnel
 
   qdrant:
-    image: docker.io/qdrant/qdrant:v1.18.1@sha256:45f8e3ddc2570a4d029877e1b5ec1045c19b3852b4e22a55c7f43b05aea0ca89
+    image: docker.io/qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c
     restart: always
     ports:
       - 127.0.0.1:6333:6333  # REST API

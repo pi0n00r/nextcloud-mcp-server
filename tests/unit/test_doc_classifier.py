@@ -1,0 +1,286 @@
+"""Unit tests for the tier-0 document classifier.
+
+Pins the routing decisions and the text-quality heuristic that drive which
+extraction tier a PDF starts in:
+  * a clean born-digital PDF (text, no full-page images) -> ``fast`` (tier 1);
+  * a full-page-image scan -> ``ocr`` (tier 3), since handwriting/stamps aren't
+    in any text layer;
+  * the text-quality score distinguishes clean prose from mashed/space-less junk.
+"""
+
+import pymupdf
+import pytest
+
+from nextcloud_mcp_server.document_processors import classifier as clf
+
+pytestmark = pytest.mark.unit
+
+
+def _digital_pdf(
+    pages: int = 3, body: str = "Hello world this is clean text. "
+) -> bytes:
+    doc = pymupdf.open()
+    for _ in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 60), body * 8)
+    data: bytes = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _full_page_image_pdf(pages: int = 2) -> bytes:
+    # A page whose entire area is a raster image -> looks scanned.
+    doc = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 600, 850))
+    pix.clear_with(255)
+    img = pix.tobytes("png")
+    del pix  # Pixmap holds native memory; release it before the loop
+    for _ in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=img)
+    data: bytes = doc.tobytes()
+    doc.close()
+    return data
+
+
+# --- text-quality heuristic --------------------------------------------------
+
+
+def test_text_quality_clean_prose_scores_high():
+    assert clf._text_quality("the quick brown fox jumps over the lazy dog") > 0.8
+
+
+def test_text_quality_mashed_tokens_scores_low():
+    # space-less / mashed layer (the "Student 147" failure mode)
+    mashed = "01322234567mobileoutstandingresilienceacademicachievementhurdles"
+    assert clf._text_quality(mashed) < clf.MIN_TEXT_QUALITY
+
+
+def test_text_quality_empty_is_zero():
+    assert clf._text_quality("") == pytest.approx(0.0)
+
+
+# --- routing -----------------------------------------------------------------
+
+
+def test_digital_pdf_routes_fast():
+    c = clf.classify_pdf(_digital_pdf())
+    assert c.recommended_tier == "fast"
+    assert c.ocr_page_fraction == pytest.approx(0.0)
+    assert "image_heavy" not in c.flags
+    assert c.mean_text_quality > 0.8
+
+
+def test_full_page_image_routes_ocr():
+    c = clf.classify_pdf(_full_page_image_pdf())
+    assert c.recommended_tier == "ocr"
+    assert c.ocr_page_fraction == pytest.approx(1.0)
+    assert "image_heavy" in c.flags
+    assert "scanned" in c.flags  # no text layer at all
+
+
+# --- sampling bounds large docs ----------------------------------------------
+
+
+def test_large_doc_is_sampled():
+    c = clf.classify_pdf(_digital_pdf(pages=120))
+    assert c.page_count == 120
+    assert c.sampled_pages <= clf.MAX_SAMPLED_PAGES
+
+
+def test_sample_indices_includes_first_and_last_page():
+    idx = clf._sample_indices(100)
+    assert idx[0] == 0
+    assert idx[-1] == 99  # last page must be sampled (scanned-tail case)
+    assert len(idx) <= clf.MAX_SAMPLED_PAGES
+
+
+# --- flag paths --------------------------------------------------------------
+
+
+def _image_with_mashed_text_pdf(pages: int = 2) -> bytes:
+    # Full-page image with a junk (mashed/space-less) text layer over it -- a
+    # scan whose OCR'd text layer is unusable.
+    doc = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 600, 850))
+    pix.clear_with(255)
+    img = pix.tobytes("png")
+    del pix  # Pixmap holds native memory; release it before the loop
+    mashed = "01322234567mobileoutstandingresilienceacademicachievement " * 3
+    for _ in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=img)
+        page.insert_text((50, 60), mashed)
+    data: bytes = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_scanned_flag_when_no_text_layer():
+    c = clf.classify_pdf(_full_page_image_pdf())
+    assert c.total_chars == 0
+    assert "scanned" in c.flags
+    assert c.recommended_tier == "ocr"
+
+
+def test_bad_text_layer_flag_on_image_with_junk_text():
+    c = clf.classify_pdf(_image_with_mashed_text_pdf())
+    assert c.total_chars > 0
+    assert c.mean_text_quality < clf.MIN_TEXT_QUALITY
+    assert "bad_text_layer" in c.flags
+    assert c.recommended_tier == "ocr"
+
+
+def _mostly_text_one_image_pdf() -> bytes:
+    # 3 digital text pages + 1 full-page-image page: one image-heavy page, but
+    # ocr_frac = 1/4 < OCR_PAGE_FRACTION, so the doc routes fast.
+    doc = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 600, 850))
+    pix.clear_with(255)
+    img = pix.tobytes("png")
+    del pix  # Pixmap holds native memory; release it before the loop
+    for _ in range(3):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 60), "Hello world this is clean text. " * 8)
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, stream=img)
+    data: bytes = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_image_heavy_flag_without_ocr_routing():
+    # The documented asymmetry operators rely on: a mostly-digital doc with one
+    # full-page image carries the image_heavy flag yet still routes fast.
+    c = clf.classify_pdf(_mostly_text_one_image_pdf())
+    assert "image_heavy" in c.flags
+    assert c.recommended_tier == "fast"
+    assert c.ocr_page_fraction < clf.OCR_PAGE_FRACTION
+
+
+# --- classify_from_text (hot-path, derived from tier-1 extraction) -----------
+
+
+def test_classify_from_text_clean_routes_fast():
+    txt = "the quick brown fox jumps over the lazy dog " * 3
+    c = clf.classify_from_text(
+        txt, [{"page": 1, "start_offset": 0, "end_offset": len(txt)}]
+    )
+    assert c.recommended_tier == "fast"
+    assert c.mean_text_quality > 0.8
+    assert c.flags == set()
+
+
+def test_classify_from_text_empty_routes_ocr():
+    c = clf.classify_from_text("", [{"page": 1, "start_offset": 0, "end_offset": 0}])
+    assert c.recommended_tier == "ocr"
+    assert "scanned" in c.flags  # unified with classify_pdf's flag name
+    assert c.total_chars == 0
+
+
+def test_classify_from_text_no_pages_routes_fast():
+    # An empty/corrupt PDF (no page boundaries) is not OCR evidence -> "fast",
+    # so the recorded classification metric isn't a misleading "ocr".
+    c = clf.classify_from_text("", [])
+    assert c.recommended_tier == "fast"
+    assert c.ocr_page_fraction == pytest.approx(0.0)
+    assert c.flags == set()
+
+
+def test_classify_from_text_junk_layer_flags_bad_text_layer():
+    # Each short segment (<MIN_PAGE_CHARS) sets needs_ocr -> high ocr_frac, and
+    # total_chars>0 with mean_quality<MIN_TEXT_QUALITY (no-whitespace junk scores
+    # 0.0) -> bad_text_layer (gated on ocr_frac, matching classify_pdf).
+    text = "x1y2zx1y2z"
+    c = clf.classify_from_text(
+        text,
+        [
+            {"page": 1, "start_offset": 0, "end_offset": 5},
+            {"page": 2, "start_offset": 5, "end_offset": 10},
+        ],
+    )
+    assert c.recommended_tier == "ocr"
+    assert c.total_chars > 0
+    assert "bad_text_layer" in c.flags
+    assert "scanned" not in c.flags  # has text, just junk -> not the empty case
+
+
+# --- quality + scan escalation triggers (Deck #207) --------------------------
+
+_JUNK = (
+    "ST. TRINIAN'SSCHOOLSTUDENT RECORDFILE struggledsignificantlywith "
+    "learningdifficulties demonstrateda positiveattitude academictasks"
+)
+_CLEAN = "the quick brown fox jumps over the lazy dog and then runs away home"
+
+
+def _two_page(text_a: str, text_b: str):
+    na = len(text_a)
+    return text_a + text_b, [
+        {"page": 1, "start_offset": 0, "end_offset": na},
+        {"page": 2, "start_offset": na, "end_offset": na + len(text_b)},
+    ]
+
+
+def test_classify_from_text_low_quality_routes_ocr():
+    full, bounds = _two_page(_JUNK, _JUNK)
+    c = clf.classify_from_text(full, bounds)
+    assert c.recommended_tier == "ocr"
+    assert "bad_text_layer" in c.flags
+
+
+def test_quality_floor_override_disables_trigger():
+    # min_text_quality=0.0 => quality never trips; text present + not scanned => fast
+    full, bounds = _two_page(_JUNK, _JUNK)
+    c = clf.classify_from_text(full, bounds, min_text_quality=0.0)
+    assert c.recommended_tier == "fast"
+
+
+def test_scan_signal_routes_ocr_even_with_clean_text():
+    # clean text but every page is a raster scan -> OCR (the Student-147 case)
+    full, bounds = _two_page(_CLEAN, _CLEAN)
+    c = clf.classify_from_text(full, bounds, image_coverage=[1.0, 1.0])
+    assert c.recommended_tier == "ocr"
+    assert "image_heavy" in c.flags
+
+
+def test_scan_signal_ignored_when_coverage_low():
+    full, bounds = _two_page(_CLEAN, _CLEAN)
+    c = clf.classify_from_text(full, bounds, image_coverage=[0.1, 0.0])
+    assert c.recommended_tier == "fast"
+
+
+def test_page_fraction_override():
+    # exactly one of two pages is junk -> ocr_frac 0.5
+    full, bounds = _two_page(_CLEAN, _JUNK)
+    assert (
+        clf.classify_from_text(full, bounds, page_fraction=0.5).recommended_tier
+        == "ocr"
+    )
+    assert (
+        clf.classify_from_text(full, bounds, page_fraction=0.6).recommended_tier
+        == "fast"
+    )
+
+
+def test_image_coverage_per_page():
+    scan = clf.image_coverage_per_page(_full_page_image_pdf(pages=2))
+    assert len(scan) == 2 and all(c >= 0.8 for c in scan)
+    digital = clf.image_coverage_per_page(_digital_pdf(pages=2))
+    assert len(digital) == 2 and all(c < 0.1 for c in digital)
+
+
+def test_scan_coverage_shorter_than_pages_falls_back_to_text():
+    # image_coverage shorter than the boundaries (the MAX_SAMPLED_PAGES cap):
+    # page 0 is flagged scanned; later pages fall back to the text-quality signal.
+    n = len(_CLEAN)
+    full = _CLEAN * 3
+    bounds = [
+        {"page": 1, "start_offset": 0, "end_offset": n},
+        {"page": 2, "start_offset": n, "end_offset": 2 * n},
+        {"page": 3, "start_offset": 2 * n, "end_offset": 3 * n},
+    ]
+    c = clf.classify_from_text(full, bounds, image_coverage=[1.0])
+    assert c.pages[0].needs_ocr is True  # scanned (coverage)
+    assert c.pages[1].needs_ocr is False  # clean text, no coverage entry
+    assert c.recommended_tier == "fast"  # only 1/3 pages bad

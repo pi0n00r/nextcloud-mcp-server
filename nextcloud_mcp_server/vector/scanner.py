@@ -19,6 +19,7 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue, Record
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.client.news import NewsItemType
 from nextcloud_mcp_server.config import get_settings
+from nextcloud_mcp_server.models.deck import DeckCard
 from nextcloud_mcp_server.observability.metrics import record_vector_sync_scan
 from nextcloud_mcp_server.observability.tracing import trace_operation
 from nextcloud_mcp_server.server.tag_exclusion import (
@@ -31,6 +32,10 @@ from nextcloud_mcp_server.vector.placeholder import (
 )
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 from nextcloud_mcp_server.vector.queue.ports import TaskProducer
+from nextcloud_mcp_server.vector.sharing_state import (
+    claim_existing_index,
+    reconcile_document_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +247,38 @@ async def scanner_task(
     logger.info("Scanner task stopped - stream closed")
 
 
+async def _get_enabled_apps_or_none(
+    nc_client: NextcloudClient, user_id: str, scan_id: int
+) -> set[str] | None:
+    """Enabled-app id set for gating, or ``None`` when detection fails.
+
+    ``None`` signals "couldn't determine" — callers must then scan every app
+    (the prior behaviour), so a transient navigation-endpoint failure never
+    silently halts indexing. The per-app 404 guards in ``scan_user_documents``
+    remain the safety net for that fallback path.
+    """
+    try:
+        return await nc_client.get_enabled_apps()
+    except Exception as e:
+        logger.warning(
+            "[SCAN-%s] Could not determine enabled apps for %s (%s); scanning all apps",
+            scan_id,
+            user_id,
+            e,
+        )
+        return None
+
+
+def _app_enabled(app_id: str, enabled_apps: set[str] | None) -> bool:
+    """Whether ``app_id`` should be scanned for the current user.
+
+    ``enabled_apps is None`` means detection failed — every app is treated as
+    enabled (the scan-all fallback) so a transient navigation-endpoint failure
+    never silently halts indexing.
+    """
+    return enabled_apps is None or app_id in enabled_apps
+
+
 async def scan_user_documents(
     user_id: str,
     send_stream: TaskProducer,
@@ -323,6 +360,11 @@ async def scan_user_documents(
 
             logger.debug("Found %s indexed documents in Qdrant", len(indexed_doc_ids))
 
+        # Determine which apps are enabled for this user so we skip polling
+        # apps they lack — those polls 404 and flood tenant logs. ``None`` means
+        # detection failed: fall back to scanning every app (prior behaviour).
+        enabled_apps = await _get_enabled_apps_or_none(nc_client, user_id, scan_id)
+
         # Notes (isolated so an uninstalled or disabled Notes app — whose API
         # returns 404 — cannot abort scanning of the other apps; this mirrors the
         # per-app try/except guards already wrapping files/news/deck below).
@@ -331,36 +373,52 @@ async def scan_user_documents(
         current_time = time.time()
         queued = 0
 
-        try:
-            queued += await scan_notes(
-                user_id=user_id,
-                send_stream=send_stream,
-                nc_client=nc_client,
-                initial_sync=initial_sync,
-                scan_id=scan_id,
-                prune_before=prune_before,
-                indexed_doc_ids=indexed_doc_ids,
-                grace_period=grace_period,
-                current_time=current_time,
-            )
-        except HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.info(
-                    "[SCAN-%s] Notes app unavailable for %s (HTTP 404); skipping notes",
-                    scan_id,
-                    user_id,
+        if _app_enabled("notes", enabled_apps):
+            try:
+                queued += await scan_notes(
+                    user_id=user_id,
+                    send_stream=send_stream,
+                    nc_client=nc_client,
+                    initial_sync=initial_sync,
+                    scan_id=scan_id,
+                    prune_before=prune_before,
+                    indexed_doc_ids=indexed_doc_ids,
+                    grace_period=grace_period,
+                    current_time=current_time,
                 )
-            else:
+            except HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    logger.info(
+                        "[SCAN-%s] Notes app unavailable for %s (HTTP 404); skipping notes",
+                        scan_id,
+                        user_id,
+                    )
+                else:
+                    logger.warning("Failed to scan notes for %s: %s", user_id, e)
+            except Exception as e:
                 logger.warning("Failed to scan notes for %s: %s", user_id, e)
-        except Exception as e:
-            logger.warning("Failed to scan notes for %s: %s", user_id, e)
+        else:
+            logger.debug(
+                "[SCAN-%s] Notes app not enabled for %s; skipping notes",
+                scan_id,
+                user_id,
+            )
 
         if initial_sync:
             logger.info("Sent %s documents for initial sync: %s", queued, user_id)
             return
 
         # Scan tagged PDF files (after notes)
-        # Get indexed file IDs from Qdrant (for deletion tracking)
+        # Get indexed file IDs from Qdrant (for deletion tracking).
+        # NOTE: this is filtered by user_id, so a "pure claimer" — a user who
+        # gained access to a shared file via the tenant-wide dedup path
+        # (claim_existing_index) without ever indexing it themselves — is NOT in
+        # this set (the points carry the first indexer's user_id, only the
+        # claimer's user:<uid> in acl_principals). Such a user is therefore never
+        # enqueued for deletion by the grace-period sweep below; their stale
+        # acl_principals entry is reclaimed lazily by verify-on-read eviction
+        # (release_document_for_user) when a search surfaces a now-inaccessible
+        # result. A future scanner-side cleanup could scroll acl_principals too.
         indexed_file_ids = set()
         if not initial_sync:
             assert qdrant_client is not None  # narrow for the type checker
@@ -448,6 +506,26 @@ async def scan_user_documents(
                     except (ValueError, KeyError):
                         pass
 
+                # Tenant-wide content dedup (Layer 1 / observed-access ACL): if
+                # this exact file content (fileid + etag) is already indexed under
+                # the current embedding model by ANY user in the tenant, skip
+                # re-parsing/re-embedding and just record that this user can read
+                # it. Eliminates the per-user reprocessing ping-pong that arises
+                # because chunk point IDs are user-agnostic (note 386945 #5).
+                etag = str(file_info.get("etag") or "")
+                if etag and await claim_existing_index(
+                    file_id, "file", etag, user_id, current_path=file_path
+                ):
+                    _potentially_deleted.pop((user_id, file_id), None)
+                    logger.debug(
+                        "Dedup: file %s (ID: %s) already indexed in tenant; "
+                        "granted access to %s without reprocessing",
+                        file_path,
+                        file_id,
+                        user_id,
+                    )
+                    continue
+
                 if initial_sync:
                     # Send everything on first sync - write placeholder first
                     await write_placeholder_point(
@@ -455,6 +533,7 @@ async def scan_user_documents(
                         doc_type="file",
                         user_id=user_id,
                         modified_at=modified_at,
+                        etag=etag,
                         file_path=file_path,
                     )
                     await send_stream.send(
@@ -465,6 +544,7 @@ async def scan_user_documents(
                             operation="index",
                             modified_at=modified_at,
                             file_path=file_path,
+                            etag=etag,
                         )
                     )
                     file_queued += 1
@@ -495,13 +575,24 @@ async def scan_user_documents(
                         # File modified since last indexing
                         needs_indexing = True
                     elif existing_metadata.get("is_placeholder", False):
-                        # Placeholder exists - check if it's stale (processing may have failed)
-                        # Only requeue if placeholder is older than 5x scan interval
-                        # (Large PDFs can take 3-4 minutes to process)
+                        # Placeholder exists - check its status / staleness.
                         queued_at = existing_metadata.get("queued_at", 0)
                         placeholder_age = time.time() - queued_at
                         stale_threshold = get_settings().vector_sync_scan_interval * 5
-                        if placeholder_age > stale_threshold:
+                        if existing_metadata.get("status") == "failed":
+                            # A permanent parse failure (e.g. an isolated-worker
+                            # OOM/timeout on a pathological PDF). Don't keep
+                            # re-queuing an unchanged file that will just fail
+                            # again -- the modified_at branch above still retries
+                            # it once the file actually changes.
+                            logger.debug(
+                                "Skipping file %s (ID: %s): previous parse failed permanently",
+                                file_path,
+                                file_id,
+                            )
+                        elif placeholder_age > stale_threshold:
+                            # Only requeue if placeholder is older than 5x scan
+                            # interval (large PDFs can take minutes to process).
                             logger.debug(
                                 "Found stale placeholder for file %s (ID: %s) (age=%ss), requeuing",
                                 file_path,
@@ -525,6 +616,7 @@ async def scan_user_documents(
                             doc_type="file",
                             user_id=user_id,
                             modified_at=modified_at,
+                            etag=etag,
                             file_path=file_path,
                         )
                         await send_stream.send(
@@ -535,9 +627,38 @@ async def scan_user_documents(
                                 operation="index",
                                 modified_at=modified_at,
                                 file_path=file_path,
+                                etag=etag,
                             )
                         )
                         file_queued += 1
+                    elif existing_metadata is not None and not existing_metadata.get(
+                        "is_placeholder", False
+                    ):
+                        # Reached only on the rename-with-stable-mtime path: a
+                        # fresh modified_at would have set needs_indexing, and an
+                        # etag dedup hit would have continued above -- so here the
+                        # content wasn't re-queued (modified_at stable) yet the
+                        # stored path may be stale from a rename/move (the fileid
+                        # is unchanged). Refresh path/title without re-embedding;
+                        # reconcile_document_path no-ops when the path matches.
+                        # Skip placeholders: reconcile only touches real chunks, so
+                        # a not-yet-indexed file would just incur a 0-point
+                        # set_payload (the real index writes the current path).
+                        try:
+                            await reconcile_document_path(
+                                file_id,
+                                "file",
+                                existing_metadata.get("file_path"),
+                                file_path,
+                            )
+                        except Exception as exc:  # noqa: BLE001 — non-fatal
+                            logger.warning(
+                                "Path reconcile failed for file %s (ID: %s) (%s); "
+                                "next scan retries",
+                                file_path,
+                                file_id,
+                                exc,
+                            )
 
             logger.info(
                 "[SCAN-%s] Found %s tagged PDFs for %s", scan_id, file_count, user_id
@@ -589,31 +710,45 @@ async def scan_user_documents(
 
         # Scan News items (starred + unread)
         news_queued = 0
-        try:
-            news_queued = await scan_news_items(
-                user_id=user_id,
-                send_stream=send_stream,
-                nc_client=nc_client,
-                initial_sync=initial_sync,
-                scan_id=scan_id,
+        if _app_enabled("news", enabled_apps):
+            try:
+                news_queued = await scan_news_items(
+                    user_id=user_id,
+                    send_stream=send_stream,
+                    nc_client=nc_client,
+                    initial_sync=initial_sync,
+                    scan_id=scan_id,
+                )
+                queued += news_queued
+            except Exception as e:
+                logger.warning("Failed to scan news items for %s: %s", user_id, e)
+        else:
+            logger.debug(
+                "[SCAN-%s] News app not enabled for %s; skipping news items",
+                scan_id,
+                user_id,
             )
-            queued += news_queued
-        except Exception as e:
-            logger.warning("Failed to scan news items for %s: %s", user_id, e)
 
         # Scan Deck cards
         deck_queued = 0
-        try:
-            deck_queued = await scan_deck_cards(
-                user_id=user_id,
-                send_stream=send_stream,
-                nc_client=nc_client,
-                initial_sync=initial_sync,
-                scan_id=scan_id,
+        if _app_enabled("deck", enabled_apps):
+            try:
+                deck_queued = await scan_deck_cards(
+                    user_id=user_id,
+                    send_stream=send_stream,
+                    nc_client=nc_client,
+                    initial_sync=initial_sync,
+                    scan_id=scan_id,
+                )
+                queued += deck_queued
+            except Exception as e:
+                logger.warning("Failed to scan deck cards for %s: %s", user_id, e)
+        else:
+            logger.debug(
+                "[SCAN-%s] Deck app not enabled for %s; skipping deck cards",
+                scan_id,
+                user_id,
             )
-            queued += deck_queued
-        except Exception as e:
-            logger.warning("Failed to scan deck cards for %s: %s", user_id, e)
 
         if queued > 0:
             logger.info(
@@ -1065,8 +1200,10 @@ async def scan_deck_cards(
             if not stack.cards:
                 continue
 
-            # Iterate through cards in stack
-            for card in stack.cards:
+            # Iterate through cards in stack. get_stacks() always yields full
+            # DeckCard objects; the DeckCardSummary projection only happens in
+            # the tool layer (server/deck.py), never on freshly-fetched stacks.
+            for card in cast(list[DeckCard], stack.cards):
                 # Skip archived cards
                 if card.archived:
                     continue

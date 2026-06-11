@@ -5,6 +5,266 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.111.0 (2026-06-10)
+
+### Feat
+
+- **deck**: surface remapped labels in move-card response
+- **deck**: add deck_move_card_to_board tool for cross-board moves
+
+### Fix
+
+- **deck**: make done-restore best-effort on move; cover combined states
+- **deck**: preserve done/archived and validate target board on move
+
+## v0.110.2 (2026-06-10)
+
+### Fix
+
+- convert astrolabe int provisioned_at to ISO before ProvisioningStatus
+- **ci**: gate can-i-deploy broker steps individually, not at job level
+
+## v0.110.1 (2026-06-10)
+
+### Fix
+
+- **app**: port-aware MCP URL fallback + clear readiness cache per lifespan (round 4)
+- **app**: cancel readiness loop on lifespan shutdown (review round 2)
+- **config**: correct OIDC token-type/scopes env keys; address review round 1
+- **health**: non-gating readiness probe; shared-task-group lifespan; settings migration
+
+### Refactor
+
+- **app**: cancel only the readiness loop at shutdown (review round 3)
+
+## v0.110.0 (2026-06-08)
+
+### Feat
+
+- **metering**: pages_embedded = real parsed page count
+
+### Refactor
+
+- **metering**: harden page_count guard per review
+
+## v0.109.1 (2026-06-08)
+
+### Fix
+
+- **documents**: guard Unix-only resource import for Windows (#877)
+
+### Refactor
+
+- **documents**: fully decouple document stack from server startup; Windows-safe tests
+
+## v0.109.0 (2026-06-08)
+
+### Feat
+
+- **usage**: rename metrics → tokens_embedded/pages_embedded + export token cost to Prometheus
+- **usage**: meter embedding tokens as embeddings_queries on both paths
+
+### Fix
+
+- **usage**: drop redundant GatewayProvider.embed_batch override (round 3)
+- **usage**: embed query once across doc_types; address review round 1
+
+### Refactor
+
+- **search**: structural per-instance query side-channel; doc search billing gap
+- **usage**: extract indexing metering helper; address review round 2
+
+## v0.108.3 (2026-06-08)
+
+### Fix
+
+- **contacts**: address PR #876 round-2 nits
+- **contacts**: address PR #876 round-1 review
+- **contacts**: resolve real CardDAV object path for delete/update (fixes #874)
+
+## v0.108.2 (2026-06-07)
+
+### Fix
+
+- **vector**: address PR #873 round-2 review
+- **vector**: gate scanner app polls on per-user enabled apps
+
+## v0.108.1 (2026-06-07)
+
+### Fix
+
+- **deck**: include archived cards in list tools for status=all/archived
+
+### Refactor
+
+- **deck**: address PR #872 round-1 review
+
+## v0.108.0 (2026-06-07)
+
+### Feat
+
+- **usage**: record per-tenant usage events into the app DB
+
+### Refactor
+
+- **usage**: final round-6 nits on PR #871
+- **usage**: close out round-5 nits on PR #871
+- **usage**: address round-4 review on PR #871
+- **usage**: address round-3 review on PR #871
+- **usage**: address round-2 review on PR #871
+- **usage**: address round-1 review on PR #871
+
+## v0.107.0 (2026-06-06)
+
+### BREAKING CHANGE
+
+- PDFs are re-chunked page-aware by default. Existing
+deployments will re-index PDF content on the next vector sync (different
+chunk counts and page_number labels). Set DOCUMENT_CHUNK_PAGE_AWARE=false
+to retain the previous char-based behaviour.
+
+### Feat
+
+- **vector**: page-aware PDF chunking for predictable per-page retrieval
+
+### Fix
+
+- **vector**: skip page-assignment span/warning on empty boundaries
+- **vector**: route empty page_boundaries to char-based path; test ws offsets
+
+## v0.106.0 (2026-06-06)
+
+### Feat
+
+- **vector**: index files in real time on vector-index tag changes
+
+## v0.105.0 (2026-06-05)
+
+### Feat
+
+- quality + scan OCR escalation trigger (junk-text-layer scans)
+
+### Fix
+
+- **review**: unify "scanned" flag name + log image_coverage length drift
+- **review**: align classify_pdf routing with the hot path + scan-tail test
+- **review**: align quality threshold, cap + DRY scan coverage, warn on failure
+
+## v0.104.1 (2026-06-05)
+
+### Fix
+
+- close pypdfium2 page handle on error + cover classifier/OCR edge cases
+
+## v0.104.0 (2026-06-05)
+
+### Feat
+
+- tier-3 OCR processor (gateway or direct Mistral)
+- tiered PDF processor with pypdfium2 fast path (deprecate pymupdf4llm)
+
+### Fix
+
+- **review**: _enum_fields validation, gate classify_from_text flags, OCR warnings
+- **review**: lock OCR backend init, warn on rollback fallthrough, zero-page metric
+- **review**: cache OCR backend, drop asserts, real pipeline_tier, guard zero-page
+- OCR escalation falls back to tier-1 result when OCR can't run
+
+## v0.103.0 (2026-06-04)
+
+### Feat
+
+- use Nextcloud filename for indexed file title + reconcile on rename
+
+### Fix
+
+- **review**: guard placeholder in scanner reconcile + test dual-write path
+
+## v0.102.0 (2026-06-04)
+
+### Feat
+
+- tier-0 document classifier in shadow mode
+
+### Fix
+
+- **review**: warn (not debug) on shadow-classify failure; tidy pymupdf usage
+- **review**: sample last page, document flags-vs-routing, add flag-path tests
+
+## v0.101.4 (2026-06-04)
+
+### Fix
+
+- lower DOCUMENT_PDF_GRAPHICS_LIMIT default 5000 -> 1000
+
+## v0.101.3 (2026-06-04)
+
+### Fix
+
+- **tests**: moderate re-scan interval to stop multi-user index churn
+- **tests**: fast vector-sync cadence for multi-user-basic CI service
+- **tests**: repair multi-user-basic Astrolabe integration suite
+
+## v0.101.2 (2026-06-04)
+
+### Fix
+
+- **review**: type timeout as float; document worker reuse + identity check
+- **review**: require graphics_limit>=1, type _index_document, cover rlimit branch
+- **review**: close doc via try/finally; don't count parse failures as indexed
+- isolate PDF parse in a subprocess so a bad file can't OOM the pod
+
+## v0.101.1 (2026-06-04)
+
+### Fix
+
+- resolve startup NameError in vector-sync metrics task
+
+## v0.101.0 (2026-06-04)
+
+### BREAKING CHANGE
+
+- /api/v1/vector-sync/status field `indexed_documents` now holds
+the distinct-document count (was the chunk count); the chunk count moved to the
+new `indexed_chunks` field. The Astrolabe UI + the nc_get_vector_sync_status MCP
+tool / userinfo page are harmonized in a follow-up (Deck #195).
+
+### Feat
+
+- harmonize MCP tool + userinfo page to documents/chunks model
+- backend-agnostic vector-sync gauges (pending/documents/chunks)
+
+### Fix
+
+- add metrics-interval validator + type/test gaps (review #850)
+
+## v0.100.0 (2026-06-04)
+
+### Feat
+
+- add IngestTransport port for local/distributed ingest backends
+
+### Refactor
+
+- address PR #851 review round 5 (ingest transport)
+- address PR #851 review round 4 (ingest transport)
+- address PR #851 review round 3 (ingest transport)
+- address PR #851 review round 2 (ingest transport)
+- address PR #851 review round 1 (ingest transport)
+
+## v0.99.0 (2026-06-04)
+
+### Feat
+
+- dedup shared-file parsing/embedding across users in vector sync
+
+### Fix
+
+- only merge prior acl_principals for files (review #848)
+- **webdav**: harden offset/key truthiness and escape SEARCH mime type
+- **webdav**: await fallback, guard dedup key, split paging for complexity
+- paginate tagged-folder SEARCH so the scanner discovers all files
+
 ## v0.98.1 (2026-06-04)
 
 ### Fix

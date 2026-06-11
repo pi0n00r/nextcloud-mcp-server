@@ -18,7 +18,6 @@ from mcp.types import (
     ToolAnnotations,
 )
 from pydantic import Field
-from qdrant_client.models import Filter
 
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.config import get_settings
@@ -40,11 +39,79 @@ from nextcloud_mcp_server.search.access_filter import (
 from nextcloud_mcp_server.search.bm25_hybrid import BM25HybridSearchAlgorithm
 from nextcloud_mcp_server.search.context import get_chunk_with_context
 from nextcloud_mcp_server.search.verification import verify_search_results
+from nextcloud_mcp_server.usage import UsageEventStore
 from nextcloud_mcp_server.utils.validation import parse_modified_timestamp
-from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
+from nextcloud_mcp_server.vector.metrics_publisher import count_indexed
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
 logger = logging.getLogger(__name__)
+
+# Cap how many doc_types we copy into a usage-metering metadata row. doc_types
+# is caller-supplied and (unlike path_prefixes) has no max_length on the tool
+# signature, so an adversarial caller could pass a huge list. The CP rollup
+# ignores metadata for billing (GROUP BY day, metric) and the value is bound
+# parameterized, so this is not a billing/injection risk — the cap just keeps
+# a single JSONB row from ballooning. 16 is generous headroom over the handful
+# of real indexed doc types.
+_USAGE_METADATA_MAX_DOC_TYPES = 16
+
+
+async def record_search_usage(
+    *,
+    enabled: bool,
+    user_id: str,
+    fusion: str,
+    doc_types: list[str] | None,
+    token_count: int | None,
+) -> None:
+    """Record the billable ``tokens_embedded`` event for one semantic search.
+
+    The value is the query embedding's token count (provider-reported or
+    estimated) — the unit upstream providers bill on, and the same metric the
+    indexing path records for chunk embeddings (Deck #67). ``nc_semantic_search``
+    and ``nc_semantic_search_answer`` (which reuses it) both flow through here —
+    do not add a second hook. ``nc_semantic_search_answer`` exposes no
+    ``doc_types`` parameter, so its searches always meter with
+    ``doc_types=None``.
+
+    Best-effort and flag-gated: a metering failure is logged and never breaks
+    the search. Unlike the indexing path's chunk-count guard, a 0-token query is
+    still recorded (the query embedding ran); a zero-value row is a no-op at the
+    Stripe ``sum`` aggregation.
+
+    Privacy note: ``user_id`` stays tenant-local — the CP rollup aggregates
+    GROUP BY (day, metric) into ``usage_daily`` (no metadata column), so nothing
+    here propagates to Stripe; it is retained only to keep Deck #67's future
+    per-user attribution derivable from app-DB metadata without a re-migration.
+    """
+    if not enabled:
+        return
+    try:
+        store = await UsageEventStore.shared()
+        await store.record_usage_event(
+            metric="tokens_embedded",
+            value=token_count or 0,
+            metadata={
+                "user_id": user_id,
+                "fusion": fusion,
+                # Bounded copy — see _USAGE_METADATA_MAX_DOC_TYPES. Both None and
+                # [] normalize to null so a future metadata->'doc_types' IS NULL
+                # query counts the all-types case consistently.
+                "doc_types": (
+                    doc_types[:_USAGE_METADATA_MAX_DOC_TYPES] if doc_types else None
+                ),
+            },
+            # The caller already confirmed the flag, so pass enabled=True
+            # directly — the store then skips a second uncached Settings build on
+            # this hot query path (ADR-024).
+            enabled=True,
+        )
+    except Exception:
+        # Reached only when shared()/store construction itself raises
+        # (record_usage_event swallows its own write failures). Metering is on,
+        # so warn — a silent DEBUG line would hide "operator enabled metering
+        # but gets no data".
+        logger.warning("usage metering hook (tokens_embedded) skipped", exc_info=True)
 
 
 def configure_semantic_tools(mcp: FastMCP):
@@ -518,6 +585,30 @@ def configure_semantic_tools(mcp: FastMCP):
 
             logger.info("Returning %d results from BM25 hybrid search", len(results))
 
+            # Usage metering (Deck #67): record the query embedding's token
+            # count as a billable 'tokens_embedded' event. query_token_count
+            # is set by BM25HybridSearchAlgorithm during the search() above; the
+            # doc_types loop reuses one search_algo instance for the same query
+            # and the algorithm caches the dense embedding per query, so the
+            # query is embedded — and metered — exactly once regardless of how
+            # many doc_types were searched. See record_search_usage for the
+            # metric/privacy details.
+            #
+            # NOTE (v1 billing gap): this fires only on a fully successful
+            # search. If the query embed succeeded (provider billed the tokens,
+            # and Prometheus recorded them via record_embedding_tokens) but a
+            # later step (Qdrant/verify) raised, no tokens_embedded row is
+            # written — the embed cost is real but absent from the billing
+            # ledger. Acceptable for v1 (search failures are rare and the meter
+            # is not billed today); revisit if billing accuracy needs it.
+            await record_search_usage(
+                enabled=settings.usage_metering_enabled,
+                user_id=username,
+                fusion=fusion,
+                doc_types=doc_types,
+                token_count=search_algo.query_token_count,
+            )
+
             return SemanticSearchResponse(
                 results=results,
                 query=query,
@@ -982,28 +1073,27 @@ def configure_semantic_tools(mcp: FastMCP):
                 ingest_queue=settings.ingest_queue,
             )
 
-            # Get Qdrant client and query indexed count
-            indexed_count = 0
+            # Corpus size: distinct documents AND total chunks (placeholders
+            # excluded). A single "indexed" figure is ambiguous because each
+            # document fans out to ~N chunks.
+            indexed_documents = 0
+            indexed_chunks = 0
             try:
                 qdrant_client = await get_qdrant_client()
-
-                # Count documents in collection, excluding placeholders
-                # Placeholders are zero-vector points used to track processing state
-                count_result = await qdrant_client.count(
-                    collection_name=settings.get_collection_name(),
-                    count_filter=Filter(must=[get_placeholder_filter()]),
+                indexed_documents, indexed_chunks = await count_indexed(
+                    qdrant_client, settings.get_collection_name()
                 )
-                indexed_count = count_result.count
-
             except Exception as e:
-                logger.warning("Failed to query Qdrant for indexed count: %s", e)
-                # Continue with indexed_count = 0
+                logger.warning("Failed to query Qdrant for indexed counts: %s", e)
+                # Continue with zeroed counts
 
             # Determine status
             status = "syncing" if pending.pending > 0 else "idle"
 
             return VectorSyncStatusResponse(
-                indexed_count=indexed_count,
+                indexed_documents=indexed_documents,
+                indexed_chunks=indexed_chunks,
+                indexed_count=indexed_chunks,  # deprecated alias
                 pending_count=pending.pending,
                 status=status,
                 enabled=True,

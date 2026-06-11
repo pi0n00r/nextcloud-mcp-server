@@ -2,30 +2,130 @@
 
 Currently covers ``find_files_by_tag``: the wrapper that combines
 ``WebDAVClient.get_tag_by_name``, ``WebDAVClient.get_files_by_tag``, and
-``WebDAVClient.find_by_type`` to resolve a system tag (and any tagged
+``WebDAVClient.find_all_by_type`` to resolve a system tag (and any tagged
 folders) into a flat list of files.
 """
 
-from unittest.mock import AsyncMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nextcloud_mcp_server.client import NextcloudClient, _normalise_search_result
 
 
-def _make_client() -> NextcloudClient:
+def _make_client() -> Any:
     """Build a NextcloudClient with mocked sub-clients.
 
     The client constructor opens an httpx session; we don't need it, just
-    a stub instance whose ``webdav`` attribute we can replace.
+    a stub instance whose ``webdav`` attribute we can replace. Returned as
+    ``Any`` so tests can freely reassign mocked methods on the sub-clients
+    without fighting the real ``WebDAVClient`` signatures.
     """
-    client = NextcloudClient.__new__(NextcloudClient)
+    client: Any = NextcloudClient.__new__(NextcloudClient)
     client.username = "alice"
     client.webdav = AsyncMock()
     return client
 
 
 pytestmark = pytest.mark.unit
+
+
+def _navigation_response(entries: list[dict]) -> MagicMock:
+    """Build a mocked OCS v2 ``core/navigation/apps`` response."""
+    response = MagicMock()
+    response.status_code = 200
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {"ocs": {"meta": {}, "data": entries}}
+    return response
+
+
+class TestGetEnabledApps:
+    async def test_returns_app_ids_from_navigation(self):
+        client = _make_client()
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(
+            return_value=_navigation_response(
+                [
+                    {"id": "files", "app": "files"},
+                    {"id": "notes", "app": "notes"},
+                    {"id": "deck", "app": "deck"},
+                    {"id": "news", "app": "news"},
+                ]
+            )
+        )
+
+        apps = await client.get_enabled_apps()
+
+        assert apps == {"files", "notes", "deck", "news"}
+        # Hits the per-user navigation endpoint, not capabilities.
+        assert (
+            client._client.get.await_args.args[0] == "/ocs/v2.php/core/navigation/apps"
+        )
+
+    async def test_unions_id_and_app_keys(self):
+        """When ``id`` and ``app`` differ, both are collected so an enabled
+        app is never hidden by an unexpected nav-entry id."""
+        client = _make_client()
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(
+            return_value=_navigation_response([{"id": "files_sharing", "app": "files"}])
+        )
+
+        apps = await client.get_enabled_apps()
+
+        assert apps == {"files", "files_sharing"}
+
+    async def test_empty_navigation_returns_empty_set(self):
+        client = _make_client()
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(return_value=_navigation_response([]))
+
+        assert await client.get_enabled_apps() == set()
+
+    async def test_skips_entries_missing_both_keys(self):
+        client = _make_client()
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(
+            return_value=_navigation_response(
+                [{"name": "Logout", "href": "/logout"}, {"app": "notes"}]
+            )
+        )
+
+        assert await client.get_enabled_apps() == {"notes"}
+
+    @pytest.mark.parametrize("body", [{}, {"ocs": None}, {"ocs": {"data": None}}])
+    async def test_malformed_envelope_returns_empty_set(self, body):
+        """A missing/null ``ocs``/``data`` envelope yields an empty set rather
+        than raising. NOTE: an empty set does NOT trigger the
+        ``_get_enabled_apps_or_none`` scan-all fallback (that fires only on
+        exceptions) — all optional apps are gated off for this scan cycle, with
+        Files unaffected (unconditional) and the next cycle retrying normally."""
+        client = _make_client()
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = body
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(return_value=response)
+
+        assert await client.get_enabled_apps() == set()
+
+    async def test_ocs_failure_status_raises(self):
+        """A 200 with ``ocs.meta.status == "failure"`` raises so the scanner's
+        ``_get_enabled_apps_or_none`` falls back to scanning all apps, instead
+        of silently gating every app off on the empty ``data`` of a failure
+        envelope."""
+        client = _make_client()
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {
+            "ocs": {"meta": {"status": "failure", "statuscode": 997}, "data": None}
+        }
+        client._client = AsyncMock()
+        client._client.get = AsyncMock(return_value=response)
+
+        with pytest.raises(ValueError, match="failure"):
+            await client.get_enabled_apps()
 
 
 class TestNormaliseSearchResult:
@@ -99,7 +199,7 @@ class TestFindFilesByTag:
         result = await client.find_files_by_tag("vector-index")
 
         assert result == []
-        client.webdav.find_by_type.assert_not_called()
+        client.webdav.find_all_by_type.assert_not_called()
 
     async def test_directly_tagged_files_pass_through_with_mime_filter(self):
         client = _make_client()
@@ -127,7 +227,7 @@ class TestFindFilesByTag:
 
         assert {f["id"] for f in result} == {1}
         # No tagged dirs → no SEARCH walk.
-        client.webdav.find_by_type.assert_not_called()
+        client.webdav.find_all_by_type.assert_not_called()
 
     async def test_expands_tagged_directory_into_pdf_descendants(self):
         client = _make_client()
@@ -144,7 +244,7 @@ class TestFindFilesByTag:
             ]
         )
         # Search inside the folder returns two PDFs.
-        client.webdav.find_by_type = AsyncMock(
+        client.webdav.find_all_by_type = AsyncMock(
             return_value=[
                 {
                     "file_id": 11,
@@ -174,8 +274,8 @@ class TestFindFilesByTag:
             assert f["last_modified_timestamp"] is not None
         # SEARCH was scoped to the tagged folder (no leading slash) and
         # forwarded the requested MIME type as the positional first arg.
-        client.webdav.find_by_type.assert_awaited_once()
-        call_args = client.webdav.find_by_type.await_args
+        client.webdav.find_all_by_type.assert_awaited_once()
+        call_args = client.webdav.find_all_by_type.await_args
         assert call_args.args[0] == "application/pdf"
         assert call_args.kwargs["scope"] == "corpus"
 
@@ -199,7 +299,7 @@ class TestFindFilesByTag:
                 },
             ]
         )
-        client.webdav.find_by_type = AsyncMock(
+        client.webdav.find_all_by_type = AsyncMock(
             return_value=[
                 {
                     "file_id": 11,
@@ -244,7 +344,9 @@ class TestFindFilesByTag:
                 },
             ]
         )
-        client.webdav.find_by_type = AsyncMock(side_effect=RuntimeError("REPORT 500"))
+        client.webdav.find_all_by_type = AsyncMock(
+            side_effect=RuntimeError("REPORT 500")
+        )
 
         import logging
 
@@ -282,10 +384,10 @@ class TestFindFilesByTag:
         # Without a MIME filter, directory expansion would fan out
         # uncontrollably — the helper deliberately skips it.
         assert {f["id"] for f in result} == {7}
-        client.webdav.find_by_type.assert_not_called()
+        client.webdav.find_all_by_type.assert_not_called()
 
     async def test_skips_descendant_directories_in_search_results(self):
-        """find_by_type can return collections too (e.g. when the SEARCH
+        """find_all_by_type can return collections too (e.g. when the SEARCH
         backend treats a folder's mime type as matching). Those must not
         slip through and clobber file IDs."""
         client = _make_client()
@@ -300,7 +402,7 @@ class TestFindFilesByTag:
                 }
             ]
         )
-        client.webdav.find_by_type = AsyncMock(
+        client.webdav.find_all_by_type = AsyncMock(
             return_value=[
                 {
                     "file_id": 50,

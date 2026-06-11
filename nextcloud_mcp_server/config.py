@@ -37,6 +37,11 @@ _DEFAULTS: dict[str, Any] = {
     "cookie_secure": None,
     # OAuth/OIDC
     "oidc_discovery_url": None,
+    # Keys must uppercase to the env var dynaconf reads (ignore_unknown_envvars):
+    # NEXTCLOUD_OIDC_TOKEN_TYPE / NEXTCLOUD_OIDC_SCOPES, matching _field_map.
+    "nextcloud_oidc_token_type": "Bearer",
+    "nextcloud_oidc_scopes": "",
+    "port": 8000,
     "nextcloud_oidc_client_id": None,
     "nextcloud_oidc_client_secret": None,
     "oidc_issuer": None,
@@ -88,7 +93,9 @@ _DEFAULTS: dict[str, Any] = {
     "vector_sync_scan_interval": 300,
     "vector_sync_processor_workers": 3,
     "vector_sync_queue_max_size": 10000,
+    "vector_sync_metrics_refresh_interval": 20,
     "vector_sync_user_poll_interval": 60,
+    "health_ready_refresh_interval": 15,
     # Orphan-sweep at Pod startup (card #101). When True, delete any
     # placeholders carrying a different / absent ``instance_id`` before
     # the scanner's first cycle, so a Pod restart mid-batch doesn't
@@ -131,6 +138,36 @@ _DEFAULTS: dict[str, Any] = {
     # Document chunking
     "document_chunk_size": 2048,
     "document_chunk_overlap": 200,
+    # Page-aware chunking for paginated docs (PDFs): split on page boundaries
+    # first so no chunk spans a page (exact page_number, clean snippets, and
+    # predictable ~1 chunk/page when chunk_size >= the largest page).
+    "document_chunk_page_aware": True,
+    # PDF parse isolation (OOM guard)
+    "document_pdf_graphics_limit": 1000,
+    "document_parse_timeout_seconds": 120.0,
+    "document_parse_mem_limit_mb": 1536,
+    # Tier-0 classifier (records classification metrics on the tiered path)
+    "document_classify_enabled": True,
+    # Tiered PDF pipeline: pypdfium2 is the default/only hot-path extractor;
+    # "pymupdf" is a deprecated rollback escape hatch. OCR (tier-3) is the only
+    # escalation target and is off by default (no provider wired yet).
+    "document_tier1_engine": "pypdfium2",
+    "document_ocr_enabled": False,
+    # OCR backend: "auto" picks gateway (if EMBEDDING_GATEWAY_URL) else mistral
+    # (if MISTRAL_API_KEY); "gateway"/"mistral" force one; "none" disables.
+    "document_ocr_provider": "auto",
+    # Provider-namespaced OCR model id (gateway routes on the prefix; the direct
+    # mistral backend strips it).
+    "document_ocr_model": "mistral/mistral-ocr-latest",
+    # OCR escalation triggers (tier-0). A page is OCR-worthy when its text is
+    # near-empty (< min_page_chars) OR low-quality (< min_text_quality) OR (when
+    # detect_scanned) mostly a raster image; a doc escalates when the OCR-worthy
+    # page fraction reaches page_fraction. Calibrate min_text_quality from the
+    # bridgette_document_text_quality histogram per tenant.
+    "document_ocr_min_text_quality": 0.5,
+    "document_ocr_page_fraction": 0.5,
+    "document_ocr_min_page_chars": 16,
+    "document_ocr_detect_scanned": True,
     # Observability
     "metrics_enabled": True,
     "metrics_port": 9090,
@@ -213,6 +250,11 @@ _DEFAULTS: dict[str, Any] = {
     # this before a real ACL backfill would silently drop legacy results.
     # verify-on-read remains the correctness backstop regardless.
     "acl_prefilter_enabled": False,
+    # Usage metering (Deck #67, control-plane usage-metering.md). OFF by
+    # default so OSS self-hosters don't accrue a metering table or write
+    # overhead; Astrolabe Cloud provisioning sets it true. When on, billable
+    # ops record rows into the app-DB usage_events table (best-effort).
+    "usage_metering_enabled": False,
 }
 
 
@@ -270,14 +312,27 @@ _dynaconf = Dynaconf(
         Validator("VECTOR_SYNC_SCAN_INTERVAL", gte=1),
         Validator("VECTOR_SYNC_PROCESSOR_WORKERS", gte=1),
         Validator("VECTOR_SYNC_QUEUE_MAX_SIZE", gte=1),
+        Validator("VECTOR_SYNC_METRICS_REFRESH_INTERVAL", gte=1),
         Validator("VECTOR_SYNC_USER_POLL_INTERVAL", gte=1),
+        Validator("HEALTH_READY_REFRESH_INTERVAL", gte=1),
+        Validator("PORT", gte=1, lte=65535),
         Validator("VERIFICATION_CONCURRENCY", gte=1),
         Validator("DOCUMENT_CHUNK_SIZE", gte=1),
+        Validator("DOCUMENT_PARSE_TIMEOUT_SECONDS", gte=1),
+        Validator("DOCUMENT_PARSE_MEM_LIMIT_MB", gte=128),
+        # >=1: pymupdf4llm treats graphics_limit=0 as "no cap", which would
+        # re-expose the OOM this guards against.
+        Validator("DOCUMENT_PDF_GRAPHICS_LIMIT", gte=1),
+        # OCR escalation thresholds: quality + page-fraction are [0, 1].
+        Validator("DOCUMENT_OCR_MIN_TEXT_QUALITY", gte=0, lte=1),
+        Validator("DOCUMENT_OCR_PAGE_FRACTION", gte=0, lte=1),
+        Validator("DOCUMENT_OCR_MIN_PAGE_CHARS", gte=0),
         # Non-negative
         Validator("DOCUMENT_CHUNK_OVERLAP", gte=0),
         # Non-empty strings
         Validator("VECTOR_SYNC_PDF_TAG", len_min=1),
-        # Enum constraints
+        # Enum constraints (document_* enums are validated + normalized in
+        # __post_init__ via _enum_fields instead, for case-insensitive input).
         Validator("LOG_FORMAT", is_in=["text", "json"]),
         Validator(
             "LOG_LEVEL",
@@ -553,6 +608,9 @@ class Settings:
     oidc_client_secret: str | None = None
     oidc_issuer: str | None = None
     oidc_resource_server_id: str | None = None
+    oidc_token_type: str = "Bearer"  # NEXTCLOUD_OIDC_TOKEN_TYPE
+    oidc_scopes: str = ""  # NEXTCLOUD_OIDC_SCOPES (space-separated)
+    port: int = 8000  # Server port (PORT); used to build fallback URLs
 
     # Nextcloud settings
     nextcloud_host: str | None = None
@@ -645,8 +703,16 @@ class Settings:
     vector_sync_scan_interval: int = 300  # seconds (5 minutes)
     vector_sync_processor_workers: int = 3
     vector_sync_queue_max_size: int = 10000
+    # Cadence for the periodic gauge publisher (vector/metrics_publisher.py):
+    # outstanding-work + indexed documents/chunks. Decoupled from the consumer
+    # so the gauges are correct on every deployment mode and queue backend.
+    vector_sync_metrics_refresh_interval: int = 20  # seconds
     vector_sync_user_poll_interval: int = 60  # seconds - OAuth mode user discovery
     vector_sync_orphan_sweep_enabled: bool = True  # card #101
+    # Cadence for the background readiness dependency-health refresh loop
+    # (app.py): keeps the Nextcloud/Qdrant snapshot warm off the probe path so
+    # /health/ready never does external I/O (Deck #302).
+    health_ready_refresh_interval: int = 15  # seconds
     # System tag marking files for vector indexing. The scanner indexes files
     # carrying this tag and verify-on-read gates results on current membership
     # (ADR-019), so an untagged file drops out of search immediately.
@@ -694,6 +760,55 @@ class Settings:
     # Document chunking settings (for vector embeddings)
     document_chunk_size: int = 2048  # Characters per chunk
     document_chunk_overlap: int = 200  # Overlapping characters between chunks
+    # Page-aware chunking for paginated docs (PDFs). When True (default), PDF
+    # text is split on page boundaries first (one chunk per page; oversized
+    # pages are character-split within the page), giving exact page numbers,
+    # snippets that never lead with a neighbouring page, and a predictable
+    # ~1 chunk/page when document_chunk_size >= the largest page. When False,
+    # the legacy char-based path runs with post-hoc assign_page_numbers.
+    document_chunk_page_aware: bool = True
+
+    # PDF parse isolation (OOM guard). The parse runs in a subprocess so one
+    # pathological file fails that doc, not the pod.
+    # to_markdown graphics cap: pages with more vector drawings than this skip
+    # the O(n^2) find_tables analysis. Must be >=1 -- pymupdf4llm treats 0 as
+    # "no cap", which re-exposes the OOM. Default 1000: form/table PDFs have
+    # ~1.5k grid-line drawings per page, which at the old 5000 cap slipped
+    # through uncapped and timed out after ~17s/page (for zero recovered
+    # tables); at 1000 they parse in ~3s with identical text. Pages with genuine
+    # simple tables (<1000 drawings) still get table detection.
+    document_pdf_graphics_limit: int = 1000
+    # wall-clock cap per parse; the worker subprocess is killed on timeout.
+    # float so a fractional DOCUMENT_PARSE_TIMEOUT_SECONDS is honoured, matching
+    # anyio.move_on_after's float seconds.
+    document_parse_timeout_seconds: float = 120.0
+    # RLIMIT_AS in the parse subprocess (below the pod limit). Applied once per
+    # worker for its lifetime, so changing it needs a pod restart.
+    document_parse_mem_limit_mb: int = 1536
+    # Tier-0 classifier. Records classification metrics (recommended_tier,
+    # text-quality) on the tiered path, derived from the tier-1 extraction.
+    document_classify_enabled: bool = True
+    # PDF extraction engine for the ``fast`` tier. "pypdfium2" (default,
+    # permissive license, no find_tables) is the hot path; "pymupdf" is a
+    # deprecated rollback to pymupdf4llm (AGPL, graphics-limited) for one corpus.
+    document_tier1_engine: str = "pypdfium2"
+    # Route scanned/no-text-layer PDFs to the tier-3 OCR provider. Off by
+    # default; when off, the fast tier is terminal.
+    document_ocr_enabled: bool = False
+    # OCR backend selection: "auto" | "gateway" | "mistral" | "none".
+    document_ocr_provider: str = "auto"
+    # Provider-namespaced OCR model id (e.g. "mistral/mistral-ocr-latest"). The
+    # gateway routes on the "<provider>/" prefix; the direct mistral backend
+    # strips it.
+    document_ocr_model: str = "mistral/mistral-ocr-latest"
+    # OCR escalation triggers (tier-0), per-tenant tunable. A page is OCR-worthy
+    # if near-empty (< min_page_chars) OR low text-quality (< min_text_quality)
+    # OR (when detect_scanned, image-analysis only runs when OCR is enabled)
+    # mostly a raster image; the doc escalates at >= page_fraction such pages.
+    document_ocr_min_text_quality: float = 0.5
+    document_ocr_page_fraction: float = 0.5
+    document_ocr_min_page_chars: int = 16
+    document_ocr_detect_scanned: bool = True
 
     # Observability settings
     metrics_enabled: bool = True
@@ -734,6 +849,10 @@ class Settings:
     embedding_gateway_scope: str | None = None
     tenant_id: str | None = None  # per-tenant identity (UUID form)
     acl_prefilter_enabled: bool = False  # query-side ACL pre-filter (§11); OFF
+    # Usage metering (Deck #67); OFF by default. When true, billable ops
+    # record best-effort rows into the app-DB usage_events table for the
+    # control plane to pull. See nextcloud_mcp_server/usage/store.py.
+    usage_metering_enabled: bool = False
 
     def __post_init__(self):
         """Validate configuration and set defaults."""
@@ -821,6 +940,8 @@ class Settings:
             "embedding_provider": {"autodetect", "gateway"},
             "mcp_role": {"api", "worker", "all"},
             "collection_metadata_source": {"qdrant", "api"},
+            "document_tier1_engine": {"pypdfium2", "pymupdf"},
+            "document_ocr_provider": {"auto", "gateway", "mistral", "none"},
         }
         for _field, _allowed in _enum_fields.items():
             _val = (getattr(self, _field) or "").strip().lower()
@@ -1230,6 +1351,9 @@ def get_settings() -> Settings:
         "oidc_client_secret": "NEXTCLOUD_OIDC_CLIENT_SECRET",
         "oidc_issuer": "OIDC_ISSUER",
         "oidc_resource_server_id": "OIDC_RESOURCE_SERVER_ID",
+        "oidc_token_type": "NEXTCLOUD_OIDC_TOKEN_TYPE",
+        "oidc_scopes": "NEXTCLOUD_OIDC_SCOPES",
+        "port": "PORT",
         # Nextcloud settings
         "nextcloud_host": "NEXTCLOUD_HOST",
         "nextcloud_username": "NEXTCLOUD_USERNAME",
@@ -1267,8 +1391,10 @@ def get_settings() -> Settings:
         "vector_sync_scan_interval": "VECTOR_SYNC_SCAN_INTERVAL",
         "vector_sync_processor_workers": "VECTOR_SYNC_PROCESSOR_WORKERS",
         "vector_sync_queue_max_size": "VECTOR_SYNC_QUEUE_MAX_SIZE",
+        "vector_sync_metrics_refresh_interval": "VECTOR_SYNC_METRICS_REFRESH_INTERVAL",
         "vector_sync_user_poll_interval": "VECTOR_SYNC_USER_POLL_INTERVAL",
         "vector_sync_orphan_sweep_enabled": "VECTOR_SYNC_ORPHAN_SWEEP_ENABLED",
+        "health_ready_refresh_interval": "HEALTH_READY_REFRESH_INTERVAL",
         "vector_sync_pdf_tag": "VECTOR_SYNC_PDF_TAG",
         # Verify-on-read (ADR-019)
         "verification_concurrency": "VERIFICATION_CONCURRENCY",
@@ -1302,6 +1428,19 @@ def get_settings() -> Settings:
         # Document chunking settings
         "document_chunk_size": "DOCUMENT_CHUNK_SIZE",
         "document_chunk_overlap": "DOCUMENT_CHUNK_OVERLAP",
+        "document_chunk_page_aware": "DOCUMENT_CHUNK_PAGE_AWARE",
+        "document_pdf_graphics_limit": "DOCUMENT_PDF_GRAPHICS_LIMIT",
+        "document_parse_timeout_seconds": "DOCUMENT_PARSE_TIMEOUT_SECONDS",
+        "document_parse_mem_limit_mb": "DOCUMENT_PARSE_MEM_LIMIT_MB",
+        "document_classify_enabled": "DOCUMENT_CLASSIFY_ENABLED",
+        "document_tier1_engine": "DOCUMENT_TIER1_ENGINE",
+        "document_ocr_enabled": "DOCUMENT_OCR_ENABLED",
+        "document_ocr_provider": "DOCUMENT_OCR_PROVIDER",
+        "document_ocr_model": "DOCUMENT_OCR_MODEL",
+        "document_ocr_min_text_quality": "DOCUMENT_OCR_MIN_TEXT_QUALITY",
+        "document_ocr_page_fraction": "DOCUMENT_OCR_PAGE_FRACTION",
+        "document_ocr_min_page_chars": "DOCUMENT_OCR_MIN_PAGE_CHARS",
+        "document_ocr_detect_scanned": "DOCUMENT_OCR_DETECT_SCANNED",
         # Observability settings
         "metrics_enabled": "METRICS_ENABLED",
         "metrics_port": "METRICS_PORT",
@@ -1330,6 +1469,7 @@ def get_settings() -> Settings:
         "embedding_gateway_scope": "EMBEDDING_GATEWAY_SCOPE",
         "tenant_id": "TENANT_ID",
         "acl_prefilter_enabled": "ACL_PREFILTER_ENABLED",
+        "usage_metering_enabled": "USAGE_METERING_ENABLED",
     }
 
     # Only pass values that dynaconf actually has; omit unset keys so
