@@ -714,6 +714,28 @@ class CalendarClient:
         except caldav_error.NotFoundError as e:
             logger.debug("Todo %s not found: %s", todo_uid, e)
             return {"status_code": 404}
+        except caldav_error.AuthorizationError as e:
+            # NC Sabre rejects bare DELETE on iMIP-scheduled VTODOs (UID with
+            # @<domain> form) without going through an iTip CANCEL flow; the
+            # rejection surfaces as 403 Forbidden. Return a structured response
+            # with a workaround suggestion instead of letting the raw caldav
+            # exception bubble to the MCP caller.
+            logger.debug(
+                "Todo %s DELETE rejected (%s) - likely iMIP-scheduled",
+                todo_uid,
+                e,
+            )
+            return {
+                "status_code": 403,
+                "error": (
+                    "server rejected DELETE; VTODO may be iMIP-scheduled "
+                    "(UID with @<domain> form)"
+                ),
+                "suggestion": (
+                    "use update_todo with status=COMPLETED, or recreate with "
+                    "bare-string UID for DELETE compatibility"
+                ),
+            }
 
     async def search_todos_across_calendars(
         self, filters: dict[str, Any] | None = None
