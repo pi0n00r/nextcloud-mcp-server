@@ -146,6 +146,10 @@ _DEFAULTS: dict[str, Any] = {
     "document_pdf_graphics_limit": 1000,
     "document_parse_timeout_seconds": 120.0,
     "document_parse_mem_limit_mb": 1536,
+    # Pre-parse size cap (MB): PDFs larger than this fail fast with reason
+    # "oversize" instead of burning the OCR timeout to 0 chars on a pathological
+    # file. 0 disables the guard.
+    "document_max_pdf_size_mb": 50.0,
     # Tier-0 classifier (records classification metrics on the tiered path)
     "document_classify_enabled": True,
     # Tiered PDF pipeline: pypdfium2 is the default/only hot-path extractor;
@@ -168,6 +172,10 @@ _DEFAULTS: dict[str, Any] = {
     "document_ocr_page_fraction": 0.5,
     "document_ocr_min_page_chars": 16,
     "document_ocr_detect_scanned": True,
+    # OCR backend request timeout (seconds). Slow scanned newspapers can take
+    # 20-60s; raise/lower per tenant. Configurable so a tenant isn't stuck with
+    # the 180s default when its gateway has its own shorter ceiling.
+    "document_ocr_timeout_seconds": 180.0,
     # Observability
     "metrics_enabled": True,
     "metrics_port": 9090,
@@ -226,6 +234,29 @@ _DEFAULTS: dict[str, Any] = {
     # queue-depth metric clean). Set false to retain succeeded rows for audit
     # (note: indexing success is also recorded in logs/metrics regardless).
     "ingest_delete_succeeded_jobs": True,
+    # Per-tier escalation on the procrastinate (postgres) ingest path (Deck
+    # #323). When true, a document that a tier cannot parse well is requeued onto
+    # the next tier's queue (fast -> structured -> ocr) via a native procrastinate
+    # queue-hop. When false the ``fast`` tier is terminal -- reproduces the
+    # pre-#323 behaviour where the cheap tier's output is indexed as-is. No effect
+    # on the in-process ``memory`` backend, which keeps the inline escalation.
+    # HOT: re-read per job (process_document_task), so it takes effect on the next
+    # job -- unlike INGEST_TRANSIENT_MAX_ATTEMPTS, which is snapshotted at worker
+    # startup and needs a restart.
+    "ingest_escalation_enabled": True,
+    # Global cap on SAME-tier retries for transient infra errors (doc fetch /
+    # embed / Qdrant blips) on the procrastinate path. Parse-quality failures
+    # escalate (one parse attempt per tier) and do NOT consume this budget; only
+    # whitelisted transient exceptions retry in place. Shared across tiers because
+    # a queue-hop cannot reset a per-tier counter (see TieredEscalationStrategy).
+    # Snapshotted at worker startup (blueprint build); restart to change it.
+    "ingest_transient_max_attempts": 5,
+    # Delay (seconds) before a reclaimed stalled job is re-run. A stall is often
+    # systemic (Qdrant/embedding outage), so reclaiming every crashed job at
+    # now() would thundering-herd a recovering dependency every reclaim tick
+    # (*/5min), bypassing TieredEscalationStrategy's per-job backoff. A small
+    # fixed delay staggers the retry. 0 = immediate (legacy behaviour).
+    "ingest_reclaim_retry_delay_seconds": 30,
     "collection_metadata_source": "qdrant",  # qdrant | api
     # CP base URL for COLLECTION_METADATA_SOURCE=api (e.g. http://control-plane).
     # Required only when the source is api.
@@ -309,6 +340,8 @@ _dynaconf = Dynaconf(
         Validator("METRICS_PORT", gte=1, lte=65535),
         # Positive integers
         Validator("INGEST_STALLED_JOB_SECONDS", gte=1),
+        Validator("INGEST_TRANSIENT_MAX_ATTEMPTS", gte=1),
+        Validator("INGEST_RECLAIM_RETRY_DELAY_SECONDS", gte=0),
         Validator("VECTOR_SYNC_SCAN_INTERVAL", gte=1),
         Validator("VECTOR_SYNC_PROCESSOR_WORKERS", gte=1),
         Validator("VECTOR_SYNC_QUEUE_MAX_SIZE", gte=1),
@@ -319,7 +352,10 @@ _dynaconf = Dynaconf(
         Validator("VERIFICATION_CONCURRENCY", gte=1),
         Validator("DOCUMENT_CHUNK_SIZE", gte=1),
         Validator("DOCUMENT_PARSE_TIMEOUT_SECONDS", gte=1),
+        Validator("DOCUMENT_OCR_TIMEOUT_SECONDS", gte=1),
         Validator("DOCUMENT_PARSE_MEM_LIMIT_MB", gte=128),
+        # 0 disables the pre-parse PDF size cap; otherwise it must be positive.
+        Validator("DOCUMENT_MAX_PDF_SIZE_MB", gte=0),
         # >=1: pymupdf4llm treats graphics_limit=0 as "no cap", which would
         # re-expose the OOM this guards against.
         Validator("DOCUMENT_PDF_GRAPHICS_LIMIT", gte=1),
@@ -782,6 +818,11 @@ class Settings:
     # float so a fractional DOCUMENT_PARSE_TIMEOUT_SECONDS is honoured, matching
     # anyio.move_on_after's float seconds.
     document_parse_timeout_seconds: float = 120.0
+    # Pre-parse PDF size cap (MB). A PDF larger than this fails fast with
+    # parse_failed_reason="oversize" (placeholder marked "failed") rather than
+    # being handed to the fast/OCR tiers, where a pathological large file burns
+    # the OCR timeout for 0 chars. 0 disables the guard.
+    document_max_pdf_size_mb: float = 50.0
     # RLIMIT_AS in the parse subprocess (below the pod limit). Applied once per
     # worker for its lifetime, so changing it needs a pod restart.
     document_parse_mem_limit_mb: int = 1536
@@ -801,6 +842,10 @@ class Settings:
     # gateway routes on the "<provider>/" prefix; the direct mistral backend
     # strips it.
     document_ocr_model: str = "mistral/mistral-ocr-latest"
+    # OCR backend HTTP request timeout (seconds). float for parity with the
+    # parse timeout / httpx.Timeout; per-tenant tunable so a gateway with a
+    # shorter ceiling isn't masked by the 180s default.
+    document_ocr_timeout_seconds: float = 180.0
     # OCR escalation triggers (tier-0), per-tenant tunable. A page is OCR-worthy
     # if near-empty (< min_page_chars) OR low text-quality (< min_text_quality)
     # OR (when detect_scanned, image-analysis only runs when OCR is enabled)
@@ -836,6 +881,9 @@ class Settings:
     mcp_role: str = "all"  # api | worker | all (Deck #183 two-pod model)
     ingest_stalled_job_seconds: int = 300  # crashed-worker reclaim threshold
     ingest_delete_succeeded_jobs: bool = True  # drop succeeded ingest jobs
+    ingest_escalation_enabled: bool = True  # per-tier queue-hop (Deck #323)
+    ingest_transient_max_attempts: int = 5  # same-tier transient-retry cap
+    ingest_reclaim_retry_delay_seconds: int = 30  # stagger reclaimed-job retries
     collection_metadata_source: str = "qdrant"  # qdrant | api
     collection_metadata_api_url: str | None = None  # CP URL when source=api
     embedding_gateway_url: str | None = None  # required when provider=gateway
@@ -1431,12 +1479,14 @@ def get_settings() -> Settings:
         "document_chunk_page_aware": "DOCUMENT_CHUNK_PAGE_AWARE",
         "document_pdf_graphics_limit": "DOCUMENT_PDF_GRAPHICS_LIMIT",
         "document_parse_timeout_seconds": "DOCUMENT_PARSE_TIMEOUT_SECONDS",
+        "document_max_pdf_size_mb": "DOCUMENT_MAX_PDF_SIZE_MB",
         "document_parse_mem_limit_mb": "DOCUMENT_PARSE_MEM_LIMIT_MB",
         "document_classify_enabled": "DOCUMENT_CLASSIFY_ENABLED",
         "document_tier1_engine": "DOCUMENT_TIER1_ENGINE",
         "document_ocr_enabled": "DOCUMENT_OCR_ENABLED",
         "document_ocr_provider": "DOCUMENT_OCR_PROVIDER",
         "document_ocr_model": "DOCUMENT_OCR_MODEL",
+        "document_ocr_timeout_seconds": "DOCUMENT_OCR_TIMEOUT_SECONDS",
         "document_ocr_min_text_quality": "DOCUMENT_OCR_MIN_TEXT_QUALITY",
         "document_ocr_page_fraction": "DOCUMENT_OCR_PAGE_FRACTION",
         "document_ocr_min_page_chars": "DOCUMENT_OCR_MIN_PAGE_CHARS",
@@ -1459,6 +1509,9 @@ def get_settings() -> Settings:
         "mcp_role": "MCP_ROLE",
         "ingest_stalled_job_seconds": "INGEST_STALLED_JOB_SECONDS",
         "ingest_delete_succeeded_jobs": "INGEST_DELETE_SUCCEEDED_JOBS",
+        "ingest_escalation_enabled": "INGEST_ESCALATION_ENABLED",
+        "ingest_transient_max_attempts": "INGEST_TRANSIENT_MAX_ATTEMPTS",
+        "ingest_reclaim_retry_delay_seconds": "INGEST_RECLAIM_RETRY_DELAY_SECONDS",
         "collection_metadata_source": "COLLECTION_METADATA_SOURCE",
         "collection_metadata_api_url": "COLLECTION_METADATA_API_URL",
         "embedding_gateway_url": "EMBEDDING_GATEWAY_URL",

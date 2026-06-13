@@ -190,6 +190,21 @@ vector_sync_indexed_chunks = Gauge(
     "Total indexed chunks (non-placeholder points) in the vector store",
 )
 
+# Per-tier-queue ingest depth (Deck #323). One series per (queue, status) so an
+# operator can see where work sits -- a ``fast`` backlog, docs waiting on
+# ``ingest-structured``/``ingest-ocr``, or failures piling up per tier. KEDA
+# scales each tier Deployment off the queue's ``todo`` depth via direct SQL; this
+# gauge is the dashboard/alerting view of the same figures. Published by the
+# periodic vector_sync metrics task from the procrastinate per-queue job counts.
+ingest_queue_depth = Gauge(
+    "bridgette_ingest_queue_depth",
+    "Ingest jobs per tier queue by status (todo/doing/failed)",
+    ["queue", "status"],
+)
+# The subset of statuses worth a gauge series; the rest (succeeded/cancelled/
+# aborted) are pruned from the queue table and uninteresting for operating.
+_INGEST_DEPTH_STATUSES = ("todo", "doing", "failed")
+
 qdrant_operations_total = Counter(
     "mcp_qdrant_operations_total",
     "Total Qdrant vector database operations",
@@ -261,6 +276,21 @@ document_escalation_total = Counter(
     ["from_tier", "to_tier", "reason"],
 )
 
+# Would-be escalations SUPPRESSED because the target tier is disabled (Deck
+# #324). The cost-sensitive ``ocr`` tier is opt-in (DOCUMENT_OCR_ENABLED): when
+# it's off, a doc the classifier would route to OCR is indexed at the pre-OCR
+# tier instead of hopping, and that intent is counted here rather than on
+# document_escalation_total. This is the "what-if OCR were enabled" signal —
+# escalation_suppressed_total{to_tier="ocr"} is the latent OCR demand an operator
+# weighs before enabling OCR; enabling it converts these into real
+# document_escalation_total{to_tier="ocr"} hops.
+document_escalation_suppressed_total = Counter(
+    "bridgette_document_escalation_suppressed_total",
+    "Would-be tier escalations suppressed because the target tier is disabled",
+    # reason: low_confidence | empty_text
+    ["from_tier", "to_tier", "reason"],
+)
+
 # Hard parse failures: the parse now runs in an isolated subprocess, so a
 # timeout/OOM that kills the worker is caught here. This is distinct from
 # ``document_parse_total{status="error"}`` (an in-process exception): a hard
@@ -270,6 +300,18 @@ document_parse_failed_total = Counter(
     "bridgette_document_parse_failed_total",
     "Document parses that failed in the isolated worker (process killed)",
     ["reason"],  # reason: timeout | oom | error
+)
+
+# Documents dropped after exhausting in-process indexing retries (the scanner
+# re-picks them on a later full scan, so this is "dropped for this cycle", not
+# "lost forever"). Labelled by classified cause so the embed-drop rate from a
+# transient backend-pod rollover (connection/timeout) is alertable distinctly
+# from a persistent fault (card 309).
+vector_ingest_dropped_total = Counter(
+    "bridgette_vector_ingest_dropped_total",
+    "Documents dropped after exhausting indexing retries, by cause",
+    # reason: connection | timeout | rate_limit | server | qdrant | other
+    ["reason"],
 )
 
 # --- Tier-0 classifier (shadow mode) -----------------------------------------
@@ -625,6 +667,42 @@ def update_vector_sync_indexed_chunks(count: int) -> None:
     vector_sync_indexed_chunks.set(count)
 
 
+def update_ingest_queue_depth(by_queue: dict[str, dict[str, int]] | None) -> None:
+    """Set the per-tier-queue depth gauge from procrastinate job counts (#323).
+
+    ``by_queue`` is ``{queue_name: {status: count}}`` (see
+    ``queue.procrastinate.get_ingest_job_counts_by_queue``). No-op only on the
+    memory backend (``by_queue is None``); an empty dict (postgres backend with
+    every queue drained) still runs the pre-zero so the gauge reads 0.
+
+    Every managed queue is zeroed first: ``list_queues_async`` stops returning a
+    queue once it has no jobs, so a queue that drained to empty drops out of
+    ``by_queue`` entirely (and when ALL drain, ``by_queue`` is ``{}``). Without
+    the pre-zero its gauge series would stick at its last non-zero value (ghost
+    backlog in Grafana/alerts) instead of reading 0. The live counts then
+    overwrite the zeros for queues that still have work.
+    """
+    # ``is None`` not ``not by_queue``: an empty dict means "postgres, all queues
+    # drained" and MUST still zero the gauge -- only None (memory) is the no-op.
+    if by_queue is None:
+        return
+    # Lazy import to keep observability decoupled from the queue layer at module
+    # load (and sidestep any import cycle); both names are public constants.
+    from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
+        ALL_INGEST_QUEUES,
+        LEGACY_INGEST_QUEUE,
+    )
+
+    for queue in (*ALL_INGEST_QUEUES, LEGACY_INGEST_QUEUE):
+        for status in _INGEST_DEPTH_STATUSES:
+            ingest_queue_depth.labels(queue=queue, status=status).set(0)
+    for queue, per_status in by_queue.items():
+        for status in _INGEST_DEPTH_STATUSES:
+            ingest_queue_depth.labels(queue=queue, status=status).set(
+                per_status.get(status, 0)
+            )
+
+
 def record_document_parse(
     processor: str,
     tier: str,
@@ -683,6 +761,20 @@ def record_document_escalation(from_tier: str, to_tier: str, reason: str) -> Non
     ).inc()
 
 
+def record_document_escalation_suppressed(
+    from_tier: str, to_tier: str, reason: str
+) -> None:
+    """Record a would-be escalation suppressed because ``to_tier`` is disabled.
+
+    The "what-if OCR were enabled" signal (Deck #324): the document is indexed at
+    ``from_tier`` (terminal) rather than hopped, because the ideal next tier
+    (typically ``ocr``) is turned off. See ``document_escalation_suppressed_total``.
+    """
+    document_escalation_suppressed_total.labels(
+        from_tier=from_tier, to_tier=to_tier, reason=reason
+    ).inc()
+
+
 def record_document_parse_failed(reason: str) -> None:
     """Record a hard parse failure from the isolated worker.
 
@@ -690,6 +782,16 @@ def record_document_parse_failed(reason: str) -> None:
         reason: ``timeout`` | ``oom`` | ``error``
     """
     document_parse_failed_total.labels(reason=reason).inc()
+
+
+def record_ingest_dropped(reason: str) -> None:
+    """Record a document dropped after exhausting in-process indexing retries.
+
+    Args:
+        reason: ``connection`` | ``timeout`` | ``rate_limit`` | ``server`` |
+            ``qdrant`` | ``other`` (classified from the terminal exception).
+    """
+    vector_ingest_dropped_total.labels(reason=reason).inc()
 
 
 def record_document_classification(

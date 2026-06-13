@@ -6,6 +6,7 @@ import click
 import uvicorn
 
 from nextcloud_mcp_server.config import (
+    Settings,
     get_database_url,
     get_settings,
     is_ephemeral_token_db,
@@ -17,7 +18,12 @@ from nextcloud_mcp_server.migrations import (
     show_migration_history,
     upgrade_database,
 )
-from nextcloud_mcp_server.observability import get_uvicorn_logging_config
+from nextcloud_mcp_server.observability import (
+    get_uvicorn_logging_config,
+    setup_logging,
+    setup_metrics,
+    setup_tracing,
+)
 from nextcloud_mcp_server.server import AVAILABLE_APPS
 
 from .app import get_app
@@ -284,6 +290,41 @@ def run(
     )
 
 
+def _init_worker_observability(settings: Settings) -> None:
+    """Configure logging, metrics, and tracing for the standalone ingest worker."""
+    # Mirrors app.py's lifespan bootstrap; without it the worker's astrolabe_*
+    # metrics and document_processor.parse spans are invisible in external mode.
+    # Structured logging first, so every subsequent startup line is JSON like
+    # the API's — the worker entrypoint never went through uvicorn's log_config.
+    setup_logging(
+        log_format=settings.log_format,
+        log_level=settings.log_level,
+        include_trace_context=settings.log_include_trace_context,
+    )
+
+    if settings.metrics_enabled:
+        setup_metrics(port=settings.metrics_port)
+        logger.info(
+            "Prometheus metrics enabled on dedicated port %s", settings.metrics_port
+        )
+
+    if settings.otel_exporter_otlp_endpoint:
+        setup_tracing(
+            service_name=settings.otel_service_name,
+            otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+            otlp_verify_ssl=settings.otel_exporter_verify_ssl,
+            sampling_rate=settings.otel_traces_sampler_arg,
+        )
+        logger.info(
+            "OpenTelemetry tracing enabled (endpoint: %s)",
+            settings.otel_exporter_otlp_endpoint,
+        )
+    else:
+        logger.info(
+            "OpenTelemetry tracing disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)"
+        )
+
+
 @click.command()
 @click.option(
     "--concurrency",
@@ -292,8 +333,18 @@ def run(
     default=None,
     help="Max concurrent jobs. Defaults to VECTOR_SYNC_PROCESSOR_WORKERS.",
 )
-def worker(concurrency: int | None):
-    """Run the ingest worker (Deck #183).
+@click.option(
+    "--tier",
+    type=click.Choice(["fast", "structured", "ocr"]),
+    default=None,
+    help=(
+        "Run only this extraction tier's queue (Deck #323). Omit to drain ALL "
+        "tier queues in one process (single-Deployment / dev); set it to run one "
+        "tier per Deployment so the fleets scale independently."
+    ),
+)
+def worker(concurrency: int | None, tier: str | None):
+    """Run the ingest worker (Deck #183, per-tier fleets #323).
 
     \b
     Drains the per-tenant Postgres ingest queue (procrastinate): for each
@@ -302,13 +353,20 @@ def worker(concurrency: int | None):
     the api/worker split; run it as a separate Deployment from the API pod.
 
     \b
+    With --tier the worker drains only that tier's queue (``ingest-<tier>``), so
+    a CPU-bound ``fast`` fleet, an in-cluster ``structured`` fleet, and a paid
+    ``ocr`` fleet scale independently. Without it, all tier queues are drained in
+    one process (handy for dev / a single Deployment). A low-quality parse hops
+    the job to the next tier's queue automatically (see TieredEscalationStrategy).
+
+    \b
     Requires INGEST_QUEUE=postgres (a PostgreSQL DATABASE_URL); procrastinate is
     Postgres-only.
 
     \b
     Example:
       $ export DATABASE_URL=postgresql+asyncpg://mcp:mcp@db/mcp
-      $ nextcloud-mcp-server worker -c 4
+      $ nextcloud-mcp-server worker -c 4 --tier fast
     """
     import anyio  # noqa: PLC0415
 
@@ -319,11 +377,30 @@ def worker(concurrency: int | None):
             f"resolved INGEST_QUEUE={settings.ingest_queue!r}"
         )
 
+    # Initialize observability here, not in a lifespan — the worker never runs
+    # uvicorn, so it skips app.py's bootstrap (the WHY lives in the helper's
+    # docstring). Done after the queue check so a misconfig fails fast.
+    _init_worker_observability(settings)
+
     from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
-        INGEST_QUEUE_NAME,
+        ALL_INGEST_QUEUES,
+        INGEST_QUEUE_MAINTENANCE,
+        LEGACY_INGEST_QUEUE,
+        TIER_QUEUES,
         apply_ingest_queue_schema,
         get_procrastinate_app,
     )
+
+    # Which queues this process drains. A single tier -> just its queue; no tier
+    # -> every tier queue PLUS the legacy single queue, so a rolling upgrade
+    # never strands jobs deferred under the pre-#323 name. Every worker also
+    # drains the maintenance queue so the periodic stalled-job reclaim fires
+    # regardless of which tier(s) are scaled up (procrastinate dedups the
+    # periodic, so multiple drainers don't multiply the reclaim).
+    if tier is not None:
+        queues = [TIER_QUEUES[tier], INGEST_QUEUE_MAINTENANCE]
+    else:
+        queues = [*ALL_INGEST_QUEUES, LEGACY_INGEST_QUEUE, INGEST_QUEUE_MAINTENANCE]
 
     # This is the consumer side of the distributed (postgres) ingest backend.
     # Unlike the in-process anyio pool, the worker talks to procrastinate's App
@@ -351,13 +428,15 @@ def worker(concurrency: int | None):
             # Structured log (not click.echo) so it lands in the JSON / OTel
             # pipeline like every other startup message.
             logger.info(
-                "Ingest worker started: queue=%s concurrency=%s delete_succeeded=%s",
-                INGEST_QUEUE_NAME,
+                "Ingest worker started: tier=%s queues=%s concurrency=%s "
+                "delete_succeeded=%s",
+                tier or "all",
+                queues,
                 workers,
                 settings.ingest_delete_succeeded_jobs,
             )
             await app.run_worker_async(
-                queues=[INGEST_QUEUE_NAME],
+                queues=queues,
                 concurrency=workers,
                 install_signal_handlers=True,
                 # Drop succeeded jobs (default) so the queue table stays lean and

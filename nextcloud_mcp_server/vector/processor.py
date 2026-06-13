@@ -6,12 +6,19 @@ Processes documents from stream: fetches content, generates embeddings, stores i
 import logging
 import time
 import uuid
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
+import httpx
 from anyio.abc import TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream
 from qdrant_client.models import PointStruct
+
+if TYPE_CHECKING:
+    # Type-only: the document stack is heavy (pymupdf/_isolation) and must stay
+    # off processor.py's import path (#877); the runtime import is lazy.
+    from nextcloud_mcp_server.document_processors.base import ProcessingResult
+    from nextcloud_mcp_server.document_processors.registry import ProcessorRegistry
 
 from nextcloud_mcp_server.acl_hash import compute_acl_hash
 from nextcloud_mcp_server.client import NextcloudClient
@@ -20,9 +27,12 @@ from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_servi
 from nextcloud_mcp_server.models.deck import DeckCard
 from nextcloud_mcp_server.observability.metrics import (
     record_document_chunks,
+    record_document_escalation,
+    record_document_escalation_suppressed,
     record_document_parse_failed,
     record_embedding,
     record_embedding_tokens,
+    record_ingest_dropped,
     record_qdrant_operation,
     record_vector_sync_processing,
     update_vector_sync_queue_size,
@@ -31,6 +41,7 @@ from nextcloud_mcp_server.observability.tracing import trace_operation
 from nextcloud_mcp_server.search.pdf_highlighter import PDFHighlighter
 from nextcloud_mcp_server.usage import UsageEventStore
 from nextcloud_mcp_server.vector import payload_keys
+from nextcloud_mcp_server.vector._errors import format_exception_group
 from nextcloud_mcp_server.vector.document_chunker import (
     DocumentChunker,
     PageAwareChunker,
@@ -54,6 +65,128 @@ logger = logging.getLogger(__name__)
 # Shared span-attribute key (avoids duplicating the string literal across the
 # many vector_sync spans that report a chunk count).
 _ATTR_CHUNK_COUNT = "vector_sync.chunk_count"
+
+
+def _drop_reason(exc: BaseException) -> str:
+    """Classify a terminal indexing failure into a metric label.
+
+    Distinguishes the transient backend-pod-rollover causes (connection /
+    timeout — the ones provider-level retry should now ride through, card 309)
+    from persistent faults, so ``bridgette_vector_ingest_dropped_total`` is
+    alertable per cause. Descends through nested ExceptionGroups to the first
+    leaf so a doubly-wrapped cause isn't mislabelled ``other``. Best-effort:
+    unknown causes fall back to ``other``.
+    """
+    # An anyio task group can wrap the real cause (and nest groups when sub-tasks
+    # use their own groups); descend to the first concrete leaf. Best-effort: a
+    # group bundling several distinct failures is labelled by whichever leaf
+    # sorts first, not by a "mixed" bucket.
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+
+    # Raw httpx transport errors from direct Nextcloud API calls (the nc_client
+    # uses httpx directly); the openai checks below catch the SDK-wrapped
+    # variants of the same failure modes.
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection"
+
+    # openai.* is always installed (provider dep) but import lazily to keep this
+    # helper cheap and decoupled from a specific SDK version's surface.
+    try:
+        import openai  # noqa: PLC0415
+
+        if isinstance(exc, openai.APITimeoutError):
+            return "timeout"
+        if isinstance(exc, openai.APIConnectionError):
+            return "connection"
+        if isinstance(exc, openai.RateLimitError):
+            return "rate_limit"
+        if isinstance(exc, openai.APIStatusError):
+            return "server" if exc.status_code >= 500 else "other"
+    except ImportError:  # pragma: no cover — openai is a hard dependency
+        pass
+
+    # Qdrant client errors surface from its own module namespace.
+    if type(exc).__module__.startswith("qdrant_client"):
+        return "qdrant"
+    return "other"
+
+
+def _is_pdf(content_type: str) -> bool:
+    """Whether a MIME type is a PDF (parameter-tolerant)."""
+    return content_type.split(";")[0].strip().lower() == "application/pdf"
+
+
+async def _parse_pdf_tier(
+    registry: "ProcessorRegistry",
+    content: bytes,
+    content_type: str,
+    filename: str | None,
+    tier: str,
+    settings: Any,
+) -> "ProcessingResult":
+    """Run a single extraction tier and apply the post-parse escalation gate.
+
+    The external per-tier ingest path (Deck #323): the procrastinate worker for
+    ``tier`` parses with exactly that tier, then either returns the result to
+    index or raises ``EscalateError`` to hand the document to the next tier's
+    queue (the queue's retry strategy turns the raise into a native queue-hop).
+    The escalation metric is recorded here, at the decision point.
+
+    A hard parse failure (``result.success`` False) is returned as-is, not
+    escalated -- a corrupt/encrypted/oversize PDF that one engine can't open
+    usually defeats the others too; the caller marks it failed. This preserves
+    the "OCR is an enhancement, never worse than off" invariant: a tenant who has
+    not enabled a higher tier (or has no processor for it) simply indexes the
+    cheap tier's output.
+    """
+    # Lazy import: keep the document stack (pymupdf/_isolation) off the module
+    # load path; this runs only on the per-tier worker, which needs it anyway.
+    from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+        EscalateError,
+    )
+
+    # options / progress_callback are not threaded here -- the indexing caller
+    # passes neither today, and the inline path (registry.process) omits them
+    # too. Forward them if a tier processor ever needs per-call tuning (e.g. OCR
+    # DPI); keeping the two paths symmetric until then.
+    result = await registry.process_tier(content, content_type, filename, tier)
+    if result.success:
+        decision = registry.evaluate_escalation(
+            result, content, tier, settings, filename=filename
+        )
+        if decision is not None:
+            if decision.kind == "suppressed":
+                # The ideal next tier (e.g. ocr) is disabled, so we do NOT hop:
+                # index this tier's output as terminal and record the would-be
+                # escalation so operators see the latent demand ("what-if OCR
+                # enabled"; #324).
+                record_document_escalation_suppressed(
+                    tier, decision.to_tier, decision.reason
+                )
+                logger.info(
+                    "Escalation suppressed for %s: %s->%s disabled (reason=%s), "
+                    "indexing at current tier",
+                    filename or "<bytes>",
+                    tier,
+                    decision.to_tier,
+                    decision.reason,
+                )
+            else:  # "hop" — the Literal kind makes this branch exhaustive.
+                record_document_escalation(tier, decision.to_tier, decision.reason)
+                logger.info(
+                    "Escalating %s %s->%s (reason=%s)",
+                    filename or "<bytes>",
+                    tier,
+                    decision.to_tier,
+                    decision.reason,
+                )
+                raise EscalateError(
+                    from_tier=tier, to_tier=decision.to_tier, reason=decision.reason
+                )
+    return result
 
 
 def assign_page_numbers(chunks, page_boundaries):
@@ -123,6 +256,7 @@ async def record_indexing_usage(
     token_count: int,
     total_chars: int,
     page_count: int | None,
+    pipeline_tier: str | None = None,
 ) -> None:
     """Record the billable usage events for one embedded document.
 
@@ -163,6 +297,11 @@ async def record_indexing_usage(
         "doc_type": doc_type,
         "user_id": user_id,
         "total_chars": total_chars,
+        # Which extraction tier produced the parsed pages (Deck #323). Carried so
+        # the CP rollup / a future per-tier price can attribute parsing cost to
+        # the tier that incurred it (paid OCR vs CPU-cheap fast). None for text
+        # doc types, which are never parsed.
+        "pipeline_tier": pipeline_tier,
     }
     try:
         store = await UsageEventStore.shared()
@@ -192,6 +331,18 @@ async def record_indexing_usage(
                 metadata=metadata,
                 enabled=True,
             )
+            # Paid-OCR pages are metered as a SEPARATE line (Deck #323) so the
+            # expensive tier's cost is billable independently of CPU-cheap parsing
+            # -- pages_embedded counts all parsed pages, pages_ocr only the OCR
+            # tier's. Gated on the tier so it's emitted exactly when the doc was
+            # actually OCR'd; the same page_count guard above applies.
+            if pipeline_tier == "ocr":
+                await store.record_usage_event(
+                    metric="pages_ocr",
+                    value=page_count,
+                    metadata=metadata,
+                    enabled=True,
+                )
     except Exception:
         # Reached only when shared()/store construction itself raises
         # (record_usage_event swallows its own write failures). Metering is on,
@@ -235,6 +386,11 @@ async def processor_task(
     # Signal that the task has started and is ready
     task_status.started()
 
+    # Initialised before the loop so the broad except handler below can't hit an
+    # unbound name if receive() itself raises a non-TimeoutError/EndOfStream
+    # exception on the very first iteration (mirrors multi_user_processor_task).
+    doc_task: DocumentTask | None = None
+
     while not shutdown_event.is_set():
         try:
             # Get document with timeout (allows checking shutdown)
@@ -264,14 +420,22 @@ async def processor_task(
             break
 
         except Exception as e:
-            logger.error(
-                "Processor %s error processing %s_%s: %s",
-                worker_id,
-                doc_task.doc_type,
-                doc_task.doc_id,
-                e,
-                exc_info=True,
-            )
+            if doc_task is not None:
+                logger.error(
+                    "Processor %s error processing %s_%s: %s",
+                    worker_id,
+                    doc_task.doc_type,
+                    doc_task.doc_id,
+                    format_exception_group(e),
+                    exc_info=True,
+                )
+            else:
+                logger.error(
+                    "Processor %s error: %s",
+                    worker_id,
+                    format_exception_group(e),
+                    exc_info=True,
+                )
             # Continue to next document (no task_done() needed with streams)
 
     logger.info("Processor %s stopped", worker_id)
@@ -330,7 +494,11 @@ async def _reconcile_tag_event(
 
 
 async def process_document(
-    doc_task: DocumentTask, nc_client: NextcloudClient, *, max_retries: int = 3
+    doc_task: DocumentTask,
+    nc_client: NextcloudClient,
+    *,
+    max_retries: int = 3,
+    tier: str | None = None,
 ):
     """
     Process a single document: fetch, tokenize, embed, store in Qdrant.
@@ -344,7 +512,33 @@ async def process_document(
             (3) suits the in-process SQLite pool, which has no durable retry. The
             procrastinate worker passes ``1`` so durable retry is owned by the
             queue (and survives worker crashes), avoiding compounding 3×N retries.
+        tier: Extraction tier to run for PDFs on the external per-tier path (Deck
+            #323) -- the procrastinate worker passes the tier matching its queue.
+            ``None`` (the default, used by the in-process/memory pool) runs the
+            inline tiered pipeline (``registry.process``: fast -> OCR escalation
+            in one call) and never raises ``EscalateError``.
+
+    Retry layering: the embedding provider adds its own transient retry (5
+    attempts, 2s→60s backoff — card 309) *inside* each of these attempts. On the
+    in-process path (max_retries=3) a sustained outage therefore costs up to
+    5×3=15 provider calls (~90s wall-clock) before the document is dropped and
+    re-picked on the next scan; the procrastinate path (max_retries=1) caps it at
+    one outer attempt (~30s) and defers. Don't stack a third retry layer here.
     """
+    # EscalateError is a control-flow signal that arises ONLY on the per-tier
+    # external path (tier set). Bind the class lazily here, and only when a tier
+    # is set, so the document stack is never imported at *module load* (the #877
+    # invariant) nor on the delete / text-doc call paths (file processing already
+    # imports it via get_registry regardless). When tier is None it can't be
+    # raised, so the guards below stay inert.
+    escalate_error_cls: type[BaseException] | None = None
+    if tier is not None:
+        from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+            EscalateError,
+        )
+
+        escalate_error_cls = EscalateError
+
     start_time = time.time()
 
     logger.debug(
@@ -414,7 +608,9 @@ async def process_document(
 
             for attempt in range(max_retries):
                 try:
-                    indexed = await _index_document(doc_task, nc_client, qdrant_client)
+                    indexed = await _index_document(
+                        doc_task, nc_client, qdrant_client, tier=tier
+                    )
 
                     # A permanent parse failure returns False: it was already
                     # recorded (document_parse_failed_total + the registry's
@@ -436,6 +632,14 @@ async def process_document(
                     return  # Success
 
                 except Exception as e:
+                    # An escalation signal is control flow, not a failure:
+                    # propagate it untouched so the procrastinate retry strategy
+                    # can hop the job to the next tier's queue. Never retry it
+                    # in-process and never count it as a drop.
+                    if escalate_error_cls is not None and isinstance(
+                        e, escalate_error_cls
+                    ):
+                        raise
                     if attempt < max_retries - 1:
                         logger.warning(
                             "Retry %s/%s for %s_%s: %s",
@@ -443,7 +647,7 @@ async def process_document(
                             max_retries,
                             doc_task.doc_type,
                             doc_task.doc_id,
-                            e,
+                            format_exception_group(e),
                             extra={
                                 "doc_id": doc_task.doc_id,
                                 "doc_type": doc_task.doc_type,
@@ -455,27 +659,43 @@ async def process_document(
                         await anyio.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                     else:
+                        reason = _drop_reason(e)
                         logger.error(
-                            "Failed to index %s_%s after %s retries: %s",
+                            "Failed to index %s_%s after %s retries (%s): %s",
                             doc_task.doc_type,
                             doc_task.doc_id,
                             max_retries,
-                            e,
+                            reason,
+                            format_exception_group(e),
                             extra={
                                 "doc_id": doc_task.doc_id,
                                 "doc_type": doc_task.doc_type,
                                 "attempt": max_retries,
                                 "max_retries": max_retries,
                                 "status": "error",
+                                "drop_reason": reason,
                             },
                         )
-                        # Record the failed Qdrant upsert. The processing-error
-                        # metric is recorded once by the outer handler below, so
-                        # exhausted-retry failures aren't double-counted.
-                        record_qdrant_operation("upsert", "error")
+                        # Count a failed Qdrant upsert ONLY when Qdrant was the
+                        # failing component; an embed/connection failure exhausts
+                        # retries before Qdrant is ever called, so attributing it
+                        # to mcp_qdrant_operations_total{error} would inflate that
+                        # signal. The cause is captured by record_ingest_dropped
+                        # instead, and the processing-error metric is recorded
+                        # once by the outer handler below (no double-count). The
+                        # document is NOT marked failed, so the next scan re-picks
+                        # it (re-queue via the scan loop, card 309).
+                        if reason == "qdrant":
+                            record_qdrant_operation("upsert", "error")
+                        record_ingest_dropped(reason)
                         raise
 
-        except Exception:
+        except Exception as e:
+            # An escalation signal must reach the procrastinate retry strategy
+            # un-recorded -- it is neither a processing success nor an error
+            # (the hop is its own event, counted via record_document_escalation).
+            if escalate_error_cls is not None and isinstance(e, escalate_error_cls):
+                raise
             # Single processing-error call site: catches exhausted-retry
             # re-raises, delete failures, and setup errors (get_qdrant_client /
             # get_settings) — each counted exactly once. A failed delete is not
@@ -490,10 +710,19 @@ async def process_document(
 
 
 async def _index_document(
-    doc_task: DocumentTask, nc_client: NextcloudClient, qdrant_client
+    doc_task: DocumentTask,
+    nc_client: NextcloudClient,
+    qdrant_client,
+    *,
+    tier: str | None = None,
 ) -> bool | None:
     """
     Index a single document (called by process_document with retry).
+
+    ``tier`` selects the external per-tier PDF path (Deck #323): when set and the
+    file is a PDF, exactly that tier is parsed and a low-quality result raises
+    ``EscalateError`` to hand the document to the next tier's queue. ``None``
+    (default) runs the inline tiered pipeline (``registry.process``).
 
     Returns ``False`` when a permanent parse failure means nothing was indexed
     (the caller must then skip the success metrics); ``None`` otherwise.
@@ -719,22 +948,40 @@ async def _index_document(
                 "vector_sync.file_size": len(content_bytes),
             },
         ):
-            # The registry runs the tiered PDF pipeline (tier-0 classify ->
-            # tier-1 fast -> OCR escalation) and records classification metrics.
-            # Imported lazily so module import doesn't pull in the document stack
-            # (document_processors -> _isolation, Unix-only ``resource``; see #877).
+            # The registry runs the tiered PDF pipeline and records
+            # classification metrics. Imported lazily so module import doesn't
+            # pull in the document stack (document_processors -> _isolation,
+            # Unix-only ``resource``; see #877).
             from nextcloud_mcp_server.document_processors import (  # noqa: PLC0415
                 get_registry,
+            )
+            from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+                EscalateError,
             )
 
             registry = get_registry()
 
             try:
-                result = await registry.process(
-                    content=content_bytes,
-                    content_type=content_type,
-                    filename=file_path,
-                )
+                # External per-tier path (Deck #323): run only this worker's tier
+                # for PDFs and let a low-quality parse raise EscalateError (a
+                # queue-hop to the next tier). Everything else -- non-PDF files,
+                # and the in-process/memory pool (tier is None) -- runs the inline
+                # tiered pipeline (fast -> OCR escalation in one call).
+                if tier is not None and _is_pdf(content_type):
+                    result = await _parse_pdf_tier(
+                        registry,
+                        content_bytes,
+                        content_type,
+                        file_path,
+                        tier,
+                        settings,
+                    )
+                else:
+                    result = await registry.process(
+                        content=content_bytes,
+                        content_type=content_type,
+                        filename=file_path,
+                    )
 
                 # A permanent parse failure (e.g. an isolated-worker OOM/timeout
                 # on a pathological PDF) returns success=False rather than
@@ -800,6 +1047,11 @@ async def _index_document(
                             )
                 else:
                     logger.debug("No page_boundaries in metadata for %s", file_path)
+            except EscalateError:
+                # Control-flow signal (per-tier path): re-raise untouched so the
+                # queue hops the job to the next tier. NOT a "failed to process"
+                # error -- don't log it as one.
+                raise
             except Exception as e:
                 logger.error("Failed to process file %s: %s", file_path, e)
                 raise
@@ -954,6 +1206,14 @@ async def _index_document(
                     raw_page_count
                     if isinstance(raw_page_count, int)
                     and not isinstance(raw_page_count, bool)
+                    else None
+                ),
+                # Tier that produced the parsed pages (registry stamps it on the
+                # result metadata); text doc types stay "fast". Narrow defensively
+                # to str|None — file_metadata is loosely typed (Any values).
+                pipeline_tier=(
+                    pt
+                    if isinstance(pt := file_metadata.get("pipeline_tier"), str)
                     else None
                 ),
             )

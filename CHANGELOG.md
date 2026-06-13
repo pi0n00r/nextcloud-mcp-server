@@ -5,6 +5,98 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.117.0 (2026-06-13)
+
+### Feat
+
+- **ingest**: record suppressed OCR escalations (what-if-OCR signal)
+
+### Fix
+
+- **ingest**: address review round 2 (Literal reason + exhaustive branch + test)
+- **ingest**: address review round 1 (Literal kind + log tidy)
+
+### Refactor
+
+- **ingest**: rename ignore_enabled→ignore_ocr_enabled + empty/structured test
+
+## v0.116.0 (2026-06-13)
+
+### Feat
+
+- **ingest**: per-tier escalation via procrastinate queue-hop
+
+### Fix
+
+- **ingest**: stagger stalled-job reclaim to avoid thundering herd (round 5)
+- **ingest**: zero queue-depth gauge on all-queues-drained (review round 4)
+- **ingest**: address review round 3 + SonarCloud reliability gate
+- **ingest**: address review round 2 (stale gauge + hygiene)
+- **ingest**: address review round 1 (reclaim queue + tests)
+
+## v0.115.1 (2026-06-13)
+
+### Fix
+
+- **classifier**: make image coverage diagnostic-only, not an OCR routing trigger
+
+### Refactor
+
+- **classifier**: rename IMAGE_COVERAGE_SCANNED → IMAGE_HEAVY_THRESHOLD
+
+## v0.115.0 (2026-06-12)
+
+### Feat
+
+- **vector-sync**: scan provisioned users immediately
+
+### Refactor
+
+- **vector-sync**: clear SonarCloud gate + round-2 nits
+- **vector-sync**: address round-1 review nits
+
+## v0.114.0 (2026-06-11)
+
+### Feat
+
+- **auth**: advertise offline_access in discovered OAuth scopes
+
+## v0.113.1 (2026-06-11)
+
+### Fix
+
+- **vector**: don't inflate qdrant-error metric on embed drops (#893 r3)
+- **vector**: nested-group drop classification + review/Sonar fixes (#893)
+- **vector**: retry transient embed errors so a pod rollover drops 0 docs
+
+## v0.113.0 (2026-06-11)
+
+### Feat
+
+- **document**: configurable OCR timeout and fail-fast PDF size guard
+
+### Fix
+
+- **document**: catch httpx timeout from gateway OCR backend (#892 r3)
+- **document**: timeout reason bucket + Sonar https hotspot (#892 round 2)
+- **document**: apply OCR timeout to Mistral backend + review/Sonar fixes (#892)
+- **vector**: guard unbound doc_task + address review nits (#891)
+- **vector**: URL-encode DAV paths and unwrap TaskGroup exceptions
+
+## v0.112.0 (2026-06-11)
+
+### Feat
+
+- **worker**: structured logs + metrics + traces for ingest worker
+
+### Fix
+
+- **worker**: clear Sonar S5332 hotspot + address review nits
+
+### Refactor
+
+- **worker**: trim observability helper docstring; clarify test fake
+
 ## v0.111.0 (2026-06-10)
 
 ### Feat
