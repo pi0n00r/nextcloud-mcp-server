@@ -16,6 +16,7 @@ from httpx import HTTPStatusError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, Record
 
+from nextcloud_mcp_server.capabilities import allowed_doc_types, is_doc_type_allowed
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.client.news import NewsItemType
 from nextcloud_mcp_server.config import get_settings
@@ -26,6 +27,8 @@ from nextcloud_mcp_server.server.tag_exclusion import (
     get_excluded_file_paths,
     is_path_excluded,
 )
+from nextcloud_mcp_server.vector.dead_letter import is_dead_lettered
+from nextcloud_mcp_server.vector.mail_content import MAIL_SCAN_MAX_PER_MAILBOX
 from nextcloud_mcp_server.vector.placeholder import (
     query_document_metadata,
     write_placeholder_point,
@@ -46,7 +49,7 @@ logger = logging.getLogger(__name__)
 # same PR that adds a new indexed doc_type, or accept ghost-record exposure for
 # that type (see ADR-019).
 INDEXED_DOC_TYPES: frozenset[str] = frozenset(
-    {"note", "file", "deck_card", "news_item"}
+    {"note", "file", "deck_card", "news_item", "mail_message"}
 )
 
 
@@ -127,8 +130,10 @@ class DocumentTask:
 
 
 # Track documents potentially deleted (grace period before actual deletion)
-# Format: {(user_id, doc_id): first_missing_timestamp}
-_potentially_deleted: dict[tuple[str, str], float] = {}
+# Format: {(user_id, doc_id, doc_type): first_missing_timestamp}. doc_type is
+# part of the key so the same numeric id under different doc types (a note 42
+# and a mail_message 42 for one user) tracks grace periods independently.
+_potentially_deleted: dict[tuple[str, str, str], float] = {}
 
 
 async def get_last_indexed_timestamp(user_id: str) -> int | None:
@@ -279,6 +284,150 @@ def _app_enabled(app_id: str, enabled_apps: set[str] | None) -> bool:
     return enabled_apps is None or app_id in enabled_apps
 
 
+def _should_scan(
+    app_id: str,
+    doc_type: str,
+    enabled_apps: set[str] | None,
+    allowed: frozenset[str] | None,
+) -> bool:
+    """Whether to scan ``app_id``: installed for the user AND admin-approved."""
+    return _app_enabled(app_id, enabled_apps) and is_doc_type_allowed(doc_type, allowed)
+
+
+# Text doc types whose deletion-tracking lives *inside* their scan_* function,
+# so skipping that function (when admin-disabled) leaves indexed points with no
+# grace-period backstop. Derived from INDEXED_DOC_TYPES so a newly-indexed type
+# automatically gets the backstop. ``file`` is excluded: its scan path empties
+# discovery and lets the existing reconcile loop purge on disable.
+_TEXT_BACKSTOP_DOC_TYPES: tuple[str, ...] = tuple(sorted(INDEXED_DOC_TYPES - {"file"}))
+
+# Per-process record of (user_id, doc_type) whose consent backstop deletes have
+# already been enqueued, so a *standing* admin-disable doesn't re-flood the
+# processor with idempotent deletes on every scan tick. An entry is cleared once
+# the type is allowed again, so a later re-disable re-triggers the backstop.
+# A dict (not a set) so it stays insertion-ordered for oldest-first eviction.
+_consent_backstop_done: dict[tuple[str, str], None] = {}
+
+# Safety bound on the tracking dict so a long-running multi-tenant process with
+# heavy user churn (deprovisioned users leave stale entries) can't grow it
+# without limit. At <= len(INDEXED_DOC_TYPES) entries per user this is generous;
+# on overflow we evict the *oldest* entries down to half capacity (not a full
+# clear) so the backstop re-fires for only those, avoiding a fleet-wide burst.
+_CONSENT_BACKSTOP_MAX = 50_000
+
+
+def _mark_backstop_done(key: tuple[str, str]) -> None:
+    """Record a one-shot backstop marker, evicting oldest entries on overflow.
+
+    Evicts oldest-first down to half capacity (insertion-ordered dict) rather
+    than clearing wholesale, so a bound hit re-fires the backstop only for the
+    oldest markers, not the whole fleet. A re-fire is idempotent regardless.
+    """
+    if len(_consent_backstop_done) >= _CONSENT_BACKSTOP_MAX:
+        overage = len(_consent_backstop_done) - _CONSENT_BACKSTOP_MAX // 2
+        logger.info(
+            "consent backstop tracking hit %d entries; evicting %d oldest",
+            _CONSENT_BACKSTOP_MAX,
+            overage,
+        )
+        for stale_key in list(_consent_backstop_done)[:overage]:
+            del _consent_backstop_done[stale_key]
+    _consent_backstop_done[key] = None
+
+
+async def _backstop_delete_doc_type(
+    user_id: str,
+    send_stream: TaskProducer,
+    doc_type: str,
+    qdrant_client: AsyncQdrantClient,
+    collection: str,
+    scan_id: int,
+) -> int:
+    """Enqueue delete tasks for every indexed point of one disabled doc_type.
+
+    Returns the number of delete tasks enqueued.
+    """
+    points = await _scroll_all_points(
+        qdrant_client,
+        collection_name=collection,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="doc_type", match=MatchValue(value=doc_type)),
+            ]
+        ),
+        payload_fields=["doc_id"],
+    )
+    doc_ids = {
+        str(p.payload["doc_id"])
+        for p in points
+        if p.payload is not None and "doc_id" in p.payload
+    }
+    if doc_ids:
+        logger.info(
+            "[SCAN-%s] %s disabled by admin for %s; enqueueing %d delete(s) (backstop)",
+            scan_id,
+            doc_type,
+            user_id,
+            len(doc_ids),
+        )
+    for doc_id in doc_ids:
+        await send_stream.send(
+            DocumentTask(
+                user_id=user_id,
+                doc_id=doc_id,
+                doc_type=doc_type,
+                operation="delete",
+                modified_at=0,
+            )
+        )
+    return len(doc_ids)
+
+
+async def _enqueue_deletes_for_disabled_types(
+    user_id: str,
+    send_stream: TaskProducer,
+    allowed: frozenset[str] | None,
+    scan_id: int,
+) -> int:
+    """Enqueue delete tasks for indexed text-source points the admin disabled.
+
+    Backstop for a failed eager purge: scrolls this user's indexed points for
+    each admin-disallowed text doc_type and queues a delete. No-op when
+    ``allowed`` is ``None`` (fail-open — never delete on a transient capability
+    read failure). Returns the number of delete tasks enqueued.
+    """
+    if allowed is None:
+        return 0
+
+    # Re-enabled types: clear their one-shot marker so a later re-disable
+    # re-triggers the backstop.
+    for doc_type in _TEXT_BACKSTOP_DOC_TYPES:
+        if doc_type in allowed:
+            _consent_backstop_done.pop((user_id, doc_type), None)
+
+    # Disabled types not yet backstopped this episode.
+    disabled = [
+        dt
+        for dt in _TEXT_BACKSTOP_DOC_TYPES
+        if dt not in allowed and (user_id, dt) not in _consent_backstop_done
+    ]
+    if not disabled:
+        return 0
+
+    qdrant_client = await get_qdrant_client()
+    collection = get_settings().get_collection_name()
+    queued = 0
+    for doc_type in disabled:
+        queued += await _backstop_delete_doc_type(
+            user_id, send_stream, doc_type, qdrant_client, collection, scan_id
+        )
+        # Mark backstopped (even when nothing was found) so subsequent scans
+        # don't re-scroll/re-enqueue for this disable episode.
+        _mark_backstop_done((user_id, doc_type))
+    return queued
+
+
 async def scan_user_documents(
     user_id: str,
     send_stream: TaskProducer,
@@ -365,6 +514,13 @@ async def scan_user_documents(
         # detection failed: fall back to scanning every app (prior behaviour).
         enabled_apps = await _get_enabled_apps_or_none(nc_client, user_id, scan_id)
 
+        # Admin consent gate (Astrolabe): only index sources the admin has
+        # approved for semantic search. ``None`` = no restriction (fail-open /
+        # older Astrolabe), so a transient capabilities failure never silently
+        # halts (or worse, mass-deletes) indexing. This is independent of
+        # ``enabled_apps``, which reflects only what the user has installed.
+        allowed = await allowed_doc_types(nc_client, user_id)
+
         # Notes (isolated so an uninstalled or disabled Notes app — whose API
         # returns 404 — cannot abort scanning of the other apps; this mirrors the
         # per-app try/except guards already wrapping files/news/deck below).
@@ -373,7 +529,17 @@ async def scan_user_documents(
         current_time = time.time()
         queued = 0
 
-        if _app_enabled("notes", enabled_apps):
+        # Backstop purge for admin-disabled text sources. Their deletion-
+        # tracking lives inside the scan_* function we skip below, so (unlike
+        # files, whose discovery-empties-then-reconcile path purges on disable)
+        # they'd linger if Astrolabe's eager purge failed. Enqueue deletes for
+        # any indexed points of a now-disallowed type. Gated on a concrete
+        # allow-set, so a fail-open None never triggers deletion.
+        queued += await _enqueue_deletes_for_disabled_types(
+            user_id, send_stream, allowed, scan_id
+        )
+
+        if _should_scan("notes", "note", enabled_apps, allowed):
             try:
                 queued += await scan_notes(
                     user_id=user_id,
@@ -454,9 +620,24 @@ async def scan_user_documents(
             # folder applies to every PDF beneath it.
             settings = get_settings()
             tag_name = settings.vector_sync_pdf_tag
-            tagged_files = await nc_client.find_files_by_tag(
-                tag_name, mime_type_filter="application/pdf"
-            )
+            if is_doc_type_allowed("file", allowed):
+                tagged_files = await nc_client.find_files_by_tag(
+                    tag_name, mime_type_filter="application/pdf"
+                )
+            else:
+                # Files disabled by admin: discover nothing so no new file is
+                # indexed. The deletion-reconcile below then sees every indexed
+                # file as "missing" and purges it after the grace period — the
+                # backstop for the eager purge Astrolabe runs on disable.
+                # Asymmetry (intentional): files purge up to 1.5x scan_interval
+                # later than text types, which get immediate one-shot backstop
+                # deletes via _enqueue_deletes_for_disabled_types.
+                logger.debug(
+                    "[SCAN-%s] Files disabled by admin for %s; skipping tagged-file discovery",
+                    scan_id,
+                    user_id,
+                )
+                tagged_files = []
 
             # Apply EXCLUDED_TAGS as defense-in-depth: a folder marked
             # off-limits via the exclusion tag must not be indexed even if
@@ -487,6 +668,16 @@ async def scan_user_documents(
                         skipped,
                     )
 
+            # Escalation-tier fingerprint for the dead-letter skip below, computed
+            # once per scan. Lazy import: document_processors.__init__ pulls the
+            # heavy parse stack (pymupdf/_isolation, Unix-only ``resource``; #877),
+            # which the scanner (API role) must not load at module import.
+            from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+                escalation_tiers_signature,
+            )
+
+            tiers_sig = escalation_tiers_signature(get_settings())
+
             for file_info in tagged_files:
                 # Files are already filtered by MIME type in find_files_by_tag()
                 file_count += 1
@@ -516,13 +707,31 @@ async def scan_user_documents(
                 if etag and await claim_existing_index(
                     file_id, "file", etag, user_id, current_path=file_path
                 ):
-                    _potentially_deleted.pop((user_id, file_id), None)
+                    _potentially_deleted.pop((user_id, file_id, "file"), None)
                     logger.debug(
                         "Dedup: file %s (ID: %s) already indexed in tenant; "
                         "granted access to %s without reprocessing",
                         file_path,
                         file_id,
                         user_id,
+                    )
+                    continue
+
+                # Tenant-wide dead-letter skip: a document that terminally failed
+                # parsing (no escalation tier) is recorded user-agnostically, so
+                # EVERY user's scan skips re-queuing it until its content (etag) or
+                # the escalation-tier set (tiers_sig, e.g. OCR enabled) changes.
+                # Unlike the per-user placeholder "failed" mark this is not
+                # defeated by a file shared across users -- whose single
+                # user-agnostic placeholder's user_id is overwritten by the last
+                # scanner, so every other user re-queued it on a loop.
+                if etag and await is_dead_lettered(file_id, "file", etag, tiers_sig):
+                    _potentially_deleted.pop((user_id, file_id, "file"), None)
+                    logger.debug(
+                        "Skipping dead-lettered file %s (ID: %s) until content/"
+                        "tier change",
+                        file_path,
+                        file_id,
                     )
                     continue
 
@@ -551,7 +760,7 @@ async def scan_user_documents(
                 else:
                     # Incremental sync: check if file exists and compare modified_at
                     # If file reappeared, remove from potentially_deleted
-                    file_key = (user_id, file_id)
+                    file_key = (user_id, file_id, "file")
                     if file_key in _potentially_deleted:
                         logger.debug(
                             "File %s (ID: %s) reappeared, removing from deletion grace period",
@@ -669,7 +878,7 @@ async def scan_user_documents(
             if not initial_sync:
                 for file_id in indexed_file_ids:
                     if file_id not in nextcloud_file_ids:
-                        file_key = (user_id, file_id)
+                        file_key = (user_id, file_id, "file")
 
                         if file_key in _potentially_deleted:
                             # Check if grace period elapsed
@@ -710,7 +919,7 @@ async def scan_user_documents(
 
         # Scan News items (starred + unread)
         news_queued = 0
-        if _app_enabled("news", enabled_apps):
+        if _should_scan("news", "news_item", enabled_apps, allowed):
             try:
                 news_queued = await scan_news_items(
                     user_id=user_id,
@@ -731,7 +940,7 @@ async def scan_user_documents(
 
         # Scan Deck cards
         deck_queued = 0
-        if _app_enabled("deck", enabled_apps):
+        if _should_scan("deck", "deck_card", enabled_apps, allowed):
             try:
                 deck_queued = await scan_deck_cards(
                     user_id=user_id,
@@ -750,13 +959,36 @@ async def scan_user_documents(
                 user_id,
             )
 
+        # Scan Mail messages (newest per mailbox)
+        mail_queued = 0
+        if _should_scan("mail", "mail_message", enabled_apps, allowed):
+            try:
+                mail_queued = await scan_mail_messages(
+                    user_id=user_id,
+                    send_stream=send_stream,
+                    nc_client=nc_client,
+                    initial_sync=initial_sync,
+                    scan_id=scan_id,
+                )
+                queued += mail_queued
+            except Exception as e:
+                logger.warning("Failed to scan mail messages for %s: %s", user_id, e)
+        else:
+            logger.debug(
+                "[SCAN-%s] Mail app not enabled for %s; skipping mail messages",
+                scan_id,
+                user_id,
+            )
+
         if queued > 0:
             logger.info(
-                "Sent %s documents (%s files, %s news items, %s deck cards) for incremental sync: %s",
+                "Sent %s documents (%s files, %s news items, %s deck cards, "
+                "%s mail messages) for incremental sync: %s",
                 queued,
                 file_queued,
                 news_queued,
                 deck_queued,
+                mail_queued,
                 user_id,
             )
         else:
@@ -818,7 +1050,7 @@ async def scan_notes(
         else:
             # Incremental sync: check if document exists and compare modified_at
             # If document reappeared, remove from potentially_deleted
-            doc_key = (user_id, doc_id)
+            doc_key = (user_id, doc_id, "note")
             if doc_key in _potentially_deleted:
                 logger.debug(
                     "Document %s reappeared, removing from deletion grace period",
@@ -893,7 +1125,7 @@ async def scan_notes(
     # Use grace period: only delete after 2 consecutive scans confirm absence
     for doc_id in indexed_doc_ids:
         if doc_id not in nextcloud_doc_ids:
-            doc_key = (user_id, doc_id)
+            doc_key = (user_id, doc_id, "note")
 
             if doc_key in _potentially_deleted:
                 # Already marked as potentially deleted, check if grace period elapsed
@@ -1028,7 +1260,7 @@ async def scan_news_items(
             queued += 1
         else:
             # Incremental sync: check if item exists and compare modified_at
-            doc_key = (user_id, doc_id)
+            doc_key = (user_id, doc_id, "news_item")
             if doc_key in _potentially_deleted:
                 logger.debug(
                     "News item %s reappeared, removing from deletion grace period",
@@ -1092,7 +1324,7 @@ async def scan_news_items(
 
         for doc_id in indexed_item_ids:
             if doc_id not in nextcloud_item_ids:
-                doc_key = (user_id, doc_id)
+                doc_key = (user_id, doc_id, "news_item")
 
                 if doc_key in _potentially_deleted:
                     first_missing_time = _potentially_deleted[doc_key]
@@ -1119,6 +1351,291 @@ async def scan_news_items(
                 else:
                     logger.debug(
                         "News item %s missing for first time, starting grace period",
+                        doc_id,
+                    )
+                    _potentially_deleted[doc_key] = current_time
+
+    return queued
+
+
+# Newest-N messages indexed per mailbox (= the Mail OCS per-request maximum;
+# imported from mail_content so the scanner index window and the search-time
+# verifier presence window stay identical). Older messages age out of the index
+# as newer ones arrive — the deletion-tracking pass below evicts them, the same
+# way it handles actually-deleted messages. Going beyond 100 would require
+# cursor pagination, so the value is fixed rather than configurable.
+#
+# Per-process record of (user_id, mailbox_id) for which the newest-N cap has
+# already been logged, so the "older mail not indexed" notice is emitted once at
+# info level (discoverable) rather than on every scan tick (which would flood
+# multi-tenant logs). Insertion-ordered dict + bounded eviction (mirrors
+# _consent_backstop_done) so a long-running multi-tenant process can't leak it.
+_mail_cap_logged: dict[tuple[str, int], None] = {}
+_MAIL_CAP_LOGGED_MAX = 50_000
+
+
+def _mark_mail_cap_logged(key: tuple[str, int]) -> bool:
+    """Record a one-shot cap-log marker; return True if this is the first time.
+
+    Evicts oldest-first to half capacity on overflow (a re-log after eviction is
+    a harmless info line), so the dedup set stays bounded.
+    """
+    if key in _mail_cap_logged:
+        return False
+    if len(_mail_cap_logged) >= _MAIL_CAP_LOGGED_MAX:
+        overage = len(_mail_cap_logged) - _MAIL_CAP_LOGGED_MAX // 2
+        for stale_key in list(_mail_cap_logged)[:overage]:
+            del _mail_cap_logged[stale_key]
+    _mail_cap_logged[key] = None
+    return True
+
+
+async def scan_mail_messages(
+    user_id: str,
+    send_stream: TaskProducer,
+    nc_client: NextcloudClient,
+    initial_sync: bool,
+    scan_id: int,
+) -> int:
+    """
+    Scan a user's Mail messages and queue changed messages for indexing.
+
+    Enumerates accounts → mailboxes → newest ``MAIL_SCAN_MAX_PER_MAILBOX``
+    messages per mailbox. Email is immutable, so a message's ``dateInt`` (sent
+    timestamp) is used as the change-detection ``modified_at`` — a message is
+    indexed once and not re-sent. Messages that drop out of the newest-N window
+    (or are deleted) are evicted via the deletion-tracking pass, keeping the
+    index bounded to recent mail.
+
+    The MCP server never speaks IMAP: listing reads the Mail app's DB-cached
+    envelopes, and the body fetch (in the processor) goes through the Mail app's
+    OCS API, which handles IMAP server-side.
+
+    Args:
+        user_id: User to scan
+        send_stream: Stream to send changed documents to processors
+        nc_client: Authenticated Nextcloud client
+        initial_sync: If True, send all documents (first-time sync)
+        scan_id: Scan identifier for logging
+
+    Returns:
+        Number of messages queued for processing
+    """
+    settings = get_settings()
+    queued = 0
+
+    # Get indexed mail message IDs from Qdrant (for deletion tracking)
+    indexed_message_ids: set[str] = set()
+    if not initial_sync:
+        qdrant_client = await get_qdrant_client()
+        points = await _scroll_all_points(
+            qdrant_client,
+            collection_name=settings.get_collection_name(),
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(
+                        key="doc_type", match=MatchValue(value="mail_message")
+                    ),
+                ]
+            ),
+            payload_fields=["doc_id"],
+        )
+        indexed_message_ids = {
+            str(point.payload["doc_id"])
+            for point in points
+            if point.payload is not None and "doc_id" in point.payload
+        }
+        logger.debug(
+            "Found %s indexed mail messages in Qdrant", len(indexed_message_ids)
+        )
+
+    # Enumerate accounts → mailboxes → newest-N messages.
+    accounts = await nc_client.mail.list_accounts()
+    nextcloud_message_ids: set[str] = set()
+    message_count = 0
+
+    for account in accounts:
+        account_id = account.get("id")
+        if account_id is None:
+            continue
+        try:
+            mailboxes = await nc_client.mail.get_mailboxes(account_id)
+        except Exception as e:
+            logger.warning(
+                "[SCAN-%s] Failed to list mailboxes for account %s: %s",
+                scan_id,
+                account_id,
+                e,
+            )
+            continue
+
+        for mailbox in mailboxes:
+            mailbox_id = mailbox.get("databaseId")
+            if mailbox_id is None:
+                continue
+            try:
+                messages = await nc_client.mail.list_messages(
+                    mailbox_id, limit=MAIL_SCAN_MAX_PER_MAILBOX
+                )
+            except Exception as e:
+                logger.warning(
+                    "[SCAN-%s] Failed to list messages for mailbox %s: %s",
+                    scan_id,
+                    mailbox_id,
+                    e,
+                )
+                continue
+
+            if len(messages) >= MAIL_SCAN_MAX_PER_MAILBOX and _mark_mail_cap_logged(
+                (user_id, mailbox_id)
+            ):
+                logger.info(
+                    "[SCAN-%s] Mailbox %s contains more than %s messages; only "
+                    "the newest %s are indexed (cursor pagination not yet "
+                    "implemented)",
+                    scan_id,
+                    mailbox_id,
+                    MAIL_SCAN_MAX_PER_MAILBOX,
+                    MAIL_SCAN_MAX_PER_MAILBOX,
+                )
+
+            for message in messages:
+                msg_db_id = message.get("databaseId")
+                if msg_db_id is None:
+                    continue
+                doc_id = str(msg_db_id)
+                nextcloud_message_ids.add(doc_id)
+                message_count += 1
+
+                modified_at = message.get("dateInt", 0) or 0
+                task_metadata: dict[str, int | str] = {
+                    "account_id": account_id,
+                    "mailbox_id": mailbox_id,
+                }
+
+                if initial_sync:
+                    await write_placeholder_point(
+                        doc_id=doc_id,
+                        doc_type="mail_message",
+                        user_id=user_id,
+                        modified_at=modified_at,
+                    )
+                    await send_stream.send(
+                        DocumentTask(
+                            user_id=user_id,
+                            doc_id=doc_id,
+                            doc_type="mail_message",
+                            operation="index",
+                            modified_at=modified_at,
+                            metadata=task_metadata,
+                        )
+                    )
+                    queued += 1
+                else:
+                    doc_key = (user_id, doc_id, "mail_message")
+                    if doc_key in _potentially_deleted:
+                        logger.debug(
+                            "Mail message %s reappeared, removing from deletion "
+                            "grace period",
+                            doc_id,
+                        )
+                        del _potentially_deleted[doc_key]
+
+                    existing_metadata = await query_document_metadata(
+                        doc_id=doc_id, doc_type="mail_message", user_id=user_id
+                    )
+
+                    needs_indexing = False
+                    if existing_metadata is None:
+                        needs_indexing = True
+                    elif existing_metadata.get("modified_at", 0) < modified_at:
+                        needs_indexing = True
+                    elif existing_metadata.get("status") == "failed":
+                        # A permanent processing failure — don't re-queue an
+                        # unchanged message that will just fail again; the
+                        # modified_at branch above retries once it changes
+                        # (mirrors the file scanner's failed-placeholder guard).
+                        logger.debug(
+                            "Skipping mail message %s: previous processing "
+                            "failed permanently",
+                            doc_id,
+                        )
+                    elif existing_metadata.get("is_placeholder", False):
+                        queued_at = existing_metadata.get("queued_at", 0)
+                        placeholder_age = time.time() - queued_at
+                        stale_threshold = settings.vector_sync_scan_interval * 5
+                        if placeholder_age > stale_threshold:
+                            logger.debug(
+                                "Found stale placeholder for mail message %s "
+                                "(age=%ss), requeuing",
+                                doc_id,
+                                format(placeholder_age, ".1f"),
+                            )
+                            needs_indexing = True
+
+                    if needs_indexing:
+                        await write_placeholder_point(
+                            doc_id=doc_id,
+                            doc_type="mail_message",
+                            user_id=user_id,
+                            modified_at=modified_at,
+                        )
+                        await send_stream.send(
+                            DocumentTask(
+                                user_id=user_id,
+                                doc_id=doc_id,
+                                doc_type="mail_message",
+                                operation="index",
+                                modified_at=modified_at,
+                                metadata=task_metadata,
+                            )
+                        )
+                        queued += 1
+
+    logger.info(
+        "[SCAN-%s] Found %s mail messages for %s",
+        scan_id,
+        message_count,
+        user_id,
+    )
+    record_vector_sync_scan(message_count)
+
+    # Check for deleted / aged-out messages (not initial sync)
+    if not initial_sync:
+        grace_period = settings.vector_sync_scan_interval * 1.5
+        current_time = time.time()
+
+        for doc_id in indexed_message_ids:
+            if doc_id not in nextcloud_message_ids:
+                doc_key = (user_id, doc_id, "mail_message")
+
+                if doc_key in _potentially_deleted:
+                    first_missing_time = _potentially_deleted[doc_key]
+                    time_missing = current_time - first_missing_time
+
+                    if time_missing >= grace_period:
+                        logger.info(
+                            "Mail message %s missing for %ss (>%ss grace period), "
+                            "sending deletion",
+                            doc_id,
+                            format(time_missing, ".1f"),
+                            format(grace_period, ".1f"),
+                        )
+                        await send_stream.send(
+                            DocumentTask(
+                                user_id=user_id,
+                                doc_id=doc_id,
+                                doc_type="mail_message",
+                                operation="delete",
+                                modified_at=0,
+                            )
+                        )
+                        queued += 1
+                        del _potentially_deleted[doc_key]
+                else:
+                    logger.debug(
+                        "Mail message %s missing for first time, starting grace period",
                         doc_id,
                     )
                     _potentially_deleted[doc_key] = current_time
@@ -1236,7 +1753,7 @@ async def scan_deck_cards(
                     queued += 1
                 else:
                     # Incremental sync: check if card exists and compare modified_at
-                    doc_key = (user_id, doc_id)
+                    doc_key = (user_id, doc_id, "deck_card")
                     if doc_key in _potentially_deleted:
                         logger.debug(
                             "Deck card %s reappeared, removing from deletion grace period",
@@ -1300,7 +1817,7 @@ async def scan_deck_cards(
 
         for doc_id in indexed_card_ids:
             if doc_id not in nextcloud_card_ids:
-                doc_key = (user_id, doc_id)
+                doc_key = (user_id, doc_id, "deck_card")
 
                 if doc_key in _potentially_deleted:
                     first_missing_time = _potentially_deleted[doc_key]

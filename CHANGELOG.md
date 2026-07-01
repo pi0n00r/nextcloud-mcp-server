@@ -5,23 +5,301 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
-## v0.118.1 (2026-06-13)
+## v0.118.1 (2026-06-13, fork-local)
 
 ### Fix
 
 - **calendar**: structured response for iMIP-scheduled VTODO DELETE rejection
 
-## v0.118.0 (2026-06-13)
+## v0.118.0 (2026-06-13, fork-local)
 
 ### Feat
 
 - **calendar**: add nc_calendar_complete_todo convenience tool
 
-## v0.117.1 (2026-06-13)
+## v0.117.1 (2026-06-13, fork-local)
 
 ### Fix
 
 - **providers**: pin an explicit timeout on Mistral embedding requests
+
+## v0.126.3 (2026-06-26)
+
+### Fix
+
+- **mail**: raise on outbox-create failure so the tool can't fake success
+- **mail**: drop the dropped `from_email` param; refresh stale docstrings
+
+### Refactor
+
+- **mail**: drop dead isinstance branch on required `to` arg (round-6)
+- **mail**: merge identical header dicts; guard outbox 204 (round-3)
+
+## v0.126.2 (2026-06-25)
+
+### Fix
+
+- address round-1 review on #968 (logging, startup warn, guards)
+- detect truncated WebDAV downloads and add NEXTCLOUD_HTTP_KEEPALIVE knob
+
+## v0.126.1 (2026-06-25)
+
+### Fix
+
+- send email via Mail 5.x outbox API (two-step create+send)
+- **mail**: use correct Mail 5.x API routes
+
+## v0.126.0 (2026-06-25)
+
+### Feat
+
+- **ingest**: add INGEST_LISTEN_NOTIFY toggle for poll-only worker
+
+## v0.125.1 (2026-06-25)
+
+### Fix
+
+- **auth**: use Nextcloud loginName for WebDAV path in Login Flow v2
+
+## v0.125.0 (2026-06-23)
+
+### Feat
+
+- **sharing**: add short-lived public download link tool (#829)
+
+### Fix
+
+- **sharing**: parameterize _build_link_response dict annotation (#952)
+- **sharing**: address review round 2 — fail hard on missing url, extract response builder (#952)
+- **sharing**: harden public-link tool per review round 1 (#952)
+
+## v0.124.4 (2026-06-23)
+
+### Fix
+
+- **documents**: recover full text layer when pymupdf4llm under-extracts
+
+## v0.124.3 (2026-06-23)
+
+### Fix
+
+- **webdav**: XML-escape find_by_name pattern + find_by_tag tag literal
+- address PR #950 review (metric comment, dead test assertion, hoist import)
+- **webdav**: XML-escape SEARCH scope + surface server error on failure
+- **ingest**: record batch-OCR-pending polls as status="pending", not "error"
+
+## v0.124.2 (2026-06-22)
+
+### Fix
+
+- **search**: word-level pymupdf chunk bboxes (coverage + per-line geometry)
+
+### Refactor
+
+- **search**: fix chunks_by_page type annotation + loop var name (#945 r4)
+- **search**: address #945 round-3 review (docstring + boundary lookup)
+- **search**: address #945 round-2 review (stale docstring, dead params)
+- **search**: address #945 review nits (dead params, clamp, docs)
+
+## v0.124.1 (2026-06-22)
+
+### Fix
+
+- **vector**: attribute OCR bboxes whitespace-insensitively + page guard
+
+## v0.124.0 (2026-06-22)
+
+### Feat
+
+- **vector**: meter bytes_ingested / bytes_stored at indexing
+
+## v0.123.2 (2026-06-22)
+
+### Fix
+
+- **vector**: escalate hard parse failures up the tier ladder (#399)
+
+## v0.123.1 (2026-06-21)
+
+### Fix
+
+- **vector**: index dead_letter payload field to stop ingest loop
+
+## v0.123.0 (2026-06-21)
+
+### Feat
+
+- **ocr**: store + expose gateway-provided OCR bounding boxes
+
+### Refactor
+
+- **ocr**: address PR #940 round-4 review (no blockers)
+- **ocr**: address PR #940 round-3 review
+- **ocr**: address PR #940 round-2 review
+- **ocr**: address PR #940 round-1 review
+
+## v0.122.2 (2026-06-21)
+
+### Fix
+
+- **vector**: key _potentially_deleted by doc_type to avoid cross-type collisions
+
+## v0.122.1 (2026-06-21)
+
+### Refactor
+
+- **ocr**: fix stale batch comment, single-source legacy OCR queues (PR #938 round-2)
+- **ocr**: consolidate the two OCR tiers into one configurable tier
+
+## v0.122.0 (2026-06-20)
+
+### Feat
+
+- **mail**: read and index Nextcloud Mail via the Mail OCS API
+
+### Fix
+
+- **mail**: guard empty message payload in processor (PR #935 round-6)
+- **mail**: address PR #935 round-2 review
+
+### Refactor
+
+- **mail**: address PR #935 round-1 review
+
+### Perf
+
+- **mail**: batch verify-on-read; test build_mail_content; addr-recall
+
+## v0.121.3 (2026-06-19)
+
+### Fix
+
+- **vector**: offload embedded Qdrant ops to a worker thread (#926)
+
+## v0.121.2 (2026-06-18)
+
+### Fix
+
+- **docker**: enable PYTHONFAULTHANDLER for native-crash diagnostics
+
+## v0.121.1 (2026-06-18)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.28,<1.29
+
+## v0.121.0 (2026-06-18)
+
+### Feat
+
+- **ingest**: split OCR into tier2 in-cluster (GPU, gateway-only) + tier3 upstream
+
+### Fix
+
+- **ingest**: warn when provider=none disables in-cluster; precise model fallback
+- **ingest**: suppress misleading batch-fallback warn for in-cluster rung
+
+### Refactor
+
+- **ingest**: doc legacy ocr queue; fix docstrings + getattr guard
+
+## v0.120.5 (2026-06-17)
+
+### Fix
+
+- **auth**: clarify empty-allowlist startup warning when userinfo is configured
+- **auth**: quiet per-validation userinfo TTL log; test introspection-timeout fall-through
+- **auth**: document introspection-error fall-through, drop misleading userinfo metric
+- **auth**: quiet cache-hit userinfo log, test real-exp userinfo path
+- **auth**: harden userinfo fallback (anti-forgery, SSRF guard, unconfigured-introspection)
+- **auth**: tighten userinfo-token cache TTL and metric labelling
+- **auth**: validate opaque access tokens via userinfo fallback
+
+## v0.120.4 (2026-06-17)
+
+### Fix
+
+- **vector**: guard dead-letter on etag, harden marker filter
+- **vector**: clear dead-letter marker on delete, treat oversize as terminal
+- **vector**: dead-letter terminally-failed documents to stop multi-user re-queue loop
+
+## v0.120.3 (2026-06-16)
+
+### Fix
+
+- **document-processors**: make glyph-corruption ratio of 0 disable the signal
+- **document-processors**: inline/external parity when structured tier is absent
+- **document-processors**: correct cascade escalation metric + review nits
+- **document-processors**: escalate glyph-corrupt PDFs to the structured tier
+
+## v0.120.2 (2026-06-16)
+
+### Refactor
+
+- **auth**: drop built-in well-known MCP client list
+
+## v0.120.1 (2026-06-16)
+
+### Fix
+
+- **vector**: propagate cancel in cleanup task; cover 403 + sweep-failure
+- **vector**: self-heal stale app passwords on auth failure
+
+## v0.120.0 (2026-06-16)
+
+### Feat
+
+- **vector-sync**: honor Astrolabe admin consent for searchable sources
+
+### Fix
+
+- **vector-sync**: address round-7 — only log purge endpoint when enabled
+- **vector-sync**: address round-6 review — rename shadowed var, add test
+- **vector-sync**: address round-5 review — partial-failure signal, markers
+- **vector-sync**: address round-4 review — processor test, partial eviction
+- **vector-sync**: address round-3 review — gate purge route, bound set, nits
+- **vector-sync**: address round-2 review — one-shot backstop, helper, caps
+- **vector-sync**: address PR review — dict guard, symmetric backstop, metrics
+
+### Refactor
+
+- **scanner**: _should_scan helper to cut scan_user_documents complexity
+- **scanner**: cut backstop cognitive complexity (SonarQube S3776)
+- **vector-sync**: dedupe "Bad request" 400s via a helper (SonarCloud S1192)
+
+## v0.119.0 (2026-06-15)
+
+### Feat
+
+- **ocr**: opt-in batch OCR mode via the gateway's async batch routes
+
+### Fix
+
+- **ocr**: round-5 review nits — empty-pages failure, comments, test cleanup
+- **ocr**: round-4 review — defensive poll + drop dead tracking columns
+- **ocr**: round-3 review — guard unexpected batch status + tests/comments
+- **ocr**: round-2 review — lazy store lock, mode enum normalization, type hints
+- **ocr**: wire batch settings into _field_map + review nits
+
+## v0.118.0 (2026-06-15)
+
+### Feat
+
+- **calendar**: list external read-only (subscribed) calendars
+
+## v0.117.2 (2026-06-14)
+
+### Fix
+
+- **security**: enforce WEBHOOK_SECRET min length + address round-2 review
+- **security**: require WEBHOOK_SECRET for the Nextcloud webhook receiver
+
+## v0.117.1 (2026-06-14)
+
+### Refactor
+
+- **auth**: drop remaining stale token-exchange references
+- **auth**: remove vestigial token-exchange code path
 
 ## v0.117.0 (2026-06-13)
 

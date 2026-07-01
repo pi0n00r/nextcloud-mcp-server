@@ -19,7 +19,7 @@ cp env.sample .env                     # Full reference with all options
 # Edit .env with your Nextcloud details
 ```
 
-> **Note:** The legacy templates `env.sample.oauth-multi-user` and `env.sample.oauth-advanced` configure the deprecated direct-OAuth-to-Nextcloud modes. New deployments should use [Login Flow v2](login-flow-v2.md) for multi-user setups.
+> **Note:** `env.sample.oauth-multi-user` is a Login Flow v2 quick-start template for multi-user setups. See [Login Flow v2](login-flow-v2.md).
 
 Then choose your deployment mode:
 
@@ -97,6 +97,13 @@ MCP_DEPLOYMENT_MODE=login_flow
 TOKEN_ENCRYPTION_KEY=<fernet-key>
 TOKEN_STORAGE_DB=/app/data/tokens.db
 
+# Static OIDC client for the MCP server's own IdP registration.
+# Strongly recommended — with Nextcloud's built-in oidc app the DCR
+# fallback expires after ~1h (see the warning below). Create the client
+# under Administration settings → OpenID Connect provider.
+NEXTCLOUD_OIDC_CLIENT_ID=<client-id-from-nextcloud>
+NEXTCLOUD_OIDC_CLIENT_SECRET=<client-secret-from-nextcloud>
+
 # Public URLs for browser redirects
 NEXTCLOUD_MCP_SERVER_URL=https://mcp.example.com
 NEXTCLOUD_PUBLIC_ISSUER_URL=https://your.nextcloud.instance.com
@@ -110,9 +117,21 @@ NEXTCLOUD_PUBLIC_ISSUER_URL=https://your.nextcloud.instance.com
 | `TOKEN_STORAGE_DB` | ✅ Yes | Path to SQLite DB for stored app passwords (use a persistent volume) |
 | `NEXTCLOUD_MCP_SERVER_URL` | ✅ Yes | Public URL of the MCP server (used as the audience claim and for browser redirects) |
 | `NEXTCLOUD_PUBLIC_ISSUER_URL` | ✅ Yes | Public URL of Nextcloud (for browser redirects during Login Flow v2) |
-| `NEXTCLOUD_OIDC_CLIENT_ID` | ⚠️ Optional (preferred) | OIDC client ID for the MCP server's relying-party registration with the IdP (Nextcloud OIDC by default; Keycloak / Cognito / etc. via `OIDC_DISCOVERY_URL`). If unset and the IdP advertises a `registration_endpoint`, RFC 7591 DCR is used as fallback. |
-| `NEXTCLOUD_OIDC_CLIENT_SECRET` | ⚠️ Optional (preferred) | OIDC client secret paired with `NEXTCLOUD_OIDC_CLIENT_ID`. |
+| `NEXTCLOUD_OIDC_CLIENT_ID` | ✅ Strongly recommended | OIDC client ID for the MCP server's relying-party registration with the IdP (Nextcloud's built-in OIDC by default; Keycloak / Cognito / etc. via `OIDC_DISCOVERY_URL`). If unset and the IdP advertises a `registration_endpoint`, the server falls back to RFC 7591 Dynamic Client Registration (DCR) — **but with Nextcloud's built-in `oidc` app this fallback breaks after ~1 hour** (see warning below). Create a static client and set this instead. |
+| `NEXTCLOUD_OIDC_CLIENT_SECRET` | ✅ Strongly recommended | OIDC client secret paired with `NEXTCLOUD_OIDC_CLIENT_ID`. |
 | `OIDC_DISCOVERY_URL` | Optional | Override the IdP discovery URL. Defaults to `${NEXTCLOUD_HOST}/.well-known/openid-configuration` (Nextcloud's built-in OIDC). Set to a Keycloak realm or AWS Cognito user-pool discovery URL to use an external IdP. |
+
+> **⚠️ Use a static OIDC client with Nextcloud's built-in `oidc` app.** If you
+> don't set `NEXTCLOUD_OIDC_CLIENT_ID` / `NEXTCLOUD_OIDC_CLIENT_SECRET`, the MCP
+> server registers its own relying-party client via DCR. Nextcloud's `oidc` app
+> treats DCR clients as **ephemeral** and deletes them after `client_expire_time`
+> (default **3600s = 1 hour**), pruning on every `/authorize`. Once it's gone,
+> authorization and token refresh fail and users hit an **"Access forbidden"**
+> page — permanently, because the server keeps reusing the deleted client.
+> Register a permanent client in **Administration settings → OpenID Connect
+> provider** and set the two env vars. See
+> [Login Flow v2 → Troubleshooting](login-flow-v2.md#troubleshooting) and
+> [issue #907](https://github.com/cbcoutinho/nextcloud-mcp-server/issues/907).
 
 See [Login Flow v2](login-flow-v2.md) for full setup, scope reference, and troubleshooting.
 
@@ -223,6 +242,18 @@ NEXTCLOUD_VERIFY_SSL=false
 |----------|----------|---------|-------------|
 | `NEXTCLOUD_VERIFY_SSL` | ⚠️ Optional | `true` | Set to `false` to disable TLS certificate verification |
 | `NEXTCLOUD_CA_BUNDLE` | ⚠️ Optional | - | Path to a PEM CA bundle file for custom certificate authorities |
+| `NEXTCLOUD_HTTP_KEEPALIVE` | ⚠️ Optional | `true` | Reuse pooled keep-alive connections for the Nextcloud httpx client. Set to `false` to open a fresh connection per request. See the note below. |
+
+> **`NEXTCLOUD_HTTP_KEEPALIVE`** — With the default (`true`) the httpx client pools
+> and reuses connections. Setting it to `false` builds the transport with
+> `max_keepalive_connections=0`, so every request opens (and closes) its own
+> connection. This is recommended for deployments behind a flaky CDN/WAN path,
+> where a truncated/interrupted response can poison a pooled connection and make
+> later reads silently return empty bytes — see
+> [#965](https://github.com/cbcoutinho/nextcloud-mcp-server/issues/965). It
+> mirrors the `DATABASE_POOL_SIZE`→`NullPool` precedent at the HTTP layer. The
+> trade-off is a TLS handshake per request, which is negligible for a background
+> indexer.
 
 ### Scope
 
@@ -552,6 +583,92 @@ A PDF larger than `DOCUMENT_MAX_PDF_SIZE_MB` fails fast with reason `oversize`
 (exported on `astrolabe_document_parse_failed_total{reason="oversize"}`) instead
 of being handed to the tiers, where a 40+ MB scan would otherwise burn the full
 OCR timeout for zero recovered text.
+
+#### OCR tier configuration
+
+OCR is a single configurable escalation tier. Enable it and choose the backend,
+model, and execution mode:
+
+```dotenv
+DOCUMENT_OCR_ENABLED=true              # route scanned/no-text-layer PDFs to OCR (default: false)
+DOCUMENT_OCR_PROVIDER=auto            # "auto" | "gateway" | "mistral" | "none"
+DOCUMENT_OCR_MODEL=mistral/mistral-ocr-latest  # provider-namespaced model id
+```
+
+- **`DOCUMENT_OCR_PROVIDER`** selects the backend: `gateway` posts to the Astrolabe
+  Cloud model gateway's `POST /v1/ocr` (no provider keys in the pod; the gateway
+  routes on the model's `<provider>/` prefix, so it serves Mistral, surya, etc.);
+  `mistral` calls the Mistral OCR API directly (`MISTRAL_API_KEY`); `auto` prefers
+  the gateway (if `EMBEDDING_GATEWAY_URL` is set) then direct Mistral; `none`
+  disables OCR.
+- **`DOCUMENT_OCR_MODEL`** is the provider-namespaced model id — e.g.
+  `mistral/mistral-ocr-latest` (Mistral) or `surya/surya-ocr-2` (surya, via the
+  gateway). The gateway routes on the prefix; the direct Mistral backend strips it.
+
+#### OCR execution mode: synchronous vs batch (Deck #332)
+
+The OCR tier has two execution modes, selected by `DOCUMENT_OCR_MODE`:
+
+```dotenv
+DOCUMENT_OCR_MODE=sync                 # "sync" (default) | "batch"
+DOCUMENT_OCR_BATCH_POLL_SECONDS=120    # re-poll cadence for a batch job (default: 120)
+DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS=86400  # give up + mark timeout after this (default: 24h)
+```
+
+- **`sync`** (default) — transcribe the document inline via the backend's
+  synchronous path (`POST /v1/ocr` for the gateway, or the direct Mistral OCR
+  API). The document is parsed in a single call.
+- **`batch`** — submit the document to the **gateway's async Batch OCR** job
+  (`POST /v1/ocr/batch`) and re-poll `GET /v1/ocr/batch/{job_id}` until it
+  finishes. This trades latency (a batch job runs minutes–hours) for roughly
+  **half the OCR cost**, so it suits large-corpus backfill rather than
+  interactive ingest.
+
+Batch mode is **opt-in and gateway-routed**: the embedding gateway is the
+batching layer, so batch OCR always routes *through* the gateway's batch routes
+(no provider keys in the pod). This is how batch works even when the chosen *sync*
+backend is direct Mistral — we leverage the gateway to batch for backends that
+have no native batch path from the pod. Because it needs a gateway, `DOCUMENT_OCR_MODE=batch`
+**requires `EMBEDDING_GATEWAY_URL`**: the server rejects the combination at startup
+rather than silently downgrading to synchronous OCR. Batch also requires the
+Postgres ingest queue (the per-tier procrastinate workers); the in-process
+(`INGEST_QUEUE=memory`) pipeline can't defer a poll, so use `DOCUMENT_OCR_MODE=sync`
+there.
+
+Mechanics: the OCR tier submits the job, records its id in the `batch_ocr_jobs`
+app-DB table (keyed on the document + its etag), and raises a re-poll deferral so
+procrastinate re-runs the tier after `DOCUMENT_OCR_BATCH_POLL_SECONDS` — releasing
+the worker slot between polls (a long batch never pins a worker or is reclaimed as
+stalled). On completion the per-page markdown is indexed exactly like the sync
+path; a failure or a job exceeding `DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS` marks the
+document parse-failed. Each poll re-fetches + re-classifies the PDF (a known v1
+inefficiency, bounded by the poll cadence); one batch job is submitted per
+document (coalescing many documents per job is a planned follow-up).
+
+#### Upgrade notes: OCR-tier consolidation
+
+The two OCR rungs (`ocr-incluster` / `ocr-upstream`) were merged into one `ocr`
+tier. When upgrading from a deployment that used the split tiers:
+
+- **`DOCUMENT_OCR_INCLUSTER_ENABLED` / `DOCUMENT_OCR_INCLUSTER_MODEL` are removed.**
+  Configure the single tier with `DOCUMENT_OCR_PROVIDER` + `DOCUMENT_OCR_MODEL`
+  (the gateway routes on the model's `<provider>/` prefix, so surya is reached by
+  setting e.g. `DOCUMENT_OCR_PROVIDER=gateway` + `DOCUMENT_OCR_MODEL=surya/surya-ocr-2`).
+- **Dead-letter retry burst.** The dead-letter signature dropped its `ocric=`
+  component, so a deployment that had `DOCUMENT_OCR_INCLUSTER_ENABLED=true` will see
+  its signature change on upgrade and **automatically re-attempt** documents that
+  were dead-lettered while the in-cluster rung was on. This is intended (those docs
+  can OCR via the unified tier) but can produce a burst of OCR jobs on
+  scanned-doc-heavy instances right after deploy — expect it and scale the OCR
+  worker fleet accordingly.
+- **Batch mode now fails loud instead of downgrading to sync.** `DOCUMENT_OCR_MODE=batch`
+  requires the embedding gateway (rejected at startup without `EMBEDDING_GATEWAY_URL`)
+  and the Postgres ingest queue. On the in-process (`INGEST_QUEUE=memory`) path —
+  which can't defer a poll — batch raises at ingest time rather than silently
+  transcribing synchronously; use `DOCUMENT_OCR_MODE=sync` there.
+- **In-flight jobs are drained.** Jobs still parked on the old `ingest-ocr-incluster`
+  / `ingest-ocr-upstream` queues during a rolling upgrade are processed by the new
+  `ocr` worker and routed back to the single `ocr` tier — nothing is stranded.
 
 ### Embedding Service Configuration
 

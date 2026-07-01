@@ -1,5 +1,6 @@
 """Unit tests for WebDAV client."""
 
+import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock
 
 import pytest
@@ -254,7 +255,7 @@ async def test_get_or_create_tag_creates_new_tag(mocker):
 
     # Mock no existing tag
     mocker.patch.object(client, "get_tag_by_name", return_value=None)
-    mocker.patch.object(
+    mock_create_tag = mocker.patch.object(
         client,
         "create_tag",
         return_value={"id": 42, "name": "vector-index", "userVisible": True},
@@ -265,7 +266,7 @@ async def test_get_or_create_tag_creates_new_tag(mocker):
 
     # Verify tag was created
     assert result["id"] == 42
-    client.create_tag.assert_called_once_with("vector-index", True, True)
+    mock_create_tag.assert_called_once_with("vector-index", True, True)
 
 
 @pytest.mark.unit
@@ -602,6 +603,92 @@ async def test_read_file_ascii_path_unchanged(mocker):
 
 
 @pytest.mark.unit
+async def test_read_file_raises_on_truncated_body(mocker):
+    """A body shorter than Content-Length is a poisoned/truncated download (#965).
+
+    httpx can hand back empty/short bytes on a healthy-looking 200 when a pooled
+    keep-alive connection is desynced. read_file must raise a retryable transport
+    error (so the vector-sync processor retries/re-queues instead of parsing the
+    empty bytes and dead-lettering the file), not return the truncated content.
+    """
+    from httpx import RemoteProtocolError
+
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+
+    mock_response = AsyncMock()
+    mock_response.content = b""  # poisoned connection delivered nothing
+    mock_response.headers = {
+        "content-type": "application/pdf",
+        "content-length": "187564",
+    }
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    with pytest.raises(RemoteProtocolError, match="Truncated download"):
+        await client.read_file("Active-Personal/fw9-filled.pdf")
+
+
+@pytest.mark.unit
+async def test_read_file_accepts_matching_content_length(mocker):
+    """A body matching Content-Length is returned unchanged."""
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+
+    body = b"%PDF-1.7 full body"
+    mock_response = AsyncMock()
+    mock_response.content = body
+    mock_response.headers = {
+        "content-type": "application/pdf",
+        "content-length": str(len(body)),
+    }
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    content, content_type = await client.read_file("Documents/report.pdf")
+    assert content == body
+    assert content_type == "application/pdf"
+
+
+@pytest.mark.unit
+async def test_read_file_skips_check_without_content_length(mocker):
+    """A header-less (e.g. chunked) response must not raise — nothing to compare."""
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+
+    body = b"chunked body of unknown declared length"
+    mock_response = AsyncMock()
+    mock_response.content = body
+    mock_response.headers = {"content-type": "text/plain"}  # no content-length
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    content, _ = await client.read_file("Documents/stream.txt")
+    assert content == body
+
+
+@pytest.mark.unit
+async def test_get_note_attachment_raises_on_truncated_body(mocker):
+    """get_note_attachment shares the short-read guard with read_file (#965)."""
+    from httpx import RemoteProtocolError
+
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+
+    mock_response = AsyncMock()
+    mock_response.content = b"abc"  # 3 bytes
+    mock_response.headers = {
+        "content-type": "application/pdf",
+        "content-length": "2048",
+    }
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    with pytest.raises(RemoteProtocolError, match="Truncated download"):
+        await client.get_note_attachment(123, "doc.pdf")
+
+
+@pytest.mark.unit
 async def test_move_resource_encodes_destination_header(mocker):
     """The MOVE Destination header must be percent-encoded too (card 309)."""
     mock_http_client = AsyncMock()
@@ -640,3 +727,95 @@ async def test_copy_resource_encodes_destination_header(mocker):
     destination = call.kwargs["headers"]["Destination"]
     assert "%23" in destination
     assert "#" not in destination
+
+
+@pytest.mark.unit
+def test_build_search_xml_escapes_special_chars_in_scope():
+    """A scope folder containing XML-special characters must yield a *well-formed*
+    SEARCH body, not malformed XML that Nextcloud rejects with 400.
+
+    Regression: a tagged folder whose name contains ``&`` (e.g. "Reports &
+    Plans") injected a bare ``&`` into ``<d:href>``, so Nextcloud's Sabre/DAV
+    parser 400'd the SEARCH and the tag-based indexing walk skipped the folder
+    and *all* its descendants (silent indexing gap).
+    """
+    client = WebDAVClient(AsyncMock(), "testuser")
+    scope = "Reports & Plans/2024"
+
+    body = client._build_search_xml(
+        scope=scope,
+        where_conditions=None,
+        properties=["displayname"],
+        order_by=None,
+        limit=None,
+    )
+
+    # 1. Must parse as well-formed XML (raised ParseError on the bare '&' before
+    #    the fix).
+    root = ET.fromstring(body)
+
+    # 2. The href round-trips to the *literal* path — Sabre unescapes ``&amp;``
+    #    back to ``&``, so matching is unchanged for folders without specials.
+    href = root.find(".//{DAV:}href")
+    assert href is not None
+    assert href.text == f"/files/testuser/{scope}"
+
+    # 3. The serialized body escapes the ampersand rather than emitting it raw.
+    assert "& Plans" not in body  # no bare ampersand
+    assert "&amp; Plans" in body  # escaped form present
+
+
+@pytest.mark.unit
+def test_build_search_xml_escapes_angle_brackets_in_scope():
+    """``<`` / ``>`` in a folder name are escaped too (not just ``&``)."""
+    client = WebDAVClient(AsyncMock(), "testuser")
+    scope = "weird <name>"
+
+    body = client._build_search_xml(
+        scope=scope,
+        where_conditions=None,
+        properties=["displayname"],
+        order_by=None,
+        limit=None,
+    )
+
+    root = ET.fromstring(body)  # well-formed
+    href = root.find(".//{DAV:}href")
+    assert href is not None
+    assert href.text == f"/files/testuser/{scope}"
+    # Escaped forms present in the serialized body; raw angle brackets absent.
+    assert "weird <name>" not in body
+    assert "&lt;name&gt;" in body
+
+
+@pytest.mark.unit
+async def test_find_by_name_escapes_special_chars_in_pattern(mocker):
+    # The filename pattern is embedded in a <d:literal>; '&'/'<'/'>' must be
+    # escaped or the SEARCH body is malformed and Sabre 400s — the same bug class
+    # as the scope fix. Regression for the find_by_name path.
+    client = WebDAVClient(AsyncMock(), "testuser")
+    mock_search = mocker.patch.object(client, "search_files", return_value=[])
+
+    await client.find_by_name("Costs & Revenue <draft>.pdf")
+
+    where = mock_search.call_args.kwargs["where_conditions"]
+    # Well-formed once wrapped with the DAV namespace (raised ParseError pre-fix).
+    ET.fromstring(f"<root xmlns:d='DAV:'>{where}</root>")
+    assert "&amp;" in where and "&lt;draft&gt;" in where
+    assert "Costs & Revenue" not in where  # no bare ampersand
+
+
+@pytest.mark.unit
+async def test_find_by_tag_escapes_special_chars_in_tag(mocker):
+    # Tag names can contain '&' (e.g. "R&D"); the tag literal must be escaped too.
+    client = WebDAVClient(AsyncMock(), "testuser")
+    mock_search = mocker.patch.object(client, "search_files", return_value=[])
+
+    await client.find_by_tag("R&D")
+
+    where = mock_search.call_args.kwargs["where_conditions"]
+    ET.fromstring(
+        f"<root xmlns:d='DAV:' xmlns:oc='http://owncloud.org/ns'>{where}</root>"
+    )
+    assert "R&amp;D" in where
+    assert "R&D" not in where  # no bare ampersand

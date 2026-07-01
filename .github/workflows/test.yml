@@ -9,7 +9,7 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Check format
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [linting]
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Run unit tests
@@ -44,7 +44,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: package-smoke (${{ matrix.os }})
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
@@ -59,9 +59,9 @@ jobs:
       fail-fast: false
       matrix:
         nextcloud_version:
-          - "31"
           - "32"
-          # - "33"  # Disabled until all upstream apps support NC 33
+          - "33"
+          # - "34"  # Disabled until all upstream apps support NC 34
         mode:
           - "single-user"
           - "multi-user-basic"
@@ -69,14 +69,14 @@ jobs:
           - "keycloak"
         include:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
-          # Each entry is pinned to its major version (e.g., NC 31 only gets 31.x updates)
-          - nextcloud_version: "31"
-            nextcloud_image: "docker.io/library/nextcloud:31.0.14@sha256:07ec73cc816e58d6f45a162cd53ef886462c29271a23fc68d0124cec276e3767"
+          # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.11@sha256:3ae4045d53e890680ec35e3e4349332123d959c72808aceb44930e79f1be9b9b"
-          # Disabled until all upstream apps support NC 33
-          # - nextcloud_version: "33"
-          #   nextcloud_image: "docker.io/library/nextcloud:33.0.5@sha256:56bdc45109067500fd0832fa64832b7c77a167d9394cbf5f0f4b59740b94194d"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.11@sha256:828cc04eedd9c7139e9a9a7693fb3a5d30f607c912af97e9030ce8cf78f119da"
+          - nextcloud_version: "33"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.5@sha256:bb3672cdb9dfccb2159da88826981a8d749f5d4cd9a2816c1f32d93e08f541eb"
+          # Disabled until all upstream apps support NC 34
+          # - nextcloud_version: "34"
+          #   nextcloud_image: "docker.io/library/nextcloud:34.0.0@sha256:4d4a6b5ed15a7eb4537538c848eb78833f53bed62f93e7d5af144f360cd53ff2"
 
           # Mode-specific properties
           - mode: single-user
@@ -85,6 +85,9 @@ jobs:
             wait-port: 8000
             mcp-internal-url: "http://mcp:8000"
             needs-playwright: false
+            # Also start GreenMail (SMTP/IMAP) so the Mail integration tests have
+            # a real backend; the Mail account is provisioned in a step below.
+            extra-compose-profiles: "--profile mail"
             extra-args: >-
               --ignore=tests/integration/test_qdrant_collection_creation.py
               --ignore=tests/rag_evaluation/
@@ -116,7 +119,7 @@ jobs:
     name: integration (${{ matrix.mode }} / nc${{ matrix.nextcloud_version }})
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: 'true'
 
@@ -169,7 +172,7 @@ jobs:
         uses: hoverkraft-tech/compose-action@11beaa1c2dae4e8ed7b1665aa074723b6cecb0e4 # v3.0.0
         with:
           compose-file: "./docker-compose.yml"
-          compose-flags: "--profile ${{ matrix.profile }}"
+          compose-flags: "--profile ${{ matrix.profile }} ${{ matrix.extra-compose-profiles }}"
           up-flags: "--build"
         env:
           MCP_SERVER_URL: ${{ matrix.mcp-internal-url }}
@@ -201,6 +204,12 @@ jobs:
             sleep 5
           done
           echo "Nextcloud is ready."
+
+      # Provision a GreenMail-backed Mail account for the Mail integration tests
+      # (single-user lane only; the `mail` profile started GreenMail above).
+      - name: Provision GreenMail mail account
+        if: matrix.mode == 'single-user'
+        run: bash scripts/provision-greenmail-account.sh admin admin@example.org
 
       # Wait for the MCP service to be healthy
       - name: Wait for MCP service (${{ matrix.mode }})

@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:11.8.8-noble@sha256:be1ef4fe5f14589325c08a41c76334097ce66c86264b75e1d28342c742782a61
+    image: docker.io/library/mariadb:12.3.2-noble@sha256:b1c7bf836e64ed9406a8984af29509f40089d55cea14b32f12c4726a1f17104b
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -19,11 +19,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.8.0-alpine@sha256:09160599abd229764c0fb44cb6be640294e1d360a54b19985ab4843dcf2d90f1
+    image: docker.io/library/redis:8.8.0-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.11@sha256:3ae4045d53e890680ec35e3e4349332123d959c72808aceb44930e79f1be9b9b}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.11@sha256:828cc04eedd9c7139e9a9a7693fb3a5d30f607c912af97e9030ce8cf78f119da}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -58,7 +58,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.1-alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    image: docker.io/library/nginx:1.31.2-alpine@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -99,8 +99,19 @@ services:
 
       # Semantic search configuration (ADR-007, ADR-021)
       - ENABLE_SEMANTIC_SEARCH=true
-      - VECTOR_SYNC_SCAN_INTERVAL=5
+      # The sync scanner runs an initial scan immediately on startup, so the
+      # corpus is indexed without waiting for the first periodic re-scan. A very
+      # short re-scan interval (was 5s) just re-queues the whole corpus faster
+      # than the workers can drain it: on a loaded CI runner pending_count
+      # snowballs (observed 1465 pending), sync never reaches idle, and the
+      # single-user vector tests (test_rag, test_sampling) time out. 30s matches
+      # the tuned multi-user-basic cadence and stays well within the tests' 90s
+      # sync-wait budget.
+      - VECTOR_SYNC_SCAN_INTERVAL=30
       - VECTOR_SYNC_PROCESSOR_WORKERS=2
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
 
       #- LOG_FORMAT=json
 
@@ -160,6 +171,9 @@ services:
       - TOKEN_STORAGE_DB=/app/data/tokens.db
 
       - ENABLE_SEMANTIC_SEARCH=true
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
       # Tuned cadence for the multi-user background-sync integration suite,
       # which provisions a user, creates a note, then waits ~90s for it to be
       # indexed. Two independent knobs matter here:
@@ -177,8 +191,10 @@ services:
       - VECTOR_SYNC_SCAN_INTERVAL=30
       - VECTOR_SYNC_PROCESSOR_WORKERS=1
 
-      # OAuth credentials for background sync (optional - uses DCR if not provided)
-      # Uncomment to avoid DCR:
+      # OAuth client for the MCP server's IdP registration. Falls back to DCR
+      # if unset — but with Nextcloud's built-in `oidc` app, DCR clients expire
+      # after ~1h (client_expire_time) and break auth permanently (see #907).
+      # For any non-CI deployment, register a static client and set these:
       # - NEXTCLOUD_OIDC_CLIENT_ID=your_client_id
       # - NEXTCLOUD_OIDC_CLIENT_SECRET=your_client_secret
 
@@ -195,7 +211,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.6.3@sha256:5fdbf2dbb5897cc34e82de49d13e23db011f9925089dbc555fc095f2c8bc1dac
+    image: quay.io/keycloak/keycloak:26.6.3@sha256:9b0330756022422149aa6502eb2def8cd47c6e1b000c7c65cdb13e7c0133e992
     command:
       - "start-dev"
       - "--import-realm"
@@ -249,12 +265,6 @@ services:
       - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY must be set in .env (see env.sample)}
       - TOKEN_STORAGE_DB=/app/data/tokens.db
 
-      # ADR-005: Token exchange mode (RFC 8693)
-      # Exchange MCP tokens (aud: nextcloud-mcp-server) for Nextcloud tokens (aud: http://localhost:8080)
-      # Provides strict audience separation between MCP session and Nextcloud API access
-      - ENABLE_TOKEN_EXCHANGE=true
-      - TOKEN_EXCHANGE_CACHE_TTL=300  # Cache exchanged tokens for 5 minutes (default)
-
       # Login Flow v2 (ADR-022) with external IdP — derived from the
       # auto-detected LOGIN_FLOW deployment mode; no separate flag needed.
       - ENABLE_DCR=true
@@ -293,6 +303,14 @@ services:
       # the browser-based app-password layer is derived automatically.
       - MCP_DEPLOYMENT_MODE=login_flow
 
+      # NOTE: this dev/test service relies on Dynamic Client Registration for
+      # the MCP server's own OIDC client, which is fine for short-lived CI runs.
+      # For a real self-hosted login_flow deployment, register a STATIC client
+      # in Nextcloud (Administration → OpenID Connect provider) and set
+      # NEXTCLOUD_OIDC_CLIENT_ID / NEXTCLOUD_OIDC_CLIENT_SECRET — the built-in
+      # `oidc` app deletes DCR clients after ~1h, which breaks auth (see #907
+      # and docs/login-flow-v2.md → Troubleshooting).
+
       # Token storage (required for app password + session persistence).
       # Source the key from .env — see env.sample. To generate a fresh key:
       #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -303,6 +321,9 @@ services:
       - ENABLE_SEMANTIC_SEARCH=true
       - VECTOR_SYNC_SCAN_INTERVAL=60
       - VECTOR_SYNC_PROCESSOR_WORKERS=1
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
 
       # Management API allowlist (ADR-018) — matches mcp-multi-user-basic so
       # the same configure_astrolabe_for_mcp_server fixture (which creates the
@@ -339,7 +360,7 @@ services:
       - claude-funnel
 
   nginx-claude-filter:
-    image: docker.io/library/nginx:1.31.1-alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    image: docker.io/library/nginx:1.31.2-alpine@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa
     restart: always
     depends_on:
       - mcp-login-flow
@@ -373,7 +394,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
+    image: docker.io/library/postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp
@@ -388,6 +409,32 @@ services:
       retries: 10
     profiles:
       - postgres
+
+  # GreenMail: standalone SMTP/IMAP test server for exercising the Nextcloud
+  # Mail app end-to-end (#965 follow-up). `greenmail.auth.disabled` makes any
+  # login succeed and auto-creates the mailbox, so the Nextcloud Mail account
+  # provisioned by the post-installation hook can connect without seeding users.
+  # SMTP 3025 / IMAP 3143 are the plaintext ports (ssl-mode "none").
+  greenmail:
+    image: docker.io/greenmail/standalone:2.1.9@sha256:3ac5a83dd6727cf95e4d50e18907fb8ee7bbf5f67e8534714dee2fb1b5b2e1d4
+    restart: always
+    environment:
+      - GREENMAIL_OPTS=-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose
+    ports:
+      # Plaintext SMTP/IMAP + the management REST API (8080 → 8085 to avoid the
+      # host 8080 already taken by the `app` service).
+      - 127.0.0.1:3025:3025
+      - 127.0.0.1:3143:3143
+      - 127.0.0.1:8085:8080
+    healthcheck:
+      # The slim JRE base has no curl/wget, but the Ubuntu base ships bash, so
+      # probe the IMAP port directly (open once `setup.test.all` has bound it).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3143"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles:
+      - mail
 
 volumes:
   nextcloud:

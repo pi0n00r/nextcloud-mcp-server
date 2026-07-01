@@ -41,11 +41,27 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 > [!TIP]
 > Generate an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) in Nextcloud under **Settings > Security > Devices & sessions** instead of using your login password.
 
+### Docker
+
+For full features including semantic search, run with Docker:
+
+```bash
+docker run -p 127.0.0.1:8000:8000 --rm \
+  -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
+  -e NEXTCLOUD_USERNAME=your_username \
+  -e NEXTCLOUD_PASSWORD=your_app_password \
+  pi0n00r/nextcloud-mcp-server:0.126.3
+```
+
+Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
+
+For deployment options and Compose profiles, see [docs/installation.md](docs/installation.md).
+
 ## Key Features
 
 - **110+ MCP Tools** - Comprehensive API coverage across 10 Nextcloud apps
 - **MCP Resources** - Structured data URIs for browsing Nextcloud data
-- **Semantic Search (Experimental)** - Optional vector-powered search for Notes, Files, News items, and Deck cards (requires Qdrant + Ollama)
+- **Semantic Search (Experimental)** - Optional vector-powered search for Notes, Files, News items, Deck cards, and Mail messages (requires Qdrant + Ollama)
 - **Document Processing** - OCR and text extraction from PDFs, DOCX, images with progress notifications
 - **Flexible Deployment** - Docker, Kubernetes, VM, or local installation
 - **Production-Ready Auth** - Basic Auth with app passwords; multi-user via Login Flow v2 — MCP clients authenticate via OAuth, the server handles Nextcloud app passwords transparently
@@ -65,9 +81,10 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 | **Tables** | 5 | Row operations on Nextcloud Tables |
 | **Sharing** | 10+ | Create and manage shares |
 | **News** | 8 | Feeds, folders, items, feed health monitoring |
+| **Mail** | 5 | Read-only: accounts, mailboxes, messages, attachments (via Mail app's OCS API) |
 | **Collectives** | 16 | Full CRUD on collectives, pages, and tags |
 | **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
-| **Semantic Search** | 2+ | Vector search for Notes, Files, News items, and Deck cards (experimental, opt-in, requires infrastructure) |
+| **Semantic Search** | 2+ | Vector search for Notes, Files, News items, Deck cards, and Mail messages (experimental, opt-in, requires infrastructure) |
 
 Want to see another Nextcloud app supported? [Open an issue](https://github.com/pi0n00r/nextcloud-mcp-server/issues) or contribute a pull request!
 
@@ -79,7 +96,7 @@ The MCP server authenticates to Nextcloud using **app-specific passwords** (Basi
 |------|----------|
 | Single-User (BasicAuth) | Personal use, development, single-user deployments |
 | Multi-User (BasicAuth pass-through) | Multi-user setups where clients send credentials via Authorization header |
-| Multi-User (Login Flow v2) | Multi-user / hosted deployments — clients authenticate to the MCP server via OAuth, and the server obtains a per-user app password from Nextcloud and uses it transparently |
+| Multi-User (Login Flow v2) | Shared deployments — clients authenticate to the MCP server via OAuth, and the server obtains a per-user app password from Nextcloud and uses it transparently |
 
 OAuth-direct-to-Nextcloud is no longer supported (it required upstream patches to `user_oidc` that were never merged). Login Flow v2 replaces it for multi-user deployments and works with stock Nextcloud.
 
@@ -102,11 +119,12 @@ An experimental RAG pipeline that lets MCP clients find Nextcloud content by **m
 
 ## Contributing
 
-Contributions are welcome!
+Code contributions and pull requests are welcome under this repository's AGPL
+license.
 
 - Report bugs or request features: [GitHub Issues](https://github.com/pi0n00r/nextcloud-mcp-server/issues)
 - Submit improvements: [Pull Requests](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
-- Development guidelines: [CLAUDE.md](CLAUDE.md)
+- Agent and development guidelines: [AGENTS.md](AGENTS.md)
 
 ## Security
 

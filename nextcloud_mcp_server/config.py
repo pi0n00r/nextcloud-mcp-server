@@ -31,6 +31,7 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_app_password": None,
     "nextcloud_verify_ssl": True,
     "nextcloud_ca_bundle": None,
+    "nextcloud_http_keepalive": True,
     "nextcloud_mcp_server_url": None,
     "nextcloud_resource_uri": None,
     "nextcloud_public_issuer_url": None,
@@ -57,7 +58,6 @@ _DEFAULTS: dict[str, Any] = {
     "enable_background_operations": False,
     "vector_sync_enabled": False,
     "enable_offline_access": False,
-    "enable_token_exchange": False,
     # Token storage
     "token_encryption_key": None,
     # None = ephemeral per-process tempfile (see get_token_db_path()).
@@ -158,10 +158,14 @@ _DEFAULTS: dict[str, Any] = {
     "document_tier1_engine": "pypdfium2",
     "document_ocr_enabled": False,
     # OCR backend: "auto" picks gateway (if EMBEDDING_GATEWAY_URL) else mistral
-    # (if MISTRAL_API_KEY); "gateway"/"mistral" force one; "none" disables.
+    # (if MISTRAL_API_KEY); "gateway"/"mistral" force one; "none" disables. The
+    # gateway routes on the model's "<provider>/" prefix, so it serves Mistral,
+    # surya (in-cluster GPU over the tailnet), etc. — one configurable OCR tier.
     "document_ocr_provider": "auto",
     # Provider-namespaced OCR model id (gateway routes on the prefix; the direct
-    # mistral backend strips it).
+    # mistral backend strips it). e.g. "mistral/mistral-ocr-latest" (Mistral) or
+    # "surya/surya-ocr-2" (surya via the gateway) — never hard-coded, only this
+    # default.
     "document_ocr_model": "mistral/mistral-ocr-latest",
     # OCR escalation triggers (tier-0). A page is OCR-worthy when its text is
     # near-empty (< min_page_chars) OR low-quality (< min_text_quality) OR (when
@@ -172,10 +176,31 @@ _DEFAULTS: dict[str, Any] = {
     "document_ocr_page_fraction": 0.5,
     "document_ocr_min_page_chars": 16,
     "document_ocr_detect_scanned": True,
+    # Tier-0 glyph-corruption trigger. When the fast (pypdfium2) extraction's
+    # doc-level C0-control-char ratio exceeds this, the text layer is treated as
+    # glyph-corrupt (a broken /ToUnicode mapping leaking raw glyph codes) and the
+    # doc escalates fast->structured (pymupdf re-extracts it correctly -- no OCR).
+    # 0 disables. Clean docs sit ~0; affected PDFs measured ~1-11% in testing.
+    "document_glyph_corruption_ratio": 0.02,
     # OCR backend request timeout (seconds). Slow scanned newspapers can take
     # 20-60s; raise/lower per tenant. Configurable so a tenant isn't stuck with
     # the 180s default when its gateway has its own shorter ceiling.
     "document_ocr_timeout_seconds": 180.0,
+    # OCR execution mode (Deck #332). "sync" (default) transcribes inline via the
+    # backend's synchronous path. "batch" routes to the gateway's async Batch OCR
+    # job (~50% cheaper, minutes-hours latency) for large-corpus backfill — opt-in
+    # and gateway-routed. It requires EMBEDDING_GATEWAY_URL (rejected at startup
+    # otherwise, see __post_init__) and the per-tier procrastinate path; the
+    # inline/memory pool can't defer a poll, so batch raises there rather than
+    # silently downgrading to sync.
+    "document_ocr_mode": "sync",
+    # Seconds between batch-job polls (the procrastinate re-enqueue delay). Each
+    # poll re-runs the tier; keep it well above a few seconds.
+    "document_ocr_batch_poll_seconds": 120,
+    # Hard deadline (seconds from submit) after which a still-pending batch job is
+    # abandoned and the document marked parse-failed (timeout). Matches the
+    # gateway's 24h Batch timeout default.
+    "document_ocr_batch_max_wait_seconds": 86400,
     # Observability
     "metrics_enabled": True,
     "metrics_port": 9090,
@@ -234,6 +259,16 @@ _DEFAULTS: dict[str, Any] = {
     # queue-depth metric clean). Set false to retain succeeded rows for audit
     # (note: indexing success is also recorded in logs/metrics regardless).
     "ingest_delete_succeeded_jobs": True,
+    # Whether the procrastinate worker uses LISTEN/NOTIFY for job pickup (Deck
+    # #424). True (default) = near-instant wakeup via a long-lived LISTEN
+    # connection. Set false to run POLL-ONLY when DATABASE_URL routes through a
+    # transaction-mode connection pooler (PgBouncer transaction mode), which is
+    # incompatible with LISTEN/NOTIFY — the LISTEN registration is dropped when
+    # the backend returns to the pool. Poll-only trades a few seconds of pickup
+    # latency (fetch_job_polling_interval) for pooler safety; job queries still
+    # multiplex through the pooler. Snapshotted at worker startup; needs a
+    # restart to change.
+    "ingest_listen_notify": True,
     # Per-tier escalation on the procrastinate (postgres) ingest path (Deck
     # #323). When true, a document that a tier cannot parse well is requeued onto
     # the next tier's queue (fast -> structured -> ocr) via a native procrastinate
@@ -353,6 +388,14 @@ _dynaconf = Dynaconf(
         Validator("DOCUMENT_CHUNK_SIZE", gte=1),
         Validator("DOCUMENT_PARSE_TIMEOUT_SECONDS", gte=1),
         Validator("DOCUMENT_OCR_TIMEOUT_SECONDS", gte=1),
+        # DOCUMENT_OCR_MODE is normalised + membership-checked in
+        # Settings.__post_init__ via _enum_fields (case-insensitive, like
+        # DOCUMENT_OCR_PROVIDER) — no strict dynaconf Validator here, so
+        # "Batch"/"SYNC" normalise instead of erroring.
+        # Poll cadence well above a few seconds (each poll re-runs the tier);
+        # deadline at least one poll interval.
+        Validator("DOCUMENT_OCR_BATCH_POLL_SECONDS", gte=5),
+        Validator("DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS", gte=60),
         Validator("DOCUMENT_PARSE_MEM_LIMIT_MB", gte=128),
         # 0 disables the pre-parse PDF size cap; otherwise it must be positive.
         Validator("DOCUMENT_MAX_PDF_SIZE_MB", gte=0),
@@ -363,10 +406,21 @@ _dynaconf = Dynaconf(
         Validator("DOCUMENT_OCR_MIN_TEXT_QUALITY", gte=0, lte=1),
         Validator("DOCUMENT_OCR_PAGE_FRACTION", gte=0, lte=1),
         Validator("DOCUMENT_OCR_MIN_PAGE_CHARS", gte=0),
+        Validator("DOCUMENT_GLYPH_CORRUPTION_RATIO", gte=0, lte=1),
         # Non-negative
         Validator("DOCUMENT_CHUNK_OVERLAP", gte=0),
         # Non-empty strings
         Validator("VECTOR_SYNC_PDF_TAG", len_min=1),
+        # WEBHOOK_SECRET is optional (None disables webhooks — GHSA-8vh3-g2qg-2h2c),
+        # but when set it must be long enough to resist guessing. Surfaces a
+        # weak/placeholder secret at startup rather than in a later audit.
+        Validator(
+            "WEBHOOK_SECRET",
+            condition=lambda v: v is None or len(v) >= 16,
+            messages={
+                "condition": "WEBHOOK_SECRET must be at least 16 characters when set"
+            },
+        ),
         # Enum constraints (document_* enums are validated + normalized in
         # __post_init__ via _enum_fields instead, for case-insensitive input).
         Validator("LOG_FORMAT", is_in=["text", "json"]),
@@ -668,6 +722,14 @@ class Settings:
     nextcloud_verify_ssl: bool = True
     nextcloud_ca_bundle: str | None = None
 
+    # Reuse pooled keep-alive connections for the Nextcloud httpx client.
+    # Default True preserves low-latency interactive traffic. Set
+    # NEXTCLOUD_HTTP_KEEPALIVE=false to force a fresh connection per request
+    # (max_keepalive_connections=0) — mirrors the DATABASE_POOL_SIZE→NullPool
+    # precedent and prevents a truncated/desynced response from poisoning a
+    # pooled connection on flaky CDN/WAN paths (see #965).
+    nextcloud_http_keepalive: bool = True
+
     # Postgres backend TLS settings (ADR-026). Default verify_ssl is None,
     # not True: when DATABASE_URL is unset there's nothing to verify, and
     # when it is set we don't want to break cluster-internal Postgres that
@@ -723,11 +785,15 @@ class Settings:
     token_encryption_key: str | None = None
     token_storage_db: str | None = None
 
-    # Webhook delivery authentication (ADR-010).
-    # When set, the registrar passes Authorization: Bearer <secret> as the
-    # webhook authData and the receiver validates the same header on each
-    # delivery. When unset, registration uses authMethod="none" and the
-    # receiver accepts unauthenticated POSTs (backward-compatible).
+    # Webhook delivery authentication (ADR-010). REQUIRED for webhooks
+    # (GHSA-8vh3-g2qg-2h2c). When set, the registrar passes
+    # Authorization: Bearer <secret> as the webhook authData and the receiver
+    # validates the same header on each delivery. When unset, the
+    # /webhooks/nextcloud route is not mounted, the receiver refuses any request
+    # that reaches it (503), and registration refuses to create webhooks — the
+    # receiver trusts user.uid from the payload, so unauthenticated access would
+    # let any caller delete/re-index other users' embeddings. Vector sync still
+    # works via the polling scanner when this is unset.
     webhook_secret: str | None = None
     # Internal URL override for webhook registration. Highest-priority
     # source for the URL we register with NC (above
@@ -833,19 +899,28 @@ class Settings:
     # permissive license, no find_tables) is the hot path; "pymupdf" is a
     # deprecated rollback to pymupdf4llm (AGPL, graphics-limited) for one corpus.
     document_tier1_engine: str = "pypdfium2"
-    # Route scanned/no-text-layer PDFs to the tier-3 OCR provider. Off by
-    # default; when off, the fast tier is terminal.
+    # Route scanned/no-text-layer PDFs to the OCR tier. Off by default; when off,
+    # the fast tier is terminal.
     document_ocr_enabled: bool = False
-    # OCR backend selection: "auto" | "gateway" | "mistral" | "none".
+    # OCR backend selection: "auto" | "gateway" | "mistral" | "none". The gateway
+    # routes on the model's "<provider>/" prefix, so it serves Mistral, surya, etc.
     document_ocr_provider: str = "auto"
-    # Provider-namespaced OCR model id (e.g. "mistral/mistral-ocr-latest"). The
-    # gateway routes on the "<provider>/" prefix; the direct mistral backend
-    # strips it.
+    # Provider-namespaced OCR model id (e.g. "mistral/mistral-ocr-latest" or
+    # "surya/surya-ocr-2"). The gateway routes on the "<provider>/" prefix; the
+    # direct mistral backend strips it.
     document_ocr_model: str = "mistral/mistral-ocr-latest"
     # OCR backend HTTP request timeout (seconds). float for parity with the
     # parse timeout / httpx.Timeout; per-tenant tunable so a gateway with a
     # shorter ceiling isn't masked by the 180s default.
     document_ocr_timeout_seconds: float = 180.0
+    # OCR execution mode: "sync" | "batch" (Deck #332). batch is opt-in and routes
+    # through the embedding gateway's async Batch OCR job (large-corpus backfill).
+    # It requires a gateway: with no EMBEDDING_GATEWAY_URL, __post_init__ rejects
+    # mode=batch at startup rather than silently downgrading to sync.
+    document_ocr_mode: str = "sync"
+    # Batch-job poll cadence (procrastinate re-enqueue delay) and hard deadline.
+    document_ocr_batch_poll_seconds: int = 120
+    document_ocr_batch_max_wait_seconds: int = 86400
     # OCR escalation triggers (tier-0), per-tenant tunable. A page is OCR-worthy
     # if near-empty (< min_page_chars) OR low text-quality (< min_text_quality)
     # OR (when detect_scanned, image-analysis only runs when OCR is enabled)
@@ -854,6 +929,10 @@ class Settings:
     document_ocr_page_fraction: float = 0.5
     document_ocr_min_page_chars: int = 16
     document_ocr_detect_scanned: bool = True
+    # Tier-0 glyph-corruption trigger: doc-level C0-control-char ratio above which
+    # the fast (pypdfium2) text layer is treated as glyph-corrupt and escalated
+    # fast->structured (pymupdf). 0 disables. See classifier._control_char_ratio.
+    document_glyph_corruption_ratio: float = 0.02
 
     # Observability settings
     metrics_enabled: bool = True
@@ -881,6 +960,7 @@ class Settings:
     mcp_role: str = "all"  # api | worker | all (Deck #183 two-pod model)
     ingest_stalled_job_seconds: int = 300  # crashed-worker reclaim threshold
     ingest_delete_succeeded_jobs: bool = True  # drop succeeded ingest jobs
+    ingest_listen_notify: bool = True  # False = poll-only (txn-mode pooler, Deck #424)
     ingest_escalation_enabled: bool = True  # per-tier queue-hop (Deck #323)
     ingest_transient_max_attempts: int = 5  # same-tier transient-retry cap
     ingest_reclaim_retry_delay_seconds: int = 30  # stagger reclaimed-job retries
@@ -918,6 +998,16 @@ class Settings:
                     f"NEXTCLOUD_CA_BUNDLE path does not exist: {self.nextcloud_ca_bundle}"
                 )
             logger.info("Using custom CA bundle: %s", self.nextcloud_ca_bundle)
+
+        # Surface the keep-alive opt-out at startup so an operator who set it to
+        # work around #965 gets confirmation it took effect.
+        if not self.nextcloud_http_keepalive:
+            logger.info(
+                "NEXTCLOUD_HTTP_KEEPALIVE is disabled. The Nextcloud HTTP client "
+                "will open a fresh connection per request (no pooled keep-alive "
+                "reuse) — a TLS handshake per call in exchange for immunity to "
+                "poisoned/desynced pooled connections (#965)."
+            )
 
         # Validate Postgres backend TLS configuration (ADR-026)
         if self.database_verify_ssl is False:
@@ -990,6 +1080,7 @@ class Settings:
             "collection_metadata_source": {"qdrant", "api"},
             "document_tier1_engine": {"pypdfium2", "pymupdf"},
             "document_ocr_provider": {"auto", "gateway", "mistral", "none"},
+            "document_ocr_mode": {"sync", "batch"},
         }
         for _field, _allowed in _enum_fields.items():
             _val = (getattr(self, _field) or "").strip().lower()
@@ -1023,6 +1114,20 @@ class Settings:
         if self.embedding_provider == "gateway" and not self.embedding_gateway_url:
             raise ValueError(
                 "EMBEDDING_GATEWAY_URL is required when EMBEDDING_PROVIDER=gateway"
+            )
+        # Batch OCR routes through the embedding gateway's async Batch API (the only
+        # batch path from the pod), so it requires a gateway. Fail fast rather than
+        # silently downgrading to synchronous OCR at ingest time. provider=none means
+        # OCR is off entirely, so the mode is moot there.
+        if (
+            self.document_ocr_mode == "batch"
+            and self.document_ocr_provider != "none"
+            and not self.embedding_gateway_url
+        ):
+            raise ValueError(
+                "DOCUMENT_OCR_MODE=batch requires EMBEDDING_GATEWAY_URL (batch OCR "
+                "routes through the embedding gateway); use DOCUMENT_OCR_MODE=sync "
+                "for the direct backend without a gateway"
             )
         if (
             self.collection_metadata_source == "api"
@@ -1268,7 +1373,6 @@ def _is_multi_user_mode() -> bool:
     - Multi-user BasicAuth (MCP_DEPLOYMENT_MODE=multi_user_basic)
     - Login Flow v2 / default OAuth (MCP_DEPLOYMENT_MODE=login_flow, or no
       username/password and no explicit mode)
-    - OAuth Token Exchange (ENABLE_TOKEN_EXCHANGE=true)
 
     Single-user mode is:
     - Single-user BasicAuth (username and password both set)
@@ -1284,10 +1388,6 @@ def _is_multi_user_mode() -> bool:
         return True
     if explicit_mode == "single_user_basic":
         return False
-
-    # Token exchange implies OAuth multi-user
-    if _dynaconf.get("ENABLE_TOKEN_EXCHANGE", False):
-        return True
 
     # If both username and password are set, it's single-user BasicAuth
     has_username = bool(_dynaconf.get("NEXTCLOUD_USERNAME"))
@@ -1412,6 +1512,7 @@ def get_settings() -> Settings:
         # Nextcloud SSL/TLS settings
         "nextcloud_verify_ssl": "NEXTCLOUD_VERIFY_SSL",
         "nextcloud_ca_bundle": "NEXTCLOUD_CA_BUNDLE",
+        "nextcloud_http_keepalive": "NEXTCLOUD_HTTP_KEEPALIVE",
         # Postgres backend TLS (ADR-026)
         "database_verify_ssl": "DATABASE_VERIFY_SSL",
         "database_ca_bundle": "DATABASE_CA_BUNDLE",
@@ -1487,10 +1588,14 @@ def get_settings() -> Settings:
         "document_ocr_provider": "DOCUMENT_OCR_PROVIDER",
         "document_ocr_model": "DOCUMENT_OCR_MODEL",
         "document_ocr_timeout_seconds": "DOCUMENT_OCR_TIMEOUT_SECONDS",
+        "document_ocr_mode": "DOCUMENT_OCR_MODE",
+        "document_ocr_batch_poll_seconds": "DOCUMENT_OCR_BATCH_POLL_SECONDS",
+        "document_ocr_batch_max_wait_seconds": "DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS",
         "document_ocr_min_text_quality": "DOCUMENT_OCR_MIN_TEXT_QUALITY",
         "document_ocr_page_fraction": "DOCUMENT_OCR_PAGE_FRACTION",
         "document_ocr_min_page_chars": "DOCUMENT_OCR_MIN_PAGE_CHARS",
         "document_ocr_detect_scanned": "DOCUMENT_OCR_DETECT_SCANNED",
+        "document_glyph_corruption_ratio": "DOCUMENT_GLYPH_CORRUPTION_RATIO",
         # Observability settings
         "metrics_enabled": "METRICS_ENABLED",
         "metrics_port": "METRICS_PORT",
@@ -1509,6 +1614,7 @@ def get_settings() -> Settings:
         "mcp_role": "MCP_ROLE",
         "ingest_stalled_job_seconds": "INGEST_STALLED_JOB_SECONDS",
         "ingest_delete_succeeded_jobs": "INGEST_DELETE_SUCCEEDED_JOBS",
+        "ingest_listen_notify": "INGEST_LISTEN_NOTIFY",
         "ingest_escalation_enabled": "INGEST_ESCALATION_ENABLED",
         "ingest_transient_max_attempts": "INGEST_TRANSIENT_MAX_ATTEMPTS",
         "ingest_reclaim_retry_delay_seconds": "INGEST_RECLAIM_RETRY_DELAY_SECONDS",
@@ -1555,6 +1661,17 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
         ctx = ssl.create_default_context(cafile=settings.nextcloud_ca_bundle)
         return ctx
     return True
+
+
+def get_nextcloud_http_keepalive() -> bool:
+    """Return whether the Nextcloud httpx client may reuse pooled connections.
+
+    Returns:
+        - False if NEXTCLOUD_HTTP_KEEPALIVE=false (fresh connection per
+          request; mitigates the poisoned-keep-alive truncation in #965).
+        - True otherwise (default pooled keep-alive behavior).
+    """
+    return get_settings().nextcloud_http_keepalive
 
 
 def get_database_ssl() -> bool | ssl.SSLContext | None:

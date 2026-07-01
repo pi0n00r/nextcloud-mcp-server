@@ -7,8 +7,9 @@ The escalation ladder is the cheapest-first ordering of extraction tiers:
 It mirrors the ``tier`` vocabulary documented on
 :meth:`DocumentProcessor.tier <.base.DocumentProcessor.tier>` and the
 observability label set. On the *external* (procrastinate) ingest path each tier
-runs on its own queue + worker fleet; a document that a tier cannot parse well is
-**requeued onto the next tier's queue** rather than escalated inline. The
+runs on its own queue + worker fleet; a document that a tier cannot parse well --
+or cannot parse at all (a hard timeout/OOM failure, #399) -- is **requeued onto
+the next tier's queue** rather than dropped or escalated inline. The
 mechanism is a raised :class:`EscalateError` that the procrastinate retry
 strategy turns into a native ``RetryDecision(queue=<next-tier queue>)`` queue-hop
 (see ``vector/queue/procrastinate.py``).
@@ -22,11 +23,43 @@ mapping lives in the queue layer, which imports :class:`EscalateError` from here
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-# Cheapest-first. ``llm`` is reserved (see base.DocumentProcessor.tier) and not
-# wired yet, so it is intentionally absent from the live ladder.
+# Cheapest-first. ``ocr`` is the single configurable OCR tier: the backend (direct
+# Mistral vs the embedding gateway, which can route Mistral, surya, etc.) and the
+# model are chosen by ``document_ocr_provider`` + ``document_ocr_model``. ``llm`` is
+# reserved (see base.DocumentProcessor.tier) and not wired yet.
 TIER_LADDER: tuple[str, ...] = ("fast", "structured", "ocr")
+
+
+def escalation_tiers_signature(settings: Any) -> str:
+    """A stable string fingerprint of the runtime escalation-tier configuration.
+
+    Used by the document dead-letter marker (``vector/dead_letter.py``) as part of
+    its content key: a document that fails its terminal tier is dead-lettered until
+    either its content (etag) OR this signature changes. The signature therefore
+    captures every setting that can make a *new* escalation tier become available
+    at runtime — flip it and previously dead-lettered documents become retryable.
+
+    Derived purely from settings (not the live ``ProcessorRegistry``) so it is
+    identical across the API/scanner and worker roles: the *registered* processor
+    set is build-constant, so the only runtime variables are the OCR-enabled gate
+    (``document_ocr_enabled`` — the single OCR-tier toggle) and the tier-1 engine
+    pin (``document_tier1_engine``). Enabling OCR changes the signature, so the
+    pathological-but-OCR-recoverable documents dead-lettered while OCR was off are
+    re-attempted automatically.
+
+    TODO: when a future setting can make a previously-terminal document parseable,
+    fold it in here so raising it auto-retries existing dead-letters. Two known
+    candidates: a new escalation tier becoming toggleable (e.g. the reserved
+    ``llm`` rung in ``TIER_LADDER``), and a raised oversize cap (an oversize PDF is
+    always-terminal, so without the cap in this signature it stays dead-lettered
+    until its etag changes even after an operator allows bigger files).
+    """
+    return (
+        f"ocr={int(bool(settings.document_ocr_enabled))};"
+        f"t1={settings.document_tier1_engine}"
+    )
 
 
 @dataclass(frozen=True)
@@ -49,7 +82,7 @@ class EscalationDecision:
 
     kind: Literal["hop", "suppressed"]
     to_tier: str
-    reason: Literal["empty_text", "low_confidence"]
+    reason: Literal["empty_text", "low_confidence", "corrupt_glyphs"]
 
 
 def next_tier(current: str) -> str | None:
@@ -80,10 +113,19 @@ class EscalateError(Exception):
     the junk text is never indexed, and it must never be swallowed by a broad
     ``except Exception`` on the indexing path.
 
-    ``reason`` uses the existing escalation label vocabulary. This PR raises
-    ``empty_text`` (scanned / no text layer) and ``low_confidence`` (junk text
-    layer); ``unsupported`` and ``forced`` are reserved for future callers and
-    not raised yet.
+    ``reason`` uses the post-parse quality vocabulary: ``empty_text``
+    (scanned / no text layer), ``low_confidence`` (junk text layer), and
+    ``corrupt_glyphs`` (a usable-looking layer whose extractor leaked raw glyph
+    codes -- the broken-/ToUnicode case -- recovered by a different in-cluster
+    extractor); ``unsupported`` and ``forced`` are reserved for future callers.
+
+    A second caller (``vector/processor._index_document``, #399) reuses this
+    signal to escalate a *hard parse failure* -- an isolated-worker timeout/OOM
+    on a pathological PDF -- up the ladder instead of dropping the document, so
+    ``reason`` may also carry a ``parse_failed_reason`` value (``timeout``,
+    ``oom``, ``error``). The ``from_tier``/``to_tier`` hop is identical; only the
+    reason label widens, which surfaces on
+    ``bridgette_document_escalation_total{reason}``.
     """
 
     def __init__(self, *, from_tier: str, to_tier: str, reason: str) -> None:
@@ -93,3 +135,27 @@ class EscalateError(Exception):
         super().__init__(
             f"escalate {from_tier}->{to_tier} (reason={reason})",
         )
+
+
+class BatchPending(Exception):
+    """Raised when a tier's work is in flight on an async backend and the worker
+    should poll again later (Deck #332 — batch OCR).
+
+    Like :class:`EscalateError` it is a **control-flow signal, NOT a failure**:
+    the document's batch OCR job is still running on the gateway, so the OCR tier
+    submits it (or polls an existing job) and raises this to ask the procrastinate
+    retry strategy to re-run the SAME job on the SAME queue after ``retry_in``
+    seconds — releasing the worker slot meanwhile so a multi-minute/hour batch
+    doesn't pin a worker (and isn't reclaimed as a stalled ``doing`` job).
+
+    It must propagate untouched to the retry strategy: never swallowed by a broad
+    ``except Exception`` on the indexing path, never counted as a drop/parse
+    error, and never marks the placeholder failed (the doc isn't done yet).
+    Unlike ``EscalateError`` it does NOT change queue — the job stays on its own
+    (``ocr``) tier queue and is simply deferred (batch mode routes through the
+    embedding gateway's async Batch OCR job).
+    """
+
+    def __init__(self, *, retry_in: int) -> None:
+        self.retry_in = retry_in
+        super().__init__(f"batch OCR pending (retry_in={retry_in}s)")

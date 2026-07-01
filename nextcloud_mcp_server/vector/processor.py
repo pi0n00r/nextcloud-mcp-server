@@ -21,12 +21,14 @@ if TYPE_CHECKING:
     from nextcloud_mcp_server.document_processors.registry import ProcessorRegistry
 
 from nextcloud_mcp_server.acl_hash import compute_acl_hash
+from nextcloud_mcp_server.capabilities import allowed_doc_types, is_doc_type_allowed
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_service
 from nextcloud_mcp_server.models.deck import DeckCard
 from nextcloud_mcp_server.observability.metrics import (
     record_document_chunks,
+    record_document_dead_lettered,
     record_document_escalation,
     record_document_escalation_suppressed,
     record_document_parse_failed,
@@ -40,13 +42,23 @@ from nextcloud_mcp_server.observability.metrics import (
 from nextcloud_mcp_server.observability.tracing import trace_operation
 from nextcloud_mcp_server.search.pdf_highlighter import PDFHighlighter
 from nextcloud_mcp_server.usage import UsageEventStore
+from nextcloud_mcp_server.utils.validation import is_valid_nextcloud_doc_id
 from nextcloud_mcp_server.vector import payload_keys
 from nextcloud_mcp_server.vector._errors import format_exception_group
+from nextcloud_mcp_server.vector.dead_letter import (
+    clear_dead_letter,
+    mark_dead_letter,
+)
 from nextcloud_mcp_server.vector.document_chunker import (
+    ChunkWithPosition,
     DocumentChunker,
     PageAwareChunker,
 )
 from nextcloud_mcp_server.vector.html_processor import html_to_markdown
+from nextcloud_mcp_server.vector.mail_content import (
+    build_mail_content,
+    format_mail_addresses,
+)
 from nextcloud_mcp_server.vector.placeholder import (
     delete_placeholder_point,
     update_placeholder_status,
@@ -126,6 +138,7 @@ async def _parse_pdf_tier(
     filename: str | None,
     tier: str,
     settings: Any,
+    options: dict[str, Any] | None = None,
 ) -> "ProcessingResult":
     """Run a single extraction tier and apply the post-parse escalation gate.
 
@@ -141,18 +154,31 @@ async def _parse_pdf_tier(
     the "OCR is an enhancement, never worse than off" invariant: a tenant who has
     not enabled a higher tier (or has no processor for it) simply indexes the
     cheap tier's output.
+
+    Batch OCR (Deck #332): when the OCR tier's batch job is still in flight the
+    processor returns a *pending sentinel* result; we translate it here into a
+    ``BatchPending`` raise (same decision point as ``EscalateError``) so the
+    retry strategy re-runs this tier after a delay instead of indexing empty text.
     """
     # Lazy import: keep the document stack (pymupdf/_isolation) off the module
     # load path; this runs only on the per-tier worker, which needs it anyway.
     from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+        BatchPending,
         EscalateError,
     )
+    from nextcloud_mcp_server.document_processors.ocr import (  # noqa: PLC0415
+        OCR_BATCH_PENDING_KEY,
+        OCR_BATCH_RETRY_IN_KEY,
+    )
 
-    # options / progress_callback are not threaded here -- the indexing caller
-    # passes neither today, and the inline path (registry.process) omits them
-    # too. Forward them if a tier processor ever needs per-call tuning (e.g. OCR
-    # DPI); keeping the two paths symmetric until then.
-    result = await registry.process_tier(content, content_type, filename, tier)
+    # ``options`` threads per-document identity (user_id/doc_id/doc_type/etag) to
+    # the OCR tier so batch mode can key its job-tracking table (Deck #332). Other
+    # tiers ignore it. The inline path (registry.process) passes None.
+    result = await registry.process_tier(
+        content, content_type, filename, tier, options=options
+    )
+    if result.metadata.get(OCR_BATCH_PENDING_KEY):
+        raise BatchPending(retry_in=int(result.metadata[OCR_BATCH_RETRY_IN_KEY]))
     if result.success:
         decision = registry.evaluate_escalation(
             result, content, tier, settings, filename=filename
@@ -187,6 +213,47 @@ async def _parse_pdf_tier(
                     from_tier=tier, to_tier=decision.to_tier, reason=decision.reason
                 )
     return result
+
+
+def _ocr_chunk_bboxes(
+    chunks: list[ChunkWithPosition], block_spans: list[dict[str, Any]]
+) -> dict[int, list[tuple[float, float, float, float]]]:
+    """Attribute OCR block bboxes to chunks by char-span overlap.
+
+    ``block_spans`` is the OCR tier's per-block geometry (``OCR_BLOCK_SPANS_KEY``):
+    each ``{"bbox": [x0,y0,x1,y1] normalized, "start_offset", "end_offset",
+    "page", ...}``. A block belongs to chunk *i* when their char spans intersect
+    (half-open overlap: ``block.start < chunk.end and block.end > chunk.start``)
+    AND the block's page matches the chunk's ``page_number``.
+
+    The page guard makes attribution correct-by-construction independent of the
+    chunker. ``chunk_bbox`` is stored as a flat rect list rendered on the chunk's
+    single ``page_number``, so a block from a *different* page must not be
+    attributed — its box would render on the wrong page at the wrong page's
+    coordinates. The page-aware chunker keeps every chunk single-page (guard is a
+    no-op), but the page-agnostic char-based chunker can straddle a page break: on
+    Student 147, 9/16 char-based chunks pulled blocks from two pages. When a chunk
+    has no ``page_number`` (no page boundaries), fall back to overlap-only.
+    Conversely, a span without a ``page`` key is excluded from any chunk that has a
+    ``page_number`` — ``_pages_to_text`` always stamps ``page`` on OCR spans, so this
+    only affects externally-built spans.
+
+    Returns ``chunk_index -> [bbox, ...]`` (a chunk spanning N blocks gets N bboxes,
+    in the spans' reading order), omitting chunks with no overlapping block. Pure +
+    module-level so the predicate is unit-testable in isolation."""
+    out: dict[int, list[tuple[float, float, float, float]]] = {}
+    for i, chunk in enumerate(chunks):
+        page = getattr(chunk, "page_number", None)
+        boxes = [
+            (s["bbox"][0], s["bbox"][1], s["bbox"][2], s["bbox"][3])
+            for s in block_spans
+            if s["start_offset"] < chunk.end_offset
+            and s["end_offset"] > chunk.start_offset
+            and (page is None or s.get("page") == page)
+        ]
+        if boxes:
+            out[i] = boxes
+    return out
 
 
 def assign_page_numbers(chunks, page_boundaries):
@@ -245,6 +312,20 @@ def should_use_page_aware(
     return page_aware_enabled and doc_type == "file" and bool(page_boundaries)
 
 
+def ingested_byte_size(content_bytes: bytes | None, content: str) -> int:
+    """Bytes ingested for one document (card #401).
+
+    Files carry their raw WebDAV binary in ``content_bytes`` — that raw size is
+    what the customer ingested. Text doc types (note, deck card, news item, mail
+    message) have no binary (``content_bytes is None``), so fall back to the
+    UTF-8 size of the extracted text. Selecting on ``content_bytes is not None``
+    (not ``doc_type``) keeps this correct for any future binary-backed type.
+    """
+    if content_bytes is not None:
+        return len(content_bytes)
+    return len(content.encode("utf-8"))
+
+
 async def record_indexing_usage(
     *,
     enabled: bool,
@@ -256,11 +337,13 @@ async def record_indexing_usage(
     token_count: int,
     total_chars: int,
     page_count: int | None,
+    bytes_ingested: int,
+    bytes_stored: int,
     pipeline_tier: str | None = None,
 ) -> None:
     """Record the billable usage events for one embedded document.
 
-    Two metered dimensions (Deck #67), recorded independently:
+    Metered dimensions (Deck #67 / #401), recorded independently:
 
     - ``tokens_embedded`` — the embedding request's token count, recorded for
       *every* embedded document. The same metric search records, so the meter
@@ -273,15 +356,30 @@ async def record_indexing_usage(
       ``pages_embedded`` row — only ``tokens_embedded``. There is deliberately
       no chars/tokens-per-page constant: pages map 1:1 to parsed document pages
       (card #282).
+    - ``bytes_ingested`` — the raw source size at ingestion time, recorded for
+      *every* embedded document. For files this is the raw binary size fetched
+      from WebDAV; for text doc types (note, deck card, news item, mail message
+      — no binary) it is the UTF-8 size of the extracted text. The caller
+      resolves the right source per ``doc_type`` (see the call site).
+    - ``bytes_stored`` — the UTF-8 byte size of the chunk texts persisted as
+      Qdrant payload excerpts, recorded for *every* embedded document. Reflects
+      the indexed footprint and so includes chunk-overlap duplication; it is
+      therefore typically larger than ``bytes_ingested`` for text content.
 
     Best-effort and flag-gated: a metering failure is logged and never breaks
     indexing. ``chunk_count`` is the empty-batch no-op guard — a document that
-    produced no chunks embedded nothing, so both events are skipped rather than
+    produced no chunks embedded nothing, so all events are skipped rather than
     writing zero-value rows. ``pages_embedded`` is additionally skipped when
     ``page_count`` is absent or not strictly positive — gating on the page count
     itself (not the ``doc_type``) keeps this correct if a future non-PDF parsed
     type starts reporting pages, and a malformed non-positive count meters as
-    "no pages" rather than emitting a zero/negative billing row.
+    "no pages" rather than emitting a zero/negative billing row. The
+    ``bytes_*`` events are likewise skipped on a non-positive count.
+
+    Cross-repo note: the control-plane rollup silently ignores a ``metric`` its
+    catalog doesn't know (see migration 007), so ``bytes_ingested`` /
+    ``bytes_stored`` only bill once the CP metric catalog + Stripe meter learn
+    them too (card #401).
 
     Privacy note: ``user_id`` stays tenant-local — the CP rollup aggregates
     GROUP BY (day, metric) into ``usage_daily`` (no metadata column), so nothing
@@ -331,11 +429,10 @@ async def record_indexing_usage(
                 metadata=metadata,
                 enabled=True,
             )
-            # Paid-OCR pages are metered as a SEPARATE line (Deck #323) so the
-            # expensive tier's cost is billable independently of CPU-cheap parsing
-            # -- pages_embedded counts all parsed pages, pages_ocr only the OCR
-            # tier's. Gated on the tier so it's emitted exactly when the doc was
-            # actually OCR'd; the same page_count guard above applies.
+            # OCR pages are metered as a SEPARATE line (Deck #323) so the OCR
+            # tier's cost is billable independently of CPU-cheap parsing --
+            # pages_embedded counts all parsed pages, pages_ocr only the OCR tier's.
+            # Gated on the tier so it's emitted exactly when the doc hit OCR.
             if pipeline_tier == "ocr":
                 await store.record_usage_event(
                     metric="pages_ocr",
@@ -343,6 +440,25 @@ async def record_indexing_usage(
                     metadata=metadata,
                     enabled=True,
                 )
+        # Byte-volume dimensions (card #401), recorded for every embedded
+        # document. Appended after the conditional pages block so the
+        # tokens-then-pages ordering above is preserved. Each is skipped on a
+        # non-positive count to avoid writing a zero-value billing row (the
+        # chunk_count guard already filtered truly-empty documents).
+        if bytes_ingested > 0:
+            await store.record_usage_event(
+                metric="bytes_ingested",
+                value=bytes_ingested,
+                metadata=metadata,
+                enabled=True,
+            )
+        if bytes_stored > 0:
+            await store.record_usage_event(
+                metric="bytes_stored",
+                value=bytes_stored,
+                metadata=metadata,
+                enabled=True,
+            )
     except Exception:
         # Reached only when shared()/store construction itself raises
         # (record_usage_event swallows its own write failures). Metering is on,
@@ -525,19 +641,21 @@ async def process_document(
     re-picked on the next scan; the procrastinate path (max_retries=1) caps it at
     one outer attempt (~30s) and defers. Don't stack a third retry layer here.
     """
-    # EscalateError is a control-flow signal that arises ONLY on the per-tier
-    # external path (tier set). Bind the class lazily here, and only when a tier
-    # is set, so the document stack is never imported at *module load* (the #877
-    # invariant) nor on the delete / text-doc call paths (file processing already
-    # imports it via get_registry regardless). When tier is None it can't be
-    # raised, so the guards below stay inert.
-    escalate_error_cls: type[BaseException] | None = None
+    # EscalateError and BatchPending are control-flow signals that arise ONLY on
+    # the per-tier external path (tier set). Bind them lazily here, and only when a
+    # tier is set, so the document stack is never imported at *module load* (the
+    # #877 invariant) nor on the delete / text-doc call paths (file processing
+    # already imports them via get_registry regardless). When tier is None neither
+    # can be raised, so the guards below stay inert. Bound as a tuple so the guards
+    # treat both identically: propagate untouched, never record an error/drop.
+    control_flow_excs: tuple[type[BaseException], ...] = ()
     if tier is not None:
         from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+            BatchPending,
             EscalateError,
         )
 
-        escalate_error_cls = EscalateError
+        control_flow_excs = (EscalateError, BatchPending)
 
     start_time = time.time()
 
@@ -574,6 +692,27 @@ async def process_document(
             ):
                 await _reconcile_tag_event(doc_task, nc_client)
 
+            # Admin consent gate (Astrolabe): never index a source the admin has
+            # disabled for semantic search — this catches near-real-time webhook
+            # events that bypass the scanner's discovery gate. Deletes always
+            # proceed (removing data honours consent). ``None`` from the reader
+            # means no restriction (fail-open / older Astrolabe), so a transient
+            # capabilities failure never silently drops indexing.
+            if doc_task.operation == "index":
+                allowed = await allowed_doc_types(nc_client, doc_task.user_id)
+                if not is_doc_type_allowed(doc_task.doc_type, allowed):
+                    logger.info(
+                        "Skipping index of %s_%s for %s: doc_type disabled by admin",
+                        doc_task.doc_type,
+                        doc_task.doc_id,
+                        doc_task.user_id,
+                    )
+                    # Alertable counter so a flood of webhook events for a
+                    # disabled source is observable (not silently swallowed).
+                    record_ingest_dropped("admin_disabled")
+                    record_vector_sync_processing(time.time() - start_time, "skipped")
+                    return
+
             # Handle deletion
             if doc_task.operation == "delete":
                 # Release this user rather than blind-delete: a file shared across
@@ -583,6 +722,13 @@ async def process_document(
                 await release_document_for_user(
                     doc_task.doc_id, doc_task.doc_type, doc_task.user_id
                 )
+                # Drop any dead-letter marker for the file too: release only
+                # removes it when the last reader leaves (its filter misses the
+                # user-agnostic, principal-less marker), so without this a
+                # dead-lettered-then-deleted file would leave an orphan marker
+                # accumulating in Qdrant. Only files are ever dead-lettered.
+                if doc_task.doc_type == "file":
+                    await clear_dead_letter(doc_task.doc_id, doc_task.doc_type)
                 logger.info(
                     "Deleted %s_%s for %s",
                     doc_task.doc_type,
@@ -632,13 +778,11 @@ async def process_document(
                     return  # Success
 
                 except Exception as e:
-                    # An escalation signal is control flow, not a failure:
-                    # propagate it untouched so the procrastinate retry strategy
-                    # can hop the job to the next tier's queue. Never retry it
+                    # A control-flow signal (escalation hop, or batch-OCR re-poll
+                    # deferral) is not a failure: propagate it untouched so the
+                    # procrastinate retry strategy handles it. Never retry it
                     # in-process and never count it as a drop.
-                    if escalate_error_cls is not None and isinstance(
-                        e, escalate_error_cls
-                    ):
+                    if isinstance(e, control_flow_excs):
                         raise
                     if attempt < max_retries - 1:
                         logger.warning(
@@ -691,10 +835,11 @@ async def process_document(
                         raise
 
         except Exception as e:
-            # An escalation signal must reach the procrastinate retry strategy
-            # un-recorded -- it is neither a processing success nor an error
-            # (the hop is its own event, counted via record_document_escalation).
-            if escalate_error_cls is not None and isinstance(e, escalate_error_cls):
+            # A control-flow signal must reach the procrastinate retry strategy
+            # un-recorded -- it is neither a processing success nor an error (an
+            # escalation hop is counted via record_document_escalation; a batch
+            # re-poll deferral is not an event at all).
+            if isinstance(e, control_flow_excs):
                 raise
             # Single processing-error call site: catches exhausted-retry
             # re-raises, delete failures, and setup errors (get_qdrant_client /
@@ -784,6 +929,44 @@ async def _index_document(
                 "guid_hash": item.get("guidHash"),
                 "enclosure_link": item.get("enclosureLink"),
                 "enclosure_mime": item.get("enclosureMime"),
+            }
+            file_path = None
+            content_bytes = None
+            content_type = None
+        elif doc_task.doc_type == "mail_message":
+            # Fetch the full message via the Mail OCS API. The Mail app handles
+            # IMAP server-side; we only ever speak HTTP. build_mail_content is
+            # shared with search/context.py so index- and query-time text match.
+            # Guard the cast before the network call (consistent with the same
+            # doc_type in search/context.py) so a malformed queue record produces
+            # a specific error rather than a bare ValueError.
+            if not is_valid_nextcloud_doc_id(doc_task.doc_id):
+                raise ValueError(f"Invalid mail_message doc_id: {doc_task.doc_id!r}")
+            message = await nc_client.mail.get_message(int(doc_task.doc_id))
+            # An empty payload (OCS data=null with a <400 meta) would otherwise
+            # index a useless near-empty placeholder; fail loudly so the task
+            # dead-letters instead of corrupting the index.
+            if not message:
+                raise ValueError(
+                    f"mail_message {doc_task.doc_id!r} returned an empty payload"
+                )
+            content = build_mail_content(message)
+
+            subject = message.get("subject") or ""
+            title = subject
+            # Email is immutable; key change-detection on the message id so a
+            # re-index is a no-op unless the id changes.
+            etag = str(message.get("id") or doc_task.doc_id)
+            file_metadata = {
+                "subject": subject,
+                "from": format_mail_addresses(message.get("from")),
+                "to": format_mail_addresses(message.get("to")),
+                "cc": format_mail_addresses(message.get("cc")),
+                "bcc": format_mail_addresses(message.get("bcc")),
+                "date_int": message.get("dateInt"),
+                "has_attachments": bool(message.get("attachments")),
+                "account_id": (doc_task.metadata or {}).get("account_id"),
+                "mailbox_id": (doc_task.metadata or {}).get("mailbox_id"),
             }
             file_path = None
             content_bytes = None
@@ -956,7 +1139,10 @@ async def _index_document(
                 get_registry,
             )
             from nextcloud_mcp_server.document_processors.escalation import (  # noqa: PLC0415
+                TIER_LADDER,
+                BatchPending,
                 EscalateError,
+                escalation_tiers_signature,
             )
 
             registry = get_registry()
@@ -968,6 +1154,16 @@ async def _index_document(
                 # and the in-process/memory pool (tier is None) -- runs the inline
                 # tiered pipeline (fast -> OCR escalation in one call).
                 if tier is not None and _is_pdf(content_type):
+                    # Per-document identity, forwarded to every tier's processor.
+                    # Only the OCR tier reads it (batch mode keys its job-tracking
+                    # table on it, Deck #332); fast/structured ignore it, so it's
+                    # safe to pass on all tiers.
+                    doc_identity_options = {
+                        "user_id": doc_task.user_id,
+                        "doc_id": doc_task.doc_id,
+                        "doc_type": doc_task.doc_type,
+                        "etag": doc_task.etag or "",
+                    }
                     result = await _parse_pdf_tier(
                         registry,
                         content_bytes,
@@ -975,6 +1171,7 @@ async def _index_document(
                         file_path,
                         tier,
                         settings,
+                        options=doc_identity_options,
                     )
                 else:
                     result = await registry.process(
@@ -986,34 +1183,138 @@ async def _index_document(
                 # A permanent parse failure (e.g. an isolated-worker OOM/timeout
                 # on a pathological PDF) returns success=False rather than
                 # raising -- there is nothing to index and retrying would just
-                # fail again. Mark the placeholder "failed" so the scanner stops
-                # re-queuing it (until the file changes) and return False so the
-                # caller skips the success metrics (it was not indexed).
+                # fail again.
                 if not result.success:
                     reason = result.metadata.get("parse_failed_reason", "error")
-                    record_document_parse_failed(reason)
-                    logger.warning(
-                        "Permanent parse failure for %s (reason=%s); marking "
-                        "failed and skipping index",
-                        file_path,
-                        reason,
+                    # The tier that produced this failed result: the worker's own
+                    # tier on the per-tier path, else the deepest tier the inline
+                    # pipeline reached (recorded as ``pipeline_tier``).
+                    failing_tier = tier or result.metadata.get(
+                        "pipeline_tier", TIER_LADDER[0]
                     )
-                    try:
-                        await update_placeholder_status(
-                            doc_id=doc_task.doc_id,
-                            doc_type=doc_task.doc_type,
-                            user_id=doc_task.user_id,
-                            status="failed",
+                    # The next tier that can still run above the failing one
+                    # (``None`` == terminal). An oversize PDF is rejected by the
+                    # pre-parse size guard before any tier runs (no pipeline_tier
+                    # stamped on the inline path) and no tier can ever parse it, so
+                    # it is terminal regardless of failing_tier.
+                    next_avail = (
+                        None
+                        if reason == "oversize"
+                        else registry.next_available_tier(failing_tier, settings)
+                    )
+                    # #399: a hard parse failure (an isolated-worker timeout/OOM on
+                    # a pathological PDF) is not necessarily terminal. On the
+                    # per-tier path, if a higher tier can still run, ESCALATE the
+                    # failure to it rather than dropping the doc -- e.g. a
+                    # structured-tier pymupdf timeout on a garbled/huge plan hops to
+                    # OCR, where surya rasterizes + reads the rendered glyphs.
+                    # Without this the doc was marked "failed" and the scanner
+                    # re-queued it into the same failing tier forever (the retry
+                    # loop seen on 406-105-style plans). The inline pipeline (tier
+                    # is None) already ran every tier in one call, so it never hops
+                    # here -- its failures fall through to the terminal handling.
+                    if tier is not None and next_avail is not None:
+                        # Mirror the quality-gate hop in _parse_pdf_tier: record the
+                        # escalation + raise so the retry strategy requeues onto the
+                        # next tier's queue. Deliberately NOT counted as a parse
+                        # failure (no record_document_parse_failed / failed mark) --
+                        # that would both inflate the hard-parse-failure panel and
+                        # lose a document OCR can still read.
+                        record_document_escalation(failing_tier, next_avail, reason)
+                        logger.info(
+                            "Parse failure for %s at tier=%s (reason=%s); "
+                            "escalating to %s",
+                            file_path,
+                            failing_tier,
+                            reason,
+                            next_avail,
                         )
-                    except Exception:
-                        # Best-effort: a transient Qdrant error here only means
-                        # the placeholder isn't marked, so the scanner retries
-                        # the (still un-indexable) file later -- not fatal.
-                        logger.debug(
-                            "Could not mark placeholder failed for %s",
+                        raise EscalateError(
+                            from_tier=failing_tier,
+                            to_tier=next_avail,
+                            reason=reason,
+                        )
+                    # Terminal: oversize, the inline pipeline exhausted every tier,
+                    # or the deepest per-tier rung failed. Count the failure and
+                    # dead-letter / mark it below.
+                    record_document_parse_failed(reason)
+                    terminal = next_avail is None
+                    if terminal and doc_task.etag:
+                        # No higher tier can run (e.g. structured timed out with
+                        # OCR off), so retrying just re-burns the same failing
+                        # parse. Dead-letter the document tenant-wide
+                        # (content-addressed, user-agnostic) so EVERY user's scan
+                        # stops re-queuing it until its content (etag) or the
+                        # escalation-tier set (e.g. OCR enabled -> new tiers_sig)
+                        # changes. This fixes the multi-user placeholder
+                        # ping-pong the per-user "failed" mark could not: a file
+                        # shared by N users has ONE user-agnostic placeholder
+                        # whose user_id is overwritten by the last scanner, so
+                        # every other user re-queued it forever. Requires an etag
+                        # to content-address the marker; without one (rare) we
+                        # fall back to the legacy per-user mark below.
+                        await mark_dead_letter(
                             doc_task.doc_id,
-                            exc_info=True,
+                            doc_task.doc_type,
+                            doc_task.etag,
+                            escalation_tiers_signature(settings),
+                            reason,
+                            file_path=file_path,
                         )
+                        record_document_dead_lettered(reason)
+                        logger.warning(
+                            "Permanent parse failure for %s (reason=%s); "
+                            "dead-lettered (terminal tier=%s, no escalation) and "
+                            "skipping index",
+                            file_path,
+                            reason,
+                            failing_tier,
+                        )
+                        # Drop the volatile in-flight placeholder; the durable
+                        # marker is now the document's terminal-state record.
+                        try:
+                            await delete_placeholder_point(
+                                doc_id=doc_task.doc_id,
+                                doc_type=doc_task.doc_type,
+                                user_id=doc_task.user_id,
+                            )
+                        except Exception:
+                            # A real Qdrant I/O failure (not control-flow): warn so
+                            # it's observable. Non-fatal -- the durable dead-letter
+                            # marker is already written, so the leftover volatile
+                            # placeholder is merely redundant.
+                            logger.warning(
+                                "Could not delete placeholder for dead-lettered %s",
+                                doc_task.doc_id,
+                                exc_info=True,
+                            )
+                    else:
+                        # Either a higher tier exists (parse failures don't
+                        # escalate to it today) or there's no etag to
+                        # content-address a dead-letter marker. Keep the legacy
+                        # per-user "failed" placeholder mark.
+                        logger.warning(
+                            "Permanent parse failure for %s (reason=%s); marking "
+                            "failed and skipping index",
+                            file_path,
+                            reason,
+                        )
+                        try:
+                            await update_placeholder_status(
+                                doc_id=doc_task.doc_id,
+                                doc_type=doc_task.doc_type,
+                                user_id=doc_task.user_id,
+                                status="failed",
+                            )
+                        except Exception:
+                            # Best-effort: a transient Qdrant error here only
+                            # means the placeholder isn't marked, so the scanner
+                            # retries the (still un-indexable) file later.
+                            logger.debug(
+                                "Could not mark placeholder failed for %s",
+                                doc_task.doc_id,
+                                exc_info=True,
+                            )
                     return False
 
                 content = result.text
@@ -1047,10 +1348,12 @@ async def _index_document(
                             )
                 else:
                     logger.debug("No page_boundaries in metadata for %s", file_path)
-            except EscalateError:
-                # Control-flow signal (per-tier path): re-raise untouched so the
-                # queue hops the job to the next tier. NOT a "failed to process"
-                # error -- don't log it as one.
+            except (EscalateError, BatchPending):
+                # Control-flow signals (per-tier path): re-raise untouched.
+                # EscalateError hops the job to the next tier; BatchPending defers
+                # a re-poll on the same tier (batch OCR still in flight, Deck
+                # #332). Neither is a "failed to process" error -- don't log them
+                # as one.
                 raise
             except Exception as e:
                 logger.error("Failed to process file %s: %s", file_path, e)
@@ -1137,6 +1440,9 @@ async def _index_document(
     # `chunk.page_number` (offset-based) and stored as `page_number`
     # in the Qdrant payload, so we don't carry an `actual_page_num` here.
     chunk_bboxes: dict[int, list[tuple[float, float, float, float]]] = {}
+    # Where the bboxes came from — "ocr" (gateway-provided per-block geometry) or
+    # "pymupdf" (local text-search). Stamped on each chunk payload that has a bbox.
+    bbox_source: str | None = None
 
     # Determine if we need PDF highlighting
     is_pdf = doc_task.doc_type == "file" and content_type == "application/pdf"
@@ -1208,6 +1514,13 @@ async def _index_document(
                     and not isinstance(raw_page_count, bool)
                     else None
                 ),
+                # bytes_ingested: raw source size at ingestion (raw WebDAV binary
+                # for files, UTF-8 text size for text doc types — note,
+                # deck_card, news_item, mail_message). See helper.
+                bytes_ingested=ingested_byte_size(content_bytes, content),
+                # bytes_stored: UTF-8 size of the chunk texts persisted as Qdrant
+                # payload excerpts (includes chunk-overlap duplication).
+                bytes_stored=sum(len(t.encode("utf-8")) for t in chunk_texts),
                 # Tier that produced the parsed pages (registry stamps it on the
                 # result metadata); text doc types stay "fast". Narrow defensively
                 # to str|None — file_metadata is loosely typed (Any values).
@@ -1249,13 +1562,62 @@ async def _index_document(
             )
 
     async def generate_highlights():
-        """Compute chunk bounding boxes for PDF chunks (CPU-bound, no rendering)."""
-        nonlocal chunk_bboxes
+        """Compute chunk bounding boxes for PDF chunks (CPU-bound, no rendering).
+
+        Prefers OCR-provided geometry: when the OCR tier returned per-block bboxes
+        (surya via the gateway, normalized [0,1] — ``OCR_BLOCK_SPANS_KEY`` in
+        metadata), a chunk's bbox is the set of blocks whose char span it overlaps,
+        and ``bbox_source`` is ``"ocr"``. This is the ONLY viable source for an
+        OCR'd (scanned) doc — its PDF has no text layer for pymupdf to search. When
+        no OCR geometry is present (fast/structured tiers, Mistral OCR), fall back
+        to the pymupdf text-search path (``bbox_source="pymupdf"``)."""
+        nonlocal chunk_bboxes, bbox_source
         if not is_pdf:
             return
 
         # Type narrowing: content_bytes is set for PDF files
         assert content_bytes is not None
+
+        # Lazy import (mirrors _parse_pdf_tier): keep the document stack off the
+        # module load path; this runs only for PDFs on the indexing path.
+        from nextcloud_mcp_server.document_processors.ocr import (  # noqa: PLC0415
+            OCR_BLOCK_SPANS_KEY,
+        )
+
+        ocr_block_spans = file_metadata.get(OCR_BLOCK_SPANS_KEY)
+        if ocr_block_spans:
+            spans = cast(list[dict[str, Any]], ocr_block_spans)
+            attributed = _ocr_chunk_bboxes(chunks, spans)
+            chunk_bboxes.update(attributed)
+            # Only stamp "ocr" when something was actually attributed — a non-empty
+            # spans list that overlaps no chunk leaves the source unset (nothing is
+            # stored either way; the payload gates on `i in chunk_bboxes`).
+            if attributed:
+                bbox_source = "ocr"
+                logger.info(
+                    "Attributed OCR bboxes for %s/%s chunks (%s blocks)",
+                    len(attributed),
+                    len(chunks),
+                    len(spans),
+                )
+            else:
+                # OCR returned geometry but none overlapped a chunk — unexpected
+                # (offset accounting / empty chunks); warn so it's visible.
+                logger.warning(
+                    "OCR returned %s blocks but none overlapped any of %s chunks; "
+                    "no pre-computed bboxes stored",
+                    len(spans),
+                    len(chunks),
+                )
+            # One path for the WHOLE document: when the OCR tier ran, surya OCRs
+            # every rendered page, so its blocks cover the whole doc — pymupdf has
+            # no text layer to add (a scanned doc) and we do NOT fall through to it,
+            # even when attribution found nothing. Caveat: a mixed native+OCR PDF
+            # gets OCR geometry only; native-page chunks won't also get pymupdf
+            # highlights. That's acceptable — escalation to OCR is a whole-document
+            # decision, so a mixed doc is rare, and unmatched blocks are logged in
+            # _pages_to_text for diagnosis.
+            return
 
         with trace_operation(
             "vector_sync.compute_chunk_bboxes",
@@ -1292,6 +1654,8 @@ async def _index_document(
 
             for chunk_index, (bboxes, _) in batch_results.items():
                 chunk_bboxes[chunk_index] = bboxes
+            if chunk_bboxes:
+                bbox_source = "pymupdf"
 
             logger.info(
                 "Computed bboxes for %s/%s chunks", len(chunk_bboxes), len(chunks)
@@ -1469,14 +1833,47 @@ async def _index_document(
                         if doc_task.doc_type == "deck_card"
                         else {}
                     ),
+                    # Mail message-specific metadata
+                    **(
+                        {
+                            "subject": file_metadata.get("subject"),
+                            "from": file_metadata.get("from"),
+                            "to": file_metadata.get("to"),
+                            "cc": file_metadata.get("cc"),
+                            "bcc": file_metadata.get("bcc"),
+                            "date_int": file_metadata.get("date_int"),
+                            "has_attachments": file_metadata.get("has_attachments"),
+                            "account_id": file_metadata.get("account_id"),
+                            "mailbox_id": file_metadata.get("mailbox_id"),
+                        }
+                        if doc_task.doc_type == "mail_message"
+                        else {}
+                    ),
                     # Chunk bbox (PDF only) — normalized rectangles in [0,1]
                     # relative to page width/height. Replaces the legacy
                     # `highlighted_page_image` (Deck #76). The page number
                     # comes from `page_number` (set above for PDF chunks).
-                    **({"chunk_bbox": chunk_bboxes[i]} if i in chunk_bboxes else {}),
+                    # ``bbox_source`` records provenance ("ocr" = gateway-provided
+                    # surya geometry, "pymupdf" = local text-search).
+                    **(
+                        {"chunk_bbox": chunk_bboxes[i], "bbox_source": bbox_source}
+                        if i in chunk_bboxes
+                        else {}
+                    ),
                 },
             )
         )
+
+    # A successful (re-)index supersedes any prior terminal failure: clear a
+    # stale dead-letter marker (e.g. the file was fixed/replaced, or a new
+    # escalation tier finally parsed it) so it isn't left behind. Only files are
+    # ever dead-lettered, and only with a non-empty etag (is_dead_lettered
+    # early-returns without one), so skip the extra Qdrant round-trip otherwise.
+    # Cleared before the real-chunk upsert below: if that upsert then fails
+    # transiently, the document is re-queued and re-parses once on the next scan
+    # (an extra parse, never a silent drop) -- the safe ordering.
+    if doc_task.doc_type == "file" and doc_task.etag:
+        await clear_dead_letter(doc_task.doc_id, doc_task.doc_type)
 
     # Delete placeholder before writing real vectors
     # This prevents duplicates and cleans up the placeholder state

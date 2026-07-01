@@ -354,8 +354,8 @@ def worker(concurrency: int | None, tier: str | None):
 
     \b
     With --tier the worker drains only that tier's queue (``ingest-<tier>``), so
-    a CPU-bound ``fast`` fleet, an in-cluster ``structured`` fleet, and a paid
-    ``ocr`` fleet scale independently. Without it, all tier queues are drained in
+    a CPU-bound ``fast`` fleet, an in-cluster ``structured`` fleet, and an ``ocr``
+    fleet scale independently. Without it, all tier queues are drained in
     one process (handy for dev / a single Deployment). A low-quality parse hops
     the job to the next tier's queue automatically (see TieredEscalationStrategy).
 
@@ -386,21 +386,32 @@ def worker(concurrency: int | None, tier: str | None):
         ALL_INGEST_QUEUES,
         INGEST_QUEUE_MAINTENANCE,
         LEGACY_INGEST_QUEUE,
+        LEGACY_OCR_QUEUES,
         TIER_QUEUES,
         apply_ingest_queue_schema,
         get_procrastinate_app,
     )
 
     # Which queues this process drains. A single tier -> just its queue; no tier
-    # -> every tier queue PLUS the legacy single queue, so a rolling upgrade
-    # never strands jobs deferred under the pre-#323 name. Every worker also
-    # drains the maintenance queue so the periodic stalled-job reclaim fires
-    # regardless of which tier(s) are scaled up (procrastinate dedups the
-    # periodic, so multiple drainers don't multiply the reclaim).
+    # -> every tier queue PLUS the legacy queues, so a rolling upgrade never
+    # strands jobs deferred under the pre-#323 single queue or the pre-#353 split
+    # OCR queues (now consolidated into ``ingest-ocr``). The ``ocr`` worker also
+    # drains those two split OCR queues so in-flight OCR jobs from a pre-
+    # consolidation deploy still get processed. Every worker drains the maintenance
+    # queue so the periodic stalled-job reclaim fires regardless of which tier(s)
+    # are scaled up (procrastinate dedups the periodic, so multiple drainers don't
+    # multiply the reclaim).
     if tier is not None:
         queues = [TIER_QUEUES[tier], INGEST_QUEUE_MAINTENANCE]
+        if tier == "ocr":
+            queues[1:1] = sorted(LEGACY_OCR_QUEUES)
     else:
-        queues = [*ALL_INGEST_QUEUES, LEGACY_INGEST_QUEUE, INGEST_QUEUE_MAINTENANCE]
+        queues = [
+            *ALL_INGEST_QUEUES,
+            LEGACY_INGEST_QUEUE,
+            *sorted(LEGACY_OCR_QUEUES),
+            INGEST_QUEUE_MAINTENANCE,
+        ]
 
     # This is the consumer side of the distributed (postgres) ingest backend.
     # Unlike the in-process anyio pool, the worker talks to procrastinate's App
@@ -429,11 +440,12 @@ def worker(concurrency: int | None, tier: str | None):
             # pipeline like every other startup message.
             logger.info(
                 "Ingest worker started: tier=%s queues=%s concurrency=%s "
-                "delete_succeeded=%s",
+                "delete_succeeded=%s listen_notify=%s",
                 tier or "all",
                 queues,
                 workers,
                 settings.ingest_delete_succeeded_jobs,
+                settings.ingest_listen_notify,
             )
             await app.run_worker_async(
                 queues=queues,
@@ -445,6 +457,11 @@ def worker(concurrency: int | None, tier: str | None):
                 delete_jobs="successful"
                 if settings.ingest_delete_succeeded_jobs
                 else "never",
+                # LISTEN/NOTIFY for near-instant job pickup. Set
+                # INGEST_LISTEN_NOTIFY=false to run poll-only when DATABASE_URL
+                # routes through a transaction-mode pooler (PgBouncer), which
+                # drops the LISTEN registration on backend checkin (Deck #424).
+                listen_notify=settings.ingest_listen_notify,
             )
 
     anyio.run(_run)

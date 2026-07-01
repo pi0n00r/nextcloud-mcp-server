@@ -20,6 +20,7 @@ from .contacts import ContactsClient
 from .cookbook import CookbookClient
 from .deck import DeckClient
 from .groups import GroupsClient
+from .mail import MailClient
 from .news import NewsClient
 from .notes import NotesClient
 from .sharing import SharingClient
@@ -144,6 +145,7 @@ class NextcloudClient:
         self.collectives = CollectivesClient(self._client, username)
         self.deck = DeckClient(self._client, username)
         self.news = NewsClient(self._client, username)
+        self.mail = MailClient(self._client, username)
         self.talk = TalkClient(self._client, username)
         self.users = UsersClient(self._client, username)
         self.groups = GroupsClient(self._client, username)
@@ -292,8 +294,9 @@ class NextcloudClient:
                     )
                 except Exception as e:
                     logger.warning(
-                        "Tag-based directory walk failed for %r (tag %r): %s; "
-                        "skipping descendants",
+                        "Tag-based directory walk failed for %r (tag %r): %s. "
+                        "Skipping this folder and all its descendants — those "
+                        "files will NOT be indexed until the walk succeeds.",
                         dir_path,
                         tag_name,
                         e,

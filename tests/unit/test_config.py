@@ -117,6 +117,56 @@ class TestGetSettings:
 
     @patch.dict(
         os.environ,
+        {
+            "DOCUMENT_OCR_MODE": "batch",
+            "DOCUMENT_OCR_BATCH_POLL_SECONDS": "45",
+            "DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS": "3600",
+            # batch routes through the gateway, so it requires a gateway URL
+            # (validated in __post_init__).
+            "EMBEDDING_GATEWAY_URL": "https://gw",
+        },
+        clear=True,
+    )
+    def test_get_settings_ocr_batch_mode_from_env(self):
+        """DOCUMENT_OCR_MODE / batch tuning must reach settings (regression).
+
+        These were added to _DEFAULTS + the Settings dataclass but initially
+        omitted from _field_map, so dynaconf silently ignored the env vars and
+        batch mode could never be enabled in production (Deck #332).
+        """
+        _reload_config()
+        settings = get_settings()
+        assert settings.document_ocr_mode == "batch"
+        assert settings.document_ocr_batch_poll_seconds == 45
+        assert settings.document_ocr_batch_max_wait_seconds == 3600
+
+    @patch.dict(
+        os.environ,
+        {"DOCUMENT_OCR_MODE": "Batch", "EMBEDDING_GATEWAY_URL": "https://gw"},
+        clear=True,
+    )
+    def test_document_ocr_mode_case_normalised(self):
+        """DOCUMENT_OCR_MODE is case-insensitive (normalised in __post_init__ via
+        _enum_fields, like DOCUMENT_OCR_PROVIDER) — "Batch" -> "batch"."""
+        _reload_config()
+        assert get_settings().document_ocr_mode == "batch"
+
+    @patch.dict(os.environ, {"DOCUMENT_OCR_MODE": "bogus"}, clear=True)
+    def test_document_ocr_mode_invalid_rejected(self):
+        _reload_config()
+        with pytest.raises(ValueError, match="DOCUMENT_OCR_MODE"):
+            get_settings()
+
+    @patch.dict(os.environ, {"DOCUMENT_OCR_MODE": "batch"}, clear=True)
+    def test_document_ocr_mode_batch_requires_gateway(self):
+        """batch OCR routes through the embedding gateway, so mode=batch without
+        EMBEDDING_GATEWAY_URL is rejected at startup (no silent sync downgrade)."""
+        _reload_config()
+        with pytest.raises(ValueError, match="DOCUMENT_OCR_MODE=batch requires"):
+            get_settings()
+
+    @patch.dict(
+        os.environ,
         {"QDRANT_LOCATION": "/app/data/qdrant"},
         clear=True,
     )
@@ -230,6 +280,30 @@ class TestChunkConfigValidation:
         with patch.dict(os.environ, {"DOCUMENT_MAX_PDF_SIZE_MB": "12.5"}, clear=True):
             _reload_config()
             assert get_settings().document_max_pdf_size_mb == pytest.approx(12.5)
+
+    def test_glyph_corruption_ratio_default_and_env_override(self):
+        """document_glyph_corruption_ratio defaults to 0.02 and reads its env var.
+
+        Guards the _DEFAULTS-key-must-match-env-var footgun.
+        """
+        assert Settings().document_glyph_corruption_ratio == pytest.approx(0.02)
+        with patch.dict(
+            os.environ, {"DOCUMENT_GLYPH_CORRUPTION_RATIO": "0.05"}, clear=True
+        ):
+            _reload_config()
+            assert get_settings().document_glyph_corruption_ratio == pytest.approx(0.05)
+
+    @patch.dict(
+        os.environ,
+        {"DOCUMENT_GLYPH_CORRUPTION_RATIO": "1.5"},
+        clear=True,
+    )
+    def test_glyph_corruption_ratio_out_of_range_raises_error(self):
+        """The ratio must be within [0, 1]."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="DOCUMENT_GLYPH_CORRUPTION_RATIO"):
+            _reload_config()
 
     def test_valid_chunk_settings(self):
         """Test valid chunk size and overlap configuration."""
@@ -484,6 +558,24 @@ class TestDynaconfValidators:
 
         with pytest.raises(ValidationError, match="OTEL_TRACES_SAMPLER"):
             _reload_config()
+
+    @patch.dict(os.environ, {"WEBHOOK_SECRET": "short"}, clear=True)
+    def test_webhook_secret_too_short(self):
+        """A set WEBHOOK_SECRET shorter than 16 chars raises ValidationError
+        (GHSA-8vh3-g2qg-2h2c hardening — reject weak/placeholder secrets at
+        startup)."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="WEBHOOK_SECRET"):
+            _reload_config()
+
+    @patch.dict(
+        os.environ, {"WEBHOOK_SECRET": "a-sufficiently-long-secret"}, clear=True
+    )
+    def test_webhook_secret_long_enough_is_accepted(self):
+        """A WEBHOOK_SECRET of >=16 chars passes validation."""
+        _reload_config()
+        assert get_settings().webhook_secret == "a-sufficiently-long-secret"
 
     @patch.dict(os.environ, {"OTEL_TRACES_SAMPLER_ARG": "2.0"}, clear=True)
     def test_sampler_arg_too_high(self):

@@ -237,7 +237,7 @@ qdrant_operations_total = Counter(
 document_parse_duration_seconds = Histogram(
     "bridgette_document_parse_duration_seconds",
     "Document text-extraction (parse) duration in seconds",
-    ["processor", "tier", "status"],  # status: success | error
+    ["processor", "tier", "status"],  # status: success | error | pending
     # Buckets reach 300s: large PDFs exceed the 60s ceiling of the whole-doc
     # histogram, which would otherwise pile every large parse into +Inf.
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
@@ -246,7 +246,7 @@ document_parse_duration_seconds = Histogram(
 document_parse_total = Counter(
     "bridgette_document_parse_total",
     "Total document parse attempts",
-    ["processor", "tier", "status"],  # status: success | error
+    ["processor", "tier", "status"],  # status: success | error | pending
 )
 
 document_pages_processed_total = Counter(
@@ -272,7 +272,7 @@ document_bytes_processed_total = Counter(
 document_escalation_total = Counter(
     "bridgette_document_escalation_total",
     "Total document parse escalations between tiers",
-    # reason: low_confidence | empty_text | unsupported | error | forced
+    # reason: low_confidence | empty_text | corrupt_glyphs | unsupported | error | forced
     ["from_tier", "to_tier", "reason"],
 )
 
@@ -287,7 +287,10 @@ document_escalation_total = Counter(
 document_escalation_suppressed_total = Counter(
     "bridgette_document_escalation_suppressed_total",
     "Would-be tier escalations suppressed because the target tier is disabled",
-    # reason: low_confidence | empty_text
+    # reason: low_confidence | empty_text | corrupt_glyphs. (corrupt_glyphs lands
+    # here only in the narrow case where the structured tier is unregistered AND
+    # OCR is registered-but-disabled: evaluate_escalation follows minimum="structured"
+    # past the missing rung to OCR, which is gated off -> suppressed{to_tier="ocr"}.)
     ["from_tier", "to_tier", "reason"],
 )
 
@@ -300,6 +303,20 @@ document_parse_failed_total = Counter(
     "bridgette_document_parse_failed_total",
     "Document parses that failed in the isolated worker (process killed)",
     ["reason"],  # reason: timeout | oom | error
+)
+
+# Documents dead-lettered after a terminal parse failure: the failing tier had
+# no higher escalation tier available (e.g. structured timed out with OCR off),
+# so the document is recorded as permanently failed for this content-version and
+# stops being re-queued (vector/dead_letter.py). Distinct from
+# ``document_parse_failed_total`` (which counts every failed parse attempt,
+# including the ones that will be retried) -- this fires once when a document
+# is given up on, and clears implicitly when its etag or the escalation-tier set
+# changes and it is re-attempted.
+document_dead_lettered_total = Counter(
+    "bridgette_document_dead_lettered_total",
+    "Documents dead-lettered after a terminal parse failure (no escalation tier)",
+    ["reason"],  # reason: timeout | oom | error | oversize
 )
 
 # Documents dropped after exhausting in-process indexing retries (the scanner
@@ -332,7 +349,7 @@ document_classifier_flag_total = Counter(
     # so flag{image_heavy} is expected to exceed classified{recommended_tier=ocr}.
     "bridgette_document_classifier_flag_total",
     "Tier-0 classifier flags raised on documents",
-    ["flag"],  # image_heavy | scanned | bad_text_layer
+    ["flag"],  # image_heavy | scanned | bad_text_layer | corrupt_glyphs
 )
 
 document_text_quality = Histogram(
@@ -420,6 +437,12 @@ documents_indexed_total = Counter(
 document_scan_truncated_total = Counter(
     "bridgette_document_scan_truncated_total",
     "Times a folder-expansion SEARCH hit the result ceiling (coverage truncated)",
+)
+
+document_download_truncated_total = Counter(
+    "bridgette_document_download_truncated_total",
+    "Times a WebDAV GET returned fewer bytes than Content-Length (truncated/"
+    "poisoned connection; raised as a retryable transport error, see #965)",
 )
 
 # =============================================================================
@@ -691,9 +714,14 @@ def update_ingest_queue_depth(by_queue: dict[str, dict[str, int]] | None) -> Non
     from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
         ALL_INGEST_QUEUES,
         LEGACY_INGEST_QUEUE,
+        LEGACY_OCR_QUEUES,
     )
 
-    for queue in (*ALL_INGEST_QUEUES, LEGACY_INGEST_QUEUE):
+    for queue in (
+        *ALL_INGEST_QUEUES,
+        LEGACY_INGEST_QUEUE,
+        *sorted(LEGACY_OCR_QUEUES),
+    ):
         for status in _INGEST_DEPTH_STATUSES:
             ingest_queue_depth.labels(queue=queue, status=status).set(0)
     for queue, per_status in by_queue.items():
@@ -722,16 +750,17 @@ def record_document_parse(
         pages: Number of pages parsed (0 if not page-based)
         chars: Number of characters extracted
         byte_size: Size of the source document in bytes
-        status: "success" or "error"
+        status: "success" | "error" | "pending" (a batch-OCR poll still in flight —
+            GPU booting / batch queued; re-queued via BatchPending, not a failure)
     """
     document_parse_duration_seconds.labels(
         processor=processor, tier=tier, status=status
     ).observe(duration)
     document_parse_total.labels(processor=processor, tier=tier, status=status).inc()
     # Throughput counters (pages/chars/bytes) accrue only on a full success.
-    # A partial extraction flagged success=False is recorded above as a
-    # parse-error but is intentionally excluded here so low-confidence output
-    # never inflates pipeline throughput.
+    # A partial extraction flagged success=False (recorded above as "error") or a
+    # batch-OCR poll still in flight ("pending") is intentionally excluded here so
+    # low-confidence output and GPU-boot polling never inflate pipeline throughput.
     if status == "success":
         if pages > 0:
             document_pages_processed_total.labels(processor=processor, tier=tier).inc(
@@ -754,7 +783,7 @@ def record_document_escalation(from_tier: str, to_tier: str, reason: str) -> Non
     Args:
         from_tier: Tier that could not satisfactorily parse the document
         to_tier: Tier the document was escalated to
-        reason: low_confidence | empty_text | unsupported | error | forced
+        reason: low_confidence | empty_text | corrupt_glyphs | unsupported | error | forced
     """
     document_escalation_total.labels(
         from_tier=from_tier, to_tier=to_tier, reason=reason
@@ -782,6 +811,22 @@ def record_document_parse_failed(reason: str) -> None:
         reason: ``timeout`` | ``oom`` | ``error``
     """
     document_parse_failed_total.labels(reason=reason).inc()
+
+
+def record_document_dead_lettered(reason: str) -> None:
+    """Record a document dead-lettered after a terminal parse failure.
+
+    Counts the dead-letter *attempt*: it is incremented alongside the
+    ``mark_dead_letter`` call, which is fail-safe (a Qdrant write error is logged,
+    not raised), so a transient write failure can leave this counter marginally
+    above the live marker count in Qdrant.
+
+    Args:
+        reason: ``timeout`` | ``oom`` | ``error`` (the terminal parse failure
+            reason carried from the isolated worker) or ``oversize`` (rejected by
+            the pre-parse size guard, which no tier can ever parse).
+    """
+    document_dead_lettered_total.labels(reason=reason).inc()
 
 
 def record_ingest_dropped(reason: str) -> None:

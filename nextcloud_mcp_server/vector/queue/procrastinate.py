@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 # network-bound ``ocr`` fleet scale (and fail) independently.
 INGEST_QUEUE_FAST = "ingest-fast"
 INGEST_QUEUE_STRUCTURED = "ingest-structured"
+# A single OCR queue: the OCR tier's backend (gateway vs direct Mistral) and model
+# (Mistral, surya, …) are configured, not split across queues. ``ingest-ocr`` is
+# also the pre-#353 name, so pre-split jobs parked on it are now handled natively.
 INGEST_QUEUE_OCR = "ingest-ocr"
 
 # tier -> queue. The producer always defers onto the cheapest tier's queue; a
@@ -77,13 +80,20 @@ TIER_QUEUES: dict[str, str] = {
 }
 _QUEUE_TIERS: dict[str, str] = {queue: tier for tier, queue in TIER_QUEUES.items()}
 ALL_INGEST_QUEUES: tuple[str, ...] = tuple(TIER_QUEUES.values())
-# New jobs start here; ``ocr`` is reached only by escalation.
+# New jobs start here; the OCR tier is reached only by escalation.
 DEFAULT_INGEST_QUEUE = INGEST_QUEUE_FAST
 
-# Legacy single-queue name (pre-#323). A rolling upgrade may still have jobs
-# parked on it; a worker can be told to drain it alongside the tier queues, and
-# the job-count / reclaim helpers include it so nothing is stranded.
+# Legacy single-queue name (pre-#323) and the two split OCR queues (the #353
+# tier2/tier3 split, now consolidated back into ``ingest-ocr``). A rolling upgrade
+# may still have jobs parked on these; a worker can drain them alongside the tier
+# queues, and the job-count / reclaim helpers include them so nothing is stranded.
 LEGACY_INGEST_QUEUE = "ingest"
+LEGACY_INGEST_QUEUE_OCR_INCLUSTER = "ingest-ocr-incluster"
+LEGACY_INGEST_QUEUE_OCR_UPSTREAM = "ingest-ocr-upstream"
+# Split OCR queues that should drain back onto the single OCR tier during rollout.
+LEGACY_OCR_QUEUES: frozenset[str] = frozenset(
+    {LEGACY_INGEST_QUEUE_OCR_INCLUSTER, LEGACY_INGEST_QUEUE_OCR_UPSTREAM}
+)
 # Back-compat alias for callers that imported the old single-queue constant.
 INGEST_QUEUE_NAME = DEFAULT_INGEST_QUEUE
 
@@ -95,8 +105,12 @@ INGEST_QUEUE_NAME = DEFAULT_INGEST_QUEUE
 # queues so tier isolation (which fleet processes which docs) is preserved.
 INGEST_QUEUE_MAINTENANCE = "ingest-maintenance"
 
-# Queues the job-count + reclaim helpers sweep (tier queues + the legacy one).
-_MANAGED_QUEUES: tuple[str, ...] = (*ALL_INGEST_QUEUES, LEGACY_INGEST_QUEUE)
+# Queues the job-count + reclaim helpers sweep (tier queues + the legacy ones).
+_MANAGED_QUEUES: tuple[str, ...] = (
+    *ALL_INGEST_QUEUES,
+    LEGACY_INGEST_QUEUE,
+    *sorted(LEGACY_OCR_QUEUES),
+)
 
 # Blueprint namespace → registered task names are prefixed ``ingest:``.
 _NAMESPACE = "ingest"
@@ -109,8 +123,19 @@ def tier_for_queue(queue: str | None) -> str:
     The queue-aware task uses this to pick which single tier to parse with: the
     job's current queue *is* its tier. A job on the legacy ``ingest`` queue (or
     any unrecognised queue) defaults to the cheapest tier.
+
+    The two split OCR queues from the #353 tier2/tier3 split
+    (``LEGACY_OCR_QUEUES``) map to the now-single ``ocr`` tier so in-flight OCR
+    jobs from a pre-consolidation deploy keep OCR'ing rather than dropping back to
+    ``fast``. The set is transient (only during a single rollout window).
     """
-    return _QUEUE_TIERS.get(queue or "", "fast")
+    queue = queue or ""
+    tier = _QUEUE_TIERS.get(queue)
+    if tier is not None:
+        return tier
+    if queue in LEGACY_OCR_QUEUES:
+        return "ocr"
+    return "fast"
 
 
 # A crashed worker leaves its job in ``doing``; reclaim it once its (per-worker)
@@ -328,12 +353,25 @@ class TieredEscalationStrategy(BaseRetryStrategy):
     def get_retry_decision(
         self, *, exception: BaseException, job: Job
     ) -> RetryDecision | None:
-        # Lazy import: EscalateError lives in the document stack, which the API
-        # pod (it also builds this App to defer) must not load. get_retry_decision
-        # runs only in the worker, where the stack is already imported.
-        from ...document_processors.escalation import EscalateError  # noqa: PLC0415
+        # Lazy import: these live in the document stack, which the API pod (it
+        # also builds this App to defer) must not load. get_retry_decision runs
+        # only in the worker, where the stack is already imported.
+        from ...document_processors.escalation import (  # noqa: PLC0415
+            BatchPending,
+            EscalateError,
+        )
 
         exc = _first_leaf(exception)
+
+        if isinstance(exc, BatchPending):
+            # Batch OCR job still in flight (Deck #332): defer a re-poll on the
+            # SAME queue after retry_in seconds. Deliberately exempt from the
+            # transient cap below — a batch job can take minutes-hours, so the
+            # poll count is unbounded here; the OCR processor's own deadline
+            # (DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS) is what terminates a stuck job.
+            # Releasing the worker between polls keeps the job out of `doing`, so
+            # it's never stall-reclaimed.
+            return RetryDecision(retry_in={"seconds": exc.retry_in})
 
         if isinstance(exc, EscalateError):
             queue = TIER_QUEUES.get(exc.to_tier)

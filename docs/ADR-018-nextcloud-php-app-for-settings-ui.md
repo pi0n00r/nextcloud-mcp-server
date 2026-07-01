@@ -1,6 +1,6 @@
 # ADR-018: Nextcloud PHP App for Settings and Management UI
 
-**Status**: Proposed
+**Status**: Accepted — implemented (the Astrolabe Nextcloud app provides the settings/management UI)
 **Date**: 2025-12-14
 **Updated**: 2025-12-15 (Added deployment modes and authentication architecture)
 **Related**: ADR-011 (AppAPI Architecture - Rejected), ADR-008 (MCP Sampling), ADR-004 (OAuth Progressive Consent)
@@ -552,6 +552,10 @@ async def get_server_status(request: Request) -> JSONResponse:
         "version": __version__,
         "auth_mode": "oauth" if settings.enable_oauth else "basic",
         "vector_sync_enabled": settings.vector_sync_enabled,
+        # Whether the /webhooks/nextcloud receiver is active (gated on
+        # WEBHOOK_SECRET — GHSA-8vh3-g2qg-2h2c). Lets the UI show webhook sync
+        # as available/unavailable.
+        "webhooks_enabled": bool(settings.webhook_secret),
         "uptime_seconds": get_uptime(),
         "management_api_version": "v1",
     })

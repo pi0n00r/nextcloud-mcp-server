@@ -18,7 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
-from httpx import HTTPStatusError
+from httpx import HTTPStatusError, RemoteProtocolError, Response
+
+from nextcloud_mcp_server.observability.metrics import (
+    document_download_truncated_total,
+    document_scan_truncated_total,
+)
 
 from .base import BaseNextcloudClient
 
@@ -36,6 +41,66 @@ class EtagConflictError(Exception):
         super().__init__(message)
         self.current_etag = current_etag
 
+
+def _read_complete_body(response: Response, label: str) -> bytes:
+    """Return the response body, raising on a short read vs ``Content-Length``.
+
+    A truncated/desynced response on a pooled keep-alive connection can hand
+    back an empty/short body that the document parser then reads as ``0 chars``
+    and the vector-sync processor permanently dead-letters (#965). Compare the
+    received byte count against the declared ``Content-Length`` and raise a
+    retryable :class:`httpx.RemoteProtocolError` on a mismatch: the processor
+    retries/re-queues a raised transport error instead of dead-lettering the
+    document, so a healthy file recovers on the next scan. (httpx already
+    raises on most genuine truncations during the read; this is the
+    belt-and-suspenders guard for the cases it returns intact. The robust
+    mitigation for connection poisoning is ``NEXTCLOUD_HTTP_KEEPALIVE=false``.)
+    A missing or malformed header (e.g. ``Transfer-Encoding: chunked``) skips
+    the check so legitimately header-less responses never raise.
+    """
+    content = response.content
+    declared = response.headers.get("content-length")
+    if declared is None:
+        return content
+    try:
+        expected = int(declared)
+    except ValueError:
+        # Malformed header — nothing reliable to compare against, so don't
+        # raise spuriously; let the (possibly fine) body through.
+        return content
+    if expected < 0:
+        # Degenerate header (negative length) — can't be a real short-read
+        # signal and would always trip the check below; ignore it.
+        return content
+    if len(content) != expected:
+        document_download_truncated_total.inc()
+        # Log here, not just in the message: both callers funnel this through a
+        # generic ``except Exception`` that would otherwise report it as an
+        # opaque "Unexpected error reading file".
+        logger.warning(
+            "Truncated download for %r: expected %d bytes, got %d "
+            "(poisoned keep-alive connection? set NEXTCLOUD_HTTP_KEEPALIVE=false "
+            "— see #965)",
+            label,
+            expected,
+            len(content),
+        )
+        raise RemoteProtocolError(
+            f"Truncated download for {label!r}: expected {expected} bytes, "
+            f"got {len(content)} (poisoned keep-alive connection? see #965)",
+            request=response.request,
+        )
+    return content
+
+
+# Paging defaults for WebDAV SEARCH. Nextcloud's SEARCH returns a server-default
+# page (~100 results) when no ``<d:nresults>`` is sent, silently truncating large
+# folders. ``search_files_all`` pages explicitly to fetch the complete result set.
+WEBDAV_SEARCH_PAGE_SIZE = 500
+# Hard ceiling so a pathologically large folder can't drive an unbounded crawl.
+# Crossing it is logged as a truncation warning (and surfaced via a metric) so the
+# cap can never again silently hide files.
+WEBDAV_SEARCH_MAX_RESULTS = 50000
 
 
 def _encode_dav_path(path: str) -> str:
@@ -252,7 +317,7 @@ class WebDAVClient(BaseNextcloudClient):
             response = await self._make_request("GET", attachment_path)
             response.raise_for_status()
 
-            content = response.content
+            content = _read_complete_body(response, filename)
             mime_type = response.headers.get("content-type", "application/octet-stream")
 
             logger.debug(
@@ -387,7 +452,7 @@ class WebDAVClient(BaseNextcloudClient):
             response = await self._make_request("GET", webdav_path)
             response.raise_for_status()
 
-            content = response.content
+            content = _read_complete_body(response, path)
             content_type = response.headers.get(
                 "content-type", "application/octet-stream"
             )
@@ -829,10 +894,24 @@ class WebDAVClient(BaseNextcloudClient):
             return results
 
         except HTTPStatusError as e:
-            logger.error(f"HTTP error during search: {e}")
+            # Surface the server's actual reason: Nextcloud/Sabre returns an XML
+            # error body (e.g. "<s:message>...</s:message>") that pinpoints the
+            # cause — far more actionable than the generic httpx
+            # "Client error '400 Bad Request' for url '.../dav/'" string. A 400
+            # here almost always means a malformed SEARCH body (commonly an
+            # un-escaped character in the scope path).
+            detail = (e.response.text or "").strip().replace("\n", " ")
+            logger.error(
+                "WebDAV SEARCH failed: HTTP %s for scope %r — %s",
+                e.response.status_code,
+                scope or "<user root>",
+                detail[:500] or "(empty response body)",
+            )
             raise e
         except Exception as e:
-            logger.error(f"Unexpected error during search: {e}")
+            logger.error(
+                "Unexpected error during WebDAV SEARCH (scope %r): %s", scope, e
+            )
             raise e
 
     def _build_search_xml(
@@ -849,6 +928,14 @@ class WebDAVClient(BaseNextcloudClient):
         scope_path = f"/files/{username}"
         if scope:
             scope_path = f"{scope_path}/{scope.lstrip('/')}"
+        # XML-escape before embedding in <d:href>: a folder whose name contains
+        # '&', '<' or '>' (e.g. "Reports & Plans") otherwise produces a malformed
+        # SEARCH body that Nextcloud's Sabre/DAV parser rejects with 400 Bad
+        # Request — silently skipping that folder and all of its descendants
+        # during the tag-based indexing walk. Escaping keeps the path literal
+        # (Sabre unescapes it back), matching how folders without special
+        # characters already resolve.
+        scope_href = xml_escape(scope_path)
 
         # Build property list
         prop_xml = "\n".join([self._property_to_xml(prop) for prop in properties])
@@ -888,7 +975,7 @@ class WebDAVClient(BaseNextcloudClient):
         </d:select>
         <d:from>
             <d:scope>
-                <d:href>{scope_path}</d:href>
+                <d:href>{scope_href}</d:href>
                 <d:depth>infinity</d:depth>
             </d:scope>
         </d:from>
@@ -1069,7 +1156,7 @@ class WebDAVClient(BaseNextcloudClient):
                 <d:prop>
                     <d:displayname/>
                 </d:prop>
-                <d:literal>{pattern}</d:literal>
+                <d:literal>{xml_escape(pattern)}</d:literal>
             </d:like>
         """
 
@@ -1188,7 +1275,7 @@ class WebDAVClient(BaseNextcloudClient):
                 <d:prop>
                     <oc:tags/>
                 </d:prop>
-                <d:literal>%{tag_name}%</d:literal>
+                <d:literal>%{xml_escape(tag_name)}%</d:literal>
             </d:like>
         """
 

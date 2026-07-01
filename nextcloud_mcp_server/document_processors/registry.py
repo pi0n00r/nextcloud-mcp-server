@@ -16,6 +16,7 @@ from nextcloud_mcp_server.observability.tracing import trace_operation
 from .base import DocumentProcessor, ProcessingResult, ProcessorError
 from .classifier import DocClassification, classify_from_text, image_coverage_per_page
 from .escalation import TIER_LADDER, EscalationDecision
+from .ocr import OCR_BATCH_PENDING_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,86 @@ class ProcessorRegistry:
             result, content, settings, record=True, filename=filename
         )
 
+        # The tier whose output produced the current ``classification`` -- used as
+        # ``from_tier`` for a subsequent OCR hop so a fast->structured->ocr cascade
+        # is attributed correctly (the OCR hop is from ``structured``, not a second
+        # ``fast`` escalation).
+        from_tier = "fast"
+        # Set when the structured tier ran but failed to parse. The document is then
+        # terminal -- the external path does not escalate a parse FAILURE either --
+        # so the OCR gate below must not treat it as a fallback.
+        structured_failed = False
+
+        # Escalate a poor fast extraction up the ladder (fast -> structured -> ocr),
+        # mirroring the external per-tier path so both modes behave identically. A
+        # glyph-corrupt layer (the extractor leaked raw glyph codes -- the
+        # broken-/ToUnicode case) OR a low-quality-but-non-empty layer first tries
+        # the structured (pymupdf) tier: free, in-cluster, and able to recover both.
+        # Only a scanned / no-text-layer doc (total_chars == 0) skips structured --
+        # a text extractor cannot conjure text from a pure raster -- and drops
+        # straight to OCR via the gate below. Structured is therefore NOT gated on
+        # document_ocr_enabled. Its output is re-classified (record=False -- the doc
+        # was already counted at the fast tier) so a doc that is ALSO partly scanned
+        # still reaches the OCR gate.
+        if (
+            classification is not None
+            and classification.page_count > 0
+            and (
+                classification.recommended_tier == "structured"
+                or (
+                    classification.recommended_tier == "ocr"
+                    and classification.total_chars > 0
+                )
+            )
+        ):
+            structured = self._pdf_processor_for_tier("structured")
+            if structured is None:
+                # Structured isn't registered: mirror the external
+                # next_available_tier, which skips the missing rung and lands on
+                # OCR. Leave the recommendation unchanged so the OCR gate below
+                # picks it up (incl. a glyph-corrupt "structured" recommendation).
+                logger.debug(
+                    "No structured processor registered; %s falls through to the "
+                    "OCR gate (recommended_tier=%s)",
+                    filename or "<bytes>",
+                    classification.recommended_tier,
+                )
+            else:
+                reason = (
+                    "corrupt_glyphs"
+                    if classification.recommended_tier == "structured"
+                    else "low_confidence"
+                )
+                record_document_escalation("fast", "structured", reason)
+                logger.info(
+                    "Escalating %s fast->structured (reason=%s)",
+                    filename or "<bytes>",
+                    reason,
+                )
+                structured_result = await self._run_processor(
+                    structured,
+                    content,
+                    content_type,
+                    filename,
+                    options,
+                    progress_callback,
+                    escalated=True,
+                )
+                if structured_result.success:
+                    result = structured_result
+                    from_tier = "structured"
+                    classification = self._classify_result(
+                        result, content, settings, record=False, filename=filename
+                    )
+                else:
+                    structured_failed = True
+                    logger.warning(
+                        "structured escalation did not succeed for %s (%s); keeping "
+                        "the tier-1 result (OCR not attempted)",
+                        filename or "<bytes>",
+                        structured_result.metadata.get("parse_failed_reason", "error"),
+                    )
+
         # NOTE: the suppressed-escalation metric (document_escalation_suppressed_total,
         # the "what-if OCR" signal; Deck #324) is intentionally NOT emitted on this
         # inline/memory path -- it is instrumented only on the per-tier external
@@ -254,30 +335,45 @@ class ProcessorRegistry:
         # is off here the would-be escalation is simply not taken (the gate below);
         # operators reading the suppressed counter are on the procrastinate fleet.
         #
-        # Escalate scanned / no-text-layer PDFs to OCR (tier-3) when enabled and
-        # a provider is registered. The fast tier is terminal otherwise. Note: a
-        # fast FAILURE (encrypted/corrupt -- result.success False, no
-        # classification) is NOT escalated; a PDF pypdfium2 can't open is treated
-        # as a hard failure (OCR reads the same bytes and would usually fail
-        # too). The page_count guard skips a zero-page (empty/corrupt) PDF, which
-        # OCR can't help either.
+        # Escalate to the OCR tier when enabled and a provider is registered. Fires
+        # for a scanned / no-text-layer doc (recommended "ocr"), and also for an
+        # unresolved "structured" recommendation -- a glyph-corrupt doc whose
+        # structured rung wasn't registered -- so the inline path falls through to
+        # OCR exactly like the external next_available_tier. ``structured_failed``
+        # excludes a doc whose structured parse FAILED (terminal, like the external
+        # path). Note: a fast FAILURE (result.success False, no classification) is
+        # NOT escalated; a PDF pypdfium2 can't open is a hard failure (OCR reads the
+        # same bytes and would usually fail too). The page_count guard skips a
+        # zero-page (empty/corrupt) PDF, which OCR can't help either.
         if (
             classification is not None
-            and classification.recommended_tier == "ocr"
+            and not structured_failed
+            and classification.recommended_tier in ("ocr", "structured")
             and classification.page_count > 0
             and settings.document_ocr_enabled
         ):
-            ocr = self._pdf_processor_for_tier("ocr")
-            if ocr is not None:
+            # Inline (memory pool) path: no queues to hop, so resolve the OCR tier
+            # via the same availability walk the queue path uses.
+            ocr_tier = self.next_available_tier(from_tier, settings, minimum="ocr")
+            ocr = self._pdf_processor_for_tier(ocr_tier) if ocr_tier else None
+            # `ocr is not None` already implies `ocr_tier is not None` at runtime,
+            # but the type checker can't infer that across the conditional above,
+            # so the explicit guard narrows `ocr_tier` to `str` for the
+            # record_document_escalation(from_tier, ocr_tier, reason) call below.
+            if ocr is not None and ocr_tier is not None:
                 reason = (
-                    "empty_text"
+                    "corrupt_glyphs"
+                    if classification.recommended_tier == "structured"
+                    else "empty_text"
                     if classification.total_chars == 0
                     else "low_confidence"
                 )
-                record_document_escalation("fast", "ocr", reason)
+                record_document_escalation(from_tier, ocr_tier, reason)
                 logger.info(
-                    "Escalating %s fast->ocr (reason=%s)",
+                    "Escalating %s %s->%s (reason=%s)",
                     filename or "<bytes>",
+                    from_tier,
+                    ocr_tier,
                     reason,
                 )
                 ocr_result = await self._run_processor(
@@ -292,13 +388,14 @@ class ProcessorRegistry:
                 # OCR is an enhancement, not a gate: if it can't run (no backend
                 # configured / API down) or returns nothing, keep the tier-1
                 # result rather than failing the document. Otherwise an operator
-                # who sets DOCUMENT_OCR_ENABLED=true without credentials would
-                # make scanned docs fail entirely -- strictly worse than off.
+                # who enables OCR without credentials would make scanned docs fail
+                # entirely -- strictly worse than off.
                 if ocr_result.success:
                     return ocr_result
                 logger.warning(
-                    "OCR escalation did not succeed for %s (%s); keeping the "
+                    "OCR escalation to %s did not succeed for %s (%s); keeping the "
                     "tier-1 result",
+                    ocr_tier,
                     filename or "<bytes>",
                     ocr_result.metadata.get("parse_failed_reason", "error"),
                 )
@@ -361,6 +458,7 @@ class ProcessorRegistry:
             return None
         try:
             image_coverage = None
+            # Scan detection feeds the OCR tier, so run it whenever OCR is enabled.
             if settings.document_ocr_enabled and settings.document_ocr_detect_scanned:
                 try:
                     image_coverage = image_coverage_per_page(content)
@@ -379,6 +477,7 @@ class ProcessorRegistry:
                 min_text_quality=settings.document_ocr_min_text_quality,
                 min_page_chars=settings.document_ocr_min_page_chars,
                 page_fraction=settings.document_ocr_page_fraction,
+                glyph_corruption_ratio=settings.document_glyph_corruption_ratio,
                 image_coverage=image_coverage,
             )
         except Exception:
@@ -410,11 +509,13 @@ class ProcessorRegistry:
         ``ignore_ocr_enabled`` drops only the OCR-enabled gate (not the registered-
         processor requirement): it answers "would this tier run if OCR were turned
         on?" — used to compute the *ideal* escalation target for the what-if-OCR
-        suppressed-escalation signal. (Today only ``ocr`` has an enabled gate; a
-        future per-tier gate would extend the condition below.)
+        suppressed-escalation signal. (The ``ocr`` tier has the
+        ``document_ocr_enabled`` gate; non-OCR tiers have none.)
         """
         if self._pdf_processor_for_tier(tier) is None:
             return False
+        # The OCR tier is opt-in via ``document_ocr_enabled`` (unless we're computing
+        # the what-if ideal target). Non-OCR tiers have no enabled gate.
         if (
             not ignore_ocr_enabled
             and tier == "ocr"
@@ -517,10 +618,13 @@ class ProcessorRegistry:
 
         Target-tier routing:
 
-        - ``total_chars == 0`` (scanned / no text layer) -> target the ``ocr``
-          tier directly. Text-extractor tiers (``structured``) cannot conjure
-          text from a pure raster scan, so a structured hop would just be wasted.
-        - low-confidence but non-empty layer -> escalate to the next rung, so a
+        - ``total_chars == 0`` (scanned / no text layer) -> target the ``ocr`` tier
+          directly. Text-extractor tiers (``structured``) cannot conjure text from a
+          pure raster scan, so a structured hop would just be wasted.
+        - glyph-corrupt text layer (``recommended_tier == "structured"``) -> target
+          the ``structured`` tier; pymupdf re-extracts a broken-/ToUnicode layer
+          correctly, so OCR is never the target for this case.
+        - low-confidence but non-empty layer -> escalate to the next tier, so a
           different in-cluster extractor can try before paying for OCR.
 
         Hop vs suppressed: if the ideal target tier can run, return a ``"hop"``.
@@ -538,13 +642,24 @@ class ProcessorRegistry:
             record=(current_tier == TIER_LADDER[0]),
             filename=filename,
         )
-        if classification is None or classification.recommended_tier != "ocr":
+        if classification is None or classification.recommended_tier not in (
+            "structured",
+            "ocr",
+        ):
             return None
         # A zero-page (empty/corrupt) PDF gains nothing from any tier.
         if classification.page_count <= 0:
             return None
-        if classification.total_chars == 0:
-            minimum: str | None = "ocr"
+        minimum: str | None
+        if classification.recommended_tier == "structured":
+            # Glyph-corrupt text layer (the extractor leaked glyph codes): a
+            # different in-cluster extractor (the structured/pymupdf tier) recovers
+            # it -- never pay for OCR here. Target the structured rung specifically.
+            minimum = "structured"
+            reason = "corrupt_glyphs"
+        elif classification.total_chars == 0:
+            # Scanned / no text layer: target the OCR tier.
+            minimum = "ocr"
             reason = "empty_text"
         else:
             minimum = None
@@ -637,7 +752,19 @@ class ProcessorRegistry:
             result.metadata.setdefault("pipeline_tier", tier)
             pages = int(result.metadata.get("page_count", 0) or 0)
             chars = len(result.text)
-            status = "success" if result.success else "error"
+            # A batch-OCR poll still in flight (GPU booting / batch queued) returns
+            # success=False + the pending sentinel; _parse_pdf_tier re-queues it via
+            # BatchPending, so it is NOT a parse failure. Record it as a distinct
+            # status="pending" — otherwise every poll inflates
+            # document_parse_total{status="error"} and the parse-rate dashboard shows
+            # GPU-boot polling as errors. Genuine failures stay "error"; worker-killed
+            # failures land in document_parse_failed_total.
+            if result.metadata.get(OCR_BATCH_PENDING_KEY):
+                status = "pending"
+            elif result.success:
+                status = "success"
+            else:
+                status = "error"
             record_document_parse(
                 processor.name,
                 tier,

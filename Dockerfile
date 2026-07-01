@@ -1,6 +1,6 @@
 FROM docker.io/library/python:3.12-slim-trixie@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.20@sha256:eaa5f1a3305307aaf9e67fe2bbba1d85ebbb2d8a63bce23af21797bfafbe0f8b /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.25@sha256:1e3808aa9023d0980e7c15b1fa7c1ac16ff35925780cf5c459858b2d693f01a9 /uv /uvx /bin/
 
 # Install dependencies
 # 1. curl (required for container healthcheck probes)
@@ -23,6 +23,13 @@ COPY . .
 RUN uv sync --locked --no-dev --no-editable --no-cache --extra postgres
 
 ENV PYTHONUNBUFFERED=1
+# Dump a Python + C-level traceback to stderr on a fatal native fault
+# (SIGSEGV/SIGABRT/SIGFPE/SIGBUS). In-process native code -- pymupdf's
+# classify/metadata open and embedded Qdrant -- can segfault the interpreter
+# during indexing, and without faulthandler the container just exits 139/133
+# with no logs (see issue #926). The handler is cheap and writes nothing in
+# normal operation.
+ENV PYTHONFAULTHANDLER=1
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH=/app/.venv/bin:$PATH
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
