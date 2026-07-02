@@ -1,147 +1,70 @@
 name: Build and Publish Docker Image
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_call:
+  workflow_dispatch:
     inputs:
       tag:
-        description: 'The tag to release (e.g. v0.70.2)'
+        description: Exact old-stable release tag to publish
         required: true
+        default: v1.1.8
         type: string
 
 env:
-  IMAGE_NAME: ghcr.io/cbcoutinho/nextcloud-mcp-server
+  IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
+  OLD_STABLE_TAG: v1.1.8
+  OLD_STABLE_VERSION: 0.118.1
 
 jobs:
-  resolve-tag:
+  publish:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      version: ${{ steps.resolve.outputs.version }}
-    steps:
-      - name: Resolve tag
-        id: resolve
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
-
-  build:
-    needs: resolve-tag
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Prepare platform pair
-        id: prep
+      - name: Validate exact old-stable tag
         run: |
-          platform="${{ matrix.platform }}"
-          echo "pair=${platform//\//-}" >> $GITHUB_OUTPUT
+          if [ "${{ inputs.tag }}" != "$OLD_STABLE_TAG" ]; then
+            echo "This workflow only publishes $OLD_STABLE_TAG as an old-stable package." >&2
+            exit 1
+          fi
 
-      - name: Checkout repository
+      - name: Checkout release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
+          ref: ${{ inputs.tag }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
-        with:
-          images: ${{ env.IMAGE_NAME }}
+      - name: Validate source version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [ "$version" != "$OLD_STABLE_VERSION" ]; then
+            echo "Expected pyproject version $OLD_STABLE_VERSION, found $version" >&2
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@a4e4898eeca5b4f8329a5e79191162386eb2bcbc # v3.6.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest
-        id: build
+      - name: Build and publish exact old-stable image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-
-      - name: Export digest
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: digests-${{ steps.prep.outputs.pair }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    needs: [resolve-tag, build]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=sha
-            type=raw,value=latest
-
-      - name: Create manifest list and push
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.OLD_STABLE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
+            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.OLD_STABLE_TAG }}
+            org.opencontainers.image.version=${{ env.OLD_STABLE_TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=nextcloud-mcp-server
+            org.opencontainers.image.description=Old stable v1.1.8 package for nextcloud-mcp-server 0.118.1
