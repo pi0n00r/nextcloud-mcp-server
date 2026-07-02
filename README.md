@@ -41,21 +41,22 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 > [!TIP]
 > Generate an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) in Nextcloud under **Settings > Security > Devices & sessions** instead of using your login password.
 
-### Docker
+### Container Package
 
-For full features including semantic search, run with Docker:
+The published old-stable container image works with Docker and Podman:
 
 ```bash
-docker run -p 127.0.0.1:8000:8000 --rm \
+podman run --rm -p 127.0.0.1:8000:8000 \
   -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
   -e NEXTCLOUD_USERNAME=your_username \
   -e NEXTCLOUD_PASSWORD=your_app_password \
-  pi0n00r/nextcloud-mcp-server:0.127.4
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
 ```
 
 Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
 
-For deployment options and Compose profiles, see [docs/installation.md](docs/installation.md).
+For Docker, replace `podman` with `docker`. For rootless Podman and Quadlet
+deployment, see [docs/container-package.md](docs/container-package.md).
 
 ## Key Features
 

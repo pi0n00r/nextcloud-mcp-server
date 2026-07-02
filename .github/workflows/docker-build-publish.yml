@@ -61,6 +61,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.IMAGE_NAME }}:${{ env.OLD_STABLE_TAG }}
+          provenance: false
+          sbom: false
           labels: |
             org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
             org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.OLD_STABLE_TAG }}

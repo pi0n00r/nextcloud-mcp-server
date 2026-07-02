@@ -34,4 +34,9 @@ ENV VIRTUAL_ENV=/app/.venv
 ENV PATH=/app/.venv/bin:$PATH
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health/live || exit 1
+
 ENTRYPOINT ["/app/.venv/bin/nextcloud-mcp-server", "run", "--host", "0.0.0.0"]
