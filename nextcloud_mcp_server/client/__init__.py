@@ -1,5 +1,4 @@
 import logging
-import os
 from email.utils import parsedate_to_datetime
 
 from httpx import (
@@ -107,15 +106,15 @@ class NextcloudClient:
         password: str | None = None,
         token: str | None = None,
     ):
-        # ``username`` is the Nextcloud UID — it drives DAV/API path
-        # construction (e.g. ``/remote.php/dav/files/<uid>/``). ``auth_username``
-        # is the credential identity Nextcloud authenticates the app password
-        # against (the loginName), which differs from the UID for
-        # OIDC-provisioned users. Defaults to ``username`` so single-user and
-        # OAuth modes (where UID == loginName) are unchanged. Callers pass the
-        # matching ``auth=BasicAuth(auth_username, ...)`` for the httpx leg;
-        # ``auth_username`` is threaded to the CalDAV client, which builds its
-        # own auth object from the raw credential.
+        # ``username`` is the Nextcloud UID and DAV path fallback. Discovery can
+        # replace that fallback with the canonical principal id when Nextcloud
+        # exposes a different DAV identity. ``auth_username`` is the credential
+        # identity Nextcloud authenticates the app password against (the
+        # loginName), which differs from the UID for OIDC-provisioned users.
+        # Defaults to ``username`` so single-user and OAuth modes are unchanged.
+        # Callers pass the matching ``auth=BasicAuth(auth_username, ...)`` for
+        # the httpx leg; ``auth_username`` is threaded to the CalDAV client,
+        # which builds its own auth object from the raw credential.
         self.username = username
         auth_username = auth_username or username
         self._client = AsyncClient(
@@ -157,11 +156,15 @@ class NextcloudClient:
 
     @classmethod
     def from_env(cls):
-        logger.info("Creating NC Client using env vars")
+        logger.info("Creating NC Client using settings + env vars")
 
-        host = os.environ["NEXTCLOUD_HOST"]
-        username = os.environ["NEXTCLOUD_USERNAME"]
-        password = os.environ["NEXTCLOUD_PASSWORD"]
+        # NEXTCLOUD_HOST is read via settings (dynaconf) so a settings.toml-only
+        # value is honoured; the credentials remain env/Secret-sourced.
+        from nextcloud_mcp_server.config import cfg, get_settings  # noqa: PLC0415
+
+        host = get_settings().nextcloud_host
+        username = cfg("NEXTCLOUD_USERNAME")
+        password = cfg("NEXTCLOUD_PASSWORD")
         # Pass username to constructor
         return cls(
             base_url=host,
@@ -345,7 +348,7 @@ class NextcloudClient:
 
     def _get_webdav_base_path(self) -> str:
         """Helper to get the base WebDAV path for the authenticated user."""
-        return f"/remote.php/dav/files/{self.username}"
+        return self.webdav._get_webdav_base_path()
 
     async def __aenter__(self):
         """Async context manager entry."""

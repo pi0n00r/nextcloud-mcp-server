@@ -241,8 +241,8 @@ async def _provision_nextcloud_access(ctx: Context, user_id: str) -> Provisionin
                 ),
             )
 
-        # Return generic Nextcloud user-settings URL for provisioning
-        nextcloud_host = os.getenv("NEXTCLOUD_HOST", "http://localhost:8080")
+        # Return generic Nextcloud user-security URL for provisioning.
+        nextcloud_host = get_settings().nextcloud_host or "http://localhost:8080"
         provisioning_url = f"{nextcloud_host}/settings/user/security"
 
         return ProvisioningResult(

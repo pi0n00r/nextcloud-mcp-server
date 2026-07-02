@@ -8,7 +8,6 @@ For OAuth mode: Requires browser-based OAuth login to establish session.
 """
 
 import logging
-import os
 import traceback
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 from nextcloud_mcp_server.auth.permissions import is_nextcloud_admin
 from nextcloud_mcp_server.client import NextcloudClient
-from nextcloud_mcp_server.config import get_settings
+from nextcloud_mcp_server.config import cfg, get_settings
 
 from ..http import nextcloud_httpx_client
 
@@ -51,9 +50,9 @@ async def _get_authenticated_client_for_userinfo(request: Request) -> NextcloudC
 
     # BasicAuth mode - use credentials from environment
     if not oauth_ctx:
-        nextcloud_host = os.getenv("NEXTCLOUD_HOST")
-        username = os.getenv("NEXTCLOUD_USERNAME")
-        password = os.getenv("NEXTCLOUD_PASSWORD")
+        nextcloud_host = get_settings().nextcloud_host
+        username = cfg("NEXTCLOUD_USERNAME")
+        password = cfg("NEXTCLOUD_PASSWORD")
 
         if not all([nextcloud_host, username, password]):
             raise RuntimeError("BasicAuth credentials not configured")
@@ -345,7 +344,7 @@ async def _get_user_info(request: Request) -> dict[str, Any]:
         return {
             "username": username,
             "auth_mode": "basic",
-            "nextcloud_host": os.getenv("NEXTCLOUD_HOST", "unknown"),
+            "nextcloud_host": get_settings().nextcloud_host or "unknown",
         }
 
     # OAuth mode - read cached profile from browser session
@@ -483,13 +482,12 @@ async def user_info_html(request: Request) -> HTMLResponse:
             str(request.url_for("oauth_logout")) if oauth_ctx else "/oauth/logout"
         )
 
-    # Get Nextcloud host for generating links to apps (used by viz tab)
-    # Use public issuer URL if available (for browser-accessible links),
-    # otherwise fall back to NEXTCLOUD_HOST from settings
+    # Get Nextcloud host for generating browser-accessible links to apps (viz
+    # tab). Use nextcloud_browser_url so the links point at Nextcloud even in
+    # external-IdP mode, where nextcloud_public_issuer_url is the IdP, not
+    # Nextcloud (falls back to public_issuer_url → nextcloud_host).
     settings = get_settings()
-    nextcloud_host_for_links = (
-        settings.nextcloud_public_issuer_url or settings.nextcloud_host
-    )
+    nextcloud_host_for_links = settings.nextcloud_browser_url
 
     # Build host info HTML (BasicAuth only)
     host_info_html = ""

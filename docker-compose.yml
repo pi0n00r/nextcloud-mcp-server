@@ -23,7 +23,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.11@sha256:828cc04eedd9c7139e9a9a7693fb3a5d30f607c912af97e9030ce8cf78f119da}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.12@sha256:94a39b5894191d4481718e177165336aa0bfec94920a155ed11d4151bc338ddc}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -99,6 +99,11 @@ services:
 
       # Semantic search configuration (ADR-007, ADR-021)
       - ENABLE_SEMANTIC_SEARCH=true
+      # Search mode (ADR-030): hybrid (default, dense+sparse) | keyword (BM25
+      # sparse only). Set keyword for fully airgapped deployments with NO
+      # embedding endpoint (no Ollama/Bedrock/gateway) — still gives cross-app
+      # Qdrant full-text search. keyword still needs ENABLE_SEMANTIC_SEARCH=true.
+      #- SEARCH_MODE=keyword
       # The sync scanner runs an initial scan immediately on startup, so the
       # corpus is indexed without waiting for the first periodic re-scan. A very
       # short re-scan interval (was 5s) just re-queues the whole corpus faster
@@ -211,7 +216,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.6.3@sha256:9b0330756022422149aa6502eb2def8cd47c6e1b000c7c65cdb13e7c0133e992
+    image: quay.io/keycloak/keycloak:26.6.4@sha256:0aae0de7fca85525f727d3354df17896092de8bb26ae4c12d89c77e5df8cbce4
     command:
       - "start-dev"
       - "--import-realm"
@@ -259,6 +264,10 @@ services:
       - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8002
       - NEXTCLOUD_RESOURCE_URI=nextcloud  # ADR-005: Keycloak uses client IDs as audiences, not URLs
       - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8888/realms/nextcloud-mcp
+      # External-IdP mode: the OAuth issuer (above) is Keycloak, but Login Flow
+      # v2 must send the browser to *Nextcloud*. NEXTCLOUD_HOST is the internal
+      # Docker hostname, so give the browser-reachable Nextcloud URL explicitly.
+      - NEXTCLOUD_PUBLIC_URL=http://localhost:8080
 
       # Refresh token storage (ADR-002 Tier 1 & 2). Source from .env.
       - ENABLE_BACKGROUND_OPERATIONS=true
@@ -435,6 +444,50 @@ services:
       retries: 20
     profiles:
       - mail
+
+  # OpenLDAP backend for the `ldap` lane — reproduces GH #980 (DAV paths built
+  # from loginName instead of the canonical Nextcloud UID). Nextcloud's
+  # user_ldap backend derives an internal UID from the LDAP UUID that differs
+  # from the login (`alice`), which single-user / user_oidc / login-by-email
+  # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
+  # so the custom LDIF is always applied.
+  openldap:
+    image: vegardit/openldap:2.6.10@sha256:f722617af8118ea9a740ebc138bdc188fd8d5e963c88e3eacf6e07e3456c88f4
+    environment:
+      - LDAP_INIT_ORG_DN=dc=example,dc=org
+      - LDAP_INIT_ORG_NAME=Example Org
+      - LDAP_INIT_ROOT_USER_PW=ldap_admin_pw
+      # Plain LDAP on 389 is enough for the internal test network; skip the
+      # self-signed LDAPS setup so user_ldap can connect without TLS fuss.
+      - LDAP_LDAPS_ENABLED=false
+    volumes:
+      # Seed ou=people + the divergent `alice` user (evaluated on first launch;
+      # no data volume, so it re-seeds fresh on every `up`).
+      - ./ldap/bootstrap.ldif:/opt/ldifs/init_org_entries.ldif:ro
+    ports:
+      - 127.0.0.1:1389:389
+    # Searching for the seeded `alice` entry (not just a port probe) means
+    # "healthy" == "bootstrap LDIF applied" — the app-hook can rely on that.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "ldapsearch",
+          "-x",
+          "-H",
+          "ldap://localhost",
+          "-b",
+          "uid=alice,ou=people,dc=example,dc=org",
+          "-D",
+          "uid=admin,dc=example,dc=org",
+          "-w",
+          "ldap_admin_pw",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    profiles:
+      - ldap
 
 volumes:
   nextcloud:
