@@ -1,660 +1,135 @@
-# CLAUDE.md
+# AGENTS.md — Nextcloud MCP Server (pi0n00r fork)
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This repo is Gary Bajaj's fork of `cbcoutinho/nextcloud-mcp-server` (AGPL-3.0).
+The fork's purpose is to fix three regressions surfaced during the 2026-04
+work cycle and integrate byte-preserving DAVx5-style CardDAV semantics:
 
-## Coding Conventions
+1. **A.1 — Photo clobber** on every contact updated through the legacy
+   `nc_contacts_update_contact`. Every contact in Gary's address book that
+   had been previously updated through this tool had its `PHOTO` blob
+   silently dropped (corpus-wide loss disclosed 2026-04-26). Root cause:
+   `_merge_vcard_properties` split on `\n` and `strip()`-ed lines, breaking
+   RFC 5545 line-folding for PHOTO base64 blocks and X-properties.
+2. **A.2 — `nc_webdav_write_file`** silently truncating writes near 20KB.
+3. **A.3 — Schema gaps** for UID-less / FN-less / non-Latin vCards.
 
-### async/await Patterns
-- **Use anyio for all async operations** - Provides structured concurrency
-  - pytest runs in `anyio` mode (`anyio_mode = "auto"` in pyproject.toml)
-  - Use `anyio.create_task_group()` for concurrent execution (NOT `asyncio.gather()`)
-  - Use `anyio.Lock()` for synchronization primitives (NOT `asyncio.Lock()`)
-  - Use `anyio.run()` for entry points (NOT `asyncio.run()`)
-  - Prefer standard async/await syntax without explicit library imports when possible
-  - Examples: app.py, search/hybrid.py, search/verification.py, auth/token_broker.py
+The fix is in three places:
 
-### Type Hints
-- **Use Python 3.10+ union syntax**: `str | None` instead of `Optional[str]`
-- **Use lowercase generics**: `dict[str, Any]` instead of `Dict[str, Any]`
-- **Type all function signatures** - Parameters and return types
-- **Type checker**: `ty` is configured for static type checking
-  ```bash
-  uv run ty check -- nextcloud_mcp_server
-  ```
+- `nextcloud_mcp_server/client/vcard_parser.py` — NEW. Byte-preserving
+  line-oriented vCard parser. Parses into `(folded-line, parsed-property)`
+  tuples; untouched lines emit verbatim from `original_bytes`; only
+  modified lines regenerate per RFC 6350 §3.2 + RFC 5545 §3.1.
+- `nextcloud_mcp_server/client/contacts.py` — rewritten to route writes
+  through the new parser and surface `EtagConflictError` on 412.
+- `nextcloud_mcp_server/client/webdav.py` — `write_file` now routes
+  bodies above `CHUNK_THRESHOLD` (1MB) through NC's chunked-upload v2
+  endpoint, eliminating the silent-truncation failure mode.
 
-### Code Quality
-- **Before committing or pushing, invoke the `pre-push-review` skill**:
-  - Runs `ruff check`, `ruff format --check`, `ty check`, and unit tests, then audits the
-    branch diff against this repo's recurring PR-review patterns (mined from PRs #733–#750).
-  - Output is a labelled punch list (🔴 blocking / 🟡 important / 🟢 nit). The main loop
-    fixes; the skill reports.
-  - Skill location: `.claude/skills/pre-push-review/SKILL.md`. Invoke via the `Skill` tool
-    with `skill="pre-push-review"`, or when the user types `/pre-push-review`.
-  - Skip only for tiny diffs (typo, README tweak, single-line dependency bump) or when the
-    user explicitly says "just push it".
-- **Manual fallback** (if the skill is unavailable):
-  ```bash
-  uv run ruff check
-  uv run ruff format
-  uv run ty check -- nextcloud_mcp_server
-  uv run pytest tests/unit/ -x -q
-  ```
-- **Ruff configuration** in pyproject.toml (extends select: ["I"] for import sorting)
+## Repo layout
 
-#### SonarCloud quality gate (the `sonar` CLI)
-
-CI runs a **required `SonarCloud Code Analysis` check** with a Quality Gate
-(new-code **Reliability Rating ≥ A**, etc.). It catches issues `ruff`/`ty`
-never will — e.g. `python:S1244` (float `==`, use `pytest.approx`),
-`python:S5778` (a `pytest.raises` block with more than one statement that can
-throw — hoist setup calls out of the `with`), `python:S8572`
-(`logging.error(..., exc)` in an `except` → `logging.exception(...)`). **A green
-`ruff`/`ty` says nothing about the Sonar gate**, so check it explicitly rather
-than guessing (a wrong guess cost a review round on PR #996).
-
-Use the authenticated **SonarQube CLI** (`sonar`, on `PATH` via
-`~/.local/share/sonarqube-cli/bin`; confirm with `sonar auth status` → org
-`cbcoutinho`). Project key: **`cbcoutinho_nextcloud-mcp-server`**.
-
-- **Pre-push (local, no network gate):** scan changed files for hardcoded
-  secrets — the one local scan available on our plan:
-  ```bash
-  sonar analyze secrets $(git diff --name-only origin/master...HEAD)
-  ```
-  `sonar verify --file` / `sonar analyze sqaa` (server-side Agentic Analysis)
-  are a **paid feature not enabled** on this org — they 403, so don't rely on
-  them for a local quality scan.
-
-- **After pushing a PR (SonarCloud analyzes in CI):** list exactly what Sonar
-  flagged on the PR's new code and read the gate — do this *inside the review
-  loop*, before merge, and fix the findings:
-  ```bash
-  sonar list issues --project cbcoutinho_nextcloud-mcp-server \
-    --pull-request <PR#> --statuses OPEN --format table
-  sonar api GET "/api/qualitygates/project_status?projectKey=cbcoutinho_nextcloud-mcp-server&pullRequest=<PR#>"
-  ```
-  (`sonar api` endpoints **must start with `/`**.) This is faster and more
-  precise than reading the SonarCloud dashboard or the reviewer's guess at
-  which line tripped the gate.
-
-### Error Handling
-- **Use custom decorators**: `@retry_on_429` for rate limiting (see base_client.py)
-- **Standard exceptions**: `HTTPStatusError` from httpx, `McpError` for MCP-specific errors
-- **Logging patterns**:
-  - `logger.debug()` for expected 404s and normal operations
-  - `logger.warning()` for retries and non-critical issues
-  - `logger.error()` for actual errors
-
-### Testing Patterns
-- **Use existing fixtures** from `tests/conftest.py` (2888 lines of test infrastructure)
-- **Session-scoped fixtures** handle anyio/pytest-asyncio incompatibility
-- **Mocked unit tests** use `mocker.AsyncMock(spec=httpx.AsyncClient)`
-- **pytest-timeout**: 180s default per test
-- **Mark tests appropriately**: `@pytest.mark.unit`, `@pytest.mark.integration`, `@pytest.mark.oauth`, `@pytest.mark.smoke`
-
-### Architectural Patterns
-- **Base classes**: **All app API clients MUST extend `BaseNextcloudClient`** and
-  issue requests through its `_make_request`. That method centralizes `_resolve_url`
-  (prepends `/index.php` to bare `/apps/...` paths — the universal entry point that
-  works without pretty-URL rewriting, issue #732), `@retry_on_429`, tracing, and
-  `raise_for_status`. Consequences:
-  - **Write bare `/apps/<app>/...` paths — never hardcode `/index.php`.** The base
-    class adds it; `/ocs/...` and `/remote.php/dav/...` paths pass through unchanged.
-  - Don't reimplement `_make_request` in a subclass — a private copy silently skips
-    `_resolve_url`/retry/tracing (and, if it omits `raise_for_status`, breaks 429
-    retry). Override only for a genuinely different transport.
-  - **Known exception**: `CalendarClient` talks CalDAV via its own `caldav` session,
-    not the shared Nextcloud HTTP client, so it does not extend `BaseNextcloudClient`.
-    This is intentional — do not "fix" it.
-- **Pydantic responses**: All MCP tools return Pydantic models inheriting from `BaseResponse`
-- **Decorators**: `@require_scopes`, `@require_provisioning` for access control
-- **Context pattern**: `await get_client(ctx)` to access authenticated NextcloudClient (async!)
-- **FastMCP decorators**: `@mcp.tool()`, `@mcp.resource()`
-- **Token acquisition**: `get_client()` resolves credentials per deployment mode (see Deployment Modes below)
-
-### MCP Tool Annotations (ADR-017)
-
-**All tools MUST include annotations** following these patterns:
-
-```python
-from mcp.types import ToolAnnotations
-
-# Read-only tools (list, search, get)
-@mcp.tool(
-    title="Human Readable Name",
-    annotations=ToolAnnotations(
-        readOnlyHint=True,
-        openWorldHint=True,  # Nextcloud is external to MCP server
-    ),
-)
-
-# Create operations
-@mcp.tool(
-    title="Create Resource",
-    annotations=ToolAnnotations(
-        idempotentHint=False,  # Creates new resources each time
-        openWorldHint=True,
-    ),
-)
-
-# Update operations (with etag/version control)
-@mcp.tool(
-    title="Update Resource",
-    annotations=ToolAnnotations(
-        idempotentHint=False,  # ETag changes = different inputs
-        openWorldHint=True,
-    ),
-)
-
-# Delete operations
-@mcp.tool(
-    title="Delete Resource",
-    annotations=ToolAnnotations(
-        destructiveHint=True,   # Permanently deletes data
-        idempotentHint=True,    # Same end state if called repeatedly
-        openWorldHint=True,
-    ),
-)
-
-# HTTP PUT without version control (special case)
-@mcp.tool(
-    title="Write File",
-    annotations=ToolAnnotations(
-        idempotentHint=True,  # Same content = same end state
-        openWorldHint=True,
-    ),
-)
+```
+nextcloud_mcp_server/
+├── client/
+│   ├── contacts.py         CardDAV client — byte-preserving rewrite
+│   ├── vcard_parser.py     Line-oriented vCard parser (load-bearing core)
+│   ├── webdav.py           WebDAV client — chunked upload >1MB
+│   └── ...
+├── models/
+│   ├── contacts.py         Pydantic schemas — UID optional, NFC, FN fallback
+│   └── ...
+├── server/
+│   ├── contacts.py         8-op MCP tool surface (unified namespace)
+│   └── ...
+tests/
+├── client/
+│   ├── contacts/test_byte_preserving.py    T1–T10 + A.3 schema gaps
+│   └── webdav/test_size_limit.py           Chunk-threshold sanity
+scripts/
+└── lint-ai-notice.sh       CI lint enforcing the 10-field AI-NOTICE block
 ```
 
-**Key Principles**:
-- **Idempotency**: Same inputs → same result. ETags change after updates, making them non-idempotent
-- **Destructive**: Operations that permanently delete/overwrite data
-- **Open World**: All Nextcloud tools access external service (openWorldHint=True)
-- **Titles**: Use human-readable names, not snake_case function names
+## The unified `nc_contacts_*` tool surface (8 ops)
 
-**See**: `docs/ADR-017-mcp-tool-annotations.md` for detailed rationale and examples
+| # | Op | Purpose |
+|---|---|---|
+| 1 | `nc_contacts_list_addressbooks` | List addressbooks |
+| 2 | `nc_contacts_list_contacts` | List contacts (`include_vcard`, `include_etag` flags) |
+| 3 | `nc_contacts_get_contact` | NEW. Single contact: `vcard_text + etag + json` |
+| 4 | `nc_contacts_create_contact` | Create from `vcard_text` or JSON |
+| 5 | `nc_contacts_patch_contact` | NEW. Surgical edit; If-Match required |
+| 6 | `nc_contacts_put_contact` | NEW. Full vCard replace; If-Match required |
+| 7 | `nc_contacts_delete_contact` | Delete; If-Match optional but recommended |
+| 8 | `nc_contacts_create_addressbook` / `nc_contacts_delete_addressbook` | Admin |
 
-### Project Structure
-- `nextcloud_mcp_server/client/` - HTTP clients for Nextcloud APIs
-- `nextcloud_mcp_server/server/` - MCP tool/resource definitions
-- `nextcloud_mcp_server/auth/` - OAuth/OIDC authentication
-- `nextcloud_mcp_server/models/` - Pydantic response models
-- `nextcloud_mcp_server/providers/` - Unified LLM provider infrastructure (embeddings + generation)
-- `tests/` - Layered test suite (unit, smoke, integration, load)
+`nc_contacts_update_contact` is **deprecated**. It remains as a thin shim
+that translates JSON-shape calls to `patch_contact` and emits a deprecation
+warning. One minor version, then removed.
 
-### Provider Architecture (ADR-015)
-
-**Unified Provider System** for embeddings and text generation:
-
-**Location:** `nextcloud_mcp_server/providers/`
-- `base.py` - `Provider` ABC with optional capabilities
-- `registry.py` - Auto-detection and factory pattern
-- `ollama.py` - Ollama provider (embeddings + generation)
-- `anthropic.py` - Anthropic provider (generation only)
-- `bedrock.py` - Amazon Bedrock provider (embeddings + generation)
-- `simple.py` - Simple in-memory provider (embeddings only, fallback)
-
-**Usage:**
-```python
-from nextcloud_mcp_server.providers import get_provider
-
-provider = get_provider()  # Auto-detects from environment
-
-# Check capabilities
-if provider.supports_embeddings:
-    embeddings = await provider.embed_batch(texts)
-
-if provider.supports_generation:
-    text = await provider.generate("prompt", max_tokens=500)
-```
-
-**Environment Variables:**
-
-Bedrock:
-- `AWS_REGION` - AWS region (e.g., "us-east-1")
-- `BEDROCK_EMBEDDING_MODEL` - Embedding model ID (e.g., "amazon.titan-embed-text-v2:0")
-- `BEDROCK_GENERATION_MODEL` - Generation model ID (e.g., "anthropic.claude-3-sonnet-20240229-v1:0")
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` - Optional, uses AWS credential chain
-
-Ollama:
-- `OLLAMA_BASE_URL` - API URL (e.g., "http://localhost:11434")
-- `OLLAMA_EMBEDDING_MODEL` - Embedding model (default: "nomic-embed-text")
-- `OLLAMA_GENERATION_MODEL` - Generation model (e.g., "llama3.2:1b")
-- `OLLAMA_VERIFY_SSL` - SSL verification (default: "true")
-
-Simple (fallback, no config needed):
-- `SIMPLE_EMBEDDING_DIMENSION` - Dimension (default: 384)
-
-**Auto-Detection Priority:** Bedrock → Ollama → Simple
-
-**Backward Compatibility:**
-- Old code using `nextcloud_mcp_server.embedding.get_embedding_service()` still works
-- `EmbeddingService` now wraps `get_provider()` internally
-
-**For Details:** See `docs/ADR-015-unified-provider-architecture.md`
-
-## Development Commands (Quick Reference)
-
-### Testing
-```bash
-# Fast feedback (recommended)
-uv run pytest tests/unit/ -v                    # Unit tests (~5s)
-uv run pytest -m smoke -v                       # Smoke tests (~30-60s)
-
-# Integration tests
-uv run pytest -m "integration and not oauth" -v # Without OAuth (~2-3min)
-uv run pytest -m oauth -v                       # OAuth only (~3min)
-uv run pytest                                   # Full suite (~4-5min)
-
-# Coverage
-uv run pytest --cov
-
-# Specific tests after changes
-uv run pytest tests/server/test_mcp.py -k "notes" -v
-uv run pytest tests/client/notes/test_notes_api.py -v
-```
-
-**Important**: After code changes, rebuild the correct container:
-- Single-user tests: `docker compose up --build -d mcp`
-- Login Flow tests: `docker compose up --build -d mcp-login-flow`
-- Keycloak tests: `docker compose up --build -d mcp-keycloak`
-
-### Running the Server
-```bash
-# Local development
-export $(grep -v '^#' .env | xargs)
-uv run mcp run --transport sse nextcloud_mcp_server.app:mcp
-
-# Docker development (rebuilds after code changes)
-docker compose up --build -d mcp        # Single-user (port 8000)
-docker compose up --build -d mcp-login-flow  # Login Flow v2 (port 8004)
-docker compose up --build -d mcp-keycloak  # Keycloak OAuth (port 8002)
-```
-
-### Astrolabe submodule mount (do NOT mount by default)
-
-The `third_party/astrolabe` submodule mount in `docker-compose.yml`
-(`./third_party/astrolabe:/opt/apps/astrolabe:ro`) is **commented out by
-default and should stay that way**. With it unmounted, the stack installs the
-most recently **published** Astrolabe version from the Nextcloud app store —
-which is the correct baseline for almost all work, including CI.
-
-Only uncomment the mount when developing features that are **tightly coupled**
-to unreleased Astrolabe changes and need the local submodule build integration-
-tested in CI. Re-comment it before the change is considered done — a left-on
-mount silently pins CI to the local checkout instead of the published app, and
-breaks for anyone without the submodule built. (See PR #872.)
-
-### Environment Setup
-```bash
-uv sync                # Install dependencies
-uv sync --group dev    # Install with dev dependencies
-```
-
-### Load Testing
-```bash
-# Quick test (default: 10 workers, 30 seconds)
-uv run python -m tests.load.benchmark
-
-# Custom concurrency and duration
-uv run python -m tests.load.benchmark -c 20 -d 60
-
-# Export results for analysis
-uv run python -m tests.load.benchmark --output results.json --verbose
-```
-
-**Expected Performance**: 50-200 RPS for mixed workload, p50 <100ms, p95 <500ms, p99 <1000ms.
-
-## Database Inspection
-
-**Credentials**: root/password, nextcloud/password, database: `nextcloud`
-
-**Do NOT use `docker compose exec db mariadb` or `docker compose exec <service> sqlite3` directly.** Use the wrapper scripts below instead -- they handle credentials, output formatting, and avoid repeated docker exec approvals.
-
-### MariaDB (Nextcloud)
-
-Use `scripts/dbquery.py` for all MariaDB queries:
+## Build / test
 
 ```bash
-# Basic query
-./scripts/dbquery.py "SELECT COUNT(*) FROM oc_users"
+# Dev install (uses uv, matches upstream)
+uv sync --dev
 
-# Vertical output (one column per line) - useful for wide tables
-./scripts/dbquery.py -E "SELECT * FROM oc_oidc_clients LIMIT 1"
+# Run the byte-preserving test corpus
+uv run pytest tests/client/contacts/test_byte_preserving.py -v
 
-# With different credentials
-./scripts/dbquery.py -u nextcloud -p nextcloud "SHOW TABLES"
+# Lint the AI-NOTICE block on every Python source file
+bash scripts/lint-ai-notice.sh
 ```
 
-**Important Tables**:
-- `oc_oidc_clients` - OAuth client registrations (DCR)
-- `oc_oidc_client_scopes` - Client allowed scopes
-- `oc_oidc_access_tokens` - Issued access tokens
-- `oc_oidc_authorization_codes` - Authorization codes
-- `oc_oidc_registration_tokens` - RFC 7592 registration tokens
-- `oc_oidc_redirect_uris` - Redirect URIs
-
-### SQLite (MCP Services)
-
-Use `scripts/sqlitequery.py` for all SQLite queries:
+Live integration tests against a real Nextcloud instance require:
 
 ```bash
-# List tables
-./scripts/sqlitequery.py ".tables"
-
-# Query specific service
-./scripts/sqlitequery.py -s oauth "SELECT * FROM refresh_tokens"
-./scripts/sqlitequery.py -s keycloak "SELECT * FROM oauth_clients"
-./scripts/sqlitequery.py -s basic "SELECT * FROM app_passwords"
-
-# With column headers
-./scripts/sqlitequery.py --column "SELECT * FROM audit_logs LIMIT 5"
-
-# JSON output
-./scripts/sqlitequery.py --json "SELECT * FROM oauth_sessions"
-
-# View schema
-./scripts/sqlitequery.py -s oauth ".schema refresh_tokens"
+export REQUIRES_LIVE_NC=1
+export NC_HOST=https://hub.bajaj.com
+export NC_USER=gary
+export NC_APP_PASSWORD="<scoped-app-password>" # never logged
+uv run pytest tests/client/contacts/ -v
 ```
 
-**Services**: `mcp` (default), `oauth`, `keycloak`, `basic`
-
-**SQLite Tables**:
-- `refresh_tokens` - OAuth refresh tokens with user profiles
-- `audit_logs` - Security audit trail
-- `oauth_clients` - DCR OAuth client credentials
-- `oauth_sessions` - OAuth flow session state
-- `registered_webhooks` - Webhook registrations
-- `app_passwords` - Multi-user BasicAuth passwords
-- `alembic_version` - Migration tracking
-
-## Architecture Quick Reference
-
-**For detailed architecture, see:**
-- `docs/comparison-context-agent.md` - Overall architecture
-- `docs/login-flow-v2.md` - OAuth/OIDC integration patterns and architecture
-- `docs/ADR-004-progressive-consent.md` - Progressive consent implementation
-
-**Core Components**:
-- `nextcloud_mcp_server/app.py` - FastMCP server entry point
-- `nextcloud_mcp_server/client/` - HTTP clients (Notes, Calendar, Contacts, Tables, WebDAV)
-- `nextcloud_mcp_server/server/` - MCP tool/resource definitions
-- `nextcloud_mcp_server/auth/` - OAuth/OIDC authentication
-
-**Supported Apps**: Notes, Calendar (CalDAV + VTODO tasks), Contacts (CardDAV), Tables, WebDAV, Deck, Cookbook
-
-**Key Patterns**:
-1. `NextcloudClient` orchestrates all app-specific clients
-2. `BaseNextcloudClient` provides common HTTP functionality + retry logic
-3. MCP tools use context pattern: `get_client(ctx)` → `NextcloudClient`
-4. All operations are async using httpx
-
-### Deployment Modes
-
-The server supports three deployment modes, controlled by environment variables and docker compose profiles:
-
-**1. Single-User** (profile: `single-user`)
-- Set `NEXTCLOUD_USERNAME` + `NEXTCLOUD_PASSWORD` (app password)
-- One shared Nextcloud identity for all MCP requests
-- Stateless, no persistent storage needed
-- Best for: personal instances, local development
-
-**2. Multi-User BasicAuth** (profile: `multi-user-basic`)
-- Set `MCP_DEPLOYMENT_MODE=multi_user_basic`
-- Each MCP client provides credentials via HTTP Authorization header
-- Per-request client creation from extracted credentials
-- Best for: internal deployments where users manage their own Nextcloud credentials
-
-**3. Login Flow v2** (profile: `login-flow`)
-- Browser-based app password acquisition via Nextcloud's native Login Flow v2 API
-- Per-user app passwords stored encrypted in SQLite
-- Application-level scope enforcement (defense-in-depth)
-- Works with any Nextcloud 16+ instance (no special apps required)
-- Best for: production multi-user deployments, OAuth MCP integration
-- See `docs/ADR-022-login-flow-v2.md` for architecture details
-
-## MCP Response Patterns (CRITICAL)
-
-**Never return raw `List[Dict]` from MCP tools** - FastMCP mangles them into dicts with numeric string keys.
-
-**Correct Pattern**:
-1. Client methods return `List[Dict]` (raw data)
-2. MCP tools convert to Pydantic models and wrap in response object
-3. Response models inherit from `BaseResponse`, include `results` field + metadata
-
-**Reference implementations**:
-- `nextcloud_mcp_server/models/notes.py:80` - `SearchNotesResponse`
-- `nextcloud_mcp_server/models/webdav.py:113` - `SearchFilesResponse`
-- `nextcloud_mcp_server/server/{notes,webdav}.py` - Tool examples
-
-**Testing**: Extract `data["results"]` from MCP responses, not `data` directly.
-
-## MCP Sampling for RAG (ADR-008)
-
-**What is MCP Sampling?**
-MCP sampling allows servers to request LLM completions from their clients. This enables Retrieval-Augmented Generation (RAG) patterns where the server retrieves context and the client's LLM generates answers.
-
-**When to use sampling:**
-- Generating natural language answers from retrieved documents
-- Synthesizing information from multiple sources
-- Creating summaries with citations
-
-**Implementation Pattern** (see ADR-008 for details):
-
-```python
-from mcp.types import ModelHint, ModelPreferences, SamplingMessage, TextContent
-
-@mcp.tool()
-@require_scopes("notes.read")
-async def nc_notes_semantic_search_answer(
-    query: str, ctx: Context, limit: int = 5, max_answer_tokens: int = 500
-) -> SamplingSearchResponse:
-    # 1. Retrieve documents
-    search_response = await nc_notes_semantic_search(query, ctx, limit)
-
-    # 2. Check for no results (don't waste sampling call)
-    if not search_response.results:
-        return SamplingSearchResponse(
-            query=query,
-            generated_answer="No relevant documents found.",
-            sources=[], total_found=0, success=True
-        )
-
-    # 3. Construct prompt with retrieved context
-    prompt = f"{query}\n\nDocuments:\n{format_sources(search_response.results)}\n\nProvide answer with citations."
-
-    # 4. Request LLM completion via sampling
-    try:
-        result = await ctx.session.create_message(
-            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-            max_tokens=max_answer_tokens,
-            temperature=0.7,
-            model_preferences=ModelPreferences(
-                hints=[ModelHint(name="claude-3-5-sonnet")],
-                intelligencePriority=0.8,
-                speedPriority=0.5,
-            ),
-            include_context="thisServer",
-        )
-
-        return SamplingSearchResponse(
-            query=query,
-            generated_answer=result.content.text,
-            sources=search_response.results,
-            model_used=result.model,
-            stop_reason=result.stopReason,
-            success=True
-        )
-    except Exception as e:
-        # Fallback: Return documents without generated answer
-        return SamplingSearchResponse(
-            query=query,
-            generated_answer=f"[Sampling unavailable: {e}]\n\nFound {len(search_response.results)} documents.",
-            sources=search_response.results,
-            search_method="semantic_sampling_fallback",
-            success=True
-        )
-```
-
-**Key Points**:
-- **No server-side LLM**: Server has no API keys, client controls which model is used
-- **Graceful degradation**: Tool always returns useful results even if sampling fails
-- **User control**: MCP clients SHOULD prompt users to approve sampling requests
-- **No results optimization**: Skip sampling call when no documents found
-- **Fixed prompts**: Prompts are not user-configurable to avoid injection risks
-
-**Reference**: See `nc_notes_semantic_search_answer` in `nextcloud_mcp_server/server/notes.py:517` and ADR-008 for complete implementation.
-
-## Testing Best Practices (MANDATORY)
-
-### Always Run Tests
-- **Run tests to completion** before considering any task complete
-- **Rebuild the correct container** after code changes (see Development Commands above)
-- **If tests require modifications**, ask for permission before proceeding
-
-### Use Existing Fixtures
-See `tests/conftest.py` for 2888 lines of test infrastructure:
-- `nc_mcp_client` - MCP client for tool/resource testing (uses `mcp` container)
-- `nc_mcp_oauth_client` - MCP client for OAuth testing (uses `mcp-login-flow` container)
-- `nc_client` - Direct NextcloudClient for setup/cleanup
-- `temporary_note`, `temporary_addressbook`, `temporary_contact` - Auto-cleanup
-
-### Writing Mocked Unit Tests
-For client-layer response parsing tests, use mocked HTTP responses:
-
-```python
-async def test_notes_api_get_note(mocker):
-    """Test that get_note correctly parses the API response."""
-    mock_response = create_mock_note_response(
-        note_id=123, title="Test Note", content="Test content",
-        category="Test", etag="abc123"
-    )
-
-    mock_make_request = mocker.patch.object(
-        NotesClient, "_make_request", return_value=mock_response
-    )
-
-    client = NotesClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    note = await client.get_note(note_id=123)
-
-    assert note["id"] == 123
-    mock_make_request.assert_called_once_with("GET", "/apps/notes/api/v1/notes/123")
-```
-
-**Mock helpers in `tests/conftest.py`**: `create_mock_response()`, `create_mock_note_response()`, `create_mock_error_response()`
-
-**When to use**: Response parsing, error handling, request parameter building
-**When NOT to use**: CalDAV/CardDAV/WebDAV protocols, OAuth flows, end-to-end MCP testing
-
-### OAuth Testing
-OAuth tests use **Playwright browser automation** to complete flows programmatically.
-
-**Test Environment**:
-- Three MCP containers: `mcp` (single-user), `mcp-login-flow` (Login Flow v2), `mcp-keycloak` (external IdP)
-- OAuth tests require `NEXTCLOUD_HOST`, `NEXTCLOUD_USERNAME`, `NEXTCLOUD_PASSWORD` environment variables
-- Playwright configuration: `--browser firefox --headed` for debugging
-- Install browsers: `uv run playwright install firefox`
-
-**OAuth fixtures**: `nc_oauth_client`, `nc_mcp_oauth_client`, `alice_oauth_token`, `bob_oauth_token`, etc.
-
-**Shared OAuth Client**: All test users authenticate using a single OAuth client (created via DCR, deleted at session end via RFC 7592). Matches production behavior.
-
-**Run OAuth tests**:
-```bash
-uv run pytest -m oauth -v                        # All OAuth tests
-uv run pytest tests/server/oauth/ --browser firefox -v
-uv run pytest tests/server/oauth/test_oauth_core.py --browser firefox --headed -v
-```
-
-### Keycloak OAuth Testing
-**Validates ADR-002 architecture** for external identity providers and offline access patterns.
-
-**Architecture**: `MCP Client → Keycloak (OAuth) → MCP Server → Nextcloud user_oidc (validates token) → APIs`
-
-**Setup**:
-```bash
-docker compose up -d keycloak app mcp-keycloak
-curl http://localhost:8888/realms/nextcloud-mcp/.well-known/openid-configuration
-docker compose exec app php occ user_oidc:provider keycloak
-```
-
-**Credentials**: admin/admin (Keycloak realm: `nextcloud-mcp`)
-
-**For detailed Keycloak setup, see**:
-- `docs/login-flow-v2.md` - OAuth/OIDC configuration (set `OIDC_DISCOVERY_URL` to a Keycloak realm)
-- `docs/ADR-002-vector-sync-authentication.md` - Offline access architecture
-- `docs/keycloak-multi-client-validation.md` - Realm-level validation
-
-### LDAP Testing (GH #980 reproduction)
-
-The `ldap` lane reproduces GH #980 (DAV paths built from the loginName instead
-of the canonical Nextcloud UID). It runs an OpenLDAP server (`vegardit/openldap`)
-whose user `alice` logs in as `alice` but is mapped by `user_ldap` to a UID
-derived from the LDAP `entryUUID` — so `loginName != UID` **and**
-`/remote.php/dav/files/alice/` does not resolve to her real home. This is the
-only backend that reproduces #980 live: login-by-email resolves to the real home
-(email is a path alias) and `user_oidc` hardcodes `loginName == UID`.
-
-The reproduction test drives the **multi-user BasicAuth** MCP service (port 8003)
-as `alice`, so no browser is needed.
-
-**Setup**:
-```bash
-# openldap (ldap profile) + the multi-user-basic MCP service (port 8003).
-# user_ldap is auto-configured by app-hooks/post-installation/15-setup-ldap-backend.sh
-# (gated on the openldap service; a no-op for every other profile).
-docker compose --profile ldap --profile multi-user-basic up --build -d
-uv run pytest -m ldap -v             # xfails until #980's client fix lands
-```
-
-> The post-installation hook only runs on a **fresh** Nextcloud install. If you
-> add the `ldap` profile to an already-installed dev stack, run the hook by hand:
-> `docker compose exec app bash /docker-entrypoint-hooks.d/post-installation/15-setup-ldap-backend.sh`
-
-**Credentials**: LDAP admin `uid=admin,dc=example,dc=org` / `ldap_admin_pw`;
-user `alice` / `AlicePass123!` (see `ldap/bootstrap.ldif`).
-
-**xfail note**: `tests/server/ldap/test_ldap_dav_principal.py` is
-`xfail(strict=True)` — it fails (RED) on `master` because the bug is present, and
-xpasses (GREEN) once #980's `BaseNextcloudClient._ensure_principal_id` discovery
-lands. `strict=True` turns the unexpected pass into a failure, signalling that
-the marker should be dropped when #980 merges.
-
-## Integration Testing with Docker
-
-**Nextcloud**: `docker compose exec app php occ ...` for occ commands
-**MariaDB**: Use `./scripts/dbquery.py` for queries (see Database Inspection above)
-**SQLite**: Use `./scripts/sqlitequery.py` for MCP service databases
-
-### Querying Nextcloud Application Logs
-
-**Use this pattern** to inspect Nextcloud application logs during debugging:
-
-```bash
-# View recent log entries
-docker compose exec app cat /var/www/html/data/nextcloud.log | jq | tail
-
-# Filter by app
-docker compose exec app cat /var/www/html/data/nextcloud.log | jq 'select(.app == "astrolabe")' | tail
-
-# Filter by log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=FATAL)
-docker compose exec app cat /var/www/html/data/nextcloud.log | jq 'select(.level >= 3)' | tail
-
-# Search for specific messages
-docker compose exec app cat /var/www/html/data/nextcloud.log | jq 'select(.message | contains("OAuth"))' | tail -20
-
-# View full exception traces
-docker compose exec app cat /var/www/html/data/nextcloud.log | jq 'select(.exception != null)' | tail -5
-```
-
-**Log Structure**: Each entry is a JSON object with fields: `reqId`, `level`, `time`, `remoteAddr`, `user`, `app`, `method`, `url`, `message`, `userAgent`, `version`, `exception`
-
-**For detailed setup, see**:
-- `docs/installation.md` - Installation guide
-- `docs/configuration.md` - Configuration options
-- `docs/authentication.md` - Authentication modes
-- `docs/running.md` - Running the server
-
-**For additional information regarding MCP during development, see**:
-- `../../Software/modelcontextprotocol/` - MCP spec
-- `../../Software/python-sdk/` - Python MCP SDK
+## Conventions (load-bearing for any contributor — human or AI)
+
+- **No JSON↔vCard round-trip on properties not being modified.** If a
+  property isn't in the change set, its bytes round-trip verbatim. Period.
+- **`If-Match` mandatory on every CardDAV write.** Concurrency is
+  ETag-based; 412 surfaces to the caller as `EtagConflictError`. No silent
+  retries unless the caller opts in via `retry_on_conflict=True`.
+- **Logs never include the NC app password or any X-Isla-Auth value.**
+  Healthz output returns auth-presence (`"ok"`/`"missing"`) not values.
+- **AI-NOTICE on every Python source file** under `nextcloud_mcp_server/`
+  and `tests/`. The 10-field block (Schema-Version through Contact) is
+  enforced by `scripts/lint-ai-notice.sh`. See `LICENSE.md` for the
+  posture's license tie-in.
+
+## Licensing
+
+This repo is **AGPL-3.0-or-later**, matching upstream
+`cbcoutinho/nextcloud-mcp-server`. Full text in `LICENSE.md`. The
+exploitation-deterrence posture is set per source file in the AI-NOTICE
+block; see `LICENSE.md § AI-NOTICE` for what each field signals.
+
+## Pointers
+
+- **NC instance:** `raidio.bajaj.com:443` (TrueNAS Mini R), publicly proxied
+  as `hub.bajaj.com`. Backend creds are an NC app password scoped to
+  Contacts read+write only — never log or echo.
+- **Plan and implementation docs:**
+  - `Documents/Projects/NC/NC-MCP-Plan.md` — mission, work streams, operator
+    context, open decisions.
+  - `Documents/Projects/NC/NC-MCP-Implementation.md` — codebase survey,
+    architecture decisions, build sequence, deliverables.
+- **Per-regression analysis:** `Documents/Projects/NC/regressions/A1-photo-clobber.md`,
+  `A2-webdav-truncation.md`, `A3-schema-gaps.md`.
+- **Photo-update embargo (lifts at Phase 7):**
+  `Documents/Projects/Isla/contacts-policy.md § INTERIM FREEZE`.
+- **Live AI-NOTICE three-layer reference:**
+  `https://github.com/pi0n00r/freepbx/tree/main/auto-restore`.
+
+## Upstream PR posture
+
+The A.1 / A.2 / A.3 fixes are non-fork-specific — they benefit anyone
+running this MCP. PRs to `cbcoutinho/nextcloud-mcp-server` should NOT
+include the AI-NOTICE additions (those are fork-only); branch the
+upstream-target work cleanly, and layer AI-NOTICE additions on top in the
+fork's `main` branch as a separate commit.
