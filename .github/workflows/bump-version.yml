@@ -1,9 +1,10 @@
 name: Bump version
 
+# Fork policy: do not auto-bump versions on master pushes. Version numbers
+# are release-governance signals, not a Commitizen side effect. Run manually
+# only when the operator intends to cut a release.
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 # Ensure only one version bump runs at a time. Concurrent runs would race to
 # bump the version and push tags, which has caused release failures in the past.
