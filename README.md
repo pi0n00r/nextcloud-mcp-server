@@ -50,7 +50,7 @@ docker run -p 127.0.0.1:8000:8000 --rm \
   -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
   -e NEXTCLOUD_USERNAME=your_username \
   -e NEXTCLOUD_PASSWORD=your_app_password \
-  pi0n00r/nextcloud-mcp-server:0.126.3
+  pi0n00r/nextcloud-mcp-server:0.127.4
 ```
 
 Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
@@ -81,7 +81,7 @@ For deployment options and Compose profiles, see [docs/installation.md](docs/ins
 | **Tables** | 5 | Row operations on Nextcloud Tables |
 | **Sharing** | 10+ | Create and manage shares |
 | **News** | 8 | Feeds, folders, items, feed health monitoring |
-| **Mail** | 5 | Read-only: accounts, mailboxes, messages, attachments (via Mail app's OCS API) |
+| **Mail** | 5 | Read-only: accounts, mailboxes, messages, attachments (via Mail app's REST API) |
 | **Collectives** | 16 | Full CRUD on collectives, pages, and tags |
 | **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
 | **Semantic Search** | 2+ | Vector search for Notes, Files, News items, Deck cards, and Mail messages (experimental, opt-in, requires infrastructure) |

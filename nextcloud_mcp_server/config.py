@@ -35,9 +35,16 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_mcp_server_url": None,
     "nextcloud_resource_uri": None,
     "nextcloud_public_issuer_url": None,
+    "nextcloud_public_url": None,
     "cookie_secure": None,
     # OAuth/OIDC
     "oidc_discovery_url": None,
+    # Startup OIDC-discovery retry/backoff. Declared here (lowercase) so
+    # dynaconf reads the UPPERCASE env vars under ignore_unknown_envvars=True;
+    # defaults mirror the Settings dataclass fields.
+    "oidc_discovery_max_attempts": 10,
+    "oidc_discovery_backoff_base": 1.0,
+    "oidc_discovery_backoff_max": 15.0,
     # Keys must uppercase to the env var dynaconf reads (ignore_unknown_envvars):
     # NEXTCLOUD_OIDC_TOKEN_TYPE / NEXTCLOUD_OIDC_SCOPES, matching _field_map.
     "nextcloud_oidc_token_type": "Bearer",
@@ -50,6 +57,19 @@ _DEFAULTS: dict[str, Any] = {
     "introspection_uri": None,
     "userinfo_uri": None,
     "oidc_resource_server_id": None,
+    # M2M / DCR / management — these MUST be declared here (lowercase) so dynaconf
+    # reads the matching UPPERCASE env var; with ignore_unknown_envvars=True an
+    # undeclared key is silently dropped (env value ignored), so they are read
+    # via cfg("ENV_NAME"). Defaults mirror the prior os.getenv(..., default).
+    "mcp_server_client_id": None,
+    "mcp_server_client_secret": None,
+    "allowed_mcp_clients": "",
+    "allowed_mgmt_client": "",
+    "enable_dcr": False,
+    # Container-runtime / webhook self-URL overrides (local-dev docker-compose).
+    "docker_container": False,
+    "nextcloud_mcp_service_name": "mcp",
+    "nextcloud_mcp_port": 8000,
     # Mode flags
     # NOTE: `enable_multi_user_basic_auth` and `enable_login_flow` are
     # intentionally absent — they are derived from MCP_DEPLOYMENT_MODE in
@@ -241,6 +261,11 @@ _DEFAULTS: dict[str, Any] = {
     # the current monolithic behavior; self-hosters who set none are
     # unaffected. See docs/architecture/mcp-decomposition.md (sibling repo).
     "embedding_provider": "autodetect",  # autodetect | gateway
+    # Search mode (ADR-030). ``hybrid`` (default) generates + queries dense
+    # embeddings AND BM25 sparse vectors. ``keyword`` skips dense entirely:
+    # BM25 sparse only, so fully airgapped deployments need no embedding
+    # endpoint. ``keyword`` still requires vector sync enabled (it uses Qdrant).
+    "search_mode": "hybrid",  # hybrid (dense+sparse) | keyword (BM25 sparse only)
     # Ingest queue backend (Deck #183). None → ``memory`` (the in-process anyio
     # queue): procrastinate is strictly opt-in, even on a Postgres DATABASE_URL.
     # Set ``postgres`` explicitly to split ingest into a procrastinate worker;
@@ -339,6 +364,11 @@ def _resolve_settings_files() -> list[str]:
     and env vars still apply.
     """
     files: list[str] = []
+    # The ONLY legitimate os.environ read in the app: this runs BEFORE the
+    # dynaconf instance is built (it computes the settings_files list passed to
+    # Dynaconf), so it cannot go through dynaconf — you can't read the location
+    # of the settings file from the settings file. This + the MCP_DEPLOYMENT_MODE
+    # env_switcher are dynaconf's own bootstrap. All OTHER config is dynaconf-driven.
     explicit = os.environ.get("NEXTCLOUD_MCP_SETTINGS_FILE")
     if explicit:
         p = Path(explicit)
@@ -377,6 +407,9 @@ _dynaconf = Dynaconf(
         Validator("INGEST_STALLED_JOB_SECONDS", gte=1),
         Validator("INGEST_TRANSIENT_MAX_ATTEMPTS", gte=1),
         Validator("INGEST_RECLAIM_RETRY_DELAY_SECONDS", gte=0),
+        Validator("OIDC_DISCOVERY_MAX_ATTEMPTS", gte=1),
+        Validator("OIDC_DISCOVERY_BACKOFF_BASE", gte=0),
+        Validator("OIDC_DISCOVERY_BACKOFF_MAX", gte=0),
         Validator("VECTOR_SYNC_SCAN_INTERVAL", gte=1),
         Validator("VECTOR_SYNC_PROCESSOR_WORKERS", gte=1),
         Validator("VECTOR_SYNC_QUEUE_MAX_SIZE", gte=1),
@@ -700,6 +733,17 @@ class Settings:
     oidc_resource_server_id: str | None = None
     oidc_token_type: str = "Bearer"  # NEXTCLOUD_OIDC_TOKEN_TYPE
     oidc_scopes: str = ""  # NEXTCLOUD_OIDC_SCOPES (space-separated)
+
+    # OIDC discovery startup resilience. Discovery runs synchronously at boot
+    # and is fatal on failure; on a freshly-scheduled pod the egress path (e.g.
+    # Cilium toFQDN allow + egress-gateway SNAT programming) can take a few
+    # seconds to converge, during which the request is dropped and times out.
+    # Retry with capped exponential backoff + jitter so a cold-start race
+    # doesn't crashloop the backend. Set OIDC_DISCOVERY_MAX_ATTEMPTS=1 to
+    # restore the original fail-fast behavior.
+    oidc_discovery_max_attempts: int = 10  # OIDC_DISCOVERY_MAX_ATTEMPTS
+    oidc_discovery_backoff_base: float = 1.0  # OIDC_DISCOVERY_BACKOFF_BASE (s)
+    oidc_discovery_backoff_max: float = 15.0  # OIDC_DISCOVERY_BACKOFF_MAX (s)
     port: int = 8000  # Server port (PORT); used to build fallback URLs
 
     # Nextcloud settings
@@ -711,7 +755,24 @@ class Settings:
     # Browser-reachable public URL for OAuth/Login-Flow-v2 redirects when
     # NEXTCLOUD_HOST is an internal Docker hostname. Falls back to
     # nextcloud_host when unset.
+    #
+    # NOTE: this doubles as the OAuth *issuer* URL used for JWT ``iss``
+    # validation. In external-IdP mode (e.g. Keycloak) the issuer is the IdP,
+    # NOT Nextcloud — so this value points at the IdP, not the browser-reachable
+    # Nextcloud host. Use ``nextcloud_public_url`` / ``nextcloud_browser_url``
+    # for anything that must resolve to Nextcloud itself (Login Flow v2 login
+    # URLs, elicitation links).
     nextcloud_public_issuer_url: str | None = None
+
+    # Browser-reachable public URL of the *Nextcloud* instance, used to rewrite
+    # Login Flow v2 login URLs and elicitation links when NEXTCLOUD_HOST is an
+    # internal Docker hostname. Distinct from ``nextcloud_public_issuer_url``
+    # because, in external-IdP (Keycloak/OIDC) deployments, the OAuth issuer is
+    # the IdP while Login Flow v2 must still point the browser at Nextcloud.
+    # Falls back to ``nextcloud_public_issuer_url`` then ``nextcloud_host`` (see
+    # ``nextcloud_browser_url``) so single-IdP (login-flow) deployments that set
+    # only NEXTCLOUD_PUBLIC_ISSUER_URL keep working unchanged.
+    nextcloud_public_url: str | None = None
 
     # Browser cookie Secure flag. None = auto-detect from nextcloud_host
     # scheme (https → True, else False). Set COOKIE_SECURE=true/false to
@@ -954,6 +1015,7 @@ class Settings:
     # MCP decomposition hook points (design §10, opt-in). All defaults
     # reproduce the current monolith; validated in __post_init__.
     embedding_provider: str = "autodetect"  # autodetect | gateway
+    search_mode: str = "hybrid"  # hybrid | keyword (BM25 sparse only) — ADR-030
     # Ingest queue backend (Deck #183). None → resolved in __post_init__ to
     # ``postgres`` when DATABASE_URL is Postgres, else ``memory``.
     ingest_queue: str | None = None  # memory | postgres
@@ -981,6 +1043,26 @@ class Settings:
     # record best-effort rows into the app-DB usage_events table for the
     # control plane to pull. See nextcloud_mcp_server/usage/store.py.
     usage_metering_enabled: bool = False
+
+    @property
+    def nextcloud_browser_url(self) -> str | None:
+        """Browser-reachable base URL of the Nextcloud instance.
+
+        Resolves the URL the *user's browser* must use to reach Nextcloud for
+        Login Flow v2 login pages and elicitation links. Prefers the dedicated
+        ``nextcloud_public_url``; falls back to ``nextcloud_public_issuer_url``
+        (correct in single-IdP / login-flow deployments where the OAuth issuer
+        IS Nextcloud) and finally the internal ``nextcloud_host``.
+
+        In external-IdP mode (e.g. Keycloak) set ``NEXTCLOUD_PUBLIC_URL`` so this
+        does not fall back to the IdP issuer URL, which would send the browser to
+        the IdP instead of Nextcloud.
+        """
+        return (
+            self.nextcloud_public_url
+            or self.nextcloud_public_issuer_url
+            or self.nextcloud_host
+        )
 
     def __post_init__(self):
         """Validate configuration and set defaults."""
@@ -1076,6 +1158,7 @@ class Settings:
         # the monolith, so deployments that set none of these pass through.
         _enum_fields = {
             "embedding_provider": {"autodetect", "gateway"},
+            "search_mode": {"hybrid", "keyword"},
             "mcp_role": {"api", "worker", "all"},
             "collection_metadata_source": {"qdrant", "api"},
             "document_tier1_engine": {"pypdfium2", "pymupdf"},
@@ -1174,6 +1257,11 @@ class Settings:
             ("ENABLE_MULTI_USER_BASIC_AUTH", "multi_user_basic"),
             ("ENABLE_LOGIN_FLOW", "login_flow"),
         ):
+            # Read raw os.environ here, NOT cfg(): these legacy keys are
+            # intentionally NOT in the dynaconf schema (they're derived from
+            # MCP_DEPLOYMENT_MODE, ADR-022), so cfg() would always ignore them.
+            # This is a deprecation *detector* for raw env usage, not config
+            # reading — a deliberate exception to the dynaconf-drives-all rule.
             if os.environ.get(_legacy, "").strip().lower() in _truthy:
                 raise ValueError(
                     f"{_legacy} is no longer read from the environment. "
@@ -1312,8 +1400,18 @@ class Settings:
             # Fallback to hostname for simple Docker deployments without OTEL config
             deployment_id = socket.gethostname()
 
-        # Sanitize deployment ID and model name
+        # Sanitize deployment ID
         deployment_id = deployment_id.lower().replace(" ", "-").replace("_", "-")
+
+        # Keyword mode (ADR-030) indexes BM25 sparse vectors only and may run
+        # with no embedding provider configured, so the embedding model name is
+        # a meaningless ``simple-{dim}`` fallback. Use a fixed mode marker
+        # instead: this guarantees keyword and hybrid indexes never share a
+        # collection (their point schemas are not interchangeable — see ADR-030)
+        # and removes keyword mode's dependency on the phantom model name.
+        if self.search_mode == "keyword":
+            return f"{deployment_id}-bm25-keyword"
+
         model_name = self.get_embedding_model_name().replace("/", "-").replace(":", "-")
 
         return f"{deployment_id}-{model_name}"
@@ -1325,6 +1423,17 @@ class Settings:
     def enable_semantic_search(self) -> bool:
         """Semantic search enabled (ADR-021 alias for vector_sync_enabled)."""
         return self.vector_sync_enabled
+
+    @property
+    def dense_enabled(self) -> bool:
+        """Dense embeddings generated + queried.
+
+        False in ``keyword`` mode (ADR-030), where ingestion and search use BM25
+        sparse vectors only — no external embedding endpoint is contacted. Single
+        source of truth for the processor, the search algorithm, and the Qdrant
+        client so the three subsystems stay consistent.
+        """
+        return self.search_mode != "keyword"
 
     @property
     def enable_background_operations(self) -> bool:
@@ -1468,6 +1577,35 @@ def _dget(key):
     return _dynaconf[key] if key in _dynaconf else _UNSET
 
 
+def cfg(key: str, default=None):
+    """Dynaconf-driven config accessor for keys NOT modelled on ``Settings``.
+
+    The single supported way for application code to read configuration that
+    isn't a first-class ``Settings`` field — reads from settings.toml, env vars
+    and runtime overrides via dynaconf. Application code MUST use this (or
+    ``get_settings().<field>``) instead of ``os.getenv`` / ``os.environ`` so all
+    config is dynaconf-driven (settings.toml [default]/[<mode>] + env + overrides).
+
+    Mirrors ``os.getenv(key, default)``: returns ``default`` when the value is
+    unset OR ``None``, so a key modelled in ``_DEFAULTS`` with a ``None`` default
+    does NOT shadow a meaningful call-site fallback (e.g.
+    ``cfg("MCP_SERVER_CLIENT_SECRET", oauth_config.get("client_secret"))``).
+    """
+    value = _dynaconf.get(key)
+    return value if value is not None else default
+
+
+def set_override(key: str, value) -> None:
+    """Set a runtime config override in dynaconf (the documented ``.set`` path).
+
+    Used by the CLI to feed ``--flags`` into dynaconf instead of mutating
+    ``os.environ``. Subsequent ``cfg()`` / ``get_settings()`` reads see it.
+    ``tomlfy=True`` parses the value so typed scalars ("9090" -> int, "true" ->
+    bool) land with the right type, matching settings.toml semantics.
+    """
+    _dynaconf.set(key, value, tomlfy=True)
+
+
 def get_settings() -> Settings:
     """Get application settings from dynaconf configuration.
 
@@ -1501,6 +1639,9 @@ def get_settings() -> Settings:
         "oidc_resource_server_id": "OIDC_RESOURCE_SERVER_ID",
         "oidc_token_type": "NEXTCLOUD_OIDC_TOKEN_TYPE",
         "oidc_scopes": "NEXTCLOUD_OIDC_SCOPES",
+        "oidc_discovery_max_attempts": "OIDC_DISCOVERY_MAX_ATTEMPTS",
+        "oidc_discovery_backoff_base": "OIDC_DISCOVERY_BACKOFF_BASE",
+        "oidc_discovery_backoff_max": "OIDC_DISCOVERY_BACKOFF_MAX",
         "port": "PORT",
         # Nextcloud settings
         "nextcloud_host": "NEXTCLOUD_HOST",
@@ -1508,6 +1649,7 @@ def get_settings() -> Settings:
         "nextcloud_password": "NEXTCLOUD_PASSWORD",
         "nextcloud_app_password": "NEXTCLOUD_APP_PASSWORD",
         "nextcloud_public_issuer_url": "NEXTCLOUD_PUBLIC_ISSUER_URL",
+        "nextcloud_public_url": "NEXTCLOUD_PUBLIC_URL",
         "cookie_secure": "COOKIE_SECURE",
         # Nextcloud SSL/TLS settings
         "nextcloud_verify_ssl": "NEXTCLOUD_VERIFY_SSL",
@@ -1610,6 +1752,7 @@ def get_settings() -> Settings:
         "excluded_tags": "EXCLUDED_TAGS",
         # MCP decomposition hook points (design §10)
         "embedding_provider": "EMBEDDING_PROVIDER",
+        "search_mode": "SEARCH_MODE",
         "ingest_queue": "INGEST_QUEUE",
         "mcp_role": "MCP_ROLE",
         "ingest_stalled_job_seconds": "INGEST_STALLED_JOB_SECONDS",

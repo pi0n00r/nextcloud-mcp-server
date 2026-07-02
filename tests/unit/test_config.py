@@ -511,6 +511,48 @@ class TestDynaconfValidators:
         with pytest.raises(ValidationError, match="METRICS_PORT"):
             _reload_config()
 
+    @patch.dict(os.environ, {"OIDC_DISCOVERY_MAX_ATTEMPTS": "0"}, clear=True)
+    def test_oidc_discovery_max_attempts_zero_rejected(self):
+        """OIDC_DISCOVERY_MAX_ATTEMPTS must be >= 1 (0 disables discovery)."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="OIDC_DISCOVERY_MAX_ATTEMPTS"):
+            _reload_config()
+
+    @patch.dict(os.environ, {"OIDC_DISCOVERY_BACKOFF_BASE": "-1"}, clear=True)
+    def test_oidc_discovery_backoff_base_negative_rejected(self):
+        """OIDC_DISCOVERY_BACKOFF_BASE must be non-negative."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="OIDC_DISCOVERY_BACKOFF_BASE"):
+            _reload_config()
+
+    @patch.dict(os.environ, {"OIDC_DISCOVERY_BACKOFF_MAX": "-1"}, clear=True)
+    def test_oidc_discovery_backoff_max_negative_rejected(self):
+        """OIDC_DISCOVERY_BACKOFF_MAX must be non-negative."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="OIDC_DISCOVERY_BACKOFF_MAX"):
+            _reload_config()
+
+    @patch.dict(
+        os.environ,
+        {
+            "OIDC_DISCOVERY_MAX_ATTEMPTS": "3",
+            "OIDC_DISCOVERY_BACKOFF_BASE": "0.5",
+            "OIDC_DISCOVERY_BACKOFF_MAX": "10",
+        },
+        clear=True,
+    )
+    def test_oidc_discovery_retry_settings_valid(self):
+        """Valid OIDC discovery retry knobs load and coerce to numbers."""
+        _reload_config()
+        settings = get_settings()
+
+        assert settings.oidc_discovery_max_attempts == 3
+        assert settings.oidc_discovery_backoff_base == pytest.approx(0.5)
+        assert settings.oidc_discovery_backoff_max == pytest.approx(10.0)
+
     @patch.dict(os.environ, {"LOG_FORMAT": "xml"}, clear=True)
     def test_invalid_log_format(self):
         """Test invalid LOG_FORMAT raises ValidationError."""
@@ -630,3 +672,34 @@ class TestDynaconfValidators:
         _reload_config()
         settings = get_settings()
         assert settings.log_format == "json"
+
+
+class TestNextcloudBrowserUrl:
+    """Test the ``nextcloud_browser_url`` resolver property (Login Flow v2 rewrite)."""
+
+    def test_prefers_public_url(self):
+        """nextcloud_public_url wins — the external-IdP (Keycloak) case."""
+        settings = Settings(
+            nextcloud_public_url="https://nc.example.com",
+            nextcloud_public_issuer_url="https://keycloak.example.com/realms/x",
+            nextcloud_host="https://app.internal",
+        )
+        assert settings.nextcloud_browser_url == "https://nc.example.com"
+
+    def test_falls_back_to_public_issuer(self):
+        """Without public_url, the OAuth issuer URL is used (single-IdP case)."""
+        settings = Settings(
+            nextcloud_public_issuer_url="https://nc.example.com",
+            nextcloud_host="https://app.internal",
+        )
+        assert settings.nextcloud_browser_url == "https://nc.example.com"
+
+    def test_falls_back_to_host(self):
+        """With neither public URL set, the internal host is used."""
+        settings = Settings(nextcloud_host="https://app.internal")
+        assert settings.nextcloud_browser_url == "https://app.internal"
+
+    def test_none_when_nothing_set(self):
+        """Returns None when no Nextcloud URL is configured at all."""
+        settings = Settings()
+        assert settings.nextcloud_browser_url is None

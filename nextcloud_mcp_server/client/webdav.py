@@ -59,6 +59,11 @@ def _read_complete_body(response: Response, label: str) -> bytes:
     the check so legitimately header-less responses never raise.
     """
     content = response.content
+    if response.headers.get("content-encoding"):
+        # httpx exposes decoded response.content while some servers report the
+        # compressed wire Content-Length. Treat encoded bodies as unsuitable
+        # for byte-count comparison; httpx still raises on genuine truncation.
+        return content
     declared = response.headers.get("content-length")
     if declared is None:
         return content
@@ -341,6 +346,7 @@ class WebDAVClient(BaseNextcloudClient):
 
     async def list_directory(self, path: str = "") -> List[Dict[str, Any]]:
         """List files and directories in the specified path via WebDAV PROPFIND."""
+        await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)
         if not webdav_path.endswith("/"):
             webdav_path += "/"
@@ -378,8 +384,8 @@ class WebDAVClient(BaseNextcloudClient):
                 if href is None:
                     continue
 
-                # Extract file/directory name from href
-                href_text = href.text or ""
+                # Extract file/directory name from href. DAV hrefs are percent-encoded.
+                href_text = unquote(href.text or "")
                 name = href_text.rstrip("/").split("/")[-1]
                 if not name:
                     continue
@@ -444,6 +450,7 @@ class WebDAVClient(BaseNextcloudClient):
         pass it to write_file(if_match=...) for race-safe read-modify-write
         sequences. Closes P1.1 backlog item — see nc-mcp-backlog.md.
         """
+        await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)
 
         logger.debug(f"Reading file: {path}")
@@ -497,6 +504,8 @@ class WebDAVClient(BaseNextcloudClient):
                 raises EtagConflictError with the server's current etag (if
                 surfaceable). Closes P1.1 backlog item.
         """
+        await self._ensure_principal_id()
+
         if not content_type:
             content_type, _ = mimetypes.guess_type(path)
             if not content_type:
@@ -924,7 +933,7 @@ class WebDAVClient(BaseNextcloudClient):
     ) -> str:
         """Build the XML body for a SEARCH request."""
         # Construct the scope path
-        username = self.username
+        username = self._principal_or_username()
         scope_path = f"/files/{username}"
         if scope:
             scope_path = f"{scope_path}/{scope.lstrip('/')}"
@@ -1055,12 +1064,13 @@ class WebDAVClient(BaseNextcloudClient):
             if href is None:
                 continue
 
-            # Extract file/directory path from href
-            href_text = href.text or ""
-            # Remove the /remote.php/dav/files/username/ prefix to get relative path
+            # Extract file/directory path from href. <d:href> is percent-encoded;
+            # decode before exposing paths to callers.
+            href_text = unquote(href.text or "")
+            # Remove the /remote.php/dav/files/<principal>/ prefix to get relative path.
             path_parts = href_text.split("/files/")
             if len(path_parts) > 1:
-                # Get the path after username
+                # Get the path after the principal segment.
                 path_after_user = "/".join(path_parts[1].split("/")[1:])
                 relative_path = path_after_user.rstrip("/")
             else:

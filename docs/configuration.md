@@ -116,10 +116,14 @@ NEXTCLOUD_PUBLIC_ISSUER_URL=https://your.nextcloud.instance.com
 | `TOKEN_ENCRYPTION_KEY` | ✅ Yes | Fernet key for app-password encryption — generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `TOKEN_STORAGE_DB` | ✅ Yes | Path to SQLite DB for stored app passwords (use a persistent volume) |
 | `NEXTCLOUD_MCP_SERVER_URL` | ✅ Yes | Public URL of the MCP server (used as the audience claim and for browser redirects) |
-| `NEXTCLOUD_PUBLIC_ISSUER_URL` | ✅ Yes | Public URL of Nextcloud (for browser redirects during Login Flow v2) |
+| `NEXTCLOUD_PUBLIC_ISSUER_URL` | ✅ Yes | Public URL used as the OAuth issuer for JWT validation **and** (by default) the browser-reachable Nextcloud URL for Login Flow v2 redirects. When Nextcloud is its own IdP these coincide. |
+| `NEXTCLOUD_PUBLIC_URL` | Optional (required for external IdPs) | Browser-reachable public URL of **Nextcloud** for Login Flow v2 login pages and elicitation links. Only needed when the OAuth issuer is a *separate* IdP (e.g. Keycloak/Cognito): there `NEXTCLOUD_PUBLIC_ISSUER_URL` points at the IdP, so set this to Nextcloud's own URL or the Login Flow v2 login page is built on the IdP origin and 404s. Falls back to `NEXTCLOUD_PUBLIC_ISSUER_URL` then `NEXTCLOUD_HOST` when unset. |
 | `NEXTCLOUD_OIDC_CLIENT_ID` | ✅ Strongly recommended | OIDC client ID for the MCP server's relying-party registration with the IdP (Nextcloud's built-in OIDC by default; Keycloak / Cognito / etc. via `OIDC_DISCOVERY_URL`). If unset and the IdP advertises a `registration_endpoint`, the server falls back to RFC 7591 Dynamic Client Registration (DCR) — **but with Nextcloud's built-in `oidc` app this fallback breaks after ~1 hour** (see warning below). Create a static client and set this instead. |
 | `NEXTCLOUD_OIDC_CLIENT_SECRET` | ✅ Strongly recommended | OIDC client secret paired with `NEXTCLOUD_OIDC_CLIENT_ID`. |
 | `OIDC_DISCOVERY_URL` | Optional | Override the IdP discovery URL. Defaults to `${NEXTCLOUD_HOST}/.well-known/openid-configuration` (Nextcloud's built-in OIDC). Set to a Keycloak realm or AWS Cognito user-pool discovery URL to use an external IdP. |
+| `OIDC_DISCOVERY_MAX_ATTEMPTS` | Optional (default `10`) | Number of attempts for the OIDC discovery fetch performed at startup. Discovery is retried on transport errors (e.g. connect timeouts) and 5xx responses with capped exponential backoff + jitter, so a cold-start network race (e.g. Cilium egress programming) doesn't crashloop the server. `4xx` responses (real misconfiguration) fail immediately. Set to `1` to restore fail-fast-on-first-error behavior. |
+| `OIDC_DISCOVERY_BACKOFF_BASE` | Optional (default `1.0`) | Base delay in seconds for the first discovery retry; subsequent retries grow exponentially (`base * 2**n`) with full jitter. |
+| `OIDC_DISCOVERY_BACKOFF_MAX` | Optional (default `15.0`) | Per-retry cap in seconds for the discovery backoff. With the defaults, worst-case startup blocks on the order of ~90s of backoff (`1+2+4+8+15×5`) **plus** the per-attempt connect timeouts (~5s each on the LOGIN_FLOW path, 30s on the hybrid multi-user-basic path) before a persistently-down IdP finally exits — size your k8s `startupProbe`/`livenessProbe` accordingly. |
 
 > **⚠️ Use a static OIDC client with Nextcloud's built-in `oidc` app.** If you
 > don't set `NEXTCLOUD_OIDC_CLIENT_ID` / `NEXTCLOUD_OIDC_CLIENT_SECRET`, the MCP
@@ -331,6 +335,44 @@ OLLAMA_BASE_URL=http://ollama:11434
 ```
 
 > **Note:** In multi-user modes (Login Flow v2, Multi-User BasicAuth), enabling `ENABLE_SEMANTIC_SEARCH` automatically enables background operations and refresh token storage. You don't need to set `ENABLE_BACKGROUND_OPERATIONS` separately!
+
+### Search Mode: Keyword-Only (Airgapped) — `SEARCH_MODE`
+
+`SEARCH_MODE` selects how indexed content is searched (ADR-030):
+
+| Value | Behavior | Embedding endpoint |
+|-------|----------|--------------------|
+| `hybrid` (default) | Dense semantic vectors **+** BM25 sparse vectors, fused in Qdrant | **Required** (Ollama/Bedrock/OpenAI/Mistral/gateway) |
+| `keyword` | BM25 sparse (full-text/keyword) only — no dense embeddings | **None** |
+
+Use `SEARCH_MODE=keyword` for fully **airgapped** deployments that cannot (or
+do not want to) run a text-embedding endpoint. You still get the unified
+cross-app Qdrant index (notes, files, OCR'd PDFs, deck cards, news, mail) and
+verify-on-read ACLs — just lexical (keyword) matching instead of conceptual
+similarity. BM25 sparse vectors are computed in-process, so no embedding service
+is contacted at ingestion or query time.
+
+```dotenv
+# Airgapped, no embedding endpoint:
+ENABLE_SEMANTIC_SEARCH=true   # keyword mode still uses the Qdrant pipeline
+SEARCH_MODE=keyword
+QDRANT_URL=http://qdrant:6333
+# (no OLLAMA_BASE_URL / Bedrock / OpenAI / gateway needed)
+```
+
+Notes:
+
+- `keyword` **still requires `ENABLE_SEMANTIC_SEARCH=true`** — it uses the Qdrant
+  index. With vector sync off the search tools don't register.
+- The `nc_semantic_search` / `nc_semantic_search_answer` tools stay available;
+  results carry `search_method="bm25_keyword"`. The RAG answer tool still works
+  airgapped (retrieval via BM25, answer generated client-side via MCP sampling).
+- **Score caveat:** in keyword mode `score` is a raw BM25 value (unbounded), not
+  a normalized [0,1] fusion score, so a non-zero `score_threshold` filters very
+  differently. The `fusion` parameter is ignored.
+- **Switching modes** uses a different collection (keyword collections are named
+  `…-bm25-keyword`). Keyword and hybrid indexes are not interchangeable — to
+  switch, use a fresh collection and let background sync re-ingest.
 
 ### Qdrant Vector Database Modes
 
@@ -871,6 +913,7 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ENABLE_SEMANTIC_SEARCH` | ⚠️ Optional | `false` | Enable semantic search with background indexing (replaces `VECTOR_SYNC_ENABLED`) |
+| `SEARCH_MODE` | ⚠️ Optional | `hybrid` | `hybrid` (dense+sparse) or `keyword` (BM25 sparse only, no embedding endpoint — airgapped, ADR-030). `keyword` still requires `ENABLE_SEMANTIC_SEARCH=true` |
 | `QDRANT_URL` | ⚠️ Optional | - | Qdrant service URL (network mode) - mutually exclusive with `QDRANT_LOCATION` |
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
 | `QDRANT_API_KEY` | ⚠️ Optional | - | Qdrant API key (network mode only) |

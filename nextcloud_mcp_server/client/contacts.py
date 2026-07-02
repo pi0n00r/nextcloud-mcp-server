@@ -39,12 +39,210 @@ import warnings
 import xml.etree.ElementTree as ET
 from datetime import date
 from typing import Any, Iterable, Optional
+from urllib.parse import unquote
 from httpx import HTTPStatusError
 from pythonvCard4.vcard import Contact
 from .base import BaseNextcloudClient
 from .vcard_parser import VCard, patch_vcard
 
 logger = logging.getLogger(__name__)
+
+
+# Canonical keys accepted by _build_contact_from_data. Callers normalise aliases
+# (``phone``→``tel``, ``organization``→``org``) via _normalize_contact_data beforehand
+# so the set never needs to list them.
+_SUPPORTED_CONTACT_KEYS = frozenset(
+    {
+        "fn",
+        "email",
+        "tel",
+        "org",
+        "note",
+        "title",
+        "nickname",
+        "bday",
+        "categories",
+        "url",
+    }
+)
+
+
+def _normalize_contact_data(contact_data: dict[str, Any]) -> dict[str, Any]:
+    """Map documented aliases to canonical keys.
+
+    ``phone`` → ``tel``, ``organization`` → ``org``. The canonical key wins if both
+    are supplied, so callers who set ``tel`` don't lose it to a stray ``phone`` entry.
+    Returns a new dict — does not mutate the caller's argument.
+    """
+    normalised = dict(contact_data)
+    if "phone" in normalised and "tel" not in normalised:
+        normalised["tel"] = normalised.pop("phone")
+    else:
+        normalised.pop("phone", None)
+    if "organization" in normalised and "org" not in normalised:
+        normalised["org"] = normalised.pop("organization")
+    else:
+        normalised.pop("organization", None)
+    return normalised
+
+
+def _wrap_contact_field(
+    value: str | dict[str, Any] | list[str | dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Normalize an email/tel input into pythonvCard4's list-of-dicts shape.
+
+    Accepts a plain string, a dict already in ``{value, type}`` form, or a list of
+    either. Empty strings and dicts without a ``value`` key are dropped. Always
+    returns a list (possibly empty).
+    """
+    if value is None or value == "":
+        return []
+    items = value if isinstance(value, list) else [value]
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("value"):
+            types = item.get("type") or ["HOME"]
+            # Wrap a bare string so ``list("WORK")`` doesn't iterate it into
+            # ``["W", "O", "R", "K"]`` — same char-iteration footgun this whole
+            # helper exists to avoid for the outer ``value``.
+            if isinstance(types, str):
+                types = [types]
+            out.append({"value": item["value"], "type": list(types)})
+        elif isinstance(item, str) and item:
+            out.append({"value": item, "type": ["HOME"]})
+    return out
+
+
+def _as_str_list(value: str | list[str]) -> list[str]:
+    """Wrap a bare string in a list. Does NOT split on commas.
+
+    Used for ORG/NICKNAME/URL where commas are part of the value (e.g.
+    ``"Smith, Jones & Associates"``) and only the list wrapper is needed to
+    prevent pythonvCard4 from iterating the string character-by-character.
+    """
+    return value if isinstance(value, list) else [value]
+
+
+def _split_categories(value: str | list[str]) -> list[str]:
+    """Normalise CATEGORIES input: a comma-separated string is split into a list.
+
+    Unlike ORG/NICKNAME, CATEGORIES is canonically comma-separated in vCards
+    (``CATEGORIES:a,b,c``) so splitting a bare string is the expected shape.
+    Lists pass through unchanged — callers that already provide ``["a,b"]`` keep
+    their exact item, no double-splitting.
+    """
+    if isinstance(value, list):
+        return value
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _parse_bday(value: str | date | None) -> date | None:
+    """Parse a BDAY input to a ``date``. Logs and returns ``None`` if unparseable.
+
+    Shared by the create path (``_build_contact_from_data``) and the update path
+    (``_merge_vcard_properties``) so a non-ISO BDAY is rejected consistently
+    instead of being written raw on update.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            logger.warning("Ignoring non-ISO bday value: %r", value)
+    return None
+
+
+def _first_custom(custom: dict[str, str | list[str]], key: str) -> str | None:
+    """Return the first raw value pythonvCard4 stashed in ``custom[key]``.
+
+    The library has no typed parser for ORG / TITLE / unencoded PHOTO, so they
+    end up in ``Contact.custom`` keyed by property name. The library's typeshed
+    declares the values as ``str | list[str]`` even though the current parser
+    always appends to a list — accept both shapes so we don't break on a future
+    library version that switches to bare strings. Returns ``None`` when the
+    key is absent or the value is empty.
+    """
+    values = custom.get(key)
+    if isinstance(values, list):
+        return values[0] if values else None
+    if isinstance(values, str):
+        return values or None
+    return None
+
+
+def _safe_vcard_value(value: Any) -> Any:
+    """Escape newlines in a value so it can't inject additional vCard properties.
+
+    Per RFC 6350 §3.4 newlines inside a property value are encoded as ``\\n``.
+    Unfolding this on the read side is pythonvCard4's job; we only need to make
+    sure ``contact_data`` strings don't terminate the line on the way out.
+    """
+    if isinstance(value, str):
+        return value.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    return value
+
+
+def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
+    """Build a pythonvCard4 Contact from an MCP ``contact_data`` dict.
+
+    Maps every key documented on ``nc_contacts_create_contact`` onto the underlying
+    library, normalising shapes (list/str) to avoid pythonvCard4's char-by-char
+    iteration of bare strings — see issue #716.
+
+    Callers must pre-normalise aliases via ``_normalize_contact_data`` before
+    invoking this helper; it assumes canonical keys only.
+    """
+    data = contact_data
+
+    if not data.get("fn"):
+        logger.warning(
+            "contact_data missing required 'fn' field; pythonvCard4 may reject or "
+            "produce an invalid vCard"
+        )
+
+    kwargs: dict[str, Any] = {"fn": data.get("fn"), "uid": uid}
+
+    emails = _wrap_contact_field(data.get("email"))
+    if emails:
+        kwargs["email"] = emails
+
+    tels = _wrap_contact_field(data.get("tel"))
+    if tels:
+        kwargs["tel"] = tels
+
+    if data.get("org"):
+        kwargs["org"] = _as_str_list(data["org"])
+
+    if data.get("note"):
+        kwargs["note"] = data["note"]
+
+    if data.get("title"):
+        kwargs["title"] = data["title"]
+
+    if data.get("nickname"):
+        kwargs["nickname"] = _as_str_list(data["nickname"])
+
+    if data.get("categories"):
+        kwargs["categories"] = _split_categories(data["categories"])
+
+    if data.get("url"):
+        kwargs["url"] = _as_str_list(data["url"])
+
+    bday = _parse_bday(data.get("bday"))
+    if bday is not None:
+        kwargs["bday"] = bday
+
+    unknown = set(data) - _SUPPORTED_CONTACT_KEYS
+    if unknown:
+        logger.debug("Ignoring unknown contact_data keys: %s", sorted(unknown))
+
+    # kwargs built dynamically from contact_data; pythonvCard4's Contact typeshed
+    # has specific typed params and doesn't accept **dict[str, Any].
+    return Contact(**kwargs)  # type: ignore[arg-type]
+
 
 
 class EtagConflictError(Exception):
@@ -76,15 +274,60 @@ class ContactsClient(BaseNextcloudClient):
     # ------------------------------------------------------------------
 
     def _get_carddav_base_path(self) -> str:
-        return f"/remote.php/dav/addressbooks/users/{self.username}"
+        return f"/remote.php/dav/addressbooks/users/{self._principal_or_username()}"
 
     def _vcard_url(self, addressbook: str, uid: str) -> str:
         return f"{self._get_carddav_base_path()}/{addressbook}/{uid}.vcf"
+
+    async def _list_object_names(self, addressbook: str) -> list[str]:
+        """Return CardDAV object filenames stored in ``addressbook``."""
+        await self._ensure_principal_id()
+        carddav_path = self._get_carddav_base_path()
+        propfind_body = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>'
+        )
+        response = await self._make_request(
+            "PROPFIND",
+            f"{carddav_path}/{addressbook}",
+            content=propfind_body,
+            headers={"Depth": "1", "Content-Type": "application/xml", "Accept": "application/xml"},
+        )
+        ns = {"d": "DAV:"}
+        root = ET.fromstring(response.content)
+        names: list[str] = []
+        for response_elem in root.findall(".//d:response", ns):
+            href = response_elem.find(".//d:href", ns)
+            if href is None or not href.text:
+                continue
+            href_text = unquote(href.text)
+            if href_text.endswith("/"):
+                continue
+            names.append(href_text.split("/")[-1])
+        return names
+
+    async def _resolve_object_name(self, addressbook: str, uid: str) -> str | None:
+        """Map a surfaced contact id back to its real CardDAV filename."""
+        candidates = [
+            name
+            for name in await self._list_object_names(addressbook)
+            if name.removesuffix(".vcf") == uid
+        ]
+        if not candidates:
+            return None
+        conventional = f"{uid}.vcf"
+        return conventional if conventional in candidates else candidates[0]
+
+    async def _resolved_vcard_url(self, addressbook: str, uid: str) -> str:
+        await self._ensure_principal_id()
+        object_name = await self._resolve_object_name(addressbook, uid) or f"{uid}.vcf"
+        return f"{self._get_carddav_base_path()}/{addressbook}/{object_name}"
 
     # ------------------------------------------------------------------
     # addressbook ops (unchanged)
     # ------------------------------------------------------------------
     async def list_addressbooks(self):
+        await self._ensure_principal_id()
         carddav_path = self._get_carddav_base_path()
         propfind_body = """<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/">
@@ -108,7 +351,7 @@ class ContactsClient(BaseNextcloudClient):
             if not href_text.endswith("/"):
                 continue
             addressbook_name = href_text.rstrip("/").split("/")[-1]
-            if not addressbook_name or addressbook_name == self.username:
+            if not addressbook_name or addressbook_name == self._principal_or_username():
                 continue
             propstat = response_elem.find(".//d:propstat", ns)
             if propstat is None:
@@ -133,6 +376,7 @@ class ContactsClient(BaseNextcloudClient):
         return addressbooks
 
     async def create_addressbook(self, *, name: str, display_name: str):
+        await self._ensure_principal_id()
         carddav_path = self._get_carddav_base_path()
         url = f"{carddav_path}/{name}/"
         prop_body = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -151,6 +395,7 @@ class ContactsClient(BaseNextcloudClient):
         await self._make_request("MKCOL", url, content=prop_body, headers=headers)
 
     async def delete_addressbook(self, *, name: str):
+        await self._ensure_principal_id()
         carddav_path = self._get_carddav_base_path()
         url = f"{carddav_path}/{name}/"
         await self._make_request("DELETE", url)
@@ -167,6 +412,7 @@ class ContactsClient(BaseNextcloudClient):
         include_etag: bool = True,
     ) -> list[dict]:
         """List contacts."""
+        await self._ensure_principal_id()
         carddav_path = self._get_carddav_base_path()
         report_body = """<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -193,8 +439,8 @@ class ContactsClient(BaseNextcloudClient):
             href = response_elem.find(".//d:href", ns)
             if href is None:
                 continue
-            href_text = href.text or ""
-            vcard_id = href_text.rstrip("/").split("/")[-1].replace(".vcf", "")
+            href_text = unquote(href.text or "")
+            vcard_id = href_text.rstrip("/").split("/")[-1].removesuffix(".vcf")
             if not vcard_id:
                 continue
             propstat = response_elem.find(".//d:propstat", ns)
@@ -227,7 +473,7 @@ class ContactsClient(BaseNextcloudClient):
         self, *, addressbook: str, uid: str
     ) -> dict[str, Any]:
         """Fetch a single contact's raw vCard + ETag + JSON projection."""
-        url = self._vcard_url(addressbook, uid)
+        url = await self._resolved_vcard_url(addressbook, uid)
         response = await self._make_request("GET", url)
         response.raise_for_status()
         etag = response.headers.get("etag", "")
@@ -242,7 +488,7 @@ class ContactsClient(BaseNextcloudClient):
 
     async def _get_raw_vcard(self, addressbook: str, uid: str) -> tuple[str, str]:
         """Internal: fetch raw vCard text + ETag."""
-        url = self._vcard_url(addressbook, uid)
+        url = await self._resolved_vcard_url(addressbook, uid)
         response = await self._make_request("GET", url)
         response.raise_for_status()
         etag = response.headers.get("etag", "")
@@ -261,17 +507,14 @@ class ContactsClient(BaseNextcloudClient):
         contact_data: Optional[dict] = None,
     ) -> dict[str, Any]:
         """Create a new contact."""
+        await self._ensure_principal_id()
         url = self._vcard_url(addressbook, uid)
         if vcard_text is None and contact_data is None:
             raise ValueError("create_contact requires vcard_text or contact_data")
         if vcard_text is None:
             assert contact_data is not None
-            contact = Contact(fn=contact_data.get("fn"), uid=uid)  # type: ignore
-            if "email" in contact_data:
-                contact.email = [{"value": contact_data["email"], "type": ["HOME"]}]
-            if "tel" in contact_data:
-                contact.tel = [{"value": contact_data["tel"], "type": ["HOME"]}]
-            vcard_text = contact.to_vcard()
+            contact_data = _normalize_contact_data(contact_data)
+            vcard_text = _build_contact_from_data(contact_data, uid).to_vcard()
         headers = {
             "Content-Type": "text/vcard; charset=utf-8",
             "If-None-Match": "*",
@@ -333,7 +576,7 @@ class ContactsClient(BaseNextcloudClient):
         retry_on_conflict: bool,
         attempt: int,
     ) -> dict[str, Any]:
-        url = self._vcard_url(addressbook, uid)
+        url = await self._resolved_vcard_url(addressbook, uid)
         current_vcard, current_etag = await self._get_raw_vcard(addressbook, uid)
         if etag and current_etag and etag != current_etag:
             raise EtagConflictError(
@@ -416,7 +659,7 @@ class ContactsClient(BaseNextcloudClient):
         etag: str,
     ) -> dict[str, Any]:
         """Full vCard replace with If-Match."""
-        url = self._vcard_url(addressbook, uid)
+        url = await self._resolved_vcard_url(addressbook, uid)
         headers = {"Content-Type": "text/vcard; charset=utf-8"}
         if etag:
             headers["If-Match"] = etag
@@ -442,7 +685,7 @@ class ContactsClient(BaseNextcloudClient):
         self, *, addressbook: str, uid: str, etag: str = ""
     ):
         """Delete a contact. Pass ``etag`` for If-Match (recommended)."""
-        url = self._vcard_url(addressbook, uid)
+        url = await self._resolved_vcard_url(addressbook, uid)
         headers: dict[str, str] = {}
         if etag:
             headers["If-Match"] = etag

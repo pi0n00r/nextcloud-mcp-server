@@ -41,6 +41,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   ```
 - **Ruff configuration** in pyproject.toml (extends select: ["I"] for import sorting)
 
+#### SonarCloud quality gate (the `sonar` CLI)
+
+CI runs a **required `SonarCloud Code Analysis` check** with a Quality Gate
+(new-code **Reliability Rating ≥ A**, etc.). It catches issues `ruff`/`ty`
+never will — e.g. `python:S1244` (float `==`, use `pytest.approx`),
+`python:S5778` (a `pytest.raises` block with more than one statement that can
+throw — hoist setup calls out of the `with`), `python:S8572`
+(`logging.error(..., exc)` in an `except` → `logging.exception(...)`). **A green
+`ruff`/`ty` says nothing about the Sonar gate**, so check it explicitly rather
+than guessing (a wrong guess cost a review round on PR #996).
+
+Use the authenticated **SonarQube CLI** (`sonar`, on `PATH` via
+`~/.local/share/sonarqube-cli/bin`; confirm with `sonar auth status` → org
+`cbcoutinho`). Project key: **`cbcoutinho_nextcloud-mcp-server`**.
+
+- **Pre-push (local, no network gate):** scan changed files for hardcoded
+  secrets — the one local scan available on our plan:
+  ```bash
+  sonar analyze secrets $(git diff --name-only origin/master...HEAD)
+  ```
+  `sonar verify --file` / `sonar analyze sqaa` (server-side Agentic Analysis)
+  are a **paid feature not enabled** on this org — they 403, so don't rely on
+  them for a local quality scan.
+
+- **After pushing a PR (SonarCloud analyzes in CI):** list exactly what Sonar
+  flagged on the PR's new code and read the gate — do this *inside the review
+  loop*, before merge, and fix the findings:
+  ```bash
+  sonar list issues --project cbcoutinho_nextcloud-mcp-server \
+    --pull-request <PR#> --statuses OPEN --format table
+  sonar api GET "/api/qualitygates/project_status?projectKey=cbcoutinho_nextcloud-mcp-server&pullRequest=<PR#>"
+  ```
+  (`sonar api` endpoints **must start with `/`**.) This is faster and more
+  precise than reading the SonarCloud dashboard or the reviewer's guess at
+  which line tripped the gate.
+
 ### Error Handling
 - **Use custom decorators**: `@retry_on_429` for rate limiting (see base_client.py)
 - **Standard exceptions**: `HTTPStatusError` from httpx, `McpError` for MCP-specific errors
@@ -57,7 +93,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Mark tests appropriately**: `@pytest.mark.unit`, `@pytest.mark.integration`, `@pytest.mark.oauth`, `@pytest.mark.smoke`
 
 ### Architectural Patterns
-- **Base classes**: `BaseNextcloudClient` for all API clients
+- **Base classes**: **All app API clients MUST extend `BaseNextcloudClient`** and
+  issue requests through its `_make_request`. That method centralizes `_resolve_url`
+  (prepends `/index.php` to bare `/apps/...` paths — the universal entry point that
+  works without pretty-URL rewriting, issue #732), `@retry_on_429`, tracing, and
+  `raise_for_status`. Consequences:
+  - **Write bare `/apps/<app>/...` paths — never hardcode `/index.php`.** The base
+    class adds it; `/ocs/...` and `/remote.php/dav/...` paths pass through unchanged.
+  - Don't reimplement `_make_request` in a subclass — a private copy silently skips
+    `_resolve_url`/retry/tracing (and, if it omits `raise_for_status`, breaks 429
+    retry). Override only for a genuinely different transport.
+  - **Known exception**: `CalendarClient` talks CalDAV via its own `caldav` session,
+    not the shared Nextcloud HTTP client, so it does not extend `BaseNextcloudClient`.
+    This is intentional — do not "fix" it.
 - **Pydantic responses**: All MCP tools return Pydantic models inheriting from `BaseResponse`
 - **Decorators**: `@require_scopes`, `@require_provisioning` for access control
 - **Context pattern**: `await get_client(ctx)` to access authenticated NextcloudClient (async!)
@@ -536,6 +584,41 @@ docker compose exec app php occ user_oidc:provider keycloak
 - `docs/login-flow-v2.md` - OAuth/OIDC configuration (set `OIDC_DISCOVERY_URL` to a Keycloak realm)
 - `docs/ADR-002-vector-sync-authentication.md` - Offline access architecture
 - `docs/keycloak-multi-client-validation.md` - Realm-level validation
+
+### LDAP Testing (GH #980 reproduction)
+
+The `ldap` lane reproduces GH #980 (DAV paths built from the loginName instead
+of the canonical Nextcloud UID). It runs an OpenLDAP server (`vegardit/openldap`)
+whose user `alice` logs in as `alice` but is mapped by `user_ldap` to a UID
+derived from the LDAP `entryUUID` — so `loginName != UID` **and**
+`/remote.php/dav/files/alice/` does not resolve to her real home. This is the
+only backend that reproduces #980 live: login-by-email resolves to the real home
+(email is a path alias) and `user_oidc` hardcodes `loginName == UID`.
+
+The reproduction test drives the **multi-user BasicAuth** MCP service (port 8003)
+as `alice`, so no browser is needed.
+
+**Setup**:
+```bash
+# openldap (ldap profile) + the multi-user-basic MCP service (port 8003).
+# user_ldap is auto-configured by app-hooks/post-installation/15-setup-ldap-backend.sh
+# (gated on the openldap service; a no-op for every other profile).
+docker compose --profile ldap --profile multi-user-basic up --build -d
+uv run pytest -m ldap -v             # xfails until #980's client fix lands
+```
+
+> The post-installation hook only runs on a **fresh** Nextcloud install. If you
+> add the `ldap` profile to an already-installed dev stack, run the hook by hand:
+> `docker compose exec app bash /docker-entrypoint-hooks.d/post-installation/15-setup-ldap-backend.sh`
+
+**Credentials**: LDAP admin `uid=admin,dc=example,dc=org` / `ldap_admin_pw`;
+user `alice` / `AlicePass123!` (see `ldap/bootstrap.ldif`).
+
+**xfail note**: `tests/server/ldap/test_ldap_dav_principal.py` is
+`xfail(strict=True)` — it fails (RED) on `master` because the bug is present, and
+xpasses (GREEN) once #980's `BaseNextcloudClient._ensure_principal_id` discovery
+lands. `strict=True` turns the unexpected pass into a failure, signalling that
+the marker should be dropped when #980 merges.
 
 ## Integration Testing with Docker
 
