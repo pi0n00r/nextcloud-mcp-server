@@ -45,6 +45,7 @@ from nextcloud_mcp_server.usage import UsageEventStore
 from nextcloud_mcp_server.utils.validation import is_valid_nextcloud_doc_id
 from nextcloud_mcp_server.vector import payload_keys
 from nextcloud_mcp_server.vector._errors import format_exception_group
+from nextcloud_mcp_server.vector.collection_metadata import build_embedding_identity
 from nextcloud_mcp_server.vector.dead_letter import (
     clear_dead_letter,
     mark_dead_letter,
@@ -485,9 +486,7 @@ async def record_indexing_usage(
         # Reached only when shared()/store construction itself raises
         # (record_usage_event swallows its own write failures). Metering is on,
         # so warn rather than hide the "enabled but no billing data" case.
-        logger.warning(
-            "usage metering hook (indexing embeddings) skipped", exc_info=True
-        )
+        logger.warning("usage metering hook (indexing embeddings) skipped")
 
 
 async def processor_task(
@@ -565,14 +564,12 @@ async def processor_task(
                     doc_task.doc_type,
                     doc_task.doc_id,
                     format_exception_group(e),
-                    exc_info=True,
                 )
             else:
                 logger.error(
                     "Processor %s error: %s",
                     worker_id,
                     format_exception_group(e),
-                    exc_info=True,
                 )
             # Continue to next document (no task_done() needed with streams)
 
@@ -714,11 +711,11 @@ async def process_document(
             ):
                 await _reconcile_tag_event(doc_task, nc_client)
 
-            # Admin consent gate (Astrolabe): never index a source the admin has
+            # Admin consent gate (management client): never index a source the admin has
             # disabled for semantic search — this catches near-real-time webhook
             # events that bypass the scanner's discovery gate. Deletes always
             # proceed (removing data honours consent). ``None`` from the reader
-            # means no restriction (fail-open / older Astrolabe), so a transient
+            # means no restriction (fail-open / older management client), so a transient
             # capabilities failure never silently drops indexing.
             if doc_task.operation == "index":
                 allowed = await allowed_doc_types(nc_client, doc_task.user_id)
@@ -1308,7 +1305,6 @@ async def _index_document(
                             logger.warning(
                                 "Could not delete placeholder for dead-lettered %s",
                                 doc_task.doc_id,
-                                exc_info=True,
                             )
                     else:
                         # Either a higher tier exists (parse failures don't
@@ -1335,7 +1331,6 @@ async def _index_document(
                             logger.debug(
                                 "Could not mark placeholder failed for %s",
                                 doc_task.doc_id,
-                                exc_info=True,
                             )
                     return False
 
@@ -1715,16 +1710,11 @@ async def _index_document(
     # PIPELINE_TIER is "fast"; ACL hash records at least the owner principal
     # (full share enumeration is a follow-up — a missing/partial acl_hash is
     # safe because the query-side pre-filter only applies when present + enabled).
-    # Keyword mode (ADR-030) writes no dense vector, so stamping a real
-    # embedding model name would be misleading (and in airgapped deployments it
-    # would be the bogus ``simple-{dim}`` fallback). Use a fixed sentinel so
-    # keyword-only points are self-describing and any mixed-mode contamination of
-    # a collection is auditable by scrolling this payload key.
-    _embedding_identity = (
-        settings.get_embedding_model_name()
-        if settings.dense_enabled
-        else "bm25-keyword"
-    )
+    # Embedding identity stamped on every chunk point. Via the shared helper so it
+    # is IDENTICAL to what the collection sentinel and the cross-user dedup lookup
+    # produce — keyword mode returns a fixed marker (not the bogus ``simple-{dim}``
+    # model-name fallback), which is what makes dedup match (Deck #509).
+    _embedding_identity = build_embedding_identity(settings)
     _acl_hash = compute_acl_hash([("user", doc_task.user_id)])
 
     # Observed-access ACL principals (computed once per document, not per chunk).

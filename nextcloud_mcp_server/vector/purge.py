@@ -1,9 +1,9 @@
 """Global purge of indexed vectors by doc type (admin consent enforcement).
 
-When an admin disables a content source for semantic search in Astrolabe,
+When an admin disables a content source for semantic search in a management client,
 consent is binding on data-at-rest: the already-indexed content for that
-source's doc type(s) must be deleted, not merely hidden. Astrolabe calls the
-``/api/v1/vector-sync/purge`` route on disable, which delegates here.
+source's doc type(s) must be deleted, not merely hidden. Management clients call
+the ``/api/v1/vector-sync/purge`` route on disable, which delegates here.
 
 The purge is global (every owner) because the admin disable is a global
 decision. It is safe to call for a doc type with no indexed points — Qdrant
@@ -66,9 +66,10 @@ async def purge_doc_types(doc_types: list[str]) -> dict[str, int]:
             )
         except Exception as exc:  # noqa: BLE001 — record and continue
             last_error = exc
-            logger.exception(
-                "Failed to purge indexed points for doc_type=%s",
+            logger.error(
+                "Failed to purge indexed points for doc_type=%s: %s",
                 doc_type,
+                exc,
             )
 
     if not purged and last_error is not None:

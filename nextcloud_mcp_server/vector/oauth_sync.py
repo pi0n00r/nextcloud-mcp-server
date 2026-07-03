@@ -8,7 +8,7 @@ Manages background vector sync for multi-user deployments:
 Background sync authenticates as each provisioned user via locally-stored
 Nextcloud app passwords (BasicAuth), retrieved through the management API
 after the user completes Login Flow v2 (or, in multi-user BasicAuth mode,
-the per-user Astrolabe provisioning flow).
+the per-user management client provisioning flow).
 
 The earlier OAuth refresh-token path was removed in the ADR-022 follow-up:
 it depended on unmerged Nextcloud `user_oidc` patches for Bearer-token
@@ -174,7 +174,7 @@ async def get_user_client_basic_auth(
     """Get an authenticated NextcloudClient using app password (BasicAuth mode).
 
     For multi-user BasicAuth deployments where users provision app passwords
-    via Astrolabe personal settings. The app password is stored locally in the
+    via management client settings. The app password is stored locally in the
     MCP server's database after being provisioned through the management API.
 
     Args:
@@ -204,7 +204,7 @@ async def get_user_client_basic_auth(
     if not app_data:
         raise NotProvisionedError(
             f"User {user_id} has not provisioned an app password. "
-            f"User must configure background sync in Astrolabe personal settings."
+            f"User must configure background sync in management client settings."
         )
 
     app_password = app_data["app_password"]
@@ -335,7 +335,6 @@ async def user_scanner_task(
                     e,
                     consecutive_errors,
                     max_consecutive_errors,
-                    exc_info=True,
                 )
 
         except Exception as e:
@@ -346,7 +345,6 @@ async def user_scanner_task(
                 format_exception_group(e),
                 consecutive_errors,
                 max_consecutive_errors,
-                exc_info=True,
             )
 
         finally:
@@ -434,14 +432,12 @@ async def multi_user_processor_task(
                     doc_task.doc_type,
                     doc_task.doc_id,
                     format_exception_group(e),
-                    exc_info=True,
                 )
             else:
                 logger.error(
                     "[BasicAuth] Processor %s error: %s",
                     worker_id,
                     format_exception_group(e),
-                    exc_info=True,
                 )
 
         finally:
@@ -647,7 +643,6 @@ async def user_manager_task(
             logger.error(
                 "[BasicAuth] User manager error: %s",
                 format_exception_group(e),
-                exc_info=True,
             )
 
         # Sleep until the next poll tick, but wake early on shutdown or a

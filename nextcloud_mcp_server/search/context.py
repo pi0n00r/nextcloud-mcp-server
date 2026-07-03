@@ -101,7 +101,6 @@ async def _get_chunk_from_qdrant(
         logger.error(
             "Error querying Qdrant for chunk: %s. Falling back to document fetch.",
             e,
-            exc_info=True,
         )
         return None
 
@@ -250,7 +249,7 @@ async def get_chunk_bbox_and_page_from_qdrant(
 
     Prefers chunk_index for the lookup (always indexed); falls back to
     (chunk_start_offset, chunk_end_offset) when chunk_index is not provided
-    — this is the legacy path for clients pre-cbcoutinho/astrolabe#75. The
+    — this is the legacy path for clients pre-indexed-chunks contract. The
     fallback may 400 in Qdrant Cloud strict mode because those offset fields
     aren't indexed there; that's logged as a warning and (None, None) is
     returned so callers degrade gracefully.
@@ -465,7 +464,7 @@ async def get_chunk_with_context(
     # index path and the offset path query the same Qdrant collection, so an
     # indexed miss means the chunk is genuinely absent. Skipping the offset
     # filter avoids a redundant Qdrant round-trip. Legacy data without
-    # chunk_index (pre-cbcoutinho/astrolabe#75) still hits the offset path
+    # chunk_index (pre-indexed-chunks contract) still hits the offset path
     # and degrades to a None chunk with a WARNING; that's the same behavior
     # get_chunk_bbox_and_page_from_qdrant already documents.
     skip_offset_lookup = chunk_index is not None
@@ -843,9 +842,7 @@ async def _fetch_document_text(
             logger.warning("Unsupported doc_type for context expansion: %s", doc_type)
             return None
     except Exception as e:
-        logger.error(
-            "Error fetching document %s %s: %s", doc_type, doc_id, e, exc_info=True
-        )
+        logger.error("Error fetching document %s %s: %s", doc_type, doc_id, e)
         return None
 
 

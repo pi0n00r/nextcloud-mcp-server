@@ -195,7 +195,7 @@ async def get_last_indexed_timestamp(user_id: str) -> int | None:
         logger.info("No indexed notes found for user %s", user_id)
         return None
     except Exception as e:
-        logger.warning("Failed to get last indexed timestamp: %s", e, exc_info=True)
+        logger.warning("Failed to get last indexed timestamp: %s", e)
         return None
 
 
@@ -238,7 +238,7 @@ async def scanner_task(
                 )
 
             except Exception as e:
-                logger.error("Scanner error: %s", e, exc_info=True)
+                logger.error("Scanner error: %s", e)
 
             # Sleep until next interval or wake event
             try:
@@ -514,9 +514,9 @@ async def scan_user_documents(
         # detection failed: fall back to scanning every app (prior behaviour).
         enabled_apps = await _get_enabled_apps_or_none(nc_client, user_id, scan_id)
 
-        # Admin consent gate (Astrolabe): only index sources the admin has
+        # Admin consent gate (management client): only index sources the admin has
         # approved for semantic search. ``None`` = no restriction (fail-open /
-        # older Astrolabe), so a transient capabilities failure never silently
+        # older management client), so a transient capabilities failure never silently
         # halts (or worse, mass-deletes) indexing. This is independent of
         # ``enabled_apps``, which reflects only what the user has installed.
         allowed = await allowed_doc_types(nc_client, user_id)
@@ -532,7 +532,7 @@ async def scan_user_documents(
         # Backstop purge for admin-disabled text sources. Their deletion-
         # tracking lives inside the scan_* function we skip below, so (unlike
         # files, whose discovery-empties-then-reconcile path purges on disable)
-        # they'd linger if Astrolabe's eager purge failed. Enqueue deletes for
+        # they'd linger if management client's eager purge failed. Enqueue deletes for
         # any indexed points of a now-disallowed type. Gated on a concrete
         # allow-set, so a fail-open None never triggers deletion.
         queued += await _enqueue_deletes_for_disabled_types(
@@ -628,7 +628,7 @@ async def scan_user_documents(
                 # Files disabled by admin: discover nothing so no new file is
                 # indexed. The deletion-reconcile below then sees every indexed
                 # file as "missing" and purges it after the grace period — the
-                # backstop for the eager purge Astrolabe runs on disable.
+                # backstop for the eager purge management client runs on disable.
                 # Asymmetry (intentional): files purge up to 1.5x scan_interval
                 # later than text types, which get immediate one-shot backstop
                 # deletes via _enqueue_deletes_for_disabled_types.

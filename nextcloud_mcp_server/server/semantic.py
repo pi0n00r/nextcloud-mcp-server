@@ -131,7 +131,7 @@ async def record_search_usage(
         # (record_usage_event swallows its own write failures). Metering is on,
         # so warn — a silent DEBUG line would hide "operator enabled metering
         # but gets no data".
-        logger.warning("usage metering hook (tokens_embedded) skipped", exc_info=True)
+        logger.warning("usage metering hook (tokens_embedded) skipped")
 
 
 def configure_semantic_tools(mcp: FastMCP):
@@ -334,14 +334,14 @@ def configure_semantic_tools(mcp: FastMCP):
         # files under their own user_id.
         accessible_owners = await list_accessible_owners(client.sharing, username)
 
-        # Admin consent gate: restrict to source types the Astrolabe admin has
+        # Admin consent gate: restrict to source types the management client admin has
         # approved (and that are installed for this user). This mirrors
-        # Astrolabe's own server-side enforcement but is independent because
+        # the management client's own server-side enforcement but is independent because
         # this tool queries Qdrant directly. ``None`` = no restriction
-        # (fail-open / Astrolabe predating this feature). An empty allow-set
+        # (fail-open / management client predating this feature). An empty allow-set
         # means the admin disabled every source.
         #
-        # Perf trade-off (accepted): when Astrolabe is present and the caller
+        # Perf trade-off (accepted): when management client is present and the caller
         # passed no doc_types, narrowing turns ``None`` into a concrete list, so
         # the search takes the per-type query branch (N queries) instead of the
         # single cross-type query. N is the count of admin-approved types
@@ -700,7 +700,12 @@ def configure_semantic_tools(mcp: FastMCP):
                 ErrorData(code=-1, message=f"Network error during search: {str(e)}")
             )
         except Exception as e:
-            logger.error("Search error: %s", e, exc_info=True)
+            # Genuinely-unexpected bucket (after the ValueError / RequestError
+            # cases above). We convert it to a client-facing McpError, which
+            # FastMCP returns as a structured protocol error without logging a
+            # server-side traceback — so, like the sampling catch-all below, keep
+            # the stack here (logger.exception) for triage.
+            logger.exception("Search error: %s", e)
             raise McpError(ErrorData(code=-1, message=f"Search failed: {str(e)}"))
 
     @mcp.tool(
@@ -1073,13 +1078,17 @@ def configure_semantic_tools(mcp: FastMCP):
             )
 
         except Exception as e:
-            # Truly unexpected errors - these SHOULD have tracebacks
-            logger.error(
-                "Unexpected error during sampling for query %r: %s: %s",
+            # Truly unexpected sampling error — the catch-all after the
+            # TimeoutError / McpError special-casing above. Unlike the rest of
+            # this PR's exc_info removals (expected/handled conditions), this is
+            # the "genuinely unexpected" bucket AND it swallows the exception
+            # (returns a degraded response below), so this is the only place the
+            # stack trace can ever be captured. Keep the traceback here for
+            # triage — via logger.exception (Sonar S8572-compliant).
+            logger.exception(
+                "Unexpected error during sampling for query %r: %s",
                 query,
                 type(e).__name__,
-                e,
-                exc_info=True,
             )
 
             return SamplingSearchResponse(

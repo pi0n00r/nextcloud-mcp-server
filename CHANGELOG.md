@@ -5,23 +5,141 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
-## v0.118.1 (2026-06-13, fork-local)
+## v0.129.1 (2026-07-03)
 
-### Fix
+### Refactor
 
-- **calendar**: structured response for iMIP-scheduled VTODO DELETE rejection
+- **search**: consolidate the keyword-mode query-path gate (ADR-030)
 
-## v0.118.0 (2026-06-13, fork-local)
+## v0.129.0 (2026-07-03)
 
 ### Feat
 
-- **calendar**: add nc_calendar_complete_todo convenience tool
+- **api**: reject explicit unsupported search algorithm with 422 (ADR-030)
 
-## v0.117.1 (2026-06-13, fork-local)
+## v0.128.4 (2026-07-03)
 
 ### Fix
 
-- **providers**: pin an explicit timeout on Mistral embedding requests
+- **ocr**: re-submit batch OCR job on gateway 404 instead of polling a dead id forever
+
+## v0.128.3 (2026-07-03)
+
+### Fix
+
+- **logging**: keep traceback for the unexpected search catch-all too
+- **logging**: clear Sonar gate + retry transient 5xx on qdrant init
+- **logging**: keep traceback for the truly-unexpected sampling catch-all
+- **logging**: no tracebacks for handled/expected errors
+
+## v0.128.2 (2026-07-03)
+
+### Fix
+
+- **vector**: keyword-mode content dedup (embedding-identity writer/reader agree)
+
+## v0.128.1 (2026-07-02)
+
+### Fix
+
+- **vector**: keyword mode must size placeholder/dead-letter dense vector from SIMPLE_EMBEDDING_DIMENSION
+
+## v0.128.0 (2026-07-02)
+
+### Feat
+
+- **documents**: add docling (docling-serve) parsing backend
+
+### Fix
+
+- **ci**: register docling on the read_file path + fix isError assertion
+- **documents**: harden docling client + address review findings
+
+## v0.127.6 (2026-07-02)
+
+### Fix
+
+- **calendar**: resolve calendar-home-set against origin, not subpath base URL
+
+## v0.127.5 (2026-07-02)
+
+### Fix
+
+- **ingest**: make stalled-job reclaim resilient to queueing_lock collisions
+
+### Refactor
+
+- **ingest**: guard reclaim discard on queueing_lock constraint; test isolation
+
+## v0.127.4 (2026-07-01)
+
+### Fix
+
+- **client**: resolve DAV paths via principal discovery
+
+## v0.127.3 (2026-07-01)
+
+### Fix
+
+- **app**: preserve hybrid path's 30s discovery timeout via optional kwarg
+- **app**: extend discovery retry to hybrid mode; broaden catch; clear Sonar smells
+- **app**: retry malformed-200 discovery responses; fix Sonar float-eq bugs
+- **app**: clamp discovery backoff and document new retry knobs
+- **app**: retry OIDC discovery at startup with backoff instead of crashlooping
+
+## v0.127.2 (2026-07-01)
+
+### Fix
+
+- **login-flow**: use nextcloud_browser_url for userinfo app links
+- **login-flow**: resolve Login Flow v2 login_url to Nextcloud in external-IdP mode
+
+## v0.127.1 (2026-07-01)
+
+### Fix
+
+- **mail**: download attachments via direct route, not OCS (#989)
+
+### Refactor
+
+- **mail**: drop Accept:json on binary download; clarify cap comment
+
+## v0.127.0 (2026-06-30)
+
+### Feat
+
+- **api**: advertise supported_search_types on /api/v1/status
+- **search**: add SEARCH_MODE=keyword for airgapped, embedding-free search
+
+### Fix
+
+- mode-accurate search logs + skip PCA embed in keyword mode (round-6)
+- **api**: drop score_threshold upper bound on /api/v1/search (ADR-030)
+- **search**: address round-3 review (mode-aware algorithm gate, log casing)
+- **search**: address round-1 review on SEARCH_MODE keyword mode
+
+### Refactor
+
+- address round-5 review nits (DRY, coercion log, typing, ADR)
+- **search**: address round-2 review (dedup, complexity, log, docs)
+
+## v0.126.5 (2026-06-28)
+
+### Refactor
+
+- **config**: drive ALL config through dynaconf; remove os.environ reads
+
+## v0.126.4 (2026-06-28)
+
+### Fix
+
+- **api**: reject unauthenticated requests before the rate limiter
+- **api**: rate-limit + clearer errors on authenticated management routes
+- **api**: validate credentials on user-management endpoints (GHSA-x88r-fhx7-52h6)
+
+### Refactor
+
+- **api**: route provision through the shared auth helper; fix Sonar gate
 
 ## v0.126.3 (2026-06-26)
 
@@ -249,7 +367,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
 ### Feat
 
-- **vector-sync**: honor Astrolabe admin consent for searchable sources
+- **vector-sync**: honor management client admin consent for searchable sources
 
 ### Fix
 
@@ -409,7 +527,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
 ### Fix
 
-- convert astrolabe int provisioned_at to ISO before ProvisioningStatus
+- convert management-client int provisioned_at to ISO before ProvisioningStatus
 - **ci**: gate can-i-deploy broker steps individually, not at job level
 
 ## v0.110.1 (2026-06-10)
@@ -591,7 +709,7 @@ to retain the previous char-based behaviour.
 
 - **tests**: moderate re-scan interval to stop multi-user index churn
 - **tests**: fast vector-sync cadence for multi-user-basic CI service
-- **tests**: repair multi-user-basic Astrolabe integration suite
+- **tests**: repair multi-user-basic management client integration suite
 
 ## v0.101.2 (2026-06-04)
 
@@ -614,7 +732,7 @@ to retain the previous char-based behaviour.
 
 - /api/v1/vector-sync/status field `indexed_documents` now holds
 the distinct-document count (was the chunk count); the chunk count moved to the
-new `indexed_chunks` field. The Astrolabe UI + the nc_get_vector_sync_status MCP
+new `indexed_chunks` field. The management client UI + the nc_get_vector_sync_status MCP
 tool / userinfo page are harmonized in a follow-up (Deck #195).
 
 ### Feat
@@ -696,7 +814,7 @@ command instead. TENANT_ID is retained (no longer NATS-subject-charset-validated
 
 ### Feat
 
-- **observability**: astrolabe_* metrics + traces for the document pipeline
+- **observability**: bridgette_* metrics + traces for the document pipeline
 
 ### Fix
 
@@ -986,7 +1104,7 @@ to multi_user_basic / single_user_basic.
 - **vector**: address PR review round 9 — drop redundant guard, add init lock, test float doc_id path
 - **vector**: guard _group_int_doc_ids against non-int doc_id values
 - **vector**: tighten get_chunk_bbox_and_page_from_qdrant doc_id to str
-- **login-flow**: allow Astrolabe's OAuth client on the management API
+- **login-flow**: allow management client's OAuth client on the management API
 - **vector**: address PR review round 8 — anyio convention + cosine-safe sentinel + dedup get_collection
 - **vector**: add BOOL index for is_placeholder + correct wait=True docstring
 - **vector**: address PR review round 6 + SonarCloud findings
@@ -1133,7 +1251,7 @@ to multi_user_basic / single_user_basic.
 
 ### Feat
 
-- **auth**: elicit Astrolabe URL on missing app password
+- **auth**: elicit management client URL on missing app password
 
 ### Fix
 
@@ -1418,7 +1536,7 @@ to multi_user_basic / single_user_basic.
 ### Fix
 
 - allow HTTPS redirect URIs for non-localhost OAuth clients
-- move Astrolabe OAuth hook to before-starting for reliable OIDC client creation
+- move management client OAuth hook to before-starting for reliable OIDC client creation
 - resolve OAuth compatibility issues for login-flow deployment
 
 ## v0.66.1 (2026-03-28)
@@ -1501,7 +1619,7 @@ to multi_user_basic / single_user_basic.
 - **ci**: fix PHP gating, add multi-user-basic matrix entry, upload debug artifacts
 - address PR #589 review feedback for Login Flow v2
 - **ci**: fix integration test collection and skip Playwright in CI
-- **test**: fix 17 pre-existing unit test failures and add astrolabe CI build
+- **test**: fix 17 pre-existing unit test failures and add management-client CI build
 - **ci**: keep third_party mount, always build submodules in CI
 - **ci**: revert accidental third_party mount, use compose override for OIDC
 - **ci**: don't block integration matrix on unit-test failures
@@ -1533,7 +1651,7 @@ to multi_user_basic / single_user_basic.
 ### Fix
 
 - address PR #571 review comments
-- resolve stale credentials causing astrolabe background sync test failures
+- resolve stale credentials causing management-client background sync test failures
 
 ### Refactor
 
@@ -1560,8 +1678,8 @@ to multi_user_basic / single_user_basic.
 
 ### Refactor
 
-- remove stale astrolabe references from commitizen config
-- extract Astrolabe to separate repository
+- remove stale management-client references from commitizen config
+- extract management client to separate repository
 
 ## v0.63.4 (2026-02-08)
 
@@ -1592,13 +1710,13 @@ to multi_user_basic / single_user_basic.
 
 ### Feat
 
-- **astrolabe**: add background token refresh job
+- **management-client**: add background token refresh job
 
 ### Fix
 
-- **astrolabe**: add pagination and psalm fixes for token refresh
-- **astrolabe**: add locking to prevent token refresh race condition
-- **astrolabe**: add issued_at to on-demand token refresh
+- **management-client**: add pagination and psalm fixes for token refresh
+- **management-client**: add locking to prevent token refresh race condition
+- **management-client**: add issued_at to on-demand token refresh
 
 ## v0.62.0 (2026-01-26)
 
@@ -1608,49 +1726,49 @@ to multi_user_basic / single_user_basic.
 
 ### Fix
 
-- **astrolabe**: resolve Psalm type errors in PDF preview code
-- **astrolabe**: fix Psalm baseline and ESLint import order
-- **astrolabe**: load pdfjs-dist externally to fix PDF viewer
-- **astrolabe**: improve error messages for authorization issues
-- **astrolabe**: rename OAuthController and fix app password check
-- **tests**: improve Astrolabe integration test reliability
-- **astrolabe**: update Plotly title attributes for v3 compatibility
+- **management-client**: resolve Psalm type errors in PDF preview code
+- **management-client**: fix Psalm baseline and ESLint import order
+- **management-client**: load pdfjs-dist externally to fix PDF viewer
+- **management-client**: improve error messages for authorization issues
+- **management-client**: rename OAuthController and fix app password check
+- **tests**: improve management client integration test reliability
+- **management-client**: update Plotly title attributes for v3 compatibility
 - **deps**: update dependency plotly.js-dist-min to v3
 
 ### Refactor
 
 - **api**: split management.py into domain-focused modules
-- **astrolabe**: replace client-side PDF.js with server-side PyMuPDF rendering
+- **management-client**: replace client-side PDF.js with server-side PyMuPDF rendering
 
 ## v0.61.5 (2026-01-17)
 
 ### Fix
 
-- **astrolabe**: improve token refresh error handling and validation
-- **astrolabe**: delete stale tokens when refresh fails
-- **astrolabe**: resolve CI failures for code quality checks
-- **astrolabe**: use internal URL for OAuth token refresh
+- **management-client**: improve token refresh error handling and validation
+- **management-client**: delete stale tokens when refresh fails
+- **management-client**: resolve CI failures for code quality checks
+- **management-client**: use internal URL for OAuth token refresh
 
 ### Refactor
 
-- **astrolabe**: add PHP property types to fix Psalm errors
-- **astrolabe**: upgrade to @nextcloud/vue 9.3.3 API
+- **management-client**: add PHP property types to fix Psalm errors
+- **management-client**: upgrade to @nextcloud/vue 9.3.3 API
 
 ## v0.61.4 (2026-01-16)
 
 ### Fix
 
-- **astrolabe**: Address reviewer feedback for hybrid mode
-- **astrolabe**: Fix NcSelect options and CSS loading
-- **astrolabe**: fix OAuth flow and settings UI for hybrid mode
-- **api**: return OIDC config in hybrid mode for Astrolabe OAuth flow
+- **management-client**: Address reviewer feedback for hybrid mode
+- **management-client**: Fix NcSelect options and CSS loading
+- **management-client**: fix OAuth flow and settings UI for hybrid mode
+- **api**: return OIDC config in hybrid mode for management client OAuth flow
 
 ## v0.61.3 (2026-01-15)
 
 ### Fix
 
-- **astrolabe**: address review feedback for Vue 3 bindings
-- **astrolabe**: update Vue component bindings for Vue 3 compatibility
+- **management-client**: address review feedback for Vue 3 bindings
+- **management-client**: update Vue component bindings for Vue 3 compatibility
 
 ## v0.61.2 (2026-01-15)
 
@@ -1662,7 +1780,7 @@ to multi_user_basic / single_user_basic.
 
 ### Fix
 
-- **astrolabe**: define appName and appVersion for @nextcloud/vue
+- **management-client**: define appName and appVersion for @nextcloud/vue
 
 ## v0.61.0 (2026-01-14)
 
@@ -1691,8 +1809,8 @@ to multi_user_basic / single_user_basic.
 ### Fix
 
 - **deck**: Always preserve fields in update_card for partial updates
-- **astrolabe**: Fix CSS loading for Nextcloud apps
-- **astrolabe**: Fix revoke access button HTTP method mismatch
+- **management-client**: Fix CSS loading for Nextcloud apps
+- **management-client**: Fix revoke access button HTTP method mismatch
 
 ## v0.60.2 (2025-12-29)
 
@@ -1713,7 +1831,7 @@ to multi_user_basic / single_user_basic.
 - Remove URL rewriting in favor of proper nextcloud config
 - **helm**: migrate to new environment variable naming convention
 - Migrate to vue 3
-- **astrolabe**: upgrade to Vue 3 and @nextcloud/vue 9
+- **management-client**: upgrade to Vue 3 and @nextcloud/vue 9
 
 ### Fix
 
@@ -1753,7 +1871,7 @@ to multi_user_basic / single_user_basic.
 ### Feat
 
 - **config**: enable DCR for multi-user BasicAuth with offline access
-- **astrolabe**: implement app password provisioning for multi-user background sync
+- **management-client**: implement app password provisioning for multi-user background sync
 - **config**: consolidate configuration with smart dependency resolution (ADR-021)
 
 ## v0.57.0 (2025-12-20)
@@ -1761,7 +1879,7 @@ to multi_user_basic / single_user_basic.
 ### Feat
 
 - **auth**: add multi-user BasicAuth pass-through mode
-- **astrolabe**: add dynamic MCP server configuration for testing
+- **management-client**: add dynamic MCP server configuration for testing
 
 ### Fix
 
@@ -1775,14 +1893,14 @@ to multi_user_basic / single_user_basic.
 
 ### Fix
 
-- **astrolabe**: screenshots in info.xml
-- **astrolabe**: screenshots in info.xml
+- **management-client**: screenshots in info.xml
+- **management-client**: screenshots in info.xml
 
 ## v0.56.1 (2025-12-19)
 
 ### Fix
 
-- **astrolabe**: Update screenshots
+- **management-client**: Update screenshots
 - **ci**: skip existing Helm chart releases to prevent duplicate release errors
 
 ## v0.56.0 (2025-12-19)
@@ -1793,10 +1911,10 @@ to multi_user_basic / single_user_basic.
 
 ### Fix
 
-- **astrolabe**: add contents:write permission to appstore workflow
-- **astrolabe**: update commitizen pattern to properly update info.xml version
-- **astrolabe**: prevent workflow failure when only helm/astrolabe commits exist
-- **astrolabe**: info.xml
+- **management-client**: add contents:write permission to appstore workflow
+- **management-client**: update commitizen pattern to properly update info.xml version
+- **management-client**: prevent workflow failure when only helm/management-client commits exist
+- **management-client**: info.xml
 
 ## v0.55.1 (2025-12-19)
 
@@ -1809,7 +1927,7 @@ to multi_user_basic / single_user_basic.
 ### BREAKING CHANGE
 
 - MCP server now bumps for ANY conventional commit except
-those explicitly scoped to helm or astrolabe.
+those explicitly scoped to helm or management-client.
 
 ### Feat
 
@@ -1825,14 +1943,14 @@ those explicitly scoped to helm or astrolabe.
 
 ### Feat
 
-- **astrolabe**: add Nextcloud App Store deployment automation
+- **management-client**: add Nextcloud App Store deployment automation
 - configure commitizen monorepo with independent versioning
 
 ### Fix
 
 - **ci**: improve versioning and error handling
 - **ci**: address critical workflow and validation issues
-- **astrolabe**: address code review feedback
+- **management-client**: address code review feedback
 
 ## v0.53.0 (2025-12-19)
 
@@ -1843,35 +1961,35 @@ those explicitly scoped to helm or astrolabe.
 - add native Plotly hover styling for clickable points
 - add click interactivity to Plotly 3D scatter chart
 - improve chunk viewer with fixed navigation and markdown rendering
-- **astrolabe**: enable multi-select for document types and refactor PDF viewer
+- **management-client**: enable multi-select for document types and refactor PDF viewer
 - **auth**: implement refresh token rotation for Nextcloud OIDC
-- **astrolabe**: enhance unified search and add webhook management
-- **astrolabe**: add webhook management UI to admin settings
-- **astrolabe**: add OAuth token refresh and webhook presets
+- **management-client**: enhance unified search and add webhook management
+- **management-client**: add webhook management UI to admin settings
+- **management-client**: add OAuth token refresh and webhook presets
 - **search**: add file_path metadata and chunk offsets to search results
-- **astrolabe**: use proper icons and thumbnails in unified search
-- **astrolabe**: add admin search settings and enhanced UI
-- **astrolabe**: add unified search provider with clickable file links
-- **astrolabe**: add 3D PCA visualization for semantic search
-- **astrolabe**: add Nextcloud PHP app for MCP server management
+- **management-client**: use proper icons and thumbnails in unified search
+- **management-client**: add admin search settings and enhanced UI
+- **management-client**: add unified search provider with clickable file links
+- **management-client**: add 3D PCA visualization for semantic search
+- **management-client**: add Nextcloud PHP app for MCP server management
 - **vector-sync**: enable background sync in OAuth mode
 
 ### Fix
 
 - **security**: address critical security issues from PR #401 code review
 - **oauth**: enable PKCE for all clients and add token_broker to oauth_context
-- **astrolabe**: revert invalid files_pdfviewer URL for file links
+- **management-client**: revert invalid files_pdfviewer URL for file links
 - resolve type checking warnings for CI
 - move Alembic to package submodule for Docker compatibility
 - update unified search results to match chunk viz display
-- **astrolabe**: handle OAuth refresh token rotation
+- **management-client**: handle OAuth refresh token rotation
 - address critical code review issues (4 fixes)
 - resolve CI linting issues for Astroglobe
 
 ### Refactor
 
-- **astrolabe**: extract PDF viewer to dedicated component
-- **astrolabe**: reframe UI as semantic search service
+- **management-client**: extract PDF viewer to dedicated component
+- **management-client**: reframe UI as semantic search service
 
 ## v0.52.1 (2025-12-13)
 

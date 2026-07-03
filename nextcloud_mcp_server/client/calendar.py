@@ -5,7 +5,7 @@ import inspect
 import logging
 import uuid
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anyio
@@ -115,7 +115,15 @@ class CalendarClient:
         if not home_url:
             return None
         if home_url.startswith("/"):
-            home_url = f"{self.base_url}{home_url}"
+            # calendar-home-set returns an absolute path that already includes
+            # any subpath under which Nextcloud is served (e.g.
+            # ``/nextcloud/remote.php/dav/calendars/David/``). Resolve it
+            # against the *origin* (scheme + host) of ``base_url`` rather than
+            # the full ``base_url`` — concatenating onto a subpath base URL
+            # would double the subpath and produce a bogus, unroutable URL
+            # (issue #1007).
+            origin = urlsplit(self.base_url)
+            home_url = urlunsplit((origin.scheme, origin.netloc, home_url, "", ""))
         if not home_url.endswith("/"):
             home_url = f"{home_url}/"
         return home_url
@@ -839,7 +847,7 @@ class CalendarClient:
                 "status_code": 200,
             }
         except Exception as e:
-            logger.error("Error updating todo %s: %s", todo_uid, e, exc_info=True)
+            logger.error("Error updating todo %s: %s", todo_uid, e)
             raise
 
     async def delete_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
@@ -1444,7 +1452,7 @@ class CalendarClient:
             return cal.to_ical().decode("utf-8")
 
         except Exception as e:
-            logger.error("Error merging iCal todo properties: %s", e, exc_info=True)
+            logger.error("Error merging iCal todo properties: %s", e)
             return self._create_ical_todo(todo_data, todo_uid)
 
     # ============= Helper Methods - Filtering =============

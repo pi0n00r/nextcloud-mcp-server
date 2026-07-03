@@ -155,7 +155,8 @@ def initialize_document_processors():
     """Initialize and register document processors based on configuration.
 
     This function reads the environment configuration and registers available
-    processors (Unstructured, Tesseract, Custom HTTP) with the global registry.
+    processors (Unstructured, Tesseract, Custom HTTP, Docling) with the global
+    registry.
     """
     config = get_document_processor_config()
 
@@ -255,6 +256,29 @@ def initialize_document_processors():
             registered_count += 1
         except Exception as e:
             logger.warning("Failed to register Custom processor: %s", e)
+
+    # Register Docling processor (docling-serve HTTP). High priority so images
+    # always route to docling when enabled; images-only for auto-selection, but
+    # force-selectable by name (e.g. to re-parse a text-layer PDF with tables).
+    if "docling" in config["processors"]:
+        docling_config = config["processors"]["docling"]
+        try:
+            from nextcloud_mcp_server.document_processors.docling_serve import (  # noqa: PLC0415
+                DoclingProcessor,
+            )
+
+            processor = DoclingProcessor(
+                api_url=docling_config["api_url"],
+                timeout=docling_config["timeout"],
+                ocr_lang=docling_config["ocr_lang"],
+                do_ocr=docling_config["do_ocr"],
+                progress_interval=docling_config.get("progress_interval", 10),
+            )
+            registry.register(processor, priority=20)  # Above unstructured (10)
+            logger.info("Registered Docling processor: %s", docling_config["api_url"])
+            registered_count += 1
+        except Exception as e:
+            logger.warning("Failed to register Docling processor: %s", e)
 
     if registered_count > 0:
         logger.info(
@@ -523,6 +547,80 @@ async def _check_qdrant_health() -> None:
     record_dependency_check("qdrant", time.time() - start)
 
 
+def _qdrant_init_error_is_transient(exc: BaseException) -> bool:
+    """True if a Qdrant startup-init failure is a transient connection blip.
+
+    Qdrant can be briefly unreachable during a rolling deploy (pod ordering,
+    network-policy convergence), which is worth retrying. A genuine
+    misconfiguration (bad URL/API key surfacing as a 4xx) is not transient and
+    should fail fast. Transient signals, mirroring the OIDC-discovery split:
+    connection-level failures — ``httpx.TransportError`` (raw) or qdrant's
+    ``ResponseHandlingException`` (wrapper) — and a ``5xx`` from a reachable but
+    overloaded/starting Qdrant (qdrant's ``UnexpectedResponse.status_code``). A
+    ``4xx`` (auth/URL) is not transient. Walks the ``__cause__``/``__context__``
+    chain since the real cause is nested under the qdrant wrapper.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "ResponseHandlingException" or isinstance(
+            current, httpx.TransportError
+        ):
+            return True
+        # qdrant's UnexpectedResponse carries the HTTP status: 5xx is a transient
+        # server-side blip (overloaded/starting), 4xx is a genuine misconfig.
+        status = getattr(current, "status_code", None)
+        if (
+            type(current).__name__ == "UnexpectedResponse"
+            and isinstance(status, int)
+            and 500 <= status < 600
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _init_qdrant_collection_with_retry() -> None:
+    """Initialize the Qdrant collection at startup, retrying transient failures.
+
+    Mirrors the OIDC-discovery startup retry: rather than crashloop the pod with
+    a full traceback every time Qdrant is briefly unreachable during a deploy,
+    ride out the window with capped exponential backoff + full jitter. Genuine
+    (non-transient) errors fail fast, and the budget still fails clearly if
+    Qdrant stays down. ``get_qdrant_client`` only publishes its singleton after
+    migrations succeed, so re-entering it on retry is safe. Set
+    ``QDRANT_INIT_MAX_ATTEMPTS=1`` to restore the original fail-fast behavior.
+    """
+    settings = get_settings()
+    max_attempts = max(1, settings.qdrant_init_max_attempts)
+    backoff_base = max(0.0, settings.qdrant_init_backoff_base)
+    backoff_max = max(0.0, settings.qdrant_init_backoff_max)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await get_qdrant_client()  # Triggers collection creation if needed
+            logger.info("Qdrant collection ready")
+            return
+        except Exception as exc:
+            if not _qdrant_init_error_is_transient(exc) or attempt >= max_attempts:
+                logger.error("Failed to initialize Qdrant collection: %s", exc)
+                raise RuntimeError(
+                    f"Cannot start vector sync - Qdrant initialization failed: {exc}"
+                ) from exc
+            # Full jitter over a capped exponential backoff.
+            delay = min(backoff_max, backoff_base * 2 ** (attempt - 1))
+            sleep_for = random.uniform(0, delay)
+            logger.warning(
+                "Qdrant collection init attempt %d/%d failed (%s); retrying in %.1fs",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                sleep_for,
+            )
+            await anyio.sleep(sleep_for)
+
+
 async def _refresh_dependency_health() -> None:
     """Refresh all external dependency statuses concurrently (one pass)."""
     settings = get_settings()
@@ -558,10 +656,8 @@ async def _readiness_refresh_loop(*, task_status=anyio.TASK_STATUS_IGNORED) -> N
         while True:
             try:
                 await _refresh_dependency_health()
-            except Exception:  # noqa: BLE001 - never let the loop die
-                logger.warning(
-                    "Readiness dependency refresh iteration failed", exc_info=True
-                )
+            except Exception as exc:  # noqa: BLE001 - never let the loop die
+                logger.warning("Readiness dependency refresh iteration failed: %s", exc)
             await anyio.sleep(interval)
 
 
@@ -913,7 +1009,9 @@ async def _perform_oidc_discovery(
             ):
                 raise
             if attempt >= max_attempts:
-                logger.exception("OIDC discovery failed after %d attempt(s)", attempt)
+                logger.error(
+                    "OIDC discovery failed after %d attempt(s): %s", attempt, exc
+                )
                 raise
             # Full jitter over a capped exponential backoff.
             delay = min(backoff_max, backoff_base * 2 ** (attempt - 1))
@@ -1491,7 +1589,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 logger.debug("Full traceback:\\n%s", traceback.format_exc())
                 logger.warning(
                     "Management API will be unavailable. "
-                    "Webhook management from Astrolabe admin UI will not work."
+                    "Webhook management from management UI will not work."
                 )
                 # Set to None to indicate failure
                 multi_user_token_verifier = None
@@ -1797,8 +1895,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     "collection": collection,
                 },
             )
-        except Exception:
-            logger.exception("vector_sync.orphan_sweep_failed")
+        except Exception as exc:
+            logger.error("vector_sync.orphan_sweep_failed: %s", exc)
 
     @asynccontextmanager
     async def starlette_lifespan(app: Starlette):
@@ -1864,7 +1962,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             app.state.storage = basic_auth_storage
 
             # For multi-user BasicAuth with offline access, create oauth_context for management APIs
-            # This allows Astrolabe to use management APIs with OAuth bearer tokens
+            # This allows management client to use management APIs with OAuth bearer tokens
             if settings.enable_multi_user_basic_auth and settings.enable_offline_access:
                 # Check if we have OAuth credentials AND infrastructure from setup
                 if (
@@ -1908,13 +2006,13 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     logger.warning(
                         "OAuth infrastructure setup failed - management API will be unavailable. "
                         "This is expected if OIDC discovery failed or token verifier creation failed. "
-                        "Webhook management from Astrolabe admin UI will not work."
+                        "Webhook management from management UI will not work."
                     )
                 else:
                     logger.warning(
                         "OAuth credentials not available - management API will be unavailable. "
                         "This is expected if DCR failed or static credentials were not provided. "
-                        "Webhook management from Astrolabe admin UI will not work."
+                        "Webhook management from management UI will not work."
                     )
 
             # Also share with browser_app for webhook routes
@@ -1979,14 +2077,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             # Initialize Qdrant collection before starting background tasks
             logger.info("Initializing Qdrant collection...")
 
-            try:
-                await get_qdrant_client()  # Triggers collection creation if needed
-                logger.info("Qdrant collection ready")
-            except Exception as e:
-                logger.error("Failed to initialize Qdrant collection: %s", e)
-                raise RuntimeError(
-                    f"Cannot start vector sync - Qdrant initialization failed: {e}"
-                ) from e
+            await _init_qdrant_collection_with_retry()
 
             # Orphan-sweep before scanner starts — card #101.
             await _sweep_orphan_placeholders_if_enabled()
@@ -2149,14 +2240,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 # Initialize Qdrant collection before starting background tasks
                 logger.info("Initializing Qdrant collection...")
 
-                try:
-                    await get_qdrant_client()  # Triggers collection creation if needed
-                    logger.info("Qdrant collection ready")
-                except Exception as e:
-                    logger.error("Failed to initialize Qdrant collection: %s", e)
-                    raise RuntimeError(
-                        f"Cannot start vector sync - Qdrant initialization failed: {e}"
-                    ) from e
+                await _init_qdrant_collection_with_retry()
 
                 # Orphan-sweep before scanners spawn — card #101. Runs once
                 # across the shared (per-tenant) collection regardless of
@@ -2462,7 +2546,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
     # Add management API endpoints for Nextcloud PHP app
     # Tier 1: Public endpoints (no auth required)
-    # These let Astrolabe show basic server status even in single-user BasicAuth mode
+    # These let management client show basic server status even in single-user BasicAuth mode
     routes.append(Route("/api/v1/status", get_server_status, methods=["GET"]))
     routes.append(
         Route(
@@ -2532,7 +2616,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         routes.append(
             Route("/api/v1/chunk-context", get_chunk_context, methods=["GET"])
         )
-        # PDF preview endpoint for Astrolabe (server-side rendering)
+        # PDF preview endpoint for management client (server-side rendering)
         routes.append(Route("/api/v1/pdf-preview", get_pdf_preview, methods=["GET"]))
         # ADR-018: Unified search endpoint for Nextcloud PHP app integration
         routes.append(Route("/api/v1/search", unified_search, methods=["POST"]))
@@ -2544,7 +2628,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             Route("/api/v1/webhooks/{webhook_id}", delete_webhook, methods=["DELETE"])
         )
         # Vector-sync admin: purge indexed vectors by doc type (admin consent —
-        # called by Astrolabe when a source is disabled for semantic search).
+        # called by management client when a source is disabled for semantic search).
         # Gated on vector_sync_enabled: without it there is no Qdrant client, so
         # the purge would 500 rather than no-op.
         if settings.vector_sync_enabled:
@@ -2901,8 +2985,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         return response
 
     # Log the inbound User-Agent on management API and webhook receiver routes
-    # so we can tell which Astrolabe (or other PHP-side client) build is
-    # talking to the backend. Astrolabe sends ``Nextcloud-Astrolabe/<version>``.
+    # so we can tell which a management client build is
+    # talking to the backend. Management clients may send ``Nextcloud-Management-Client/<version>``.
     _UA_LOGGED_PATH_PREFIXES = ("/api/v1/", "/webhooks/nextcloud")
 
     @app.middleware("http")

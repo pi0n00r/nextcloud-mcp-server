@@ -107,9 +107,9 @@ MCP-server-local.)
 **To switch modes:** use a new collection (or clear the old one) and let
 background vector sync re-ingest. No in-place migration is supported.
 
-### Advertising supported query types to the astrolabe UI
+### Advertising supported query types to the external UI
 
-So the astrolabe UI can gate which query types it offers without knowing the
+So the external UI can gate which query types it offers without knowing the
 server's `SEARCH_MODE`, `GET /api/v1/status` advertises a
 `supported_search_types` array (`api/management.py` `supported_search_types`):
 
@@ -118,20 +118,45 @@ server's `SEARCH_MODE`, `GET /api/v1/status` advertises a
 - `SEARCH_MODE=hybrid` → `["semantic", "bm25", "hybrid"]`
 
 The vocabulary (`semantic` | `bm25` | `hybrid`) is the same `algorithm` the
-astrolabe `McpServerClient` already passes to `/api/v1/search`; it lives in the
+external `McpServerClient` already passes to `/api/v1/search`; it lives in the
 single constant `SUPPORTED_SEARCH_ALGORITHMS`, reused by the
 `/api/v1/vector-viz/search` validation so the advertised set and the accepted
 set cannot drift.
 
-Astrolabe is the **consumer** of `/api/v1/status` and this server is the
-**provider** (ADR-029). The contract is pinned both ways: a contract-first
-consumer pact (`tests/contract/test_mcp_status_search_types_consumer.py`,
-written to the unpublished `provider_contracts/` dir) and the matching
-provider-state handlers in `tests/contract/test_mcp_provider_verification.py`
-(`the server advertises hybrid search support` /
-`… keyword-only search support`). The real response is verified per mode by
-`tests/unit/test_management_status_endpoint.py`. A follow-up astrolabe PR
-consumes `supported_search_types` to gate its query-type picker.
+#### Strict rejection of an explicit unsupported algorithm
+
+Advertising is only half the contract — the search endpoints enforce it. When a
+client sends an **explicit** `algorithm` that is not in `supported_search_types`
+(the paradigm case: `algorithm: "semantic"` while `SEARCH_MODE=keyword`), both
+`/api/v1/search` and `/api/v1/vector-viz/search` return **HTTP 422**:
+
+```json
+{ "error": "unsupported_search_type", "requested": "semantic",
+  "supported_search_types": ["bm25"] }
+```
+
+This is deliberately stricter than the earlier behaviour (which silently coerced
+`semantic` → `bm25`). A silent downgrade returns lexical results dressed up as a
+semantic answer; a 422 lets clients fail loud and
+self-correct from the advertised set. The strictness applies only to an
+**explicit** request: a call that omits `algorithm` still defaults gracefully
+across modes. `api/management.py`'s `select_search_algorithm` is the single entry
+point for both paths — explicit unsupported → raise `UnsupportedSearchType`;
+absent → default to a serviceable type (`hybrid` when available, else the first
+supported, i.e. `bm25` in keyword mode).
+
+External management clients consume `/api/v1/status` and `/api/v1/search`;
+this server provides those APIs (ADR-029). The contract is pinned both ways: a
+contract-first consumer pact
+(`tests/contract/test_mcp_status_search_types_consumer.py`, written to the
+unpublished `provider_contracts/` dir) covering the status advertisement in each
+mode **and** the keyword-mode 422, plus the matching provider-state handlers in
+`tests/contract/test_mcp_provider_verification.py` (`the server advertises hybrid
+search support` / `… keyword-only search support`). The real status response is
+verified per mode by `tests/unit/test_management_status_endpoint.py`, and the
+`select_search_algorithm` gate is unit-tested there too. External clients consume
+`supported_search_types` to gate their query-type picker client-side and surface
+the 422 as the server-side backstop.
 
 ## Consequences
 

@@ -30,6 +30,8 @@ def _settings(**kw) -> Any:  # a Settings stand-in (only the read fields matter)
         embedding_gateway_scope=None,
         mistral_api_key=None,
         mistral_base_url=None,
+        docling_api_url=None,
+        docling_ocr_lang="en,de",
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -237,6 +239,83 @@ def test_build_backend_auto_prefers_gateway():
 
 def test_build_backend_auto_none_configured():
     assert ocr.build_ocr_backend(_settings()) is None
+
+
+def test_build_backend_docling():
+    b = ocr.build_ocr_backend(
+        _settings(
+            document_ocr_provider="docling", docling_api_url="https://docling:5001"
+        )
+    )
+    assert isinstance(b, ocr._DoclingServeBackend)
+    assert b._api_url == "https://docling:5001"
+    assert b._ocr_lang == ["en", "de"]
+
+
+def test_build_backend_docling_missing_url():
+    # Explicit docling without a URL -> None (warned), never a live backend.
+    assert ocr.build_ocr_backend(_settings(document_ocr_provider="docling")) is None
+
+
+def test_build_backend_auto_never_selects_docling():
+    # "auto" must never pick docling even with a URL present -- docling needs an
+    # explicit DOCUMENT_OCR_PROVIDER=docling (a self-hosted URL auto can't presume).
+    assert (
+        ocr.build_ocr_backend(
+            _settings(
+                document_ocr_provider="auto", docling_api_url="https://docling:5001"
+            )
+        )
+        is None
+    )
+
+
+async def test_docling_backend_builds_page_boundaries(monkeypatch):
+    """The docling OCR backend groups DoclingDocument.texts by page provenance into
+    contiguous page_boundaries that index exactly into the returned text."""
+    from nextcloud_mcp_server.document_processors import docling_serve
+
+    async def _fake_convert(api_url, content, content_type, **kw):
+        assert kw["to_formats"] == ["md", "json"]
+        return {
+            "md_content": "ignored-flat",
+            "json_content": {
+                "texts": [
+                    {"text": "Page one", "prov": [{"page_no": 1}]},
+                    {"text": "Page two", "prov": [{"page_no": 2}]},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(docling_serve, "convert_file", _fake_convert)
+    monkeypatch.setattr(ocr, "get_settings", lambda: _settings())
+
+    backend = ocr._DoclingServeBackend("https://docling:5001", ["en", "de"])
+    text, boundaries, spans = await backend.ocr(b"%PDF-1.7", "application/pdf")
+    assert text == "Page one\n\nPage two"
+    assert [b["page"] for b in boundaries] == [1, 2]
+    assert boundaries[-1]["end_offset"] == len(text)
+    # docling has no normalized [0,1] block bbox contract -> no block spans.
+    assert spans == []
+
+
+async def test_docling_backend_single_page_fallback(monkeypatch):
+    """With no per-page provenance, the backend falls back to one whole-text page
+    (still satisfying end_offset == len(text))."""
+    from nextcloud_mcp_server.document_processors import docling_serve
+
+    async def _fake_convert(api_url, content, content_type, **kw):
+        return {"md_content": "whole doc text", "json_content": {"texts": []}}
+
+    monkeypatch.setattr(docling_serve, "convert_file", _fake_convert)
+    monkeypatch.setattr(ocr, "get_settings", lambda: _settings())
+
+    backend = ocr._DoclingServeBackend("https://docling:5001", None)
+    text, boundaries, spans = await backend.ocr(b"%PDF", "application/pdf")
+    assert text == "whole doc text"
+    assert len(boundaries) == 1
+    assert boundaries[0]["end_offset"] == len(text)
+    assert spans == []
 
 
 @pytest.mark.parametrize(
@@ -617,6 +696,37 @@ async def test_batch_existing_pending_polls_and_defers(monkeypatch):
     assert client.polled == ["mistral/j"]
     assert r.metadata[ocr.OCR_BATCH_PENDING_KEY] is True
     assert client.submitted == []  # did NOT resubmit
+
+
+async def test_batch_poll_404_drops_row_and_resubmits(monkeypatch):
+    # Incident 2026-07-03: a 404 on poll means the gateway lost the job (row purged
+    # by retention or orphaned by a pod move). The processor must DROP its tracking
+    # row and return the pending sentinel so the NEXT cycle re-submits a fresh job —
+    # NOT re-poll the dead id forever (which flapped the burst GPU).
+    from nextcloud_mcp_server.embedding.gateway_batch_client import OcrBatchJobNotFound
+
+    preset = SimpleNamespace(job_id="surya/dead", submitted_at=1000)
+    client = _FakeBatchClient()
+
+    async def _poll_404(job_id):
+        client.polled.append(job_id)
+        raise OcrBatchJobNotFound(job_id)
+
+    client.poll = _poll_404  # type: ignore[method-assign]
+    store = _FakeStore(preset=preset)
+    monkeypatch.setattr(ocr.time, "time", lambda: 1000.0)
+    _wire_batch(monkeypatch, client=client, store=store)
+
+    r = await ocr.OcrProcessor().process(
+        b"%PDF", "application/pdf", options=dict(_IDENTITY)
+    )
+
+    assert client.polled == ["surya/dead"]
+    # tracking row dropped -> store.get is None next cycle -> fresh submit
+    assert ("u1", "d1", "file", "v1") in store.deleted
+    # returned the pending sentinel (re-poll → resubmit); did NOT resubmit inline
+    assert r.metadata[ocr.OCR_BATCH_PENDING_KEY] is True
+    assert client.submitted == []
 
 
 async def test_batch_succeeded_returns_indexed_result(monkeypatch):

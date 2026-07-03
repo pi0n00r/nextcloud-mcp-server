@@ -38,7 +38,7 @@ The server supports three deployment modes. See [Authentication](authentication.
 |------|-------------|
 | `single_user_basic` | Personal use, dev — credentials in env vars |
 | `multi_user_basic` | Internal deployments — clients send credentials via `Authorization: Basic` header |
-| `login_flow` | Hosted / OAuth-based MCP clients (claude.ai, Astrolabe Cloud) — recommended for multi-user |
+| `login_flow` | Hosted / OAuth-based MCP clients — recommended for multi-user |
 
 You can declare the mode explicitly:
 
@@ -609,6 +609,35 @@ DOCUMENT_CHUNK_OVERLAP=200            # Overlapping characters between chunks (d
 
 > **Note:** The `VECTOR_SYNC_*` tuning parameters keep their names as they're implementation details. Only the user-facing feature flag was renamed to `ENABLE_SEMANTIC_SEARCH`.
 
+#### Enabling document parsing — `ENABLE_DOCUMENT_PROCESSING` (master switch)
+
+`ENABLE_DOCUMENT_PROCESSING` is the master switch for the parsing subsystem and
+is **off by default**. Set it *before* configuring `unstructured`, the OCR tier,
+or docling below — otherwise those processors are never registered and parsing
+silently no-ops (a common first-run trip-up):
+
+```dotenv
+ENABLE_DOCUMENT_PROCESSING=true       # register optional processors + on-demand parsing (default: false)
+```
+
+What it controls:
+
+- **Registers the optional processors** — `unstructured`, `tesseract`, `custom`,
+  and **docling** — into the shared registry at startup
+  (`initialize_document_processors()`). The built-in PDF tiers
+  (`pypdfium2_fast` → `fast`, `pymupdf` → `structured`, and the `ocr` tier) are
+  always registered independently of this flag.
+- **Gates on-demand parsing in `nc_webdav_read_file`.** With it **off** the tool
+  returns the raw file (base64) and a `force_processor=…` argument is rejected as
+  an unknown processor (the parse registry is empty). With it **on**, the tool
+  parses the file inline and honours `force_processor`.
+
+Consequently the docling **image** and **force-PDF** touchpoints (which flow
+through the registry / `nc_webdav_read_file`) require this flag; the automatic
+**scanned-PDF OCR** touchpoint rides the always-registered `ocr` tier, so it needs
+only `DOCUMENT_OCR_ENABLED` + `DOCUMENT_OCR_PROVIDER` (see the recipe table under
+_Docling_ below).
+
 #### Document parsing robustness (PDF)
 
 These guard the parse/OCR tiers against pathological PDFs. Defaults are safe;
@@ -622,7 +651,7 @@ DOCUMENT_MAX_PDF_SIZE_MB=50           # Pre-parse size cap; 0 disables (default:
 ```
 
 A PDF larger than `DOCUMENT_MAX_PDF_SIZE_MB` fails fast with reason `oversize`
-(exported on `astrolabe_document_parse_failed_total{reason="oversize"}`) instead
+(exported on `bridgette_document_parse_failed_total{reason="oversize"}`) instead
 of being handed to the tiers, where a 40+ MB scan would otherwise burn the full
 OCR timeout for zero recovered text.
 
@@ -633,19 +662,84 @@ model, and execution mode:
 
 ```dotenv
 DOCUMENT_OCR_ENABLED=true              # route scanned/no-text-layer PDFs to OCR (default: false)
-DOCUMENT_OCR_PROVIDER=auto            # "auto" | "gateway" | "mistral" | "none"
+DOCUMENT_OCR_PROVIDER=auto            # "auto" | "gateway" | "mistral" | "docling" | "none"
 DOCUMENT_OCR_MODEL=mistral/mistral-ocr-latest  # provider-namespaced model id
 ```
 
-- **`DOCUMENT_OCR_PROVIDER`** selects the backend: `gateway` posts to the Astrolabe
-  Cloud model gateway's `POST /v1/ocr` (no provider keys in the pod; the gateway
+- **`DOCUMENT_OCR_PROVIDER`** selects the backend: `gateway` posts to the configured
+  OCR gateway's `POST /v1/ocr` (no provider keys in the pod; the gateway
   routes on the model's `<provider>/` prefix, so it serves Mistral, surya, etc.);
-  `mistral` calls the Mistral OCR API directly (`MISTRAL_API_KEY`); `auto` prefers
-  the gateway (if `EMBEDDING_GATEWAY_URL` is set) then direct Mistral; `none`
-  disables OCR.
+  `mistral` calls the Mistral OCR API directly (`MISTRAL_API_KEY`); `docling`
+  posts scanned/no-text-layer PDFs to a self-hosted docling-serve instance
+  (`DOCLING_API_URL`); `auto` prefers the gateway (if `EMBEDDING_GATEWAY_URL` is
+  set) then direct Mistral (`auto` never selects docling — it needs an explicit
+  self-hosted URL); `none` disables OCR.
 - **`DOCUMENT_OCR_MODEL`** is the provider-namespaced model id — e.g.
   `mistral/mistral-ocr-latest` (Mistral) or `surya/surya-ocr-2` (surya, via the
   gateway). The gateway routes on the prefix; the direct Mistral backend strips it.
+  (Ignored by the `docling` backend, which uses the docling-serve instance's own
+  OCR engine.)
+
+#### Docling (docling-serve) — photographed / scanned / handwritten text
+
+[docling](https://github.com/docling-project/docling) has notably stronger OCR
+than `unstructured` for photographed, scanned and **handwritten** documents. The
+MCP server talks to an external
+[docling-serve](https://github.com/docling-project/docling-serve) instance over
+HTTP — no ML dependencies are added to the server image. Run one via the
+`docling` docker-compose profile (`docker compose --profile docling up -d`).
+
+```dotenv
+ENABLE_DOCLING=false                  # master switch for the docling touchpoints
+DOCLING_API_URL=http://docling:5001   # docling-serve base URL (required)
+DOCLING_TIMEOUT=120                   # image/force conversion timeout (seconds)
+DOCLING_OCR_LANG=en,de                # engine-dependent codes (EasyOCR: en,de; Tesseract: eng,deu)
+DOCLING_DO_OCR=true                   # run OCR (vs. text-layer extraction only)
+```
+
+**Required configuration per use case** (`auto` never selects docling — it needs
+an explicit self-hosted URL):
+
+| Use case | Minimal env |
+|---|---|
+| Images auto-route to docling | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
+| Force docling on a text-layer PDF (`force_processor="docling"`) | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
+| Scanned / no-text-layer PDFs auto-OCR via docling | `DOCUMENT_OCR_ENABLED=true` + `DOCUMENT_OCR_PROVIDER=docling` + `DOCLING_API_URL` |
+
+The scanned-PDF row deliberately omits `ENABLE_DOCLING`/`ENABLE_DOCUMENT_PROCESSING`:
+that path rides the always-registered `ocr` tier during **indexing** (so it also
+needs `ENABLE_SEMANTIC_SEARCH=true`), not the on-demand registry. The image and
+force-PDF rows need the `ENABLE_DOCUMENT_PROCESSING` master switch (see above).
+
+Docling plugs in at three points:
+
+- **Images (automatic).** With `ENABLE_DOCLING=true` + `DOCLING_API_URL` set,
+  image files (`image/jpeg`, `image/png`, `image/tiff`, `image/bmp`, `image/gif`,
+  `image/webp`) always route to docling — it registers at a higher priority than
+  `unstructured`. `DOCLING_DO_OCR` toggles OCR on this image path only (the scanned-PDF
+  OCR backend always OCRs). Requires
+  `ENABLE_DOCUMENT_PROCESSING=true`. If `DOCLING_API_URL` is unset the processor is
+  not registered, so a bare `ENABLE_DOCLING` never shadows other image processors
+  with a dead endpoint.
+- **Scanned PDFs (automatic).** Set `DOCUMENT_OCR_ENABLED=true` +
+  `DOCUMENT_OCR_PROVIDER=docling`. PDFs whose text layer the tier-0 classifier
+  finds missing/unusable escalate to the OCR tier and are transcribed by docling.
+  Born-digital (text-layer) PDFs still use the cheap local `fast`/`structured`
+  tiers — docling is only paid for genuine scans.
+- **Text-layer PDFs (on demand).** Pass `force_processor="docling"` to the
+  `nc_webdav_read_file` MCP tool to re-parse *any* file with docling even when it
+  already has a text layer — useful when that layer misses tables/figures or is
+  incomplete. Docling returns markdown, preserving table structure. An unknown or
+  unconfigured processor name returns a clear tool error.
+
+Office formats (DOCX/PPTX/XLSX) deliberately stay with `unstructured` — docling
+is scoped to the image/scan/handwriting use case here. OCR language codes are
+engine-dependent: the docling-serve default engine (EasyOCR) uses two-letter
+codes (`en,de`); a Tesseract-backed instance wants `eng,deu`. The synchronous
+convert endpoint has an observed ~2 min practical ceiling (from our testing, not a
+hard server-enforced limit), so a larger `DOCLING_TIMEOUT` (e.g. 300s for slow CPU
+OCR) simply lets a slow conversion finish; very large scans are future work (async
+submit/poll). See `docs/ADR-031-docling-document-parsing-backend.md`.
 
 #### OCR execution mode: synchronous vs batch (Deck #332)
 
@@ -918,6 +1012,9 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
 | `QDRANT_API_KEY` | ⚠️ Optional | - | Qdrant API key (network mode only) |
 | `QDRANT_COLLECTION` | ⚠️ Optional | Auto-generated | Qdrant collection name |
+| `QDRANT_INIT_MAX_ATTEMPTS` | ⚠️ Optional | `30` | Attempts for the startup Qdrant-collection init. Transient connection failures (Qdrant briefly unreachable during a rolling deploy) are retried with capped exponential backoff + jitter instead of crashlooping with a full traceback; genuine errors (auth/config, e.g. a 4xx) fail immediately. Set to `1` to restore fail-fast. |
+| `QDRANT_INIT_BACKOFF_BASE` | ⚠️ Optional | `1.0` | Base delay (seconds) for the first Qdrant-init retry; subsequent retries grow exponentially (`base * 2**n`) with full jitter. |
+| `QDRANT_INIT_BACKOFF_MAX` | ⚠️ Optional | `10.0` | Per-retry cap (seconds) for the Qdrant-init backoff. Size your k8s `startupProbe` accordingly (worst case ≈ `max_attempts × backoff_max` of waiting on a persistently-down Qdrant before startup finally fails). |
 | `VECTOR_SYNC_SCAN_INTERVAL` | ⚠️ Optional | `300` | Document scan interval (seconds) |
 | `VECTOR_SYNC_PROCESSOR_WORKERS` | ⚠️ Optional | `3` | Concurrent indexing workers |
 | `VECTOR_SYNC_QUEUE_MAX_SIZE` | ⚠️ Optional | `10000` | Max queued documents |

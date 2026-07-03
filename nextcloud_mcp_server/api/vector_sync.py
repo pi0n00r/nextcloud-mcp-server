@@ -1,7 +1,7 @@
 """Vector-sync admin API endpoints.
 
-Provides the purge endpoint Astrolabe calls when an admin disables a content
-source for semantic search. Consent is binding on data-at-rest, so the
+Provides the purge endpoint external management clients call when an admin disables
+a content source for semantic search. Consent is binding on data-at-rest, so the
 already-indexed content for the disabled source's doc type(s) is deleted
 globally (every owner) — see :mod:`nextcloud_mcp_server.vector.purge`.
 
@@ -120,7 +120,7 @@ async def purge_doc_types_route(request: Request) -> JSONResponse:
             return JSONResponse({"purged": {}})
 
         purged = await purge_doc_types(doc_types)
-        # Surface a partial-failure signal so Astrolabe knows which types were
+        # Surface a partial-failure signal so callers know which types were
         # NOT purged (consent not yet enforced for them) — the scanner backstop
         # still catches these, but the caller shouldn't assume full success.
         failed = [dt for dt in dict.fromkeys(doc_types) if dt not in purged]
@@ -142,7 +142,7 @@ async def purge_doc_types_route(request: Request) -> JSONResponse:
             status_code=428,
         )
     except Exception as e:
-        logger.exception("Error purging doc types for user %s", user_id)
+        logger.error("Error purging doc types for user %s: %s", user_id, e)
         return JSONResponse(
             {
                 "error": "Internal error",

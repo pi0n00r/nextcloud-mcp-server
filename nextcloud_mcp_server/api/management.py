@@ -37,7 +37,7 @@ __version__ = version("nextcloud-mcp-server")
 # Track server start time for uptime calculation
 _server_start_time = time.time()
 
-# The search algorithms astrolabe's McpServerClient understands (the ``algorithm``
+# The search algorithms external clients understand (the ``algorithm``
 # request param to /api/v1/search and /api/v1/vector-viz/search): ``semantic``
 # (dense only), ``bm25`` (sparse/keyword only), ``hybrid`` (dense+sparse fusion).
 # Single source of truth, also consumed by api/visualization.py for validation.
@@ -47,7 +47,7 @@ SUPPORTED_SEARCH_ALGORITHMS: tuple[str, ...] = ("semantic", "bm25", "hybrid")
 def supported_search_types(settings: Settings) -> list[str]:
     """Search algorithms this server can actually serve, given its config.
 
-    Advertised via /api/v1/status (ADR-030) so the astrolabe UI can gate which
+    Advertised via /api/v1/status (ADR-030) so the external UI can gate which
     query types it offers, without having to know the server's SEARCH_MODE:
 
     - vector sync disabled → ``[]`` (no Qdrant-backed search at all)
@@ -64,33 +64,59 @@ def supported_search_types(settings: Settings) -> list[str]:
     return ["bm25"]
 
 
-def resolve_search_algorithm(algorithm: str, settings: Settings) -> str:
-    """Coerce a requested search algorithm to one this server can serve now.
+class UnsupportedSearchType(Exception):
+    """A client *explicitly* asked for a search algorithm this server can't serve.
 
-    Falls back to a supported algorithm when the request is unknown OR
-    unavailable in the current SEARCH_MODE (ADR-030) — notably ``semantic`` while
-    ``SEARCH_MODE=keyword``, which would otherwise route a dense query at a
-    sparse-only index and fail. Prefers ``hybrid`` when available (the historical
-    default), else the first supported type. Keeps the search endpoints lenient
-    (no new 4xx) while keeping the accepted set in lockstep with the
-    ``supported_search_types`` that /api/v1/status advertises.
+    Raised by :func:`select_search_algorithm` and translated by the search
+    endpoints into **HTTP 422** carrying the advertised ``supported_search_types``
+    (ADR-030), so a client that requests ``semantic`` against a
+    keyword-only server gets a hard, self-correcting error instead of silent BM25
+    results. Only *explicit* requests are strict — an absent ``algorithm`` still
+    defaults gracefully (see :func:`select_search_algorithm`).
+    """
+
+    def __init__(self, requested: str, supported: list[str]) -> None:
+        self.requested = requested
+        self.supported = supported
+        super().__init__(
+            f"search algorithm {requested!r} is not supported by this server "
+            f"(supported: {supported or 'none'})"
+        )
+
+
+def select_search_algorithm(requested: str | None, settings: Settings) -> str:
+    """Pick the algorithm to run for a search request (ADR-030).
+
+    Single source of truth for the two search endpoints (`/api/v1/search`,
+    `/api/v1/vector-viz/search`), called with the raw ``body.get("algorithm")`` —
+    ``None`` when the client sent no ``algorithm`` field:
+
+    - ``requested is None`` → graceful default: ``hybrid`` when available, else the
+      first supported type (``bm25`` in keyword mode). Never errors, so callers
+      that don't pin an algorithm keep working across modes. (An explicit JSON
+      ``"algorithm": null`` is indistinguishable from an omitted key — both surface
+      as ``None`` — so it takes this default path rather than being rejected.)
+    - explicit ``requested`` in ``supported_search_types`` → returned unchanged.
+    - explicit ``requested`` NOT in ``supported_search_types`` → raise
+      :class:`UnsupportedSearchType` (→ 422). This is the strict half of the
+      contract that /api/v1/status advertises: an explicit ``semantic`` while
+      ``SEARCH_MODE=keyword`` is rejected rather than silently coerced, so the
+      accepted set stays in lockstep with the advertised one.
     """
     supported = supported_search_types(settings)
-    if algorithm in supported:
-        return algorithm
-    # Empty (vector sync off) preserves the prior default of "hybrid".
-    resolved = "hybrid" if "hybrid" in supported else (supported or ["hybrid"])[0]
-    # Log the rewrite so operators debugging "why did I get bm25 results for an
-    # algorithm=semantic request" can see the coercion (the response
-    # search_method reflects the algorithm actually run, not the request).
+    if requested is None:
+        # Empty (vector sync off) preserves the prior default of "hybrid".
+        return "hybrid" if "hybrid" in supported else (supported or ["hybrid"])[0]
+    if requested in supported:
+        return requested
+    # Log the hard reject so operators can see why an explicit algorithm got a 422
+    # rather than results (the response search_method reflects what actually ran).
     logger.debug(
-        "resolve_search_algorithm: %r unavailable in current SEARCH_MODE "
-        "(supported=%r); coercing to %r",
-        algorithm,
+        "select_search_algorithm: rejecting explicit %r (supported=%r)",
+        requested,
         supported,
-        resolved,
     )
-    return resolved
+    raise UnsupportedSearchType(requested, supported)
 
 
 def extract_bearer_token(request: Request) -> str | None:
@@ -120,8 +146,8 @@ async def validate_token_and_get_user(
     """Validate OAuth bearer token and extract user ID.
 
     Uses verify_token_for_management_api which accepts any valid Nextcloud OIDC
-    token (not just MCP-audience tokens). This is needed because Astrolabe
-    (NC PHP app) uses its own OAuth client, separate from MCP server's client.
+    token (not just MCP-audience tokens). This is needed because external
+    management clients may use OAuth clients separate from the MCP server's client.
 
     Security Model:
     ~~~~~~~~~~~~~~~
@@ -154,7 +180,7 @@ async def validate_token_and_get_user(
 
     # Validate token for management API (handles both JWT and opaque tokens)
     # Uses verify_token_for_management_api which accepts any valid Nextcloud token
-    # without requiring MCP audience - needed for Astrolabe integration (ADR-018)
+    # without requiring MCP audience - needed for management integration (ADR-018)
     access_token = await token_verifier.verify_token_for_management_api(token)
 
     if not access_token:
@@ -210,7 +236,7 @@ def _sanitize_error_for_client(error: Exception, context: str = "") -> str:
         Generic error message safe for client consumption
     """
     # Log detailed error for debugging
-    logger.error("Error in %s: %s", context, error, exc_info=True)
+    logger.error("Error in %s: %s", context, error)
 
     # Return generic message
     return "An internal error occurred. Please contact your administrator."
@@ -284,7 +310,7 @@ async def get_server_status(request: Request) -> JSONResponse:
     mode = detect_auth_mode(settings)
 
     # Map deployment mode to auth_mode for API response
-    # This helps clients (like Astrolabe) determine which auth flow to use
+    # This helps clients (like management clients) determine which auth flow to use
     if mode == AuthMode.LOGIN_FLOW:
         auth_mode = "oauth"
     elif mode == AuthMode.MULTI_USER_BASIC:
@@ -300,10 +326,10 @@ async def get_server_status(request: Request) -> JSONResponse:
         "vector_sync_enabled": settings.vector_sync_enabled,
         # Whether the /webhooks/nextcloud receiver is active. Gated on
         # WEBHOOK_SECRET (GHSA-8vh3-g2qg-2h2c): without a secret the route is
-        # not mounted, so the Astrolabe UI can show webhooks as unavailable and
+        # not mounted, so the management UI can show webhooks as unavailable and
         # vector sync falls back to the polling scanner.
         "webhooks_enabled": bool(settings.webhook_secret),
-        # Query types the astrolabe UI may offer for this server (ADR-030).
+        # Query types the external UI may offer for this server (ADR-030).
         # Empty when vector sync is off; ["bm25"] in keyword mode; all three in
         # hybrid mode. Lets the UI gate its algorithm picker without knowing
         # SEARCH_MODE.
@@ -318,7 +344,7 @@ async def get_server_status(request: Request) -> JSONResponse:
 
     # Include OIDC configuration if OAuth is available
     # This includes OAuth mode AND hybrid mode (multi_user_basic + offline_access)
-    # Astrolabe needs OIDC config to discover IdP for OAuth flow in hybrid mode
+    # OAuth clients need OIDC config to discover IdP for OAuth flow in hybrid mode
     oauth_provisioning_available = auth_mode == "oauth" or (
         mode == AuthMode.MULTI_USER_BASIC and settings.enable_offline_access
     )

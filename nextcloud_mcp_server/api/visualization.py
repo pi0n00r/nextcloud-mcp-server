@@ -1,6 +1,6 @@
 """Visualization API endpoints for search and PDF preview.
 
-ADR-018: Provides REST API endpoints for the Nextcloud PHP app (Astrolabe) to:
+ADR-018: Provides REST API endpoints for the Nextcloud PHP app (management UI) to:
 - Execute unified search with semantic/BM25/hybrid algorithms
 - Execute vector search with PCA visualization coordinates
 - Fetch chunk context with surrounding text
@@ -19,17 +19,19 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from nextcloud_mcp_server.api.management import (
+    UnsupportedSearchType,
     _parse_float_param,
     _parse_int_param,
     _sanitize_error_for_client,
     _validate_query_string,
-    resolve_search_algorithm,
+    select_search_algorithm,
     validate_token_and_get_user,
 )
-from nextcloud_mcp_server.config import get_settings
+from nextcloud_mcp_server.config import Settings, get_settings
 from nextcloud_mcp_server.embedding.service import get_embedding_service
 from nextcloud_mcp_server.search import (
     BM25HybridSearchAlgorithm,
+    SearchAlgorithm,
     SemanticSearchAlgorithm,
 )
 from nextcloud_mcp_server.search.access_filter import (
@@ -56,6 +58,51 @@ logger = logging.getLogger(__name__)
 _NEXTCLOUD_HOST_NOT_CONFIGURED = "Nextcloud host not configured"
 
 
+def _unsupported_search_type_response(e: UnsupportedSearchType) -> JSONResponse:
+    """Uniform 422 for an explicit unsupported search algorithm (ADR-030).
+
+    Shared by both search endpoints so the ``unsupported_search_type`` payload
+    shape (error / requested / supported_search_types) can't drift between them.
+    """
+    return JSONResponse(
+        {
+            "error": "unsupported_search_type",
+            "requested": e.requested,
+            "supported_search_types": e.supported,
+        },
+        status_code=422,
+    )
+
+
+def _build_search_algorithm(
+    requested_algorithm: str | None,
+    settings: Settings,
+    *,
+    score_threshold: float,
+    fusion: str,
+) -> tuple[SearchAlgorithm, str]:
+    """Resolve + instantiate the search algorithm for a request (ADR-030).
+
+    Shared by both search endpoints (`/api/v1/search`, `/api/v1/vector-viz/search`)
+    so their selection logic can't drift. Raises :class:`UnsupportedSearchType`
+    for an *explicit* unsupported algorithm (the caller maps it to a 422 via
+    :func:`_unsupported_search_type_response`); an absent algorithm defaults
+    gracefully. Invalid fusion is normalized to ``"rrf"``. Returns the
+    ``(algorithm instance, resolved algorithm name)``.
+    """
+    algorithm = select_search_algorithm(requested_algorithm, settings)
+    if algorithm == "semantic":
+        return SemanticSearchAlgorithm(score_threshold=score_threshold), algorithm
+    # Both "bm25" and "hybrid" run BM25HybridSearchAlgorithm — it combines dense
+    # semantic + sparse BM25 in hybrid mode, and issues a sparse-only query in
+    # keyword mode (it branches on dense_enabled internally).
+    fusion = fusion if fusion in ("rrf", "dbsf") else "rrf"
+    return (
+        BM25HybridSearchAlgorithm(score_threshold=score_threshold, fusion=fusion),
+        algorithm,
+    )
+
+
 async def _search_with_acl(
     request: Request,
     user_id: str,
@@ -64,7 +111,7 @@ async def _search_with_acl(
     """Resolve the caller's Nextcloud client, run ``execute(accessible_owners)``,
     and verify-on-read — shared by the /api/v1 search endpoints.
 
-    The OAuth bearer only authenticates Astrolabe → MCP Server; MCP Server →
+    The OAuth bearer only authenticates management UI -> MCP Server; MCP Server →
     Nextcloud uses the provisioned app password. When the caller never
     provisioned background sync there is no client to expand shares or verify
     with, so we fall back to self-only, unverified search (the pre-ACL
@@ -228,7 +275,7 @@ async def unified_search(request: Request) -> JSONResponse:
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
-        algorithm = body.get("algorithm", "hybrid")
+        requested_algorithm = body.get("algorithm")  # None ⇒ graceful default
         fusion = body.get("fusion", "rrf")
         include_pca = body.get("include_pca", False)
         include_chunks = body.get("include_chunks", True)
@@ -236,7 +283,7 @@ async def unified_search(request: Request) -> JSONResponse:
         # ADR-027 Phase 2 path filter (files only); blank ⇒ no filter. Accept a
         # path_prefixes list (multi-folder) alongside the legacy single
         # path_prefix; normalize drops blanks and de-dupes.
-        # path_prefixes arrives as a JSON array (the Astrolabe PHP client sends
+        # path_prefixes arrives as a JSON array (the management client sends
         # a list); any other shape is ignored rather than guessed at. The legacy
         # single path_prefix is folded in by normalize_path_prefixes.
         _path_prefixes_raw = body.get("path_prefixes")
@@ -248,24 +295,20 @@ async def unified_search(request: Request) -> JSONResponse:
         if not query:
             return JSONResponse({"results": [], "total_found": 0})
 
-        # Coerce to an algorithm this server can actually serve in its current
-        # SEARCH_MODE (ADR-030): in keyword mode "semantic" would route a dense
-        # query at a sparse-only index, so it falls back to "bm25". Keeps the
-        # accepted set in lockstep with what /api/v1/status advertises.
-        algorithm = resolve_search_algorithm(algorithm, settings)
-
-        # Validate fusion method
-        valid_fusions = {"rrf", "dbsf"}
-        if fusion not in valid_fusions:
-            fusion = "rrf"
-
-        # Select search algorithm
-        if algorithm == "semantic":
-            search_algo = SemanticSearchAlgorithm(score_threshold=score_threshold)
-        else:
-            search_algo = BM25HybridSearchAlgorithm(
-                score_threshold=score_threshold, fusion=fusion
+        # Resolve + build the search algorithm (ADR-030): an *explicit*
+        # unsupported request (e.g. "semantic" while SEARCH_MODE=keyword) is
+        # rejected with 422 carrying the advertised supported_search_types, so the
+        # client can correct it rather than silently receive BM25 results. An
+        # absent algorithm still defaults gracefully across modes.
+        try:
+            search_algo, algorithm = _build_search_algorithm(
+                requested_algorithm,
+                settings,
+                score_threshold=score_threshold,
+                fusion=fusion,
             )
+        except UnsupportedSearchType as e:
+            return _unsupported_search_type_response(e)
 
         # Request extra results to handle offset
         search_limit = limit + offset
@@ -456,7 +499,7 @@ async def vector_search(request: Request) -> JSONResponse:
         # Parse request body
         body = await request.json()
         query = body.get("query", "")
-        algorithm = body.get("algorithm", "hybrid")
+        requested_algorithm = body.get("algorithm")  # None ⇒ graceful default
         fusion = body.get("fusion", "rrf")
         score_threshold = body.get("score_threshold", 0.0)
         limit = min(body.get("limit", 10), 50)  # Enforce max limit
@@ -465,7 +508,7 @@ async def vector_search(request: Request) -> JSONResponse:
         # ADR-027 Phase 2 path filter (files only); blank ⇒ no filter. Accept a
         # path_prefixes list (multi-folder) alongside the legacy single
         # path_prefix; normalize drops blanks and de-dupes.
-        # path_prefixes arrives as a JSON array (the Astrolabe PHP client sends
+        # path_prefixes arrives as a JSON array (the management client sends
         # a list); any other shape is ignored rather than guessed at. The legacy
         # single path_prefix is folded in by normalize_path_prefixes.
         _path_prefixes_raw = body.get("path_prefixes")
@@ -501,26 +544,20 @@ async def vector_search(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-        # Coerce to an algorithm this server can actually serve in its current
-        # SEARCH_MODE (ADR-030): in keyword mode "semantic" would route a dense
-        # query at a sparse-only index, so it falls back to "bm25". Keeps the
-        # accepted set in lockstep with what /api/v1/status advertises.
-        algorithm = resolve_search_algorithm(algorithm, settings)
-
-        # Validate fusion method
-        valid_fusions = {"rrf", "dbsf"}
-        if fusion not in valid_fusions:
-            fusion = "rrf"
-
-        # Select search algorithm
-        if algorithm == "semantic":
-            search_algo = SemanticSearchAlgorithm(score_threshold=score_threshold)
-        else:
-            # Both "hybrid" and "bm25" use the BM25HybridSearchAlgorithm
-            # which combines dense semantic and sparse BM25 vectors
-            search_algo = BM25HybridSearchAlgorithm(
-                score_threshold=score_threshold, fusion=fusion
+        # Resolve + build the search algorithm (ADR-030): an *explicit*
+        # unsupported request (e.g. "semantic" while SEARCH_MODE=keyword) is
+        # rejected with 422 carrying the advertised supported_search_types, so the
+        # client can correct it rather than silently receive BM25 results. An
+        # absent algorithm still defaults gracefully across modes.
+        try:
+            search_algo, algorithm = _build_search_algorithm(
+                requested_algorithm,
+                settings,
+                score_threshold=score_threshold,
+                fusion=fusion,
             )
+        except UnsupportedSearchType as e:
+            return _unsupported_search_type_response(e)
 
         async def _execute(owners: list[str] | None) -> list:
             """Run the search across requested doc_types with the given owner
@@ -740,7 +777,7 @@ async def get_chunk_context(request: Request) -> JSONResponse:
             raise ValueError(_NEXTCLOUD_HOST_NOT_CONFIGURED)
 
         # Use the user's stored app password for Nextcloud calls.
-        # The OAuth bearer is only used to authenticate Astrolabe → MCP Server;
+        # The OAuth bearer is only used to authenticate management UI -> MCP Server;
         # MCP Server → Nextcloud always uses the app password provisioned
         # during the authorization step.
         try:
@@ -831,7 +868,7 @@ async def get_chunk_context(request: Request) -> JSONResponse:
 async def get_pdf_preview(request: Request) -> JSONResponse:
     """GET /api/v1/pdf-preview - Render PDF page to PNG image.
 
-    Server-side PDF rendering using PyMuPDF. This endpoint allows Astrolabe
+    Server-side PDF rendering using PyMuPDF. This endpoint allows management UI
     to display PDF pages without requiring client-side PDF.js, avoiding CSP
     worker restrictions and ES private field issues in Chromium.
 
@@ -906,7 +943,7 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
             raise ValueError(_NEXTCLOUD_HOST_NOT_CONFIGURED)
 
         # Use the user's stored app password for Nextcloud calls.
-        # The OAuth bearer is only used to authenticate Astrolabe → MCP Server;
+        # The OAuth bearer is only used to authenticate management UI -> MCP Server;
         # MCP Server → Nextcloud always uses the app password provisioned
         # during the authorization step.
         try:
@@ -986,7 +1023,7 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
             status_code=400,
         )
     except Exception as e:
-        logger.error("PDF preview error: %s", e, exc_info=True)
+        logger.error("PDF preview error: %s", e)
         error_msg = _sanitize_error_for_client(e, "get_pdf_preview")
         return JSONResponse(
             {"success": False, "error": error_msg},
