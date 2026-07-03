@@ -49,14 +49,12 @@ def _read_complete_body(response: Response, label: str) -> bytes:
     back an empty/short body that the document parser then reads as ``0 chars``
     and the vector-sync processor permanently dead-letters (#965). Compare the
     received byte count against the declared ``Content-Length`` and raise a
-    retryable :class:`httpx.RemoteProtocolError` on a mismatch: the processor
-    retries/re-queues a raised transport error instead of dead-lettering the
-    document, so a healthy file recovers on the next scan. (httpx already
-    raises on most genuine truncations during the read; this is the
-    belt-and-suspenders guard for the cases it returns intact. The robust
-    mitigation for connection poisoning is ``NEXTCLOUD_HTTP_KEEPALIVE=false``.)
-    A missing or malformed header (e.g. ``Transfer-Encoding: chunked``) skips
-    the check so legitimately header-less responses never raise.
+    retryable :class:`httpx.RemoteProtocolError` on a mismatch. The WebDAV GET
+    callers retry that transport error once before surfacing it, so a stale
+    pooled connection does not become a permanent false read while genuine
+    repeated short reads still fail. A missing or malformed header (e.g.
+    ``Transfer-Encoding: chunked``) skips the check so legitimately header-less
+    responses never raise.
     """
     content = response.content
     if response.headers.get("content-encoding"):
@@ -84,15 +82,15 @@ def _read_complete_body(response: Response, label: str) -> bytes:
         # opaque "Unexpected error reading file".
         logger.warning(
             "Truncated download for %r: expected %d bytes, got %d "
-            "(poisoned keep-alive connection? set NEXTCLOUD_HTTP_KEEPALIVE=false "
-            "— see #965)",
+            "(stale pooled connection or short WebDAV response - see #965)",
             label,
             expected,
             len(content),
         )
         raise RemoteProtocolError(
             f"Truncated download for {label!r}: expected {expected} bytes, "
-            f"got {len(content)} (poisoned keep-alive connection? see #965)",
+            f"got {len(content)} (stale pooled connection or short WebDAV response; "
+            "see #965)",
             request=response.request,
         )
     return content
@@ -106,6 +104,7 @@ WEBDAV_SEARCH_PAGE_SIZE = 500
 # Crossing it is logged as a truncation warning (and surfaced via a metric) so the
 # cap can never again silently hide files.
 WEBDAV_SEARCH_MAX_RESULTS = 50000
+WEBDAV_GET_MAX_ATTEMPTS = 2
 
 
 def _encode_dav_path(path: str) -> str:
@@ -129,6 +128,30 @@ class WebDAVClient(BaseNextcloudClient):
     """Client for Nextcloud WebDAV operations."""
 
     app_name = "webdav"
+
+    async def _get_complete_response(
+        self, webdav_path: str, label: str
+    ) -> Tuple[Response, bytes]:
+        """GET a WebDAV resource and retry one stale-transport/short-read error."""
+        last_exc: Optional[RemoteProtocolError] = None
+        for attempt in range(1, WEBDAV_GET_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._make_request("GET", webdav_path)
+                response.raise_for_status()
+                return response, _read_complete_body(response, label)
+            except RemoteProtocolError as exc:
+                last_exc = exc
+                if attempt >= WEBDAV_GET_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Retrying WebDAV GET for %r after transport/short-read "
+                    "failure (%d/%d): %s",
+                    label,
+                    attempt,
+                    WEBDAV_GET_MAX_ATTEMPTS,
+                    exc,
+                )
+        raise last_exc or RuntimeError("WebDAV GET retry loop exited unexpectedly")
 
     def _webdav_path(self, path: str) -> str:
         """Build the request path for ``path`` under the user's DAV root.
@@ -319,10 +342,9 @@ class WebDAVClient(BaseNextcloudClient):
         logger.debug(f"Fetching attachment '{filename}' for note {note_id}")
 
         try:
-            response = await self._make_request("GET", attachment_path)
-            response.raise_for_status()
-
-            content = _read_complete_body(response, filename)
+            response, content = await self._get_complete_response(
+                attachment_path, filename
+            )
             mime_type = response.headers.get("content-type", "application/octet-stream")
 
             logger.debug(
@@ -456,10 +478,7 @@ class WebDAVClient(BaseNextcloudClient):
         logger.debug(f"Reading file: {path}")
 
         try:
-            response = await self._make_request("GET", webdav_path)
-            response.raise_for_status()
-
-            content = _read_complete_body(response, path)
+            response, content = await self._get_complete_response(webdav_path, path)
             content_type = response.headers.get(
                 "content-type", "application/octet-stream"
             )

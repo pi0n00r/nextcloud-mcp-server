@@ -158,7 +158,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 ### Fix
 
 - address round-1 review on #968 (logging, startup warn, guards)
-- detect truncated WebDAV downloads and add NEXTCLOUD_HTTP_KEEPALIVE knob
+- detect truncated WebDAV downloads and retry stale pooled WebDAV reads once
 
 ## v0.126.1 (2026-06-25)
 

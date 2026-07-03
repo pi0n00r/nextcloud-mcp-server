@@ -31,7 +31,6 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_app_password": None,
     "nextcloud_verify_ssl": True,
     "nextcloud_ca_bundle": None,
-    "nextcloud_http_keepalive": True,
     "nextcloud_mcp_server_url": None,
     "nextcloud_resource_uri": None,
     "nextcloud_public_issuer_url": None,
@@ -835,14 +834,6 @@ class Settings:
     nextcloud_verify_ssl: bool = True
     nextcloud_ca_bundle: str | None = None
 
-    # Reuse pooled keep-alive connections for the Nextcloud httpx client.
-    # Default True preserves low-latency interactive traffic. Set
-    # NEXTCLOUD_HTTP_KEEPALIVE=false to force a fresh connection per request
-    # (max_keepalive_connections=0) — mirrors the DATABASE_POOL_SIZE→NullPool
-    # precedent and prevents a truncated/desynced response from poisoning a
-    # pooled connection on flaky CDN/WAN paths (see #965).
-    nextcloud_http_keepalive: bool = True
-
     # Postgres backend TLS settings (ADR-026). Default verify_ssl is None,
     # not True: when DATABASE_URL is unset there's nothing to verify, and
     # when it is set we don't want to break cluster-internal Postgres that
@@ -1139,16 +1130,6 @@ class Settings:
                     f"NEXTCLOUD_CA_BUNDLE path does not exist: {self.nextcloud_ca_bundle}"
                 )
             logger.info("Using custom CA bundle: %s", self.nextcloud_ca_bundle)
-
-        # Surface the keep-alive opt-out at startup so an operator who set it to
-        # work around #965 gets confirmation it took effect.
-        if not self.nextcloud_http_keepalive:
-            logger.info(
-                "NEXTCLOUD_HTTP_KEEPALIVE is disabled. The Nextcloud HTTP client "
-                "will open a fresh connection per request (no pooled keep-alive "
-                "reuse) — a TLS handshake per call in exchange for immunity to "
-                "poisoned/desynced pooled connections (#965)."
-            )
 
         # Validate Postgres backend TLS configuration (ADR-026)
         if self.database_verify_ssl is False:
@@ -1716,7 +1697,6 @@ def get_settings() -> Settings:
         # Nextcloud SSL/TLS settings
         "nextcloud_verify_ssl": "NEXTCLOUD_VERIFY_SSL",
         "nextcloud_ca_bundle": "NEXTCLOUD_CA_BUNDLE",
-        "nextcloud_http_keepalive": "NEXTCLOUD_HTTP_KEEPALIVE",
         # Postgres backend TLS (ADR-026)
         "database_verify_ssl": "DATABASE_VERIFY_SSL",
         "database_ca_bundle": "DATABASE_CA_BUNDLE",
@@ -1871,17 +1851,6 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
         ctx = ssl.create_default_context(cafile=settings.nextcloud_ca_bundle)
         return ctx
     return True
-
-
-def get_nextcloud_http_keepalive() -> bool:
-    """Return whether the Nextcloud httpx client may reuse pooled connections.
-
-    Returns:
-        - False if NEXTCLOUD_HTTP_KEEPALIVE=false (fresh connection per
-          request; mitigates the poisoned-keep-alive truncation in #965).
-        - True otherwise (default pooled keep-alive behavior).
-    """
-    return get_settings().nextcloud_http_keepalive
 
 
 def get_database_ssl() -> bool | ssl.SSLContext | None:

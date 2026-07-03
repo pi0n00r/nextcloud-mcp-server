@@ -617,6 +617,7 @@ async def test_read_file_raises_on_truncated_body(mocker):
 
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
+    client._principal_discovered = True
 
     mock_response = AsyncMock()
     mock_response.content = b""  # poisoned connection delivered nothing
@@ -625,10 +626,45 @@ async def test_read_file_raises_on_truncated_body(mocker):
         "content-length": "187564",
     }
     mock_response.raise_for_status = mocker.Mock()
-    mock_http_client.request = AsyncMock(return_value=mock_response)
+    mock_http_client.request = AsyncMock(side_effect=[mock_response, mock_response])
 
     with pytest.raises(RemoteProtocolError, match="Truncated download"):
         await client.read_file("Active-Personal/fw9-filled.pdf")
+    assert mock_http_client.request.await_count == 2
+
+
+@pytest.mark.unit
+async def test_read_file_retries_once_after_truncated_body_then_succeeds(mocker):
+    """A stale pooled GET failure is retried once before surfacing to callers."""
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+    client._principal_discovered = True
+
+    stale_response = AsyncMock()
+    stale_response.content = b""
+    stale_response.headers = {
+        "content-type": "application/json",
+        "content-length": "12",
+    }
+    stale_response.raise_for_status = mocker.Mock()
+
+    healthy_response = AsyncMock()
+    healthy_response.content = b'{"ok": true}'
+    healthy_response.headers = {
+        "content-type": "application/json",
+        "content-length": str(len(healthy_response.content)),
+        "etag": '"abc123"',
+    }
+    healthy_response.raise_for_status = mocker.Mock()
+
+    mock_http_client.request = AsyncMock(side_effect=[stale_response, healthy_response])
+
+    content, content_type, etag = await client.read_file("Documents/state.json")
+
+    assert content == healthy_response.content
+    assert content_type == "application/json"
+    assert etag == "abc123"
+    assert mock_http_client.request.await_count == 2
 
 
 @pytest.mark.unit
@@ -636,6 +672,7 @@ async def test_read_file_accepts_matching_content_length(mocker):
     """A body matching Content-Length is returned unchanged."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
+    client._principal_discovered = True
 
     body = b"%PDF-1.7 full body"
     mock_response = AsyncMock()
@@ -647,7 +684,7 @@ async def test_read_file_accepts_matching_content_length(mocker):
     mock_response.raise_for_status = mocker.Mock()
     mock_http_client.request = AsyncMock(return_value=mock_response)
 
-    content, content_type = await client.read_file("Documents/report.pdf")
+    content, content_type, _ = await client.read_file("Documents/report.pdf")
     assert content == body
     assert content_type == "application/pdf"
 
@@ -657,6 +694,7 @@ async def test_read_file_skips_check_without_content_length(mocker):
     """A header-less (e.g. chunked) response must not raise — nothing to compare."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
+    client._principal_discovered = True
 
     body = b"chunked body of unknown declared length"
     mock_response = AsyncMock()
@@ -665,8 +703,31 @@ async def test_read_file_skips_check_without_content_length(mocker):
     mock_response.raise_for_status = mocker.Mock()
     mock_http_client.request = AsyncMock(return_value=mock_response)
 
-    content, _ = await client.read_file("Documents/stream.txt")
+    content, _, _ = await client.read_file("Documents/stream.txt")
     assert content == body
+
+
+@pytest.mark.unit
+async def test_read_file_skips_content_length_check_for_encoded_body(mocker):
+    """Encoded responses expose decoded bytes, so compressed Content-Length is not comparable."""
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+    client._principal_discovered = True
+
+    body = b'{"decoded": true}'
+    mock_response = AsyncMock()
+    mock_response.content = body
+    mock_response.headers = {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "content-length": "8",
+    }
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    content, _, _ = await client.read_file("Documents/encoded.json")
+    assert content == body
+    assert mock_http_client.request.await_count == 1
 
 
 @pytest.mark.unit
@@ -684,10 +745,11 @@ async def test_get_note_attachment_raises_on_truncated_body(mocker):
         "content-length": "2048",
     }
     mock_response.raise_for_status = mocker.Mock()
-    mock_http_client.request = AsyncMock(return_value=mock_response)
+    mock_http_client.request = AsyncMock(side_effect=[mock_response, mock_response])
 
     with pytest.raises(RemoteProtocolError, match="Truncated download"):
         await client.get_note_attachment(123, "doc.pdf")
+    assert mock_http_client.request.await_count == 2
 
 
 @pytest.mark.unit
