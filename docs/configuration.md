@@ -274,6 +274,23 @@ They do **not** affect connections to internal services (Ollama, Qdrant, Unstruc
 
 ---
 
+## Gateway Secret (Optional)
+
+Set `MCP_GATEWAY_SECRET` when the MCP transport is published through a reverse
+proxy, tunnel, or gateway that can inject a shared secret header. When configured,
+the server rejects every HTTP request outside health probes and OAuth discovery
+metadata unless the request includes either `X-MCP-Gateway-Secret: <secret>` or
+`Authorization: Bearer <secret>`.
+
+```dotenv
+MCP_GATEWAY_SECRET=change-me
+```
+
+Leave the variable unset for local-only deployments or when an outer gateway
+already provides equivalent authentication.
+
+---
+
 ## Health & Readiness Probes
 
 The server exposes two Kubernetes probe endpoints:

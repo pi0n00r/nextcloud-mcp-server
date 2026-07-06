@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import logging
 import os
@@ -149,6 +150,76 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 HTTPXClientInstrumentor().instrument()
+
+
+
+# Pre-shared-secret gate paths exempt from MCP_GATEWAY_SECRET. Health probes and
+# OAuth discovery metadata must remain reachable without transport credentials.
+_GATEWAY_GATE_OPEN_PREFIXES = (
+    "/health",
+    "/.well-known",
+)
+
+
+class GatewaySecretMiddleware:
+    """Optional pre-shared-secret gate for exposed MCP deployments.
+
+    When ``MCP_GATEWAY_SECRET`` is configured, every HTTP request outside the
+    open prefixes must present the shared secret using either
+    ``X-MCP-Gateway-Secret: <secret>`` or ``Authorization: Bearer <secret>``.
+    This gives deployments that publish the MCP transport through a reverse
+    proxy or tunnel a simple outer auth gate before requests reach application
+    routes or stored Nextcloud credentials.
+
+    The middleware is fail-open by construction: callers only install it when
+    a non-empty secret is configured, preserving existing behavior by default.
+    """
+
+    def __init__(self, app: ASGIApp, secret: str) -> None:
+        assert secret, "GatewaySecretMiddleware requires a non-empty secret"
+        self.app = app
+        self._secret = secret
+
+    def _present_secret(self, headers: list[tuple[bytes, bytes]]) -> str | None:
+        for name, value in headers:
+            if name == b"x-mcp-gateway-secret":
+                return value.decode("latin-1")
+            if name == b"authorization":
+                raw = value.decode("latin-1")
+                if raw[:7].lower() == "bearer ":
+                    return raw[7:].strip()
+        return None
+
+    async def __call__(
+        self, scope: StarletteScope, receive: Receive, send: Send
+    ) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path.startswith(_GATEWAY_GATE_OPEN_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        presented = self._present_secret(scope.get("headers", []))
+        ok = presented is not None and hmac.compare_digest(presented, self._secret)
+        if not ok:
+            response = JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mcp-gateway"'},
+                content={
+                    "error": "unauthorized",
+                    "error_description": (
+                        "MCP gateway secret required "
+                        "(X-MCP-Gateway-Secret or Authorization: Bearer)."
+                    ),
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
 
 
 def initialize_document_processors():
@@ -3055,6 +3126,17 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         app = BasicAuthMiddleware(app)
         logger.info(
             "BasicAuthMiddleware enabled - multi-user BasicAuth pass-through mode active"
+        )
+
+    # Outermost gate: pre-shared-secret check (Piranesi P1 fda535d). Wraps
+    # everything else so an unauthenticated funnel request is rejected before
+    # reaching CORS / BasicAuth / the MCP transport. Fail-open when unset.
+    gateway_secret = os.getenv("MCP_GATEWAY_SECRET", "").strip()
+    if gateway_secret:
+        app = GatewaySecretMiddleware(app, gateway_secret)
+        logger.info(
+            "GatewaySecretMiddleware enabled - MCP transport gated behind "
+            "MCP_GATEWAY_SECRET (health + .well-known exempt)"
         )
 
     return app
