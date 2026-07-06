@@ -413,10 +413,11 @@ class TieredEscalationStrategy(BaseRetryStrategy):
             # Batch OCR job still in flight (Deck #332): defer a re-poll on the
             # SAME queue after retry_in seconds. Deliberately exempt from the
             # transient cap below — a batch job can take minutes-hours, so the
-            # poll count is unbounded here; the OCR processor's own deadline
-            # (DOCUMENT_OCR_BATCH_MAX_WAIT_SECONDS) is what terminates a stuck job.
-            # Releasing the worker between polls keeps the job out of `doing`, so
-            # it's never stall-reclaimed.
+            # poll count is unbounded here. A pending job is polled indefinitely:
+            # once the gateway accepts a document it owns the OCR lifecycle (Deck
+            # #523), so there is no worker-side give-up deadline; only a job-level
+            # failure terminalises it. Releasing the worker between polls keeps the
+            # job out of `doing`, so it's never stall-reclaimed.
             return RetryDecision(retry_in={"seconds": exc.retry_in})
 
         if isinstance(exc, EscalateError):
@@ -500,12 +501,29 @@ def build_app(connector: BaseConnector) -> App:
     return app
 
 
+# psycopg3 auto-prepares statements as server-side NAMED statements (``_pg3_N``, a
+# per-client counter). Behind a pgbouncer TRANSACTION-mode pooler (Deck #424) many
+# clients share the same backend server connections, so those names collide across
+# clients (``DuplicatePreparedStatement``, or a param-count ``ProtocolViolation``).
+# The failed statement aborts its transaction, and in transaction pooling an
+# aborted-but-open transaction never releases its server connection — the tenant's
+# small server pool fills with stuck ``idle in transaction (aborted)`` backends and
+# a new worker's pool init then times out (``psycopg_pool.PoolTimeout``). Disabling
+# auto-prepare (``prepare_threshold=None`` → psycopg uses unnamed statements) is the
+# standard fix. Applied UNCONDITIONALLY: harmless connecting direct (a negligible
+# re-parse cost for this poll-heavy workload) and it removes the footgun of pointing
+# a worker at a transaction-mode pooler without it — exactly how #424 regressed
+# (LISTEN/NOTIFY was disabled for the pooler, but prepared statements were not).
+# Passed to psycopg via the pool's per-connection ``kwargs`` (PsycopgConnector
+# forwards ``**kwargs`` to ``psycopg_pool.AsyncConnectionPool``).
+def _psycopg_connector(conninfo: str) -> PsycopgConnector:
+    return PsycopgConnector(conninfo=conninfo, kwargs={"prepare_threshold": None})
+
+
 def build_app_for_url(database_url: str) -> App:
     """Build an App bound to an explicit Postgres URL (for the CLI, which may
     target a ``--database-url`` that differs from the ``DATABASE_URL`` env)."""
-    return build_app(
-        PsycopgConnector(conninfo=get_procrastinate_conninfo(database_url))
-    )
+    return build_app(_psycopg_connector(get_procrastinate_conninfo(database_url)))
 
 
 _app: App | None = None
@@ -515,7 +533,7 @@ def get_procrastinate_app() -> App:
     """Process-wide procrastinate App bound to the Postgres app database."""
     global _app
     if _app is None:
-        _app = build_app(PsycopgConnector(conninfo=get_procrastinate_conninfo()))
+        _app = build_app(_psycopg_connector(get_procrastinate_conninfo()))
     return _app
 
 

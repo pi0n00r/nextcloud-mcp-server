@@ -5,6 +5,39 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.129.6 (2026-07-05)
+
+### Fix
+
+- **deps**: update dependency icalendar to >=7.2.0,<7.3.0
+
+## v0.129.5 (2026-07-05)
+
+### Refactor
+
+- **config**: drop redundant local `import re` in mask_db_password
+- **db**: pass DATABASE_URL through to psycopg verbatim; drop asyncpg
+
+## v0.129.4 (2026-07-05)
+
+### Fix
+
+- **ingest**: disable psycopg prepared statements behind the pgbouncer pooler
+
+## v0.129.3 (2026-07-05)
+
+### Fix
+
+- **ocr**: cap batch-poll Retry-After + test floor/cap/submit-path (#1027 review r2)
+- **ocr**: poll batch jobs forever + honour gateway Retry-After (Deck #523)
+
+## v0.129.2 (2026-07-04)
+
+### Fix
+
+- **ingest**: cache the poll batch-client + narrow gate + integration tests (Deck #518 review)
+- **ingest**: skip WebDAV re-download on batch-OCR poll retries (Deck #516/#518)
+
 ## v0.129.1 (2026-07-03)
 
 ### Refactor

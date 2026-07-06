@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.129.1"
+version = "0.129.6"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -13,7 +13,7 @@ dependencies = [
     "mcp[cli] (>=1.28,<1.29)",
     "httpx (>=0.28.1,<0.29.0)",
     "pillow (>=10.3.0,<12.0.0)", # Compatible with fastembed
-    "icalendar (>=7.1.0,<7.2.0)",
+    "icalendar (>=7.2.0,<7.3.0)",
     "pythonvcard4>=0.2.0",
     "pydantic>=2.11.4",
     "click>=8.1.8",
@@ -139,7 +139,6 @@ nextcloud-mcp-server = "nextcloud_mcp_server.cli:cli"
 
 [project.optional-dependencies]
 postgres = [
-    "asyncpg>=0.29",
     "procrastinate>=3.8",
     "psycopg[binary,pool]>=3.2",
 ]
