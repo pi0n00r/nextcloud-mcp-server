@@ -1,6 +1,6 @@
 """Pydantic models for Calendar app responses."""
 
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -69,9 +69,6 @@ class CalendarEventSummary(BaseModel):
     )
     calendar_display_name: Optional[str] = Field(
         None, description="Display name of calendar containing this event"
-    )
-    reminders: List[dict[str, Any]] = Field(
-        default_factory=list, description="Ordered VALARM reminder objects"
     )
 
 
@@ -251,9 +248,6 @@ class Todo(BaseModel):
     )
     calendar_display_name: Optional[str] = Field(
         None, description="Display name of calendar containing this todo"
-    )
-    reminders: List[dict[str, Any]] = Field(
-        default_factory=list, description="Ordered VALARM reminder objects"
     )
 
 
