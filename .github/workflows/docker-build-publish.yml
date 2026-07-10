@@ -33,6 +33,10 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
+      - name: Capture checked-out source revision
+        id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Validate source version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
@@ -67,6 +71,6 @@ jobs:
             org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
             org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.PACKAGE_TAG }}
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
             org.opencontainers.image.description=Stable v1.3.0 package for nextcloud-mcp-server 0.130.1
