@@ -35,7 +35,7 @@ async def test_mcp_todo_complete_workflow(
                 "description": "Test task created via MCP tools",
                 "status": "NEEDS-ACTION",
                 "priority": 3,
-                "due": tomorrow.strftime("%Y-%m-%dT18:00:00"),
+                "due": tomorrow.strftime("%Y-%m-%dT18:00:00Z"),
                 "categories": "testing,mcp",
             },
         )
@@ -329,7 +329,7 @@ async def test_mcp_todo_status_transitions(
 
         # Transition: IN-PROCESS → COMPLETED
         logger.info("Transitioning todo to COMPLETED via MCP")
-        completed_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        completed_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         update_result = await nc_mcp_client.call_tool(
             "nc_calendar_update_todo",
             {
@@ -368,8 +368,8 @@ async def test_mcp_todo_with_dates(
 
     try:
         now = datetime.now()
-        start_date = (now + timedelta(days=1)).strftime("%Y-%m-%dT09:00:00")
-        due_date = (now + timedelta(days=7)).strftime("%Y-%m-%dT17:00:00")
+        start_date = (now + timedelta(days=1)).strftime("%Y-%m-%dT09:00:00Z")
+        due_date = (now + timedelta(days=7)).strftime("%Y-%m-%dT17:00:00Z")
 
         # Create todo with dates via MCP
         logger.info("Creating todo with dates via MCP")

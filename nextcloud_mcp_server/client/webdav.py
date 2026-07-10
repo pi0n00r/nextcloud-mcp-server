@@ -726,6 +726,7 @@ class WebDAVClient(BaseNextcloudClient):
         self, path: str, recursive: bool = False
     ) -> Dict[str, Any]:
         """Create a directory via WebDAV MKCOL."""
+        await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)
         if not webdav_path.endswith("/"):
             webdav_path += "/"

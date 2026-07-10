@@ -169,8 +169,8 @@ async def test_create_contact_persists_all_documented_fields(
     try:
         # create_contact always writes <uid>.vcf, so fetch that object directly
         # (no PROPFIND resolution needed for a contact we just created).
-        raw_vcard, _etag = await nc_client.contacts._fetch_raw_vcard(
-            addressbook_name, f"{contact_uid}.vcf"
+        raw_vcard, _etag = await nc_client.contacts._get_raw_vcard(
+            addressbook_name, contact_uid
         )
         assert "FN:Full Field User" in raw_vcard
         assert "EMAIL" in raw_vcard and "full@example.com" in raw_vcard
