@@ -27,7 +27,7 @@ jobs:
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
       - name: Run unit tests
-        run: uv run pytest -v -m unit -o "addopts=-p no:asyncio"
+        run: uv run pytest -v -W error tests/unit -o "addopts=-p no:asyncio"
 
   # Cross-platform install smoke test. Installs the package (and its full
   # dependency closure) into an isolated environment and runs the CLI

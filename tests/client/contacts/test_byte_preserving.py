@@ -19,7 +19,6 @@ CardDAV server) are gated behind ``REQUIRES_LIVE_NC=1``.
 
 from nextcloud_mcp_server.client.vcard_parser import VCard, patch_vcard
 
-
 # Mankind Grooming reference vCard — the canonical clobber victim.
 MANKIND_GROOMING = (
     "BEGIN:VCARD\r\n"

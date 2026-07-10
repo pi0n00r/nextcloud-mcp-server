@@ -98,7 +98,7 @@ async def _get_provisioning_status(ctx: Context, user_id: str) -> ProvisioningSt
     Returns:
         ProvisioningStatus with current provisioning state
     """
-    settings = get_settings()
+    get_settings()
 
     # Check for OAuth refresh token (fallback)
     logger.debug(

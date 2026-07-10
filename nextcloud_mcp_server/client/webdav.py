@@ -1,4 +1,5 @@
 """WebDAV client for Nextcloud file operations."""
+# ruff: noqa: G004
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -12,6 +13,7 @@
 
 import logging
 import mimetypes
+import uuid
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -664,8 +666,6 @@ class WebDAVClient(BaseNextcloudClient):
         3. MOVE /remote.php/dav/uploads/<user>/<chunkid>/.file
            with Destination header pointing at the final webdav path.
         """
-        import uuid
-
         chunk_id = uuid.uuid4().hex
         upload_root = f"/remote.php/dav/uploads/{self.username}/{chunk_id}"
         final_dest_path = f"{self._get_webdav_base_path()}/{path.lstrip('/')}"
