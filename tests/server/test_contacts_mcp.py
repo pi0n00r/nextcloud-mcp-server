@@ -64,9 +64,8 @@ async def test_mcp_contacts_workflow(
         contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
         created = next((c for c in contacts if c["vcard_id"] == contact_uid), None)
         assert created is not None
-        raw_vcard = created.get("addressdata", "")
-        assert "ORG:MCP Test Corp" in raw_vcard
-        assert f"NOTE:Created by test {unique_suffix}" in raw_vcard
+        assert created["contact"]["org"] == "MCP Test Corp"
+        assert created["contact"]["note"] == f"Created by test {unique_suffix}"
 
         # 4a. Read-side round-trip — issue #716 follow-up. The write side has
         # been correct since PR #719, but the MCP list/search tools returned
@@ -96,9 +95,11 @@ async def test_mcp_contacts_workflow(
             },
         )
         assert update_result.isError is False
-        contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
+        contacts = await nc_client.contacts.list_contacts(
+            addressbook=addressbook_name, include_vcard=True
+        )
         updated = next(c for c in contacts if c["vcard_id"] == contact_uid)
-        updated_vcard = updated.get("addressdata", "")
+        updated_vcard = updated["vcard_text"]
         assert "mcp-test.example.com" in updated_vcard
         # Prior properties must not have been clobbered by the merge.
         assert "ORG:MCP Test Corp" in updated_vcard

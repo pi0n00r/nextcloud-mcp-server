@@ -28,7 +28,7 @@ async def temporary_todo(nc_client: NextcloudClient, temporary_calendar: str):
         "description": "Test todo created by integration tests",
         "status": "NEEDS-ACTION",
         "priority": 5,
-        "due": tomorrow.strftime("%Y-%m-%dT18:00:00"),
+        "due": tomorrow.strftime("%Y-%m-%dT18:00:00Z"),
         "categories": "testing",
     }
 
@@ -75,7 +75,7 @@ async def test_create_and_delete_todo(
         "description": "Test task for integration testing",
         "status": "NEEDS-ACTION",
         "priority": 3,
-        "due": tomorrow.strftime("%Y-%m-%dT18:00:00"),
+        "due": tomorrow.strftime("%Y-%m-%dT18:00:00Z"),
         "categories": "testing,integration",
     }
 
@@ -206,8 +206,8 @@ async def test_todo_with_dates(nc_client: NextcloudClient, temporary_calendar: s
         "summary": "Task with Dates",
         "description": "Test task with various date fields",
         "status": "NEEDS-ACTION",
-        "dtstart": start_date.strftime("%Y-%m-%dT09:00:00"),
-        "due": due_date.strftime("%Y-%m-%dT17:00:00"),
+        "dtstart": start_date.strftime("%Y-%m-%dT09:00:00Z"),
+        "due": due_date.strftime("%Y-%m-%dT17:00:00Z"),
     }
 
     try:
@@ -264,7 +264,7 @@ async def test_todo_status_transitions(
         assert todo["percent_complete"] == 25
 
         # Transition: IN-PROCESS → COMPLETED
-        completed_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        completed_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         await nc_client.calendar.update_todo(
             calendar_name,
             todo_uid,

@@ -1008,26 +1008,18 @@ async def nc_mcp_login_flow_ldap_alice_client(
 
 
 # Static OIDC client used by the management API integration tests.
-# Matches the `mcp-login-flow` allowlist
-# (`ALLOWED_MGMT_CLIENT=astrolabeMcpClientOAuth00000000000`) — i.e. the same
-# id `app-hooks/before-starting/26-configure-astrolabe-oauth.sh` provisions
-# in real deployments — so tokens issued to it pass the management API
-# allowlist check on `mcp-login-flow` and exercise the production-shaped
-# code path.
-STATIC_MGMT_CLIENT_ID = "astrolabeMcpClientOAuth00000000000"
+# Matches the generic management client allowlisted by the login-flow service.
+STATIC_MGMT_CLIENT_ID = "nextcloudMcpServerUIPublicClient"
 
 
 @pytest.fixture(scope="session")
 async def login_flow_static_client_credentials(anyio_backend, oauth_callback_server):
-    """Pre-create the static OIDC client `astrolabeMcpClientOAuth00000000000`
+    """Pre-create the static management OIDC client
     via `occ oidc:create` with the test's OAuth callback URL.
 
-    The static client_id matches the id provisioned by
-    `app-hooks/before-starting/26-configure-astrolabe-oauth.sh` in real
-    deployments, and is allowlisted on `mcp-login-flow` via
-    `ALLOWED_MGMT_CLIENT`, so tokens it issues pass the management API
-    allowlist check. Uses a confidential JWT-token client to match
-    production Astrolabe configuration.
+    The client id is allowlisted on `mcp-login-flow` via
+    `ALLOWED_MGMT_CLIENT`, so its tokens pass the management API check. Uses a
+    confidential JWT-token client to exercise the production-shaped path.
 
     Yields: (client_id, client_secret, callback_url, token_endpoint, authorization_endpoint)
     """

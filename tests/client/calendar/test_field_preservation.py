@@ -201,7 +201,9 @@ END:VCARD"""
         assert "NOTE:This is a note with important information" in raw_vcard_before
 
         # List contacts through the MCP client (this will parse and return limited fields)
-        contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
+        contacts = await nc_client.contacts.list_contacts(
+            addressbook=addressbook_name, include_vcard=True
+        )
         our_contact = next((c for c in contacts if c["vcard_id"] == contact_uid), None)
 
         assert our_contact is not None
@@ -215,10 +217,10 @@ END:VCARD"""
         assert parsed_contact["fullname"] == "John Extended Doe"
         assert parsed_contact["email"] is not None  # Some email should be present
 
-        # The raw vCard should still be available in addressdata
-        raw_addressdata = our_contact["addressdata"]
-        assert "X-CUSTOM-FIELD:This should be preserved" in raw_addressdata
-        assert "ORG:Example Corporation" in raw_addressdata
+        # Raw data remains available only when explicitly requested.
+        raw_vcard = our_contact["vcard_text"]
+        assert "X-CUSTOM-FIELD:This should be preserved" in raw_vcard
+        assert "ORG:Example Corporation" in raw_vcard
 
         # The key test: Can we update this contact without losing extended field data?
         logger.info("Testing contact update preservation...")
@@ -237,14 +239,14 @@ END:VCARD"""
 
         # Retrieve the contact again to see if extended fields survived
         contacts_after = await nc_client.contacts.list_contacts(
-            addressbook=addressbook_name
+            addressbook=addressbook_name, include_vcard=True
         )
         updated_contact = next(
             (c for c in contacts_after if c["vcard_id"] == contact_uid), None
         )
 
         assert updated_contact is not None, "Contact not found after update"
-        updated_addressdata = updated_contact["addressdata"]
+        updated_addressdata = updated_contact["vcard_text"]
 
         logger.info("Raw vCard after contact update:")
         logger.info(updated_addressdata)

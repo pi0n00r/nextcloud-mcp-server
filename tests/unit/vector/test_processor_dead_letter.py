@@ -58,7 +58,9 @@ def _nc_client() -> MagicMock:
     # MagicMock (typed Any) keeps the pre-commit ty-check happy where the real
     # signature wants a NextcloudClient -- matching the other processor tests.
     nc = MagicMock()
-    nc.webdav.read_file = AsyncMock(return_value=(b"%PDF-1.4", "application/pdf"))
+    nc.webdav.read_file = AsyncMock(
+        return_value=(b"%PDF-1.4", "application/pdf", "etag-1")
+    )
     return nc
 
 

@@ -1191,9 +1191,7 @@ def configure_calendar_tools(mcp: FastMCP):
             "percent_complete": 100,
             "completed": completed_at,
         }
-        return await client.calendar.update_todo(
-            calendar_name, todo_uid, todo_data
-        )
+        return await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
 
     @mcp.tool(
         title="Search Todo Tasks",

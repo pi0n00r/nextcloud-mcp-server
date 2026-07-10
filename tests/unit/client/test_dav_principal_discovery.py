@@ -130,6 +130,26 @@ async def test_webdav_public_method_discovers_divergent_principal(mocker):
     )
 
 
+async def test_webdav_create_directory_discovers_divergent_principal(mocker):
+    client = WebDAVClient(mocker.AsyncMock(spec=httpx.AsyncClient), "alice")
+    client._make_request = mocker.AsyncMock(
+        side_effect=[
+            _http_response(_principal_body("alice_1234")),
+            _http_response(status_code=201),
+        ]
+    )
+
+    result = await client.create_directory("Documents")
+
+    assert result["status_code"] == 201
+    calls = client._make_request.await_args_list
+    assert calls[0].args[:2] == ("PROPFIND", "/remote.php/dav/")
+    assert calls[1].args[:2] == (
+        "MKCOL",
+        "/remote.php/dav/files/alice_1234/Documents/",
+    )
+
+
 def test_webdav_search_scope_uses_discovered_principal(mocker):
     client = WebDAVClient(mocker.AsyncMock(spec=httpx.AsyncClient), "alice")
     client._principal_id = "alice_1234"

@@ -5,8 +5,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from nextcloud_mcp_server.client.webdav import EtagConflictError
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.webdav import EtagConflictError
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models import DirectoryListing, FileInfo, SearchFilesResponse
 from nextcloud_mcp_server.observability.metrics import instrument_tool

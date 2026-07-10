@@ -11,7 +11,6 @@ import httpx
 
 from .config import get_nextcloud_ssl_verify
 
-
 NEXTCLOUD_KEEPALIVE_EXPIRY_SECONDS = 5.0
 
 

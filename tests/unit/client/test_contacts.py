@@ -462,3 +462,24 @@ class TestNormalizeContactData:
 
     def test_passthrough_for_unknown_keys(self):
         assert _normalize_contact_data({"foo": "bar"}) == {"foo": "bar"}
+
+
+async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client.patch_contact = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        result = await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={"url": "https://example.com/profile"},
+            etag="etag-1",
+        )
+
+    assert result == {"uid": "alice"}
+    client.patch_contact.assert_awaited_once_with(
+        addressbook="contacts",
+        uid="alice",
+        etag="etag-1",
+        set_props={"URL": "https://example.com/profile"},
+    )

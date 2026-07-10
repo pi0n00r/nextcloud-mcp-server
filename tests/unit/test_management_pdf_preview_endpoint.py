@@ -211,7 +211,9 @@ class TestPdfPreviewRendering:
 
         # Mock the WebDAV client
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -257,7 +259,9 @@ class TestPdfPreviewRendering:
         pdf_bytes = create_mock_pdf_bytes()
 
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -314,7 +318,9 @@ class TestPdfPreviewRendering:
         pdf_bytes = create_mock_pdf_bytes()
 
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -387,7 +393,9 @@ class TestPdfPreviewRendering:
         pdf_bytes = create_mock_pdf_bytes()
 
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -428,7 +436,9 @@ class TestPdfPreviewEdgeCases:
         pdf_bytes = create_mock_pdf_bytes()
 
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -489,7 +499,7 @@ class TestPdfPreviewEdgeCases:
         mock_webdav = AsyncMock()
         # Return invalid PDF bytes
         mock_webdav.read_file = AsyncMock(
-            return_value=(b"not a valid pdf", "application/pdf")
+            return_value=(b"not a valid pdf", "application/pdf", None)
         )
 
         mock_nc_client = MagicMock()
@@ -529,7 +539,9 @@ class TestPdfPreviewEdgeCases:
         pdf_bytes = create_mock_pdf_bytes()
 
         mock_webdav = AsyncMock()
-        mock_webdav.read_file = AsyncMock(return_value=(pdf_bytes, "application/pdf"))
+        mock_webdav.read_file = AsyncMock(
+            return_value=(pdf_bytes, "application/pdf", None)
+        )
 
         mock_nc_client = MagicMock()
         mock_nc_client.webdav = mock_webdav
@@ -610,7 +622,7 @@ class TestPdfPreviewSecurityValidation:
 
         mock_webdav = AsyncMock()
         mock_webdav.read_file = AsyncMock(
-            return_value=(large_pdf_bytes, "application/pdf")
+            return_value=(large_pdf_bytes, "application/pdf", None)
         )
 
         mock_nc_client = MagicMock()
@@ -649,7 +661,7 @@ class TestPdfPreviewSecurityValidation:
 
         mock_webdav = AsyncMock()
         mock_webdav.read_file = AsyncMock(
-            return_value=(corrupted_pdf_bytes, "application/pdf")
+            return_value=(corrupted_pdf_bytes, "application/pdf", None)
         )
 
         mock_nc_client = MagicMock()
@@ -690,7 +702,7 @@ class TestPdfPreviewSecurityValidation:
 
         mock_webdav = AsyncMock()
         mock_webdav.read_file = AsyncMock(
-            return_value=(empty_pdf_bytes, "application/pdf")
+            return_value=(empty_pdf_bytes, "application/pdf", None)
         )
 
         mock_nc_client = MagicMock()
