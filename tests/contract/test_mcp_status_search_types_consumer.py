@@ -17,7 +17,7 @@ provider-state strings. The matching server-side states are registered in
 them once the management client publishes its real consumer pact.
 
 The generated pact is written to ``provider_contracts/`` (NOT ``pacts/``) so the
-``pact-broker publish tests/contract/pacts`` step never publishes it under *our*
+``pact broker publish tests/contract/pacts`` step never publishes it under *our*
 consumer identity — the management client owns and publishes the real consumer
 pact. The real provider response is verified by
 ``tests/unit/test_management_status_endpoint.py``
