@@ -48,6 +48,7 @@ class TestBuildTransport:
         # Memory backend exposes both raw stream ends.
         assert transport.send_stream is not None
         assert transport.receive_stream is not None
+        await transport.aclose()
 
     async def test_postgres_returns_distributed_transport(self, monkeypatch):
         producer = AsyncMock()
@@ -85,6 +86,7 @@ class TestLocalTransport:
             received_streams.append(receive_stream)
             # Must signal readiness or tg.start blocks forever.
             task_status.started()
+            await receive_stream.aclose()
 
         async with anyio.create_task_group() as tg:
             await transport.run_consumers(tg, fake_worker, 3)
@@ -96,6 +98,7 @@ class TestLocalTransport:
         assert len(received_streams) == 3
         assert all(s is not None for s in received_streams)
         assert len({id(s) for s in received_streams}) == 3
+        await transport.aclose()
 
     async def test_aclose_closes_owned_streams_idempotently(self):
         transport = LocalTransport(max_buffer_size=5)

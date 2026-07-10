@@ -105,7 +105,9 @@ async def test_read_file_passes_through_when_not_excluded(
 ):
     patch_get_client(fake_client)
     patch_excluded({"Secret.txt"})
-    fake_client.webdav.read_file = AsyncMock(return_value=(b"hello", "text/plain"))
+    fake_client.webdav.read_file = AsyncMock(
+        return_value=(b"hello", "text/plain", '"etag"')
+    )
 
     fn = webdav_tools["nc_webdav_read_file"].fn
     result = await fn(path="/Public/notes.md", ctx=_mock_ctx(fake_client))

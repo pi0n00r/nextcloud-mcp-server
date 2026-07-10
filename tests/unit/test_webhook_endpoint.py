@@ -34,6 +34,23 @@ def _reset_warned_flag():
 
 
 @pytest.fixture(autouse=True)
+def _close_test_streams(monkeypatch):
+    """Close raw memory streams allocated by each synchronous webhook test."""
+    create_stream = anyio.create_memory_object_stream
+    opened = []
+
+    def tracked_create_stream(*args, **kwargs):
+        streams = create_stream(*args, **kwargs)
+        opened.extend(streams)
+        return streams
+
+    monkeypatch.setattr(anyio, "create_memory_object_stream", tracked_create_stream)
+    yield
+    for stream in opened:
+        stream.close()
+
+
+@pytest.fixture(autouse=True)
 def _default_secret(monkeypatch):
     """Default every test to a configured WEBHOOK_SECRET. Auth-specific tests
     override this by calling ``_patch_secret`` in the test body (last patch

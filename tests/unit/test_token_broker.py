@@ -282,7 +282,9 @@ class TestTokenBrokerService:
                 # Verify cache was cleared
                 assert await token_broker.cache.get("user1") is None
 
-    async def test_token_refresh_with_network_error(self, token_broker, mock_storage):
+    async def test_token_refresh_with_network_error(
+        self, token_broker, mock_storage, mock_oidc_config
+    ):
         """Test handling network errors during token refresh."""
         # Storage returns already-decrypted refresh token
         mock_storage.get_refresh_token.return_value = {
@@ -290,8 +292,13 @@ class TestTokenBrokerService:
             "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
         }
 
-        # Mock network error
-        with patch.object(token_broker, "_get_http_client") as mock_client:
+        # OIDC discovery succeeds; the token endpoint request itself fails.
+        with (
+            patch.object(
+                token_broker, "_get_oidc_config", return_value=mock_oidc_config
+            ),
+            patch.object(token_broker, "_get_http_client") as mock_client,
+        ):
             mock_client.return_value.post = AsyncMock(
                 side_effect=httpx.NetworkError("Connection failed")
             )

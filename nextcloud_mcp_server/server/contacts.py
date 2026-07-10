@@ -89,6 +89,30 @@ def _raw_contact_to_model(raw: dict) -> Contact:
     contact_info = raw.get("contact", {})
     emails = _parse_vcard_fields(contact_info.get("email"), "email")
     phones = _parse_vcard_fields(contact_info.get("tel"), "phone")
+
+    raw_urls = contact_info.get("url")
+    if isinstance(raw_urls, str):
+        raw_urls = [raw_urls] if raw_urls else []
+    urls = [
+        ContactField(type="url", value=url)
+        for url in (raw_urls or [])
+        if isinstance(url, str) and url
+    ]
+
+    raw_categories = contact_info.get("categories") or []
+    if isinstance(raw_categories, str):
+        categories = [
+            category.strip()
+            for category in raw_categories.split(",")
+            if category.strip()
+        ]
+    else:
+        categories = [
+            category
+            for category in raw_categories
+            if isinstance(category, str) and category
+        ]
+
     custom_fields: dict[str, Any] = {}
     nickname = contact_info.get("nickname")
     if nickname:
@@ -104,6 +128,12 @@ def _raw_contact_to_model(raw: dict) -> Contact:
         else contact_info.get("birthday"),
         emails=emails,
         phones=phones,
+        organization=contact_info.get("org"),
+        title=contact_info.get("title"),
+        note=contact_info.get("note"),
+        photo=contact_info.get("photo"),
+        urls=urls,
+        categories=categories,
         custom_fields=custom_fields,
     )
 

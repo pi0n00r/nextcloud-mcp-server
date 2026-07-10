@@ -869,6 +869,7 @@ class WebDAVClient(BaseNextcloudClient):
         properties: Optional[List[str]] = None,
         order_by: Optional[List[Tuple[str, str]]] = None,
         limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Search for files using WebDAV SEARCH method (RFC 5323).
 
@@ -878,6 +879,9 @@ class WebDAVClient(BaseNextcloudClient):
             properties: List of property names to retrieve (defaults to basic set)
             order_by: List of (property, direction) tuples for sorting, e.g. [("getlastmodified", "descending")]
             limit: Maximum number of results to return
+            offset: Number of leading results to skip. Call ``search_files_all``
+                when complete coverage is required because some Nextcloud
+                versions ignore this value.
 
         Returns:
             List of file/directory dictionaries with requested properties
@@ -900,6 +904,7 @@ class WebDAVClient(BaseNextcloudClient):
             properties=properties,
             order_by=order_by,
             limit=limit,
+            offset=offset,
         )
 
         # The SEARCH endpoint is at the dav root
@@ -942,6 +947,121 @@ class WebDAVClient(BaseNextcloudClient):
             )
             raise e
 
+    async def search_files_all(
+        self,
+        scope: str = "",
+        where_conditions: Optional[str] = None,
+        properties: Optional[List[str]] = None,
+        order_by: Optional[List[Tuple[str, str]]] = None,
+        page_size: int = WEBDAV_SEARCH_PAGE_SIZE,
+        max_results: int = WEBDAV_SEARCH_MAX_RESULTS,
+    ) -> List[Dict[str, Any]]:
+        """Fetch a complete bounded SEARCH result set.
+
+        Offset paging is attempted first. Servers that ignore or reject the
+        offset fall back to one explicit bounded fetch, avoiding silent
+        truncation at Nextcloud's default SEARCH page size.
+        """
+        paged = await self._search_offset_paged(
+            scope, where_conditions, properties, order_by, page_size, max_results
+        )
+        if paged is None:
+            return await self._single_fetch_fallback(
+                scope, where_conditions, properties, order_by, max_results
+            )
+        self._warn_if_truncated(len(paged), scope, max_results)
+        return paged[:max_results]
+
+    async def _search_offset_paged(
+        self,
+        scope: str,
+        where_conditions: Optional[str],
+        properties: Optional[List[str]],
+        order_by: Optional[List[Tuple[str, str]]],
+        page_size: int,
+        max_results: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return offset-paged rows, or ``None`` when fallback is required."""
+
+        def _key(item: Dict[str, Any]) -> Any:
+            return item.get("file_id") or item.get("path") or id(item)
+
+        results: List[Dict[str, Any]] = []
+        seen: set[Any] = set()
+        offset = 0
+
+        while len(results) < max_results:
+            try:
+                page = await self.search_files(
+                    scope=scope,
+                    where_conditions=where_conditions,
+                    properties=properties,
+                    order_by=order_by,
+                    limit=page_size,
+                    offset=offset,
+                )
+            except Exception:
+                if offset == 0:
+                    raise
+                logger.warning(
+                    "WebDAV SEARCH offset page failed for scope %r; "
+                    "falling back to single fetch",
+                    scope,
+                )
+                return None
+
+            if not page:
+                break
+
+            fresh = [item for item in page if _key(item) not in seen]
+            if offset > 0 and not fresh:
+                logger.warning(
+                    "WebDAV SEARCH ignored offset for scope %r; "
+                    "falling back to single fetch (limit=%d)",
+                    scope,
+                    max_results,
+                )
+                return None
+
+            for item in fresh:
+                seen.add(_key(item))
+                results.append(item)
+
+            if len(page) < page_size:
+                break
+            offset += page_size
+
+        return results
+
+    async def _single_fetch_fallback(
+        self,
+        scope: str,
+        where_conditions: Optional[str],
+        properties: Optional[List[str]],
+        order_by: Optional[List[Tuple[str, str]]],
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        results = await self.search_files(
+            scope=scope,
+            where_conditions=where_conditions,
+            properties=properties,
+            order_by=order_by,
+            limit=max_results,
+        )
+        self._warn_if_truncated(len(results), scope, max_results)
+        return results
+
+    @staticmethod
+    def _warn_if_truncated(count: int, scope: str, max_results: int) -> None:
+        if count >= max_results:
+            document_scan_truncated_total.inc()
+            logger.warning(
+                "WebDAV SEARCH reached max_results=%d for scope %r; "
+                "results may be truncated -- raise WEBDAV_SEARCH_MAX_RESULTS",
+                max_results,
+                scope,
+            )
+
     def _build_search_xml(
         self,
         scope: str,
@@ -949,6 +1069,7 @@ class WebDAVClient(BaseNextcloudClient):
         properties: List[str],
         order_by: Optional[List[Tuple[str, str]]],
         limit: Optional[int],
+        offset: Optional[int] = None,
     ) -> str:
         """Build the XML body for a SEARCH request."""
         # Construct the scope path
@@ -987,10 +1108,12 @@ class WebDAVClient(BaseNextcloudClient):
         else:
             orderby_xml = ""
 
-        # Build limit clause
-        limit_xml = (
-            f"<d:limit><d:nresults>{limit}</d:nresults></d:limit>" if limit else ""
-        )
+        limit_parts = []
+        if limit:
+            limit_parts.append(f"<d:nresults>{limit}</d:nresults>")
+        if offset:
+            limit_parts.append(f"<d:firstresult>{offset}</d:firstresult>")
+        limit_xml = f"<d:limit>{''.join(limit_parts)}</d:limit>" if limit_parts else ""
 
         # Construct the full SEARCH XML
         search_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1213,18 +1336,48 @@ class WebDAVClient(BaseNextcloudClient):
             # Find all PDFs
             results = await find_by_type("application/pdf")
         """
+        where_conditions, properties = self._type_search_args(mime_type)
+
+        return await self.search_files(
+            scope=scope,
+            where_conditions=where_conditions,
+            properties=properties,
+            limit=limit,
+        )
+
+    async def find_all_by_type(
+        self, mime_type: str, scope: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Find all files of a MIME type using bounded complete SEARCH."""
+        where_conditions, properties = self._type_search_args(mime_type)
+        return await self.search_files_all(
+            scope=scope,
+            where_conditions=where_conditions,
+            properties=properties,
+        )
+
+    @staticmethod
+    def _type_search_args(mime_type: str) -> Tuple[str, List[str]]:
+        """Build the where clause and properties for a MIME-type SEARCH."""
+        escaped_mime_type = xml_escape(mime_type)
         where_conditions = f"""
             <d:like>
                 <d:prop>
                     <d:getcontenttype/>
                 </d:prop>
-                <d:literal>{mime_type}</d:literal>
+                <d:literal>{escaped_mime_type}</d:literal>
             </d:like>
         """
-
-        return await self.search_files(
-            scope=scope, where_conditions=where_conditions, limit=limit
-        )
+        properties = [
+            "displayname",
+            "getcontentlength",
+            "getcontenttype",
+            "getlastmodified",
+            "resourcetype",
+            "getetag",
+            "fileid",
+        ]
+        return where_conditions, properties
 
     async def list_favorites(
         self, scope: str = "", limit: Optional[int] = None

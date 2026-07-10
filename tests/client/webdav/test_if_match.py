@@ -19,11 +19,12 @@ Covers:
 """
 from __future__ import annotations
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from httpx import HTTPStatusError, Response, Request
+from unittest.mock import AsyncMock, MagicMock
 
-from nextcloud_mcp_server.client.webdav import WebDAVClient, EtagConflictError
+import pytest
+from httpx import HTTPStatusError, Request, Response
+
+from nextcloud_mcp_server.client.webdav import EtagConflictError, WebDAVClient
 
 
 def _make_client():
@@ -43,7 +44,6 @@ def _mock_response(status_code: int = 200, content: bytes = b"", headers: dict |
     return resp
 
 
-@pytest.mark.asyncio
 async def test_T1_read_file_returns_etag_tuple():
     """read_file returns (content, content_type, etag); etag has quotes stripped."""
     c = _make_client()
@@ -58,7 +58,6 @@ async def test_T1_read_file_returns_etag_tuple():
     assert etag == "abc123"  # quotes stripped
 
 
-@pytest.mark.asyncio
 async def test_T1b_read_file_etag_absent():
     """read_file returns etag=None when server omits ETag header."""
     c = _make_client()
@@ -69,7 +68,6 @@ async def test_T1b_read_file_etag_absent():
     assert etag is None
 
 
-@pytest.mark.asyncio
 async def test_T2_write_file_with_if_match_adds_header():
     """write_file with if_match passes If-Match header on PUT."""
     c = _make_client()
@@ -87,7 +85,6 @@ async def test_T2_write_file_with_if_match_adds_header():
     assert result.get("etag") == "new-etag-xyz"
 
 
-@pytest.mark.asyncio
 async def test_T3_write_file_412_raises_etag_conflict():
     """write_file with stale if_match → 412 → EtagConflictError carrying current server etag."""
     c = _make_client()
@@ -103,7 +100,6 @@ async def test_T3_write_file_412_raises_etag_conflict():
     assert exc_info.value.current_etag == "server-current-etag"
 
 
-@pytest.mark.asyncio
 async def test_T4_write_file_without_if_match_omits_header():
     """write_file without if_match (default) does not add If-Match header — preserves prior behavior."""
     c = _make_client()

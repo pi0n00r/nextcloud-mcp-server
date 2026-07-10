@@ -11,7 +11,7 @@ from nextcloud_mcp_server.observability.metrics import update_ingest_queue_depth
 
 pytestmark = pytest.mark.unit
 
-_METRIC = "astrolabe_ingest_queue_depth"
+_METRIC = "bridgette_ingest_queue_depth"
 
 
 def test_drained_queue_zeroes_not_stale(metric_sample):

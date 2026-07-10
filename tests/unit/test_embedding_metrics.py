@@ -4,7 +4,7 @@ Covers:
 1. ``Settings.get_embedding_provider_family()`` — the single source of truth for
    the ``provider`` metric label / span attribute — across provider configs.
 2. The ``record_embedding`` helper — that it increments the right
-   ``astrolabe_embedding_*`` series and skips the throughput counters on error.
+   ``bridgette_embedding_*`` series and skips the throughput counters on error.
 """
 
 from __future__ import annotations
@@ -84,26 +84,26 @@ class TestProviderFamily:
 class TestRecordEmbedding:
     def test_dense_success_increments_throughput(self, metric_sample):
         labels = {"kind": "dense", "provider": "uttest-prov"}
-        before_chunks = metric_sample("astrolabe_embedding_chunks_total", labels)
-        before_chars = metric_sample("astrolabe_embedding_chars_total", labels)
+        before_chunks = metric_sample("bridgette_embedding_chunks_total", labels)
+        before_chars = metric_sample("bridgette_embedding_chars_total", labels)
         before_req = metric_sample(
-            "astrolabe_embedding_requests_total", {**labels, "status": "success"}
+            "bridgette_embedding_requests_total", {**labels, "status": "success"}
         )
 
         record_embedding("dense", "uttest-prov", 0.42, chunks=12, chars=3400)
 
         assert metric_sample(
-            "astrolabe_embedding_chunks_total", labels
+            "bridgette_embedding_chunks_total", labels
         ) == pytest.approx(before_chunks + 12)
         assert metric_sample(
-            "astrolabe_embedding_chars_total", labels
+            "bridgette_embedding_chars_total", labels
         ) == pytest.approx(before_chars + 3400)
         assert metric_sample(
-            "astrolabe_embedding_requests_total", {**labels, "status": "success"}
+            "bridgette_embedding_requests_total", {**labels, "status": "success"}
         ) == pytest.approx(before_req + 1)
         assert (
             metric_sample(
-                "astrolabe_embedding_duration_seconds_count",
+                "bridgette_embedding_duration_seconds_count",
                 {**labels, "status": "success"},
             )
             >= 1
@@ -115,33 +115,33 @@ class TestRecordEmbedding:
             "sparse", "bm25-uttest", 0.1, chunks=5, chars=100, status="error"
         )
         assert metric_sample(
-            "astrolabe_embedding_chunks_total", labels
+            "bridgette_embedding_chunks_total", labels
         ) == pytest.approx(0.0)
         assert metric_sample(
-            "astrolabe_embedding_chars_total", labels
+            "bridgette_embedding_chars_total", labels
         ) == pytest.approx(0.0)
         assert metric_sample(
-            "astrolabe_embedding_requests_total", {**labels, "status": "error"}
+            "bridgette_embedding_requests_total", {**labels, "status": "error"}
         ) == pytest.approx(1.0)
 
 
 class TestRecordEmbeddingTokens:
-    """astrolabe_embedding_tokens_total — token cost split by index/query."""
+    """bridgette_embedding_tokens_total — token cost split by index/query."""
 
     def test_index_increments_by_token_count(self, metric_sample):
         labels = {"provider": "tok-prov", "operation": "index"}
-        before = metric_sample("astrolabe_embedding_tokens_total", labels)
+        before = metric_sample("bridgette_embedding_tokens_total", labels)
         record_embedding_tokens("tok-prov", "index", 4242)
         assert metric_sample(
-            "astrolabe_embedding_tokens_total", labels
+            "bridgette_embedding_tokens_total", labels
         ) == pytest.approx(before + 4242)
 
     def test_query_operation_is_separate_series(self, metric_sample):
         labels = {"provider": "tok-prov", "operation": "query"}
-        before = metric_sample("astrolabe_embedding_tokens_total", labels)
+        before = metric_sample("bridgette_embedding_tokens_total", labels)
         record_embedding_tokens("tok-prov", "query", 7)
         assert metric_sample(
-            "astrolabe_embedding_tokens_total", labels
+            "bridgette_embedding_tokens_total", labels
         ) == pytest.approx(before + 7)
 
     def test_zero_or_negative_is_noop(self, metric_sample):
@@ -149,5 +149,5 @@ class TestRecordEmbeddingTokens:
         record_embedding_tokens("tok-noop", "index", 0)
         record_embedding_tokens("tok-noop", "index", -3)
         assert metric_sample(
-            "astrolabe_embedding_tokens_total", labels
+            "bridgette_embedding_tokens_total", labels
         ) == pytest.approx(0.0)
