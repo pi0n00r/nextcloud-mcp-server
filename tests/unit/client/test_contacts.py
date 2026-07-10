@@ -18,6 +18,7 @@ from nextcloud_mcp_server.client.contacts import (
     _build_contact_from_data,
     _first_custom,
     _normalize_contact_data,
+    _vcard_to_json_projection,
     _wrap_contact_field,
 )
 
@@ -68,6 +69,34 @@ def test_org_list_input_produces_structured_org():
     """A list input is the opt-in shape for multi-component ORG (Company;Department)."""
     vcard = _vcard(fn="Alice", org=["Acme", "Engineering"])
     assert "ORG:Acme;Engineering" in vcard
+
+
+def test_vcard_projection_surfaces_complete_read_metadata():
+    """The read projection must retain every field exposed by Contact."""
+    vcard = (
+        "BEGIN:VCARD\r\n"
+        "VERSION:4.0\r\n"
+        "UID:projection-1\r\n"
+        "FN:Projection User\r\n"
+        "ORG:Acme Corp\r\n"
+        "TITLE:Engineer\r\n"
+        "NOTE:Projection note\r\n"
+        "URL:https://example.com/profile\r\n"
+        "CATEGORIES:vip,customer\r\n"
+        "PHOTO:data:image/png;base64,aGVsbG8=\r\n"
+        "X-TEST:preserve-me\r\n"
+        "END:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="projection-1")
+
+    assert projected["org"] == "Acme Corp"
+    assert projected["title"] == "Engineer"
+    assert projected["note"] == "Projection note"
+    assert projected["url"] == ["https://example.com/profile"]
+    assert projected["categories"] == ["vip", "customer"]
+    assert projected["photo"] == "data:image/png;base64,aGVsbG8="
+    assert projected["custom_fields"] == {"X-TEST": ["preserve-me"]}
 
 
 def test_invalid_bday_is_dropped_not_raised(caplog):
@@ -269,6 +298,32 @@ class TestObjectNameResolution:
     async def test_returns_none_when_no_match(self, mocker):
         client = self._client(mocker, _multistatus("alice.vcf"))
         assert await client._resolve_object_name("contacts", "missing") is None
+
+    async def test_get_contact_surfaces_resolved_object_path(self, mocker):
+        """Single-contact reads expose the real extensionless CardDAV path."""
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        resolved = "/remote.php/dav/addressbooks/users/testuser/contacts/default"
+        mocker.patch.object(
+            client, "_resolved_vcard_url", mocker.AsyncMock(return_value=resolved)
+        )
+        response = mocker.Mock(
+            headers={"etag": '"etag"'},
+            text=(
+                "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:default\r\n"
+                "FN:No Extension\r\nEND:VCARD\r\n"
+            ),
+        )
+        response.raise_for_status = mocker.Mock()
+        mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+
+        result = await client.get_contact(addressbook="contacts", uid="default")
+
+        assert result["object_name"] == "default"
+        assert result["object_path"] == resolved
 
     async def test_delete_targets_real_no_extension_path(self, mocker):
         """Regression for #874: delete must hit ``.../default`` not ``.../default.vcf``."""

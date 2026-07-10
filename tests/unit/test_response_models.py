@@ -485,6 +485,40 @@ def test_contact_mapping_categories_accepts_comma_string():
 
 
 @pytest.mark.unit
+def test_contact_mapping_accepts_get_contact_payload_shape():
+    """Single-contact reads use ``uid/json/etag`` rather than the list shape."""
+    raw_contact = {
+        "uid": "get-1",
+        "object_path": "/remote.php/dav/addressbooks/users/test/contacts/get-1.vcf",
+        "etag": '"get-etag"',
+        "vcard_text": "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:get-1\r\nFN:Get User\r\nEND:VCARD\r\n",
+        "json": {
+            "fullname": "Get User",
+            "org": "Get Corp",
+            "title": "Director",
+            "note": "Get note",
+            "url": ["https://example.com/get"],
+            "categories": ["release"],
+            "photo": "data:image/png;base64,aGVsbG8=",
+            "custom_fields": {"X-TEST": ["preserve-me"]},
+        },
+    }
+
+    contact = _map_contact(raw_contact)
+
+    assert contact.uid == "get-1"
+    assert contact.resource_path == raw_contact["object_path"]
+    assert contact.etag == '"get-etag"'
+    assert contact.organization == "Get Corp"
+    assert contact.title == "Director"
+    assert contact.note == "Get note"
+    assert contact.urls[0].value == "https://example.com/get"
+    assert contact.categories == ["release"]
+    assert contact.photo == "data:image/png;base64,aGVsbG8="
+    assert contact.custom_fields == {"X-TEST": ["preserve-me"]}
+
+
+@pytest.mark.unit
 def test_list_contacts_response_wraps_contacts():
     """Test ListContactsResponse wraps contacts correctly for MCP output."""
     contacts = [
