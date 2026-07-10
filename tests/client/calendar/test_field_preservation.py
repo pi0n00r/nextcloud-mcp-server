@@ -239,14 +239,14 @@ END:VCARD"""
 
         # Retrieve the contact again to see if extended fields survived
         contacts_after = await nc_client.contacts.list_contacts(
-            addressbook=addressbook_name
+            addressbook=addressbook_name, include_vcard=True
         )
         updated_contact = next(
             (c for c in contacts_after if c["vcard_id"] == contact_uid), None
         )
 
         assert updated_contact is not None, "Contact not found after update"
-        updated_addressdata = updated_contact["addressdata"]
+        updated_addressdata = updated_contact["vcard_text"]
 
         logger.info("Raw vCard after contact update:")
         logger.info(updated_addressdata)

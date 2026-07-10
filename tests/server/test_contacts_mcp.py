@@ -95,9 +95,11 @@ async def test_mcp_contacts_workflow(
             },
         )
         assert update_result.isError is False
-        contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
+        contacts = await nc_client.contacts.list_contacts(
+            addressbook=addressbook_name, include_vcard=True
+        )
         updated = next(c for c in contacts if c["vcard_id"] == contact_uid)
-        updated_vcard = updated.get("addressdata", "")
+        updated_vcard = updated["vcard_text"]
         assert "mcp-test.example.com" in updated_vcard
         # Prior properties must not have been clobbered by the merge.
         assert "ORG:MCP Test Corp" in updated_vcard
