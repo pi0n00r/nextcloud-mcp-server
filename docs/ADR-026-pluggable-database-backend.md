@@ -301,8 +301,7 @@ existing `--database-path / -d` (env `TOKEN_STORAGE_DB`). `-u` wins over
 2. `docker compose --profile postgres up -d postgres-test` then
    `TEST_DATABASE_URL=postgresql+psycopg://mcp:mcp@localhost:5433/mcp uv run pytest tests/unit/test_app_password_storage.py tests/unit/test_webhook_storage.py`
    — every test runs once per backend.
-3. Manual end-to-end smoke against `mcp-login-flow` with a Postgres URL
-   (commands in `/home/chris/.claude/plans/spicy-enchanting-flurry.md` →
-   Verification).
+3. Manual end-to-end smoke against `mcp-login-flow` with a Postgres URL,
+   covering login, token persistence, restart, and refresh.
 4. k8s HA validation (after merge in `homelab-argocd`): `replicas: 3`,
    confirm session continuity through the Service.

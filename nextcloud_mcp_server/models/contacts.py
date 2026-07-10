@@ -80,6 +80,13 @@ class Contact(BaseModel):
             "SHA1-based UID from raw content when needed."
         ),
     )
+    resource_path: Optional[str] = Field(
+        None,
+        description=(
+            "Resolved CardDAV object path. This may differ from <uid>.vcf and "
+            "is required to address extensionless or server-renamed objects."
+        ),
+    )
     fn: Optional[str] = Field(
         None,
         description=(

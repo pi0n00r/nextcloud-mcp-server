@@ -28,7 +28,7 @@ The server provides complete file system access to your NextCloud instance, enab
 await nc_webdav_list_directory("")
 
 # Browse a specific folder
-await nc_webdav_list_directory("Documents/Projects")
+await nc_webdav_list_directory("Documents/Reports")
 
 # Read a text file
 content = await nc_webdav_read_file("Documents/readme.txt")

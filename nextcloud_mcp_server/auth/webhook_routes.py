@@ -86,10 +86,9 @@ def _get_webhook_uri() -> str:
          settings.toml both work).
       2. ``NEXTCLOUD_MCP_SERVER_URL`` — the configured public URL set on
          cloud deployments (ECS, k8s); the URL NC must POST to.
-      3. ``/.dockerenv`` (or podman / ``DOCKER_CONTAINER=true``) → internal
-         docker-compose service name. Only relevant when no public URL is
-         configured — i.e. local dev where MCP and NC share a Docker
-         network.
+      3. ``/.dockerenv`` or ``DOCKER_CONTAINER=true`` → internal container
+         service name. Only relevant when no public URL is configured, such as
+         local development where MCP and NC share a Docker network.
       4. ``http://localhost:8000`` — last-resort fallback.
 
     Note: ECS Fargate containers also expose ``/.dockerenv``. Without this

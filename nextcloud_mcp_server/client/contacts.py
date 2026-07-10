@@ -40,8 +40,10 @@ import xml.etree.ElementTree as ET
 from datetime import date
 from typing import Any, Iterable, Optional
 from urllib.parse import unquote
+
 from httpx import HTTPStatusError
 from pythonvCard4.vcard import Contact
+
 from .base import BaseNextcloudClient
 from .vcard_parser import VCard, patch_vcard
 
@@ -244,7 +246,6 @@ def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
     return Contact(**kwargs)  # type: ignore[arg-type]
 
 
-
 class EtagConflictError(Exception):
     """Raised when a CardDAV PUT/DELETE returns 412 Precondition Failed.
 
@@ -291,7 +292,11 @@ class ContactsClient(BaseNextcloudClient):
             "PROPFIND",
             f"{carddav_path}/{addressbook}",
             content=propfind_body,
-            headers={"Depth": "1", "Content-Type": "application/xml", "Accept": "application/xml"},
+            headers={
+                "Depth": "1",
+                "Content-Type": "application/xml",
+                "Accept": "application/xml",
+            },
         )
         ns = {"d": "DAV:"}
         root = ET.fromstring(response.content)
@@ -351,7 +356,10 @@ class ContactsClient(BaseNextcloudClient):
             if not href_text.endswith("/"):
                 continue
             addressbook_name = href_text.rstrip("/").split("/")[-1]
-            if not addressbook_name or addressbook_name == self._principal_or_username():
+            if (
+                not addressbook_name
+                or addressbook_name == self._principal_or_username()
+            ):
                 continue
             propstat = response_elem.find(".//d:propstat", ns)
             if propstat is None:
@@ -361,7 +369,9 @@ class ContactsClient(BaseNextcloudClient):
                 continue
             displayname_elem = prop.find(".//d:displayname", ns)
             displayname = (
-                displayname_elem.text if displayname_elem is not None else addressbook_name
+                displayname_elem.text
+                if displayname_elem is not None
+                else addressbook_name
             )
             getctag_elem = prop.find(".//d:getctag", ns)
             getctag = getctag_elem.text if getctag_elem is not None else None
@@ -372,7 +382,7 @@ class ContactsClient(BaseNextcloudClient):
                     "getctag": getctag,
                 }
             )
-        logger.debug(f"Found {len(addressbooks)} addressbooks")
+        logger.debug("Found %s addressbooks", len(addressbooks))
         return addressbooks
 
     async def create_addressbook(self, *, name: str, display_name: str):
@@ -459,19 +469,21 @@ class ContactsClient(BaseNextcloudClient):
                 continue
             contact_dict: dict[str, Any] = {
                 "vcard_id": vcard_id,
-                "contact": _vcard_to_json_projection(addressdata, fallback_uid=vcard_id),
+                "object_name": href_text.rstrip("/").split("/")[-1],
+                "object_path": href_text,
+                "contact": _vcard_to_json_projection(
+                    addressdata, fallback_uid=vcard_id
+                ),
             }
             if include_etag:
                 contact_dict["getetag"] = getetag
             if include_vcard:
                 contact_dict["vcard_text"] = addressdata
             contacts.append(contact_dict)
-        logger.debug(f"Found {len(contacts)} contacts")
+        logger.debug("Found %s contacts", len(contacts))
         return contacts
 
-    async def get_contact(
-        self, *, addressbook: str, uid: str
-    ) -> dict[str, Any]:
+    async def get_contact(self, *, addressbook: str, uid: str) -> dict[str, Any]:
         """Fetch a single contact's raw vCard + ETag + JSON projection."""
         url = await self._resolved_vcard_url(addressbook, uid)
         response = await self._make_request("GET", url)
@@ -481,6 +493,8 @@ class ContactsClient(BaseNextcloudClient):
         return {
             "uid": uid,
             "addressbook": addressbook,
+            "object_name": url.rstrip("/").split("/")[-1],
+            "object_path": url,
             "etag": etag,
             "vcard_text": vcard_text,
             "json": _vcard_to_json_projection(vcard_text, fallback_uid=uid),
@@ -601,7 +615,7 @@ class ContactsClient(BaseNextcloudClient):
             if e.response.status_code == 412:
                 if retry_on_conflict and attempt == 0:
                     logger.info(
-                        f"412 on patch_contact {uid}; retrying once with fresh ETag"
+                        "412 on patch_contact %s; retrying once with fresh ETag", uid
                     )
                     return await self._do_patch(
                         addressbook=addressbook,
@@ -681,9 +695,7 @@ class ContactsClient(BaseNextcloudClient):
             "etag": response.headers.get("etag", ""),
         }
 
-    async def delete_contact(
-        self, *, addressbook: str, uid: str, etag: str = ""
-    ):
+    async def delete_contact(self, *, addressbook: str, uid: str, etag: str = ""):
         """Delete a contact. Pass ``etag`` for If-Match (recommended)."""
         url = await self._resolved_vcard_url(addressbook, uid)
         headers: dict[str, str] = {}
@@ -755,11 +767,13 @@ class ContactsClient(BaseNextcloudClient):
 
 
 def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str, Any]:
-    """Best-effort JSON projection for the deprecated convenience surface."""
+    """Build the complete JSON projection used by contact read tools."""
     try:
         contact = Contact.from_vcard(vcard_text)
     except Exception as e:
-        logger.warning(f"vCard parse failed for projection (UID={fallback_uid}): {e}")
+        logger.warning(
+            "vCard parse failed for projection (UID=%s): %s", fallback_uid, e
+        )
         return {
             "fullname": fallback_uid,
             "nickname": None,
@@ -785,12 +799,26 @@ def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str
     if isinstance(bday, date):
         bday = bday.isoformat()
 
+    custom = getattr(contact, "custom", None) or {}
+    custom_fields = {
+        key: value
+        for key, value in custom.items()
+        if isinstance(key, str) and key.upper().startswith("X-")
+    }
+
     return {
         "fullname": fn,
         "nickname": getattr(contact, "nickname", None),
         "birthday": bday,
         "email": getattr(contact, "email", None),
         "tel": getattr(contact, "tel", None),
+        "org": getattr(contact, "org", None) or _first_custom(custom, "ORG"),
+        "title": getattr(contact, "title", None) or _first_custom(custom, "TITLE"),
+        "note": getattr(contact, "note", None),
+        "url": getattr(contact, "url", None),
+        "categories": getattr(contact, "categories", None),
+        "photo": getattr(contact, "photo", None) or _first_custom(custom, "PHOTO"),
+        "custom_fields": custom_fields,
     }
 
 

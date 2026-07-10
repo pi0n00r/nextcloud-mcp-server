@@ -3,6 +3,10 @@
 These exercise ``_build_contact_from_data`` in isolation — no HTTP, no fixtures —
 so they cover the issue #716 regression surface and the edge cases flagged in
 PR #719 review without standing up the compose stack.
+
+Lossless update behavior is covered separately by
+``tests/client/contacts/test_byte_preserving.py``. The fork does not use
+upstream's projection-based ``_merge_vcard_properties`` write path.
 """
 
 from datetime import date
@@ -14,6 +18,7 @@ from nextcloud_mcp_server.client.contacts import (
     _build_contact_from_data,
     _first_custom,
     _normalize_contact_data,
+    _vcard_to_json_projection,
     _wrap_contact_field,
 )
 
@@ -64,6 +69,34 @@ def test_org_list_input_produces_structured_org():
     """A list input is the opt-in shape for multi-component ORG (Company;Department)."""
     vcard = _vcard(fn="Alice", org=["Acme", "Engineering"])
     assert "ORG:Acme;Engineering" in vcard
+
+
+def test_vcard_projection_surfaces_complete_read_metadata():
+    """The read projection must retain every field exposed by Contact."""
+    vcard = (
+        "BEGIN:VCARD\r\n"
+        "VERSION:4.0\r\n"
+        "UID:projection-1\r\n"
+        "FN:Projection User\r\n"
+        "ORG:Acme Corp\r\n"
+        "TITLE:Engineer\r\n"
+        "NOTE:Projection note\r\n"
+        "URL:https://example.com/profile\r\n"
+        "CATEGORIES:vip,customer\r\n"
+        "PHOTO:data:image/png;base64,aGVsbG8=\r\n"
+        "X-TEST:preserve-me\r\n"
+        "END:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="projection-1")
+
+    assert projected["org"] == "Acme Corp"
+    assert projected["title"] == "Engineer"
+    assert projected["note"] == "Projection note"
+    assert projected["url"] == ["https://example.com/profile"]
+    assert projected["categories"] == ["vip", "customer"]
+    assert projected["photo"] == "data:image/png;base64,aGVsbG8="
+    assert projected["custom_fields"] == {"X-TEST": ["preserve-me"]}
 
 
 def test_invalid_bday_is_dropped_not_raised(caplog):
@@ -266,6 +299,32 @@ class TestObjectNameResolution:
         client = self._client(mocker, _multistatus("alice.vcf"))
         assert await client._resolve_object_name("contacts", "missing") is None
 
+    async def test_get_contact_surfaces_resolved_object_path(self, mocker):
+        """Single-contact reads expose the real extensionless CardDAV path."""
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        resolved = "/remote.php/dav/addressbooks/users/testuser/contacts/default"
+        mocker.patch.object(
+            client, "_resolved_vcard_url", mocker.AsyncMock(return_value=resolved)
+        )
+        response = mocker.Mock(
+            headers={"etag": '"etag"'},
+            text=(
+                "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:default\r\n"
+                "FN:No Extension\r\nEND:VCARD\r\n"
+            ),
+        )
+        response.raise_for_status = mocker.Mock()
+        mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+
+        result = await client.get_contact(addressbook="contacts", uid="default")
+
+        assert result["object_name"] == "default"
+        assert result["object_path"] == resolved
+
     async def test_delete_targets_real_no_extension_path(self, mocker):
         """Regression for #874: delete must hit ``.../default`` not ``.../default.vcf``."""
         client = ContactsClient.__new__(ContactsClient)
@@ -274,11 +333,15 @@ class TestObjectNameResolution:
         mocker.patch.object(
             client, "_resolve_object_name", mocker.AsyncMock(return_value="default")
         )
-        make_request = mocker.patch.object(client, "_make_request", mocker.AsyncMock())
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
         await client.delete_contact(addressbook="contacts", uid="default")
         make_request.assert_awaited_once_with(
             "DELETE",
             "/remote.php/dav/addressbooks/users/testuser/contacts/default",
+            headers={},
         )
 
     async def test_delete_falls_back_to_vcf_when_unresolved(self, mocker):
@@ -291,15 +354,19 @@ class TestObjectNameResolution:
         mocker.patch.object(
             client, "_resolve_object_name", mocker.AsyncMock(return_value=None)
         )
-        make_request = mocker.patch.object(client, "_make_request", mocker.AsyncMock())
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
         await client.delete_contact(addressbook="contacts", uid="ghost")
         make_request.assert_awaited_once_with(
             "DELETE",
             "/remote.php/dav/addressbooks/users/testuser/contacts/ghost.vcf",
+            headers={},
         )
 
-    async def test_update_targets_real_no_extension_path(self, mocker):
-        """Regression for #874: update must PUT to ``.../default`` not
+    async def test_put_targets_real_no_extension_path(self, mocker):
+        """Regression for #874: replacement must PUT to ``.../default`` not
         ``.../default.vcf`` (parallels the delete coverage).
         """
         client = ContactsClient.__new__(ContactsClient)
@@ -308,26 +375,22 @@ class TestObjectNameResolution:
         mocker.patch.object(
             client, "_resolve_object_name", mocker.AsyncMock(return_value="default")
         )
-        mocker.patch.object(
-            client,
-            "_fetch_raw_vcard",
-            mocker.AsyncMock(
-                return_value=(
-                    "BEGIN:VCARD\nVERSION:3.0\nUID:default\nFN:No Ext\nEND:VCARD\n",
-                    '"etag"',
-                )
-            ),
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
         )
-        make_request = mocker.patch.object(client, "_make_request", mocker.AsyncMock())
-        await client.update_contact(
-            addressbook="contacts", uid="default", contact_data={"fn": "Updated"}
+        await client.put_contact(
+            addressbook="contacts",
+            uid="default",
+            vcard_text="BEGIN:VCARD\nVERSION:3.0\nUID:default\nFN:Updated\nEND:VCARD\n",
+            etag='"etag"',
         )
         method, url = make_request.await_args.args[0], make_request.await_args.args[1]
         assert method == "PUT"
         assert url == "/remote.php/dav/addressbooks/users/testuser/contacts/default"
 
-    async def test_update_falls_back_to_vcf_when_unresolved(self, mocker):
-        """When resolution finds nothing, update falls back to ``<uid>.vcf`` so
+    async def test_put_falls_back_to_vcf_when_unresolved(self, mocker):
+        """When resolution finds nothing, replacement falls back to ``<uid>.vcf`` so
         the caller still gets a clean 404 from the PUT (mirrors delete).
         """
         client = ContactsClient.__new__(ContactsClient)
@@ -336,13 +399,14 @@ class TestObjectNameResolution:
         mocker.patch.object(
             client, "_resolve_object_name", mocker.AsyncMock(return_value=None)
         )
-        make_request = mocker.patch.object(client, "_make_request", mocker.AsyncMock())
-        # Supplying an etag skips the existing-vCard fetch; update builds a fresh
-        # vCard and PUTs it to the fallback path.
-        await client.update_contact(
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+        await client.put_contact(
             addressbook="contacts",
             uid="ghost",
-            contact_data={"fn": "Ghost"},
+            vcard_text="BEGIN:VCARD\nVERSION:3.0\nUID:ghost\nFN:Ghost\nEND:VCARD\n",
             etag='"x"',
         )
         method, url = make_request.await_args.args[0], make_request.await_args.args[1]
@@ -398,188 +462,3 @@ class TestNormalizeContactData:
 
     def test_passthrough_for_unknown_keys(self):
         assert _normalize_contact_data({"foo": "bar"}) == {"foo": "bar"}
-
-
-class TestMergeVcardProperties:
-    """Direct tests for ``_merge_vcard_properties`` — the primary update path.
-
-    Written in response to PR #719 review claiming NICKNAME/BDAY/CATEGORIES are not
-    updatable via this function. These tests pin the actual behaviour so future
-    regressions (or claims) can be answered in one line.
-    """
-
-    @staticmethod
-    def _merge(raw: str, data: dict) -> str:
-        from nextcloud_mcp_server.client.contacts import ContactsClient
-
-        client = ContactsClient.__new__(ContactsClient)  # no HTTP / no __init__
-        return client._merge_vcard_properties(raw, data, uid="merge-test")
-
-    def test_nickname_overwrites_existing_line(self):
-        """Existing NICKNAME must be replaced with the new value, not preserved."""
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nNICKNAME:Bob\nEND:VCARD\n"
-        result = self._merge(existing, {"nickname": "Robert"})
-        assert "NICKNAME:Robert" in result
-        assert "NICKNAME:Bob" not in result
-
-    def test_bday_overwrites_existing_line(self):
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nBDAY:1990-05-01\nEND:VCARD\n"
-        result = self._merge(existing, {"bday": "1991-06-02"})
-        assert "BDAY:1991-06-02" in result
-        assert "BDAY:1990-05-01" not in result
-
-    def test_categories_overwrites_existing_line(self):
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nCATEGORIES:old,stale\nEND:VCARD\n"
-        result = self._merge(existing, {"categories": ["vip", "new"]})
-        assert "CATEGORIES:vip,new" in result
-        assert "old,stale" not in result
-
-    def test_nickname_added_when_not_in_existing_vcard(self):
-        """If the existing vCard has no NICKNAME line, update must append one."""
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(existing, {"nickname": "Bob"})
-        assert "NICKNAME:Bob" in result
-
-    def test_bday_added_when_not_in_existing_vcard(self):
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(existing, {"bday": "1990-05-01"})
-        assert "BDAY:1990-05-01" in result
-
-    def test_categories_added_when_not_in_existing_vcard(self):
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(existing, {"categories": "a,b,c"})
-        assert "CATEGORIES:a,b,c" in result
-
-    def test_url_update_preserves_unrelated_properties(self):
-        """A URL update must not clobber ORG / NOTE / TEL from the existing vCard."""
-        existing = (
-            "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\n"
-            "ORG:Acme\nTEL:555-1234\nNOTE:keep me\nEND:VCARD\n"
-        )
-        result = self._merge(existing, {"url": "https://example.com"})
-        assert "URL:https://example.com" in result
-        assert "ORG:Acme" in result
-        assert "TEL:555-1234" in result
-        assert "NOTE:keep me" in result
-
-    def test_dict_email_input_preserves_existing_line(self):
-        """Regression: a dict-form email on update used to consume the existing
-        EMAIL: line and write nothing, silently deleting the contact's email.
-        Now the original line is preserved when the input shape isn't a plain str.
-        """
-        existing = (
-            "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\n"
-            "EMAIL;TYPE=HOME:alice@example.com\nEND:VCARD\n"
-        )
-        result = self._merge(
-            existing, {"email": {"value": "work@example.com", "type": ["WORK"]}}
-        )
-        assert "EMAIL;TYPE=HOME:alice@example.com" in result
-
-    def test_list_tel_input_preserves_existing_line(self):
-        """Same regression as the email branch but for TEL — a list-shaped tel
-        input must not silently drop the existing phone number.
-        """
-        existing = (
-            "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\n"
-            "TEL;TYPE=HOME:555-0001\nEND:VCARD\n"
-        )
-        result = self._merge(
-            existing, {"tel": [{"value": "555-9999", "type": ["WORK"]}]}
-        )
-        assert "TEL;TYPE=HOME:555-0001" in result
-
-    def test_invalid_bday_on_update_preserves_existing_line(self):
-        """A non-ISO BDAY string must not produce a malformed vCard line on update.
-        We share validation with the create path; invalid → keep the existing line.
-        """
-        existing = (
-            "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\n"
-            "BDAY:1990-05-01\nEND:VCARD\n"
-        )
-        result = self._merge(existing, {"bday": "not-a-date"})
-        assert "BDAY:1990-05-01" in result
-        assert "BDAY:not-a-date" not in result
-
-    def test_invalid_bday_on_add_new_is_dropped(self):
-        """No existing BDAY + invalid input → no BDAY line appended (vs. raw write)."""
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(existing, {"bday": "not-a-date"})
-        assert "BDAY" not in result
-
-    def test_newline_in_note_does_not_inject_property(self):
-        """Regression: a literal newline in a value must not terminate the line
-        and inject a fresh vCard property.
-        """
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(
-            existing, {"note": "harmless\nEMAIL:attacker@evil.example"}
-        )
-        # The injected property must not appear as a real EMAIL line.
-        lines = result.splitlines()
-        assert "EMAIL:attacker@evil.example" not in lines
-        # The note value is preserved with newlines escaped per RFC 6350.
-        assert any(line.startswith("NOTE:") and "\\n" in line for line in lines)
-
-    def test_list_org_overwrites_with_semicolon_join(self):
-        """Regression: list-form ORG used to fall through ``_safe_vcard_value``
-        unchanged and emit a Python ``repr`` like ``ORG:['Acme', 'Engineering']``.
-        Per RFC 6350 §6.6.4 components are ``;``-separated.
-        """
-        existing = (
-            "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nORG:OldCo\nEND:VCARD\n"
-        )
-        result = self._merge(existing, {"org": ["Acme", "Engineering"]})
-        assert "ORG:Acme;Engineering" in result
-        assert "ORG:OldCo" not in result
-        assert "[" not in result and "'Acme'" not in result
-
-    def test_list_org_added_with_semicolon_join(self):
-        """Add-new branch: list ORG without an existing line still serialises
-        with ``;`` rather than as a Python list repr.
-        """
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        result = self._merge(existing, {"org": ["Acme", "Engineering"]})
-        assert "ORG:Acme;Engineering" in result
-        assert "[" not in result
-
-    def test_dict_email_on_no_existing_line_warns(self, caplog):
-        """No existing EMAIL + dict input is a known limitation of the text-merge
-        path. Surface it as a warning so the silent no-op is at least observable.
-        """
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        with caplog.at_level("WARNING"):
-            result = self._merge(
-                existing, {"email": {"value": "alice@work.com", "type": ["WORK"]}}
-            )
-        # The dict input is not applied; no EMAIL line is added.
-        assert "EMAIL" not in result
-        # A warning specifically calls out the dict/list shape and recommends
-        # plain str / create_contact as alternatives.
-        assert any(
-            "email" in r.message and "dict/list shape" in r.message
-            for r in caplog.records
-        )
-
-    def test_list_tel_on_no_existing_line_warns(self, caplog):
-        """Same warning behaviour for TEL — list input on a contact without an
-        existing TEL line must not silently disappear.
-        """
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        with caplog.at_level("WARNING"):
-            result = self._merge(
-                existing, {"tel": [{"value": "555-9999", "type": ["WORK"]}]}
-            )
-        assert "TEL" not in result
-        assert any(
-            "tel" in r.message and "dict/list shape" in r.message
-            for r in caplog.records
-        )
-
-    def test_str_email_does_not_warn(self, caplog):
-        """Plain string email is the supported shape — no warning should fire."""
-        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:merge-test\nFN:Alice\nEND:VCARD\n"
-        with caplog.at_level("WARNING"):
-            result = self._merge(existing, {"email": "alice@work.com"})
-        assert "EMAIL:alice@work.com" in result
-        assert not any("dict/list shape" in r.message for r in caplog.records)

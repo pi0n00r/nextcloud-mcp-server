@@ -1,6 +1,6 @@
 """MCP tool surface for Nextcloud Contacts (CardDAV).
 
-Unified ``nc_contacts_*`` namespace, 8 ops total. Byte-preserving vCard
+Unified ``nc_contacts_*`` namespace, 11 ops total. Byte-preserving vCard
 substrate underneath every write — no JSON↔vCard round-trip on properties
 not being modified.
 
@@ -12,12 +12,14 @@ Ops:
   5. nc_contacts_patch_contact        NEW  (surgical edit, If-Match)
   6. nc_contacts_put_contact          NEW  (full vCard replace, If-Match)
   7. nc_contacts_delete_contact       (gains If-Match)
-  8. nc_contacts_create_addressbook + nc_contacts_delete_addressbook
-                                      (counted as one — administrative)
+  8. nc_contacts_search_contacts
+  9. nc_contacts_create_addressbook
+ 10. nc_contacts_delete_addressbook
+ 11. nc_contacts_update_contact       compatibility shim
 
-nc_contacts_update_contact is DEPRECATED (kept as a thin shim that
-translates JSON-shape calls to nc_contacts_patch_contact and emits a
-deprecation warning in logs). One minor version then removed.
+New integrations should use ``nc_contacts_patch_contact`` or
+``nc_contacts_put_contact`` so preservation and concurrency semantics are
+explicit.
 """
 
 # AI-NOTICE:Schema-Version=0.1
@@ -86,24 +88,56 @@ def _parse_vcard_fields(
 
 
 def _raw_contact_to_model(raw: dict) -> Contact:
-    contact_info = raw.get("contact", {})
+    contact_info = raw.get("contact")
+    if contact_info is None:
+        contact_info = raw.get("json", {})
     emails = _parse_vcard_fields(contact_info.get("email"), "email")
     phones = _parse_vcard_fields(contact_info.get("tel"), "phone")
-    custom_fields: dict[str, Any] = {}
+
+    raw_urls = contact_info.get("url")
+    if isinstance(raw_urls, str):
+        raw_urls = [raw_urls] if raw_urls else []
+    urls = [
+        ContactField(type="url", value=url)
+        for url in (raw_urls or [])
+        if isinstance(url, str) and url
+    ]
+
+    raw_categories = contact_info.get("categories") or []
+    if isinstance(raw_categories, str):
+        categories = [
+            category.strip()
+            for category in raw_categories.split(",")
+            if category.strip()
+        ]
+    else:
+        categories = [
+            category
+            for category in raw_categories
+            if isinstance(category, str) and category
+        ]
+
+    custom_fields: dict[str, Any] = dict(contact_info.get("custom_fields") or {})
     nickname = contact_info.get("nickname")
     if nickname:
         custom_fields["nickname"] = nickname
     return Contact(
-        uid=raw["vcard_id"],
+        uid=raw.get("vcard_id") or raw.get("uid"),
         resource_path=raw.get("object_path"),
         fn=contact_info.get("fullname", ""),
-        etag=raw.get("getetag"),
+        etag=raw.get("getetag") if "getetag" in raw else raw.get("etag"),
         vcard_text=raw.get("vcard_text"),
         birthday=contact_info["birthday"].isoformat()
         if isinstance(contact_info.get("birthday"), date)
         else contact_info.get("birthday"),
         emails=emails,
         phones=phones,
+        organization=contact_info.get("org"),
+        title=contact_info.get("title"),
+        note=contact_info.get("note"),
+        photo=contact_info.get("photo"),
+        urls=urls,
+        categories=categories,
         custom_fields=custom_fields,
     )
 
@@ -193,15 +227,7 @@ def configure_contacts_tools(mcp: FastMCP):
         """
         client = await get_client(ctx)
         raw = await client.contacts.get_contact(addressbook=addressbook, uid=uid)
-        contact = Contact(
-            uid=raw["uid"],
-            fn=raw["json"].get("fullname", ""),
-            etag=raw.get("etag"),
-            vcard_text=raw.get("vcard_text"),
-            emails=_parse_vcard_fields(raw["json"].get("email"), "email"),
-            phones=_parse_vcard_fields(raw["json"].get("tel"), "phone"),
-            birthday=raw["json"].get("birthday"),
-        )
+        contact = _raw_contact_to_model(raw)
         return GetContactResponse(contact=contact)
 
     # ------------------------------------------------------------------

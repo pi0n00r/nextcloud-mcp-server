@@ -43,10 +43,10 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 
 ### Container Package
 
-The published old-stable container image works with Docker and Podman:
+The published old-stable container image runs with Docker:
 
 ```bash
-podman run --rm -p 127.0.0.1:8000:8000 \
+docker run --rm -p 127.0.0.1:8000:8000 \
   -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
   -e NEXTCLOUD_USERNAME=your_username \
   -e NEXTCLOUD_PASSWORD=your_app_password \
@@ -55,8 +55,8 @@ podman run --rm -p 127.0.0.1:8000:8000 \
 
 Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
 
-For Docker, replace `podman` with `docker`. For rootless Podman and Quadlet
-deployment, see [docs/container-package.md](docs/container-package.md).
+For a persistent Docker deployment, see
+[docs/container-package.md](docs/container-package.md).
 
 ## Key Features
 

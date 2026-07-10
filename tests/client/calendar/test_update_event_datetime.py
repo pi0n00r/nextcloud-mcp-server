@@ -9,11 +9,11 @@ The merge path used `__setitem__` and produced Python repr leak
 (`DTSTART:2026-05-15 10:00:00-04:00` instead of
 `DTSTART;TZID=...:20260515T100000`).
 
-Secondary nc-time-policy concern (Documents/Projects/Isla/nc-time-policy.md):
-fixed-offset tzinfo from `replace("Z","+00:00") + fromisoformat` does not
-preserve TZID=America/Toronto for wall-clock semantics across DST. Fixed by
-new helper `_parse_caldav_datetime` that promotes Toronto-offset datetimes
-to ZoneInfo("America/Toronto").
+Secondary time-policy concern: fixed-offset tzinfo from
+`replace("Z","+00:00") + fromisoformat` does not preserve
+TZID=America/Toronto for wall-clock semantics across DST. Fixed by new helper
+`_parse_caldav_datetime` that promotes Toronto-offset datetimes to
+ZoneInfo("America/Toronto").
 
 These tests exercise the client-layer serialization helpers directly; no
 network or live server required.
@@ -33,14 +33,11 @@ network or live server required.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
 from unittest.mock import MagicMock
-from zoneinfo import ZoneInfo
 
 import pytest
 
 from nextcloud_mcp_server.client.calendar import CalendarClient
-
 
 # Existing iCal fixture that subsequent updates merge against.
 EXISTING_ICAL = (
@@ -75,6 +72,7 @@ def client() -> CalendarClient:
 
 # === T1 — summary-only update preserves DTSTART byte-equal ===
 
+
 def test_summary_only_update_preserves_dtstart_byte_equal(client):
     """An update that touches only `title` MUST NOT mangle the DTSTART line."""
     updated = client._merge_ical_properties(
@@ -88,14 +86,14 @@ def test_summary_only_update_preserves_dtstart_byte_equal(client):
     )
     # Confirm the Python-repr leak that defined P1.2 is gone
     assert "DTSTART:2026-05-15 10:00:00" not in updated, (
-        "Python repr leak in DTSTART (the P1.2 mangle is back). "
-        f"Output:\n{updated}"
+        f"Python repr leak in DTSTART (the P1.2 mangle is back). Output:\n{updated}"
     )
     # Summary correctly updated
     assert "SUMMARY:Updated summary" in updated
 
 
 # === T2 — dtstart update with TZID=America/Toronto round-trips correctly ===
+
 
 def test_dtstart_update_with_toronto_offset_preserves_tzid(client):
     """Updating DTSTART with Toronto-offset input MUST emit TZID=America/Toronto,
@@ -117,6 +115,7 @@ def test_dtstart_update_with_toronto_offset_preserves_tzid(client):
 
 
 # === T3 — dtstart update across DST boundary preserves wall-clock semantic ===
+
 
 def test_dtstart_update_across_dst_boundary_uses_toronto_iana_zone(client):
     """A November update (EST, -05:00) and a May update (EDT, -04:00) both must
@@ -146,6 +145,7 @@ def test_dtstart_update_across_dst_boundary_uses_toronto_iana_zone(client):
 
 # === T4 — utc input produces Z-suffixed audit timestamp ===
 
+
 def test_utc_dtstart_update_serializes_with_z(client):
     """Audit-semantic input (UTC `Z`) MUST serialize as `Z`-suffix per nc-time-policy."""
     updated = client._merge_ical_properties(
@@ -154,12 +154,12 @@ def test_utc_dtstart_update_serializes_with_z(client):
         "test-uid-001",
     )
     assert "DTSTART:20260515T140000Z" in updated, (
-        "UTC dtstart input did not serialize as Z-suffix. "
-        f"Output:\n{updated}"
+        f"UTC dtstart input did not serialize as Z-suffix. Output:\n{updated}"
     )
 
 
 # === T5 — naive input is forbidden per nc-time-policy ===
+
 
 def test_naive_datetime_input_raises(client):
     """Per nc-time-policy 'never naive', a datetime string without offset/Z must raise."""
@@ -168,6 +168,7 @@ def test_naive_datetime_input_raises(client):
 
 
 # === T6 — all-day input returns a date object ===
+
 
 def test_all_day_input_returns_date(client):
     """all_day=True should strip time and return a date (no time component)."""
@@ -215,6 +216,7 @@ def test_todo_due_update_preserves_tzid(client):
 
 # === T8 — non-Toronto offset is preserved as fixed offset (don't impose Toronto) ===
 
+
 def test_non_toronto_offset_preserved_as_fixed_offset(client):
     """A datetime with a non-Toronto offset (e.g., +05:30 IST) should NOT be
     silently relocated to Toronto. icalendar emits TZID="UTC+05:30" in that
@@ -230,3 +232,39 @@ def test_non_toronto_offset_preserved_as_fixed_offset(client):
         "The helper must only promote when the offset matches Toronto's offset "
         "on the target date."
     )
+
+
+def test_event_update_retains_explicit_timezone_behavior(client):
+    """The strict offset path must not break explicit timezone updates."""
+    updated = client._merge_ical_properties(
+        EXISTING_ICAL,
+        {
+            "start_datetime": "2026-06-15T09:00:00",
+            "timezone": "America/New_York",
+        },
+        "test-uid-001",
+    )
+    assert "DTSTART;TZID=America/New_York:20260615T090000" in updated
+    assert "TZID:America/New_York" in updated
+
+
+def test_create_todo_promotes_toronto_offset_and_emits_vtimezone(client):
+    """New todos use the same wall-clock-preserving parser as updates."""
+    created = client._create_ical_todo(
+        {
+            "summary": "Release test",
+            "due": "2026-11-15T10:00:00-05:00",
+        },
+        "test-todo-create-001",
+    )
+    assert "DUE;TZID=America/Toronto:20261115T100000" in created
+    assert "TZID:America/Toronto" in created
+
+
+def test_create_todo_rejects_naive_due(client):
+    """Todo creation must not silently reinterpret a naive wall time as UTC."""
+    with pytest.raises(ValueError, match="missing timezone"):
+        client._create_ical_todo(
+            {"summary": "Release test", "due": "2026-11-15T10:00:00"},
+            "test-todo-create-002",
+        )
