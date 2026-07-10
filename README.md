@@ -43,14 +43,14 @@ Or add it directly to your MCP client configuration (e.g. `claude_desktop_config
 
 ### Container Package
 
-The published stable container image runs with Docker:
+The published old-stable container image runs with Docker:
 
 ```bash
 docker run --rm -p 127.0.0.1:8000:8000 \
   -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
   -e NEXTCLOUD_USERNAME=your_username \
   -e NEXTCLOUD_PASSWORD=your_app_password \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
 ```
 
 Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.

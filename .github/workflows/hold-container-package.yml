@@ -1,0 +1,49 @@
+name: Hold Container Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact container package tag to retract
+        required: true
+        default: v1.3.0
+        type: string
+
+jobs:
+  hold:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Delete exact package version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$PACKAGE_TAG" != "v1.3.0" ]; then
+            echo "This hold workflow only retracts v1.3.0." >&2
+            exit 1
+          fi
+
+          versions=$(gh api \
+            "/users/${{ github.repository_owner }}/packages/container/nextcloud-mcp-server/versions?per_page=100")
+          match_count=$(jq -r --arg tag "$PACKAGE_TAG" \
+            '[.[] | select(.metadata.container.tags | index($tag))] | length' \
+            <<<"$versions")
+
+          if [ "$match_count" = "0" ]; then
+            echo "$PACKAGE_TAG is already absent; the publication hold is in effect."
+            exit 0
+          fi
+          if [ "$match_count" != "1" ]; then
+            echo "Expected at most one package version tagged $PACKAGE_TAG; found $match_count." >&2
+            exit 1
+          fi
+
+          version_id=$(jq -r --arg tag "$PACKAGE_TAG" \
+            '.[] | select(.metadata.container.tags | index($tag)) | .id' \
+            <<<"$versions")
+
+          gh api --method DELETE \
+            "/users/${{ github.repository_owner }}/packages/container/nextcloud-mcp-server/versions/$version_id"
