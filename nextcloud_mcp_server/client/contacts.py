@@ -754,6 +754,15 @@ class ContactsClient(BaseNextcloudClient):
                 set_props["ORG"] = str(value)
             elif key_l == "title":
                 set_props["TITLE"] = str(value)
+            elif key_l in ("url", "urls"):
+                if isinstance(value, str):
+                    set_props["URL"] = value
+                elif isinstance(value, list):
+                    first_url = next(
+                        (item for item in value if isinstance(item, str)), None
+                    )
+                    if first_url is not None:
+                        set_props["URL"] = first_url
             elif key_l == "categories":
                 set_props["CATEGORIES"] = (
                     value if isinstance(value, str) else ",".join(value)
