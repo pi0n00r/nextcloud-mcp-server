@@ -493,10 +493,9 @@ def test_notes_tools_have_annotations():
 
 ## References
 
-- MCP Python SDK: `/home/chris/Software/python-sdk/`
-- ToolAnnotations spec: `src/mcp/types.py:1247`
-- FastMCP decorator: `src/mcp/server/fastmcp/server.py:444`
-- Examples: `examples/fastmcp/parameter_descriptions.py`, `examples/fastmcp/icons_demo.py`
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- Tool annotations: `mcp.types.ToolAnnotations`
+- FastMCP tool decorator: `mcp.server.fastmcp.FastMCP.tool`
 
 ## Decision Timeline
 

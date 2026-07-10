@@ -6,10 +6,10 @@ The published container package is the old-stable release image:
 ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
 ```
 
-The image is published as an OCI-compatible multi-architecture image for
-`linux/amd64` and `linux/arm64`. It can be pulled with Docker or Podman.
+The image is published as a multi-architecture Docker image for `linux/amd64`
+and `linux/arm64`.
 
-## Podman Quick Start
+## Docker Quick Start
 
 Create an environment file outside the repository:
 
@@ -24,17 +24,18 @@ EOF
 chmod 600 ~/.config/nextcloud-mcp/env
 ```
 
-Run the MCP server with rootless Podman:
+Run the MCP server:
 
 ```bash
-podman run --replace --name nextcloud-mcp \
+docker run --detach --name nextcloud-mcp \
+  --restart unless-stopped \
   --publish 127.0.0.1:8000:8000 \
   --env-file ~/.config/nextcloud-mcp/env \
   --health-cmd 'curl -fsS http://127.0.0.1:8000/health/live || exit 1' \
   --health-interval 30s \
   --health-timeout 5s \
-  --health-on-failure kill \
   --health-retries 3 \
+  --health-start-period 20s \
   ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
 ```
 
@@ -44,42 +45,18 @@ Then connect the MCP client to:
 http://127.0.0.1:8000/mcp
 ```
 
-## Quadlet Service
-
-Podman Quadlet lets systemd manage the container without a Docker daemon. Copy
-the example unit from `contrib/podman/nextcloud-mcp.container`:
-
-```bash
-mkdir -p ~/.config/containers/systemd
-cp contrib/podman/nextcloud-mcp.container ~/.config/containers/systemd/
-systemctl --user daemon-reload
-systemctl --user start nextcloud-mcp.service
-systemctl --user enable nextcloud-mcp.service
-```
-
 Check status and logs:
 
 ```bash
-systemctl --user status nextcloud-mcp.service
-journalctl --user -u nextcloud-mcp.service -f
+docker ps --filter name=nextcloud-mcp
+docker logs --follow nextcloud-mcp
 ```
 
-For user services that should keep running after logout, enable linger for that
-user from an administrator shell:
+Check both health endpoints before routing client traffic:
 
-```bash
-loginctl enable-linger "$USER"
-```
-
-## Docker Equivalent
-
-The same image works with Docker:
-
-```bash
-docker run --rm --name nextcloud-mcp \
-  --publish 127.0.0.1:8000:8000 \
-  --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
+```text
+http://127.0.0.1:8000/health/live
+http://127.0.0.1:8000/health/ready
 ```
 
 ## Notes

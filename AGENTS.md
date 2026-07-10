@@ -38,7 +38,7 @@ nextcloud_mcp_server/
 │   ├── contacts.py         Pydantic schemas — UID optional, NFC, FN fallback
 │   └── ...
 ├── server/
-│   ├── contacts.py         8-op MCP tool surface (unified namespace)
+│   ├── contacts.py         11-op MCP tool surface (unified namespace)
 │   └── ...
 tests/
 ├── client/
@@ -48,22 +48,26 @@ scripts/
 └── lint-ai-notice.sh       CI lint enforcing the 10-field AI-NOTICE block
 ```
 
-## The unified `nc_contacts_*` tool surface (8 ops)
+## The unified `nc_contacts_*` tool surface (11 ops)
 
 | # | Op | Purpose |
 |---|---|---|
 | 1 | `nc_contacts_list_addressbooks` | List addressbooks |
-| 2 | `nc_contacts_list_contacts` | List contacts (`include_vcard`, `include_etag` flags) |
-| 3 | `nc_contacts_get_contact` | NEW. Single contact: `vcard_text + etag + json` |
-| 4 | `nc_contacts_create_contact` | Create from `vcard_text` or JSON |
-| 5 | `nc_contacts_patch_contact` | NEW. Surgical edit; If-Match required |
-| 6 | `nc_contacts_put_contact` | NEW. Full vCard replace; If-Match required |
-| 7 | `nc_contacts_delete_contact` | Delete; If-Match optional but recommended |
-| 8 | `nc_contacts_create_addressbook` / `nc_contacts_delete_addressbook` | Admin |
+| 2 | `nc_contacts_create_addressbook` | Create an address book |
+| 3 | `nc_contacts_delete_addressbook` | Delete an address book |
+| 4 | `nc_contacts_list_contacts` | List contacts (`include_vcard`, `include_etag` flags) |
+| 5 | `nc_contacts_search_contacts` | Search contacts |
+| 6 | `nc_contacts_get_contact` | Read one contact with vCard, ETag, and mapped fields |
+| 7 | `nc_contacts_create_contact` | Create from `vcard_text` or structured fields |
+| 8 | `nc_contacts_patch_contact` | Surgical byte-preserving edit; If-Match required |
+| 9 | `nc_contacts_put_contact` | Full vCard replacement; If-Match required |
+| 10 | `nc_contacts_delete_contact` | Delete; If-Match optional but recommended |
+| 11 | `nc_contacts_update_contact` | Compatibility shim for structured updates |
 
-`nc_contacts_update_contact` is **deprecated**. It remains as a thin shim
-that translates JSON-shape calls to `patch_contact` and emits a deprecation
-warning. One minor version, then removed.
+`nc_contacts_update_contact` is retained as a compatibility shim. New
+integrations should use `nc_contacts_patch_contact` or
+`nc_contacts_put_contact` so concurrency and preservation semantics are
+explicit.
 
 ## Build / test
 
@@ -81,10 +85,9 @@ bash scripts/lint-ai-notice.sh
 Live integration tests against a real Nextcloud instance require:
 
 ```bash
-export REQUIRES_LIVE_NC=1
-export NC_HOST=https://hub.bajaj.com
-export NC_USER=gary
-export NC_APP_PASSWORD="<scoped-app-password>" # never logged
+export NEXTCLOUD_HOST=https://nextcloud.example.com
+export NEXTCLOUD_USERNAME=test_user
+export NEXTCLOUD_PASSWORD="<scoped-app-password>" # never logged
 uv run pytest tests/client/contacts/ -v
 ```
 
@@ -109,27 +112,8 @@ This repo is **AGPL-3.0-or-later**, matching upstream
 exploitation-deterrence posture is set per source file in the AI-NOTICE
 block; see `LICENSE.md § AI-NOTICE` for what each field signals.
 
-## Pointers
+## Contribution posture
 
-- **NC instance:** `raidio.bajaj.com:443` (TrueNAS Mini R), publicly proxied
-  as `hub.bajaj.com`. Backend creds are an NC app password scoped to
-  Contacts read+write only — never log or echo.
-- **Plan and implementation docs:**
-  - `Documents/Projects/NC/NC-MCP-Plan.md` — mission, work streams, operator
-    context, open decisions.
-  - `Documents/Projects/NC/NC-MCP-Implementation.md` — codebase survey,
-    architecture decisions, build sequence, deliverables.
-- **Per-regression analysis:** `Documents/Projects/NC/regressions/A1-photo-clobber.md`,
-  `A2-webdav-truncation.md`, `A3-schema-gaps.md`.
-- **Photo-update embargo (lifts at Phase 7):**
-  `Documents/Projects/Isla/contacts-policy.md § INTERIM FREEZE`.
-- **Live AI-NOTICE three-layer reference:**
-  `https://github.com/pi0n00r/freepbx/tree/main/auto-restore`.
-
-## Upstream PR posture
-
-The A.1 / A.2 / A.3 fixes are non-fork-specific — they benefit anyone
-running this MCP. PRs to `cbcoutinho/nextcloud-mcp-server` should NOT
-include the AI-NOTICE additions (those are fork-only); branch the
-upstream-target work cleanly, and layer AI-NOTICE additions on top in the
-fork's `main` branch as a separate commit.
+Contributions to this fork must target `pi0n00r/master`. Keep changes scoped,
+preserve the byte-preserving CardDAV and chunked WebDAV invariants, and include
+focused regression coverage for any changed data path.
