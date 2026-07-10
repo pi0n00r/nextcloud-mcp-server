@@ -152,7 +152,6 @@ logger = logging.getLogger(__name__)
 HTTPXClientInstrumentor().instrument()
 
 
-
 # Pre-shared-secret gate paths exempt from MCP_GATEWAY_SECRET. Health probes and
 # OAuth discovery metadata must remain reachable without transport credentials.
 _GATEWAY_GATE_OPEN_PREFIXES = (

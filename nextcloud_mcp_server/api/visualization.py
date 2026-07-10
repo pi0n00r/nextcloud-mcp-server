@@ -953,7 +953,7 @@ async def get_pdf_preview(request: Request) -> JSONResponse:
             )
 
         async with nc_client:
-            pdf_bytes, _ = await nc_client.webdav.read_file(file_path)
+            pdf_bytes, _, _ = await nc_client.webdav.read_file(file_path)
 
         # Check file size limit (50 MB)
         max_pdf_size = 50 * 1024 * 1024

@@ -1812,7 +1812,6 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
     return True
 
 
-
 def get_procrastinate_conninfo(database_url: str | None = None) -> str:
     """Return the libpq conninfo for procrastinate's psycopg3 connector.
 

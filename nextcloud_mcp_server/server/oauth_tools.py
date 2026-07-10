@@ -53,7 +53,8 @@ class ProvisioningResult(BaseModel):
 
     success: bool = Field(description="Whether provisioning was initiated")
     provisioning_url: str | None = Field(
-        None, description="URL to Nextcloud user-security settings for provisioning background sync"
+        None,
+        description="URL to Nextcloud user-security settings for provisioning background sync",
     )
     message: str = Field(description="Status message for the user")
     already_provisioned: bool = Field(

@@ -136,11 +136,11 @@ def test_t6_non_ascii_emoji_zwj_fn_preserved():
     """T6 — ZWJ-bearing emoji FN (Bell variant from Gary's address book)."""
     sample = (
         "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:t6\r\n"
-        "FN:Bell \U0001F575\U0001F3FC\u200d\u2642\ufe0f (OTP)\r\n"
+        "FN:Bell \U0001f575\U0001f3fc\u200d\u2642\ufe0f (OTP)\r\n"
         "NOTE:OTP carrier\r\nEND:VCARD\r\n"
     )
     out = patch_vcard(sample, set_props={"NOTE": "OTP carrier (verified)"})
-    assert "FN:Bell \U0001F575\U0001F3FC\u200d\u2642\ufe0f (OTP)\r\n" in out
+    assert "FN:Bell \U0001f575\U0001f3fc\u200d\u2642\ufe0f (OTP)\r\n" in out
 
 
 def test_t7_vcard_4_0_multi_param_round_trip():
@@ -158,6 +158,7 @@ def test_t7_vcard_4_0_multi_param_round_trip():
 def test_t8_etag_conflict_surfaces_412():
     """T8 — ETag conflict surfaces as EtagConflictError."""
     import os
+
     if os.environ.get("REQUIRES_LIVE_NC") != "1":
         a = patch_vcard(MANKIND_GROOMING, set_props={"NOTE": "x"})
         b = patch_vcard(MANKIND_GROOMING, set_props={"NOTE": "x"})
@@ -197,20 +198,14 @@ def test_t10_concurrent_editor_state_clean():
 
 def test_a3_uid_less_vcard_parses_without_error():
     """A.3 — UID-less vCard (older ez-vcard 0.12.1 export) parses and patches."""
-    sample = (
-        "BEGIN:VCARD\r\nVERSION:3.0\r\n"
-        "FN:Old vCard No UID\r\nEND:VCARD\r\n"
-    )
+    sample = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Old vCard No UID\r\nEND:VCARD\r\n"
     out = patch_vcard(sample, set_props={"FN": "New name"})
     assert "FN:New name\r\n" in out
 
 
 def test_a3_fn_less_org_only_vcard_parses_and_patches():
     """A.3 — FN-less ORG-only vCard preserved through patch."""
-    sample = (
-        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:org1\r\n"
-        "ORG:Acme Corp\r\nEND:VCARD\r\n"
-    )
+    sample = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:org1\r\nORG:Acme Corp\r\nEND:VCARD\r\n"
     out = patch_vcard(sample, set_props={"ORG": "Acme Corporation"})
     assert "ORG:Acme Corporation\r\n" in out
     assert "FN:" not in out
@@ -219,6 +214,7 @@ def test_a3_fn_less_org_only_vcard_parses_and_patches():
 def test_synthetic_uid_is_idempotent():
     """A.3 — synthesize_uid is content-stable (same input -> same UID)."""
     from nextcloud_mcp_server.models.contacts import synthesize_uid
+
     sample = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Test\r\nEND:VCARD\r\n"
     assert synthesize_uid(sample) == synthesize_uid(sample)
 

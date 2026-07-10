@@ -215,9 +215,7 @@ class VCard:
         """
         if ";" not in selector:
             wanted_name = selector.upper()
-            return [
-                i for i, line in enumerate(self.lines) if line.name == wanted_name
-            ]
+            return [i for i, line in enumerate(self.lines) if line.name == wanted_name]
         name, params_str = selector.split(";", 1)
         wanted_name = name.upper()
         # Extract requested TYPE values.
@@ -402,7 +400,9 @@ def patch_vcard(
     raw: str,
     *,
     set_props: Optional[dict[str, str]] = None,
-    add_props: Optional[Iterable[tuple[str, str, Optional[list[tuple[str, str]]]]]] = None,
+    add_props: Optional[
+        Iterable[tuple[str, str, Optional[list[tuple[str, str]]]]]
+    ] = None,
     remove_props: Optional[Iterable[str]] = None,
 ) -> str:
     """One-shot byte-preserving patch of a raw vCard.
@@ -429,9 +429,11 @@ def patch_vcard(
                 # ergonomic; matches DAVx5 semantics.
                 if ";" in sel:
                     name, params_str = sel.split(";", 1)
-                    params = [
-                        tuple(p.split("=", 1)) for p in params_str.split(";") if "=" in p
-                    ]
+                    params = []
+                    for param in params_str.split(";"):
+                        if "=" in param:
+                            key, value = param.split("=", 1)
+                            params.append((key, value))
                     vcard.add_property(name, new_value, params)
                 else:
                     vcard.add_property(sel, new_value)

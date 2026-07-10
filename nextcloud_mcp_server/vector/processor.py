@@ -1179,7 +1179,7 @@ async def _index_document(
                     raise BatchPending(retry_in=retry_in)
 
             # Read file content via WebDAV
-            content_bytes, content_type = await nc_client.webdav.read_file(file_path)
+            content_bytes, content_type, _ = await nc_client.webdav.read_file(file_path)
         else:
             raise ValueError(f"Unsupported doc_type: {doc_task.doc_type}")
 

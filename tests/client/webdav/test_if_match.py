@@ -15,8 +15,10 @@ Covers:
   T1 — read_file returns (content, content_type, etag) tuple; etag stripped of quotes
   T2 — write_file with if_match adds If-Match header; succeeds when server accepts
   T3 — write_file with if_match raises EtagConflictError on 412 with server_etag
+  T3b — a transport-added -gzip ETag retries once with the authoritative ETag
   T4 — write_file WITHOUT if_match preserves current behavior (no If-Match header)
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -32,13 +34,17 @@ def _make_client():
     c = WebDAVClient.__new__(WebDAVClient)
     c._client = MagicMock()
     c.username = "test-user"
+    c._principal_discovered = True
+    c._principal_id = "test-user"
     c.CHUNK_THRESHOLD = 1024 * 1024
     c.CHUNK_SIZE = 5 * 1024 * 1024
     c._get_webdav_base_path = lambda: "/remote.php/dav/files/test-user"
     return c
 
 
-def _mock_response(status_code: int = 200, content: bytes = b"", headers: dict | None = None):
+def _mock_response(
+    status_code: int = 200, content: bytes = b"", headers: dict | None = None
+):
     req = Request("GET", "http://test/")
     resp = Response(status_code, content=content, headers=headers or {}, request=req)
     return resp
@@ -98,6 +104,47 @@ async def test_T3_write_file_412_raises_etag_conflict():
     with pytest.raises(EtagConflictError) as exc_info:
         await c.write_file("/file.txt", b"data", if_match="stale-etag")
     assert exc_info.value.current_etag == "server-current-etag"
+
+
+async def test_T3b_gzip_etag_variant_retries_once_with_authoritative_etag():
+    """An exact -gzip transport variant retries without weakening If-Match."""
+    c = _make_client()
+    seen_if_match = []
+
+    async def fake_request(method, url, content=None, headers=None):
+        seen_if_match.append(headers["If-Match"])
+        if len(seen_if_match) == 1:
+            req = Request(method, url)
+            resp = Response(412, headers={"etag": '"abc123"'}, request=req)
+            raise HTTPStatusError("412", request=req, response=resp)
+        return _mock_response(204, headers={"etag": '"new-etag"'})
+
+    c._make_request = fake_request
+    result = await c.write_file("/file.txt", b"data", if_match="abc123-gzip")
+
+    assert seen_if_match == ['"abc123-gzip"', '"abc123"']
+    assert result == {
+        "status_code": 204,
+        "bytes_written": 4,
+        "etag": "new-etag",
+    }
+
+
+async def test_T3c_gzip_retry_preserves_second_conflict():
+    """A changed authoritative ETag after the retry still fails closed."""
+    c = _make_client()
+    server_etags = iter(("abc123", "changed-after-read"))
+
+    async def fake_request(method, url, content=None, headers=None):
+        req = Request(method, url)
+        resp = Response(412, headers={"etag": f'"{next(server_etags)}"'}, request=req)
+        raise HTTPStatusError("412", request=req, response=resp)
+
+    c._make_request = fake_request
+    with pytest.raises(EtagConflictError) as exc_info:
+        await c.write_file("/file.txt", b"data", if_match="abc123-gzip")
+
+    assert exc_info.value.current_etag == "changed-after-read"
 
 
 async def test_T4_write_file_without_if_match_omits_header():

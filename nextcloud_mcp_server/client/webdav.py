@@ -42,6 +42,31 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
+def _unquote_etag(etag: Optional[str]) -> Optional[str]:
+    if etag and etag.startswith('"') and etag.endswith('"'):
+        return etag[1:-1]
+    return etag
+
+
+def _quote_etag(etag: str) -> str:
+    if etag == "*" or (etag.startswith('"') and etag.endswith('"')):
+        return etag
+    return f'"{etag}"'
+
+
+def _is_compressed_etag_variant(
+    if_match: Optional[str], server_etag: Optional[str]
+) -> bool:
+    """Return true only for the exact transport-added ``-gzip`` variant."""
+    client_etag = _unquote_etag(if_match)
+    authoritative_etag = _unquote_etag(server_etag)
+    return bool(
+        client_etag
+        and authoritative_etag
+        and client_etag == f"{authoritative_etag}-gzip"
+    )
+
+
 def _read_complete_body(response: Response, label: str) -> bytes:
     """Return the response body, raising on a short read vs ``Content-Length``.
 
@@ -506,6 +531,58 @@ class WebDAVClient(BaseNextcloudClient):
     CHUNK_THRESHOLD = 1 * 1024 * 1024  # 1 MB
     CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
+    async def _conditional_request(
+        self,
+        method: str,
+        request_path: str,
+        display_path: str,
+        headers: Dict[str, str],
+        if_match: Optional[str],
+        content: Optional[bytes] = None,
+    ) -> Response:
+        """Send a conditional write with one safe compressed-ETag retry."""
+
+        async def send(request_headers: Dict[str, str]) -> Response:
+            response = await self._make_request(
+                method, request_path, content=content, headers=request_headers
+            )
+            response.raise_for_status()
+            return response
+
+        try:
+            return await send(headers)
+        except HTTPStatusError as error:
+            if error.response.status_code != 412:
+                raise
+
+            server_etag = _unquote_etag(
+                error.response.headers.get("etag") or error.response.headers.get("ETag")
+            )
+            if _is_compressed_etag_variant(if_match, server_etag):
+                assert server_etag is not None
+                retry_headers = {**headers, "If-Match": _quote_etag(server_etag)}
+                logger.info(
+                    "Retrying conditional %s for compressed ETag variant on %r",
+                    method,
+                    display_path,
+                )
+                try:
+                    return await send(retry_headers)
+                except HTTPStatusError as retry_error:
+                    if retry_error.response.status_code != 412:
+                        raise
+                    server_etag = _unquote_etag(
+                        retry_error.response.headers.get("etag")
+                        or retry_error.response.headers.get("ETag")
+                    )
+
+            raise EtagConflictError(
+                f"412 Precondition Failed on {method} {display_path}: "
+                f"If-Match {if_match!r} did not match server "
+                f"(server_etag={server_etag!r})",
+                current_etag=server_etag,
+            ) from error
+
     async def write_file(
         self,
         path: str,
@@ -552,33 +629,23 @@ class WebDAVClient(BaseNextcloudClient):
         if if_match is not None:
             # NC expects quoted etags per RFC 7232; pass through if already quoted
             # or wildcard, else add quotes
-            headers["If-Match"] = (
-                if_match
-                if (if_match == "*" or (if_match.startswith('"') and if_match.endswith('"')))
-                else f'"{if_match}"'
-            )
+            headers["If-Match"] = _quote_etag(if_match)
         try:
-            response = await self._make_request(
-                "PUT", webdav_path, content=content, headers=headers
+            response = await self._conditional_request(
+                "PUT", webdav_path, path, headers, if_match, content
             )
-            response.raise_for_status()
-            result = {"status_code": response.status_code, "bytes_written": len(content)}
+            result = {
+                "status_code": response.status_code,
+                "bytes_written": len(content),
+            }
             new_etag = response.headers.get("etag") or response.headers.get("ETag")
-            if new_etag:
-                if new_etag.startswith('"') and new_etag.endswith('"'):
-                    new_etag = new_etag[1:-1]
+            new_etag = _unquote_etag(new_etag)
+            if new_etag is not None:
                 result["etag"] = new_etag
             return result
+        except EtagConflictError:
+            raise
         except HTTPStatusError as e:
-            if e.response.status_code == 412:
-                server_etag = e.response.headers.get("etag") or e.response.headers.get("ETag")
-                if server_etag and server_etag.startswith('"') and server_etag.endswith('"'):
-                    server_etag = server_etag[1:-1]
-                raise EtagConflictError(
-                    f"412 Precondition Failed on PUT {path}: If-Match {if_match!r} "
-                    f"did not match server (server_etag={server_etag!r})",
-                    current_etag=server_etag,
-                )
             logger.error(f"HTTP error writing file '{path}': {e}")
             raise
 
@@ -640,29 +707,14 @@ class WebDAVClient(BaseNextcloudClient):
             "Content-Type": content_type,
         }
         if if_match is not None:
-            move_headers["If-Match"] = (
-                if_match
-                if (if_match == "*" or (if_match.startswith('"') and if_match.endswith('"')))
-                else f'"{if_match}"'
-            )
-        move_resp = await self._make_request(
+            move_headers["If-Match"] = _quote_etag(if_match)
+        move_resp = await self._conditional_request(
             "MOVE",
             f"{upload_root}/.file",
-            headers=move_headers,
+            path,
+            move_headers,
+            if_match,
         )
-        try:
-            move_resp.raise_for_status()
-        except HTTPStatusError as e:
-            if e.response.status_code == 412:
-                server_etag = e.response.headers.get("etag") or e.response.headers.get("ETag")
-                if server_etag and server_etag.startswith('"') and server_etag.endswith('"'):
-                    server_etag = server_etag[1:-1]
-                raise EtagConflictError(
-                    f"412 Precondition Failed on MOVE {path}: If-Match {if_match!r} "
-                    f"did not match server (server_etag={server_etag!r})",
-                    current_etag=server_etag,
-                )
-            raise
         return {
             "status_code": move_resp.status_code,
             "bytes_written": bytes_written,
