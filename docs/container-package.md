@@ -1,9 +1,9 @@
 # Container Package
 
-The published container package is the old-stable release image:
+The published container package is the stable release image:
 
 ```bash
-ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
+ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
 ```
 
 The image is published as a multi-architecture Docker image for `linux/amd64`
@@ -36,7 +36,7 @@ docker run --detach --name nextcloud-mcp \
   --health-timeout 5s \
   --health-retries 3 \
   --health-start-period 20s \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.1.8
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
 ```
 
 Then connect the MCP client to:
@@ -65,5 +65,5 @@ http://127.0.0.1:8000/health/ready
   `8000`.
 - The image exposes `/health/live` and `/health/ready` for container health
   checks.
-- Newer source releases may exist without a published container package. Use the
-  package tag above when you want the published old-stable image.
+- The package uses the exact release tag and does not publish a floating
+  `latest` tag.
