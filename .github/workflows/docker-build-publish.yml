@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact old-stable release tag to publish
+        description: Exact stable release tag to publish
         required: true
-        default: v1.1.8
+        default: v1.3.0
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  OLD_STABLE_TAG: v1.1.8
-  OLD_STABLE_VERSION: 0.118.1
+  PACKAGE_TAG: v1.3.0
+  PACKAGE_VERSION: 0.130.1
 
 jobs:
   publish:
@@ -21,10 +21,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Validate exact old-stable tag
+      - name: Validate exact stable tag
         run: |
-          if [ "${{ inputs.tag }}" != "$OLD_STABLE_TAG" ]; then
-            echo "This workflow only publishes $OLD_STABLE_TAG as an old-stable package." >&2
+          if [ "${{ inputs.tag }}" != "$PACKAGE_TAG" ]; then
+            echo "This workflow only publishes $PACKAGE_TAG as the stable package." >&2
             exit 1
           fi
 
@@ -33,11 +33,15 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
+      - name: Capture checked-out source revision
+        id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Validate source version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
-          if [ "$version" != "$OLD_STABLE_VERSION" ]; then
-            echo "Expected pyproject version $OLD_STABLE_VERSION, found $version" >&2
+          if [ "$version" != "$PACKAGE_VERSION" ]; then
+            echo "Expected pyproject version $PACKAGE_VERSION, found $version" >&2
             exit 1
           fi
 
@@ -54,19 +58,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish exact old-stable image
+      - name: Build and publish exact stable image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.OLD_STABLE_TAG }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.PACKAGE_TAG }}
           provenance: false
           sbom: false
           labels: |
             org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
-            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.OLD_STABLE_TAG }}
-            org.opencontainers.image.version=${{ env.OLD_STABLE_TAG }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.PACKAGE_TAG }}
+            org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Old stable v1.1.8 package for nextcloud-mcp-server 0.118.1
+            org.opencontainers.image.description=Stable v1.3.0 package for nextcloud-mcp-server 0.130.1
