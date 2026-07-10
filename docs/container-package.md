@@ -3,7 +3,7 @@
 The published container package is the stable release image:
 
 ```bash
-ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
+ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.1
 ```
 
 The image is published as a multi-architecture Docker image for `linux/amd64`
@@ -36,7 +36,7 @@ docker run --detach --name nextcloud-mcp \
   --health-timeout 5s \
   --health-retries 3 \
   --health-start-period 20s \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.1
 ```
 
 Then connect the MCP client to:

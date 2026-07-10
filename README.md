@@ -50,7 +50,7 @@ docker run --rm -p 127.0.0.1:8000:8000 \
   -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
   -e NEXTCLOUD_USERNAME=your_username \
   -e NEXTCLOUD_PASSWORD=your_app_password \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.0
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.1
 ```
 
 Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
