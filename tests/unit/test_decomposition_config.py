@@ -50,14 +50,14 @@ class TestDecompositionDefaults:
 
 class TestKeywordTag:
     """VECTOR_SYNC_KEYWORD_TAG selects files to index keyword-only (BM25 sparse,
-    no dense vector), mirroring VECTOR_SYNC_PDF_TAG. Defaults to ``keyword-index``
+    no dense vector), mirroring VECTOR_SYNC_TAG. Defaults to ``keyword-index``
     (symmetric with the ``vector-index`` default); set empty to disable."""
 
     def test_default_is_keyword_index(self):
         assert Settings().vector_sync_keyword_tag == "keyword-index"
 
     def test_explicit_value_round_trips(self):
-        # Mirrors VECTOR_SYNC_PDF_TAG: a configured tag is passed through verbatim
+        # Mirrors VECTOR_SYNC_TAG: a configured tag is passed through verbatim
         # (an explicit value overrides the default tag name).
         assert (
             Settings(vector_sync_keyword_tag="kw-only").vector_sync_keyword_tag
@@ -78,6 +78,7 @@ class TestEnumValidation:
             ("collection_metadata_source", "redis"),
             ("document_tier1_engine", "mupdf"),
             ("document_ocr_provider", "gatway"),
+            ("docling_pipeline", "vllm"),
         ],
     )
     def test_invalid_enum_rejected(self, field, value):
@@ -93,6 +94,41 @@ class TestEnumValidation:
         assert (
             Settings(document_ocr_provider="docling").document_ocr_provider == "docling"
         )
+
+    def test_docling_pipeline_vlm_accepted(self):
+        # vlm is the opt-in pipeline that drives docling-serve's VLM presets, ADR-032.
+        assert Settings(docling_pipeline="vlm").docling_pipeline == "vlm"
+
+
+class TestReadTimeoutCap:
+    """Opt-in interactive read-parse cap (DOCUMENT_READ_TIMEOUT_SECONDS, ADR-032)."""
+
+    def test_default_is_disabled(self):
+        assert Settings().document_read_timeout_seconds is None
+
+    def test_numeric_string_coerced_to_float(self):
+        # dynaconf may hand the env value through as a string -> coerce for fail_after.
+        s = Settings(document_read_timeout_seconds="60")
+        assert s.document_read_timeout_seconds == pytest.approx(60.0)
+
+    def test_empty_string_disables(self):
+        # A bare DOCUMENT_READ_TIMEOUT_SECONDS= (compose passthrough) means "unset".
+        assert (
+            Settings(document_read_timeout_seconds="").document_read_timeout_seconds
+            is None
+        )
+        assert (
+            Settings(document_read_timeout_seconds="  ").document_read_timeout_seconds
+            is None
+        )
+
+    def test_below_one_rejected(self):
+        with pytest.raises(ValueError, match="DOCUMENT_READ_TIMEOUT_SECONDS"):
+            Settings(document_read_timeout_seconds=0)
+
+    def test_non_numeric_rejected(self):
+        with pytest.raises(ValueError, match="DOCUMENT_READ_TIMEOUT_SECONDS"):
+            Settings(document_read_timeout_seconds="abc")
 
 
 class TestIngestQueueResolution:

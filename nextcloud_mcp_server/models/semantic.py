@@ -42,7 +42,12 @@ class SemanticSearchResult(BaseModel):
         default=None, description="Character position where chunk ends in document"
     )
     page_number: int | None = Field(
-        default=None, description="Page number for PDF documents"
+        default=None, description="First (or only) page for PDF documents"
+    )
+    page_end: int | None = Field(
+        default=None,
+        description="Last page for packed multi-page chunks; equals page_number "
+        "for single-page chunks",
     )
     page_count: int | None = Field(
         default=None, description="Total number of pages in PDF document"
@@ -203,6 +208,22 @@ class VectorSyncStatusResponse(BaseResponse):
             "postgres backend (Deck #323), so an operator can see whether work is "
             "backed up on ingest-fast vs waiting on ingest-structured/ingest-ocr; "
             "None on the in-memory backend"
+        ),
+    )
+    hybrid_chunks: int = Field(
+        default=0,
+        description=(
+            "Chunks indexed in hybrid mode (dense + sparse). These carry a dense "
+            "vector and so drive the vector-RAM footprint; keyword-index chunks "
+            "(indexed_chunks - hybrid_chunks) are sparse-only and cost no dense RAM."
+        ),
+    )
+    estimated_vector_bytes: int = Field(
+        default=0,
+        description=(
+            "Estimated dense-vector RAM footprint in bytes "
+            "(hybrid_chunks * embedding_dim * 4 * hnsw_overhead) — the real "
+            "hybrid-search cost driver, which source-byte billing does not capture."
         ),
     )
 

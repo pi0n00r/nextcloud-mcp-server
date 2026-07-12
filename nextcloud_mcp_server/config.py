@@ -113,6 +113,10 @@ _DEFAULTS: dict[str, Any] = {
     "vector_sync_processor_workers": 3,
     "vector_sync_queue_max_size": 10000,
     "vector_sync_metrics_refresh_interval": 20,
+    "vector_density_snapshot_enabled": True,
+    "vector_density_snapshot_interval": 300,
+    "vector_density_snapshot_max_documents": 50000,
+    "vector_ram_hnsw_overhead_factor": 1.5,
     "vector_sync_user_poll_interval": 60,
     "health_ready_refresh_interval": 15,
     # Orphan-sweep at Pod startup (card #101). When True, delete any
@@ -124,9 +128,9 @@ _DEFAULTS: dict[str, Any] = {
     # System tag that marks files for hybrid (dense + BM25 sparse) indexing.
     # The scanner indexes files carrying this tag; verify-on-read gates results
     # on current membership of this tag (ADR-019).
-    "vector_sync_pdf_tag": "vector-index",
+    "vector_sync_tag": "vector-index",
     # System tag that marks files for keyword-only (BM25 sparse) indexing.
-    # Defaults to ``keyword-index`` (symmetric with ``vector_sync_pdf_tag``), so
+    # Defaults to ``keyword-index`` (symmetric with ``vector_sync_tag``), so
     # a user who creates + applies that tag gets keyword-only indexing out of the
     # box. Files carrying it are indexed sparse-only (no dense embedding, no
     # embedding cost) into the SAME collection as hybrid files; ``vector-index``
@@ -168,9 +172,24 @@ _DEFAULTS: dict[str, Any] = {
     # first so no chunk spans a page (exact page_number, clean snippets, and
     # predictable ~1 chunk/page when chunk_size >= the largest page).
     "document_chunk_page_aware": True,
+    # Greedy page-packing (density fix, Deck #636): merge consecutive sub-budget
+    # pages into one chunk instead of one-per-page. Off by default until the
+    # post-change density re-measure + pricing re-calibration land.
+    "document_chunk_page_pack": False,
+    # Chunking config generation. Bump whenever chunker behaviour changes (size,
+    # overlap, page-aware, page-pack, split strategy) so the pricing model's
+    # density reference can't silently go stale. Pinned in stripe-catalog.tf.
+    "chunking_config_version": 1,
     # PDF parse isolation (OOM guard)
     "document_pdf_graphics_limit": 1000,
     "document_parse_timeout_seconds": 120.0,
+    # Optional wall-clock cap (seconds) on the SYNCHRONOUS parse inside the
+    # nc_webdav_read_file MCP tool. None (default) = disabled: an interactive read
+    # is bounded only by the underlying processor timeout (DOCLING_TIMEOUT /
+    # DOCUMENT_OCR_TIMEOUT_SECONDS). Set a client-friendly bound (e.g. 45-60s) so a
+    # slow VLM/OCR convert returns base64 quickly instead of blocking past an MCP
+    # client's own timeout. Never applies to the async ingest/worker path (ADR-032).
+    "document_read_timeout_seconds": None,
     "document_parse_mem_limit_mb": 1536,
     # Pre-parse size cap (MB): PDFs larger than this fail fast with reason
     # "oversize" instead of burning the OCR timeout to 0 chars on a pathological
@@ -274,6 +293,13 @@ _DEFAULTS: dict[str, Any] = {
     # Run OCR on IMAGES routed to the DoclingProcessor (find_processor path). The
     # docling OCR *backend* (scanned PDFs) always OCRs regardless of this flag.
     "docling_do_ocr": True,
+    # Which docling-serve pipeline to request: "standard" (classic layout+OCR,
+    # default, unchanged) or "vlm" (Vision-LLM OCR). "vlm" needs a docling-serve
+    # instance configured with VLM presets (see ADR-032).
+    "docling_pipeline": "standard",
+    # VLM preset name sent when docling_pipeline == "vlm". None -> docling-serve
+    # picks its own DOCLING_SERVE_DEFAULT_VLM_PRESET. Preset names are server-defined.
+    "docling_vlm_preset": None,
     # Tag-based file exclusion (issue #710): comma-separated list of
     # Nextcloud system tag names. Files/folders carrying any of these tags
     # are hidden from WebDAV MCP tools. Empty = feature off.
@@ -296,6 +322,21 @@ _DEFAULTS: dict[str, Any] = {
     # worker heartbeat is this many seconds stale (Deck #183). Default is well
     # above the longest expected document; raise it for slow embedding backends.
     "ingest_stalled_job_seconds": 300,
+    # Backstop reclaim: also re-queue a job stuck in ``doing`` for this many seconds
+    # regardless of worker liveness. The heartbeat threshold above only catches DEAD
+    # workers; a job whose OWN completion crashed (e.g. an unhandled queueing_lock
+    # UniqueViolation on the doing->todo retry) is stranded in ``doing`` under a LIVE,
+    # heart-beating worker and is invisible to the heartbeat sweep.
+    # This fires purely on time-in-``doing``, NOT on liveness, so it can't tell "stuck"
+    # from "legitimately slow": if a single HEALTHY process_document attempt ever ran
+    # past this, it'd be re-queued mid-flight and two workers could process the doc
+    # concurrently. That's safe ONLY because ingest re-runs are idempotent (uuid5
+    # Qdrant point IDs — see the queue module's "Design notes"), NOT because the
+    # reclaim distinguishes the two — so keep the default comfortably above the longest
+    # real single attempt. OCR batch polling releases the worker between polls
+    # (BatchPending -> retry_in), so a job never legitimately holds ``doing`` this
+    # long; 1800s is deep headroom. (Deck: ingest doing-strand reclaim.)
+    "ingest_doing_max_seconds": 1800,
     # Delete succeeded ingest jobs (keeps the queue table lean + the KEDA
     # queue-depth metric clean). Set false to retain succeeded rows for audit
     # (note: indexing success is also recorded in logs/metrics regardless).
@@ -433,11 +474,15 @@ _dynaconf = Dynaconf(
         Validator("VECTOR_SYNC_PROCESSOR_WORKERS", gte=1),
         Validator("VECTOR_SYNC_QUEUE_MAX_SIZE", gte=1),
         Validator("VECTOR_SYNC_METRICS_REFRESH_INTERVAL", gte=1),
+        Validator("VECTOR_DENSITY_SNAPSHOT_INTERVAL", gte=1),
+        Validator("VECTOR_DENSITY_SNAPSHOT_MAX_DOCUMENTS", gte=1),
+        Validator("VECTOR_RAM_HNSW_OVERHEAD_FACTOR", gte=1),
         Validator("VECTOR_SYNC_USER_POLL_INTERVAL", gte=1),
         Validator("HEALTH_READY_REFRESH_INTERVAL", gte=1),
         Validator("PORT", gte=1, lte=65535),
         Validator("VERIFICATION_CONCURRENCY", gte=1),
         Validator("DOCUMENT_CHUNK_SIZE", gte=1),
+        Validator("CHUNKING_CONFIG_VERSION", gte=1),
         Validator("DOCUMENT_PARSE_TIMEOUT_SECONDS", gte=1),
         Validator("DOCUMENT_OCR_TIMEOUT_SECONDS", gte=1),
         # DOCUMENT_OCR_MODE is normalised + membership-checked in
@@ -460,7 +505,7 @@ _dynaconf = Dynaconf(
         # Non-negative
         Validator("DOCUMENT_CHUNK_OVERLAP", gte=0),
         # Non-empty strings
-        Validator("VECTOR_SYNC_PDF_TAG", len_min=1),
+        Validator("VECTOR_SYNC_TAG", len_min=1),
         # VECTOR_SYNC_KEYWORD_TAG is optional (empty disables keyword-only
         # discovery), so no len_min — but when set it must be a usable tag name.
         # WEBHOOK_SECRET is optional (None disables webhooks — GHSA-8vh3-g2qg-2h2c),
@@ -743,6 +788,15 @@ def get_document_processor_config() -> dict[str, Any]:
                 "timeout": _dynaconf.get("DOCLING_TIMEOUT"),
                 "ocr_lang": [s.strip() for s in lang_str.split(",") if s.strip()],
                 "do_ocr": _dynaconf.get("DOCLING_DO_OCR"),
+                # Normalize like Settings.__post_init__ does (.strip().lower()) so the
+                # image path matches convert_file()'s ``pipeline == "vlm"`` check --
+                # otherwise DOCLING_PIPELINE=VLM would silently fall back to standard
+                # here while the OCR-backend path (Settings-validated) uses vlm.
+                # vlm_preset is server-defined and case-sensitive, so it stays raw.
+                "pipeline": (_dynaconf.get("DOCLING_PIPELINE") or "standard")
+                .strip()
+                .lower(),
+                "vlm_preset": _dynaconf.get("DOCLING_VLM_PRESET"),
                 "progress_interval": _dynaconf.get("PROGRESS_INTERVAL"),
             }
 
@@ -898,6 +952,20 @@ class Settings:
     # outstanding-work + indexed documents/chunks. Decoupled from the consumer
     # so the gauges are correct on every deployment mode and queue backend.
     vector_sync_metrics_refresh_interval: int = 20  # seconds
+    # Current-corpus chunk-density snapshot (vector/metrics_publisher.py:
+    # vector_density_snapshot_task). Scrolls the collection to recompute the
+    # distribution of documents CURRENTLY in Qdrant, so it runs on its own slower
+    # cadence than the count()-based gauges above. ``max_documents`` caps the
+    # scroll; hitting it sets the ``..._snapshot_truncated`` gauge (no silent cap).
+    vector_density_snapshot_enabled: bool = True
+    vector_density_snapshot_interval: int = 300  # seconds
+    vector_density_snapshot_max_documents: int = 50000
+    # HNSW-graph/segment overhead multiplier applied when estimating dense-vector
+    # RAM (``chunks * dim * 4 bytes * factor``). ~1.5 matches the cost-to-serve
+    # note's ~6 KB / 1024-dim observation; a deployment knob because the real
+    # overhead varies with HNSW ``m``/segment layout. Observability only — no
+    # billing impact.
+    vector_ram_hnsw_overhead_factor: float = 1.5
     vector_sync_user_poll_interval: int = 60  # seconds - OAuth mode user discovery
     vector_sync_orphan_sweep_enabled: bool = True  # card #101
     # Cadence for the background readiness dependency-health refresh loop
@@ -908,10 +976,10 @@ class Settings:
     # scanner indexes files carrying this tag and verify-on-read gates results
     # on current membership (ADR-019), so an untagged file drops out of search
     # immediately.
-    vector_sync_pdf_tag: str = "vector-index"
+    vector_sync_tag: str = "vector-index"
 
     # System tag marking files for keyword-only (BM25 sparse) indexing. Defaults
-    # to ``keyword-index`` (symmetric with ``vector_sync_pdf_tag``): tagged files
+    # to ``keyword-index`` (symmetric with ``vector_sync_tag``): tagged files
     # are indexed sparse-only into the same collection as hybrid files (no dense
     # embedding). ``vector-index`` takes precedence when a file carries both tags.
     # Set empty to disable the second tag entirely.
@@ -966,6 +1034,17 @@ class Settings:
     # ~1 chunk/page when document_chunk_size >= the largest page. When False,
     # the legacy char-based path runs with post-hoc assign_page_numbers.
     document_chunk_page_aware: bool = True
+    # Greedy page-packing (Deck #636). When True, the page-aware chunker merges
+    # consecutive sub-budget pages into one chunk (page-range citation via
+    # page_number/page_end) instead of one-chunk-per-page — the density fix for
+    # lean-page/born-digital PDFs. Off by default: enabling it re-scales density
+    # fleet-wide and requires the storage-rate re-calibration first (#626).
+    document_chunk_page_pack: bool = False
+    # Chunking config generation. Bump on ANY chunker behaviour change (size,
+    # overlap, page-aware, page-pack, split strategy) so a change can't silently
+    # invalidate the €/GiB density reference. Stamped on the collection sentinel
+    # and pinned next to the density reference in stripe-catalog.tf + note 389935.
+    chunking_config_version: int = 1
 
     # PDF parse isolation (OOM guard). The parse runs in a subprocess so one
     # pathological file fails that doc, not the pod.
@@ -981,6 +1060,13 @@ class Settings:
     # float so a fractional DOCUMENT_PARSE_TIMEOUT_SECONDS is honoured, matching
     # anyio.move_on_after's float seconds.
     document_parse_timeout_seconds: float = 120.0
+    # Optional cap (seconds) on the synchronous parse in the nc_webdav_read_file
+    # tool. None = disabled (bounded only by the processor timeout). When set,
+    # anyio.fail_after aborts a slow interactive convert and the tool returns
+    # base64 instead of blocking; it never affects the async ingest path (ADR-032).
+    # Distinct from document_parse_timeout_seconds, which caps the fast/structured
+    # PDF-parse subprocess, not the docling/OCR HTTP call.
+    document_read_timeout_seconds: float | None = None
     # Pre-parse PDF size cap (MB). A PDF larger than this fails fast with
     # parse_failed_reason="oversize" (placeholder marked "failed") rather than
     # being handed to the fast/OCR tiers, where a pathological large file burns
@@ -1038,6 +1124,8 @@ class Settings:
     # resolves to None (docling OCR off) and the image processor is not registered.
     docling_api_url: str | None = None
     docling_ocr_lang: str = "en,de"
+    docling_pipeline: str = "standard"
+    docling_vlm_preset: str | None = None
 
     # Observability settings
     metrics_enabled: bool = True
@@ -1064,6 +1152,7 @@ class Settings:
     ingest_queue: str | None = None  # memory | postgres
     mcp_role: str = "all"  # api | worker | all (Deck #183 two-pod model)
     ingest_stalled_job_seconds: int = 300  # crashed-worker reclaim threshold
+    ingest_doing_max_seconds: int = 1800  # backstop: reclaim live-worker doing strands
     ingest_delete_succeeded_jobs: bool = True  # drop succeeded ingest jobs
     ingest_listen_notify: bool = True  # False = poll-only (txn-mode pooler, Deck #424)
     ingest_escalation_enabled: bool = True  # per-tier queue-hop (Deck #323)
@@ -1124,6 +1213,16 @@ class Settings:
                 )
             logger.info("Using custom CA bundle: %s", self.nextcloud_ca_bundle)
 
+        # Page-packing is a sub-mode of page-aware chunking (the packing logic
+        # only runs inside the page-aware branch). Enabling it without page-aware
+        # is a silent no-op, so surface the misconfiguration at startup.
+        if self.document_chunk_page_pack and not self.document_chunk_page_aware:
+            logger.warning(
+                "DOCUMENT_CHUNK_PAGE_PACK is enabled but DOCUMENT_CHUNK_PAGE_AWARE "
+                "is disabled; page-packing only runs inside page-aware chunking, so "
+                "this setting has no effect. Enable DOCUMENT_CHUNK_PAGE_AWARE to "
+                "activate packing."
+            )
         # Postgres backend TLS is configured entirely in DATABASE_URL (e.g.
         # ?sslmode=require&sslrootcert=/path) and read by libpq/psycopg — the
         # server neither parses nor validates it (ADR-026, Model A).
@@ -1182,6 +1281,7 @@ class Settings:
             "document_tier1_engine": {"pypdfium2", "pymupdf"},
             "document_ocr_provider": {"auto", "gateway", "mistral", "docling", "none"},
             "document_ocr_mode": {"sync", "batch"},
+            "docling_pipeline": {"standard", "vlm"},
         }
         for _field, _allowed in _enum_fields.items():
             _val = (getattr(self, _field) or "").strip().lower()
@@ -1230,6 +1330,29 @@ class Settings:
                 "routes through the embedding gateway); use DOCUMENT_OCR_MODE=sync "
                 "for the direct backend without a gateway"
             )
+        # Optional interactive read-parse cap (nc_webdav_read_file). Unset / empty =
+        # disabled; when set it must be a positive number of seconds. An empty string
+        # (a bare `DOCUMENT_READ_TIMEOUT_SECONDS=` from a compose passthrough) is
+        # treated as unset. Coerce so a dynaconf env string ("60") becomes a float for
+        # anyio.fail_after.
+        _read_cap = self.document_read_timeout_seconds
+        if isinstance(_read_cap, str):
+            _read_cap = _read_cap.strip() or None
+        if _read_cap is not None:
+            try:
+                _read_cap = float(_read_cap)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "DOCUMENT_READ_TIMEOUT_SECONDS must be a positive number of "
+                    "seconds (or unset to disable); got "
+                    f"{self.document_read_timeout_seconds!r}"
+                ) from None
+            if _read_cap < 1:
+                raise ValueError(
+                    "DOCUMENT_READ_TIMEOUT_SECONDS must be >= 1 second (or unset to "
+                    f"disable); got {_read_cap}"
+                )
+        self.document_read_timeout_seconds = _read_cap
         if (
             self.collection_metadata_source == "api"
             and not self.collection_metadata_api_url
@@ -1685,10 +1808,14 @@ def get_settings() -> Settings:
         "vector_sync_processor_workers": "VECTOR_SYNC_PROCESSOR_WORKERS",
         "vector_sync_queue_max_size": "VECTOR_SYNC_QUEUE_MAX_SIZE",
         "vector_sync_metrics_refresh_interval": "VECTOR_SYNC_METRICS_REFRESH_INTERVAL",
+        "vector_density_snapshot_enabled": "VECTOR_DENSITY_SNAPSHOT_ENABLED",
+        "vector_density_snapshot_interval": "VECTOR_DENSITY_SNAPSHOT_INTERVAL",
+        "vector_density_snapshot_max_documents": "VECTOR_DENSITY_SNAPSHOT_MAX_DOCUMENTS",
+        "vector_ram_hnsw_overhead_factor": "VECTOR_RAM_HNSW_OVERHEAD_FACTOR",
         "vector_sync_user_poll_interval": "VECTOR_SYNC_USER_POLL_INTERVAL",
         "vector_sync_orphan_sweep_enabled": "VECTOR_SYNC_ORPHAN_SWEEP_ENABLED",
         "health_ready_refresh_interval": "HEALTH_READY_REFRESH_INTERVAL",
-        "vector_sync_pdf_tag": "VECTOR_SYNC_PDF_TAG",
+        "vector_sync_tag": "VECTOR_SYNC_TAG",
         "vector_sync_keyword_tag": "VECTOR_SYNC_KEYWORD_TAG",
         # Verify-on-read (ADR-019)
         "verification_concurrency": "VERIFICATION_CONCURRENCY",
@@ -1723,8 +1850,11 @@ def get_settings() -> Settings:
         "document_chunk_size": "DOCUMENT_CHUNK_SIZE",
         "document_chunk_overlap": "DOCUMENT_CHUNK_OVERLAP",
         "document_chunk_page_aware": "DOCUMENT_CHUNK_PAGE_AWARE",
+        "document_chunk_page_pack": "DOCUMENT_CHUNK_PAGE_PACK",
+        "chunking_config_version": "CHUNKING_CONFIG_VERSION",
         "document_pdf_graphics_limit": "DOCUMENT_PDF_GRAPHICS_LIMIT",
         "document_parse_timeout_seconds": "DOCUMENT_PARSE_TIMEOUT_SECONDS",
+        "document_read_timeout_seconds": "DOCUMENT_READ_TIMEOUT_SECONDS",
         "document_max_pdf_size_mb": "DOCUMENT_MAX_PDF_SIZE_MB",
         "document_parse_mem_limit_mb": "DOCUMENT_PARSE_MEM_LIMIT_MB",
         "document_classify_enabled": "DOCUMENT_CLASSIFY_ENABLED",
@@ -1745,6 +1875,8 @@ def get_settings() -> Settings:
         # image processor only (the OCR backend always OCRs), like the unstructured_* keys.
         "docling_api_url": "DOCLING_API_URL",
         "docling_ocr_lang": "DOCLING_OCR_LANG",
+        "docling_pipeline": "DOCLING_PIPELINE",
+        "docling_vlm_preset": "DOCLING_VLM_PRESET",
         # Observability settings
         "metrics_enabled": "METRICS_ENABLED",
         "metrics_port": "METRICS_PORT",
@@ -1762,6 +1894,7 @@ def get_settings() -> Settings:
         "ingest_queue": "INGEST_QUEUE",
         "mcp_role": "MCP_ROLE",
         "ingest_stalled_job_seconds": "INGEST_STALLED_JOB_SECONDS",
+        "ingest_doing_max_seconds": "INGEST_DOING_MAX_SECONDS",
         "ingest_delete_succeeded_jobs": "INGEST_DELETE_SUCCEEDED_JOBS",
         "ingest_listen_notify": "INGEST_LISTEN_NOTIFY",
         "ingest_escalation_enabled": "INGEST_ESCALATION_ENABLED",

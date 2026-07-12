@@ -5,6 +5,73 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.136.0 (2026-07-11)
+
+### Feat
+
+- **chunker**: greedy page-packing + chunking_config_version + density sweep harness
+
+### Fix
+
+- **chunker**: clear SonarCloud gate + warn on page-pack misconfig
+
+## v0.135.0 (2026-07-11)
+
+### Feat
+
+- **webdav**: opt-in interactive read-parse timeout cap
+- **config**: add DOCLING_PIPELINE/DOCLING_VLM_PRESET settings
+- **documents**: thread pipeline/vlm_preset through docling convert_file
+
+## v0.134.0 (2026-07-11)
+
+### Feat
+
+- **metrics**: current-in-Qdrant chunk-density snapshot histogram
+
+### Fix
+
+- **metrics**: avoid false truncated flag at exact scan-cap boundary
+
+## v0.133.2 (2026-07-10)
+
+### Fix
+
+- **ingest**: reclaim jobs stranded in `doing` under a live worker
+
+### Refactor
+
+- **ingest**: document backstop tradeoff + split reclaim log by sweep
+
+## v0.133.1 (2026-07-10)
+
+### Fix
+
+- **vector**: add payload index for index_mode (RAM-gauge 400)
+
+## v0.133.0 (2026-07-10)
+
+### Feat
+
+- **vector**: monitor dense-vector RAM cost during ingestion
+
+### Refactor
+
+- **vector**: address round-1 review on RAM-cost monitoring
+
+## v0.132.0 (2026-07-10)
+
+### BREAKING CHANGE
+
+- the env var VECTOR_SYNC_PDF_TAG is renamed to VECTOR_SYNC_TAG.
+Deployments that set VECTOR_SYNC_PDF_TAG must switch to VECTOR_SYNC_TAG; the old
+name is no longer read (no alias). Confirmed no tenant currently overrides it, so
+the default "vector-index" tag is unaffected.
+
+### Refactor
+
+- **config**: rename VECTOR_SYNC_PDF_TAG -> VECTOR_SYNC_TAG
+
 ## v0.131.1 (2026-07-10)
 
 ### Fix

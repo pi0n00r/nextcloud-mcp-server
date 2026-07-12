@@ -27,6 +27,8 @@ from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.embedding import get_bm25_service, get_embedding_service
 from nextcloud_mcp_server.models.deck import DeckCard
 from nextcloud_mcp_server.observability.metrics import (
+    estimate_vector_bytes,
+    record_chunk_density,
     record_document_chunks,
     record_document_dead_lettered,
     record_document_escalation,
@@ -34,6 +36,7 @@ from nextcloud_mcp_server.observability.metrics import (
     record_document_parse_failed,
     record_embedding,
     record_embedding_tokens,
+    record_estimated_vector_bytes,
     record_ingest_dropped,
     record_qdrant_operation,
     record_vector_sync_processing,
@@ -294,6 +297,18 @@ def assign_page_numbers(chunks, page_boundaries):
             chunk.page_number = assigned_page
 
 
+def resolve_page_end(chunk: ChunkWithPosition) -> int | None:
+    """Citation end-page for a chunk's Qdrant payload (Deck #636).
+
+    Packed multi-page chunks carry a real ``page_end`` (last page of the range);
+    every other chunk leaves it ``None`` — notably the char-based path, where
+    :func:`assign_page_numbers` back-fills ``page_number`` post-hoc but never
+    ``page_end``. Fall back to ``page_number`` so the payload always ships a
+    citation range (single-page chunks report ``page_end == page_number``).
+    """
+    return chunk.page_end if chunk.page_end is not None else chunk.page_number
+
+
 def should_use_page_aware(
     *, page_aware_enabled: bool, doc_type: str, page_boundaries: Any
 ) -> bool:
@@ -347,6 +362,37 @@ def build_point_vector(
     if dense_enabled:
         point_vector["dense"] = dense_embeddings[index]
     return point_vector
+
+
+def _record_ingest_vector_cost(
+    *,
+    doc_type: str,
+    chunk_count: int,
+    source_bytes: int,
+    dense_for_doc: bool,
+    overhead: float,
+) -> None:
+    """Emit the observability-only dense-vector cost signals for one document.
+
+    Records the deterministic per-document RAM estimate (hybrid docs only —
+    keyword docs embed no dense vector, so the estimate would be 0 anyway, but
+    gating on the mode avoids a needless ``get_dimension`` call) and the
+    chunk-density histogram (every embedded doc). Card #624.
+
+    Best-effort by contract: this never raises. A metrics failure here must not
+    disturb the indexing path, so every failure mode is caught and logged with
+    its cause (matching the ``metrics_publisher`` gauge guards) rather than
+    propagating.
+    """
+    try:
+        if dense_for_doc:
+            dim = get_embedding_service().get_dimension()
+            record_estimated_vector_bytes(
+                doc_type, estimate_vector_bytes(chunk_count, dim, overhead)
+            )
+        record_chunk_density(doc_type, chunk_count, source_bytes)
+    except Exception as exc:  # noqa: BLE001 — cost metrics must not break indexing
+        logger.warning("vector-cost observability hook skipped: %s", exc)
 
 
 async def record_indexing_usage(
@@ -1447,6 +1493,7 @@ async def _index_document(
             chunks = await PageAwareChunker(
                 chunk_size=settings.document_chunk_size,
                 overlap=settings.document_chunk_overlap,
+                pack_pages=settings.document_chunk_page_pack,
             ).chunk_text(content, page_boundaries_list)
         else:
             chunks = await DocumentChunker(
@@ -1760,6 +1807,23 @@ async def _index_document(
         ),
     )
 
+    # Raw source size at ingestion (raw WebDAV binary for files, UTF-8 text size
+    # for text doc types). Computed once here and reused for both the ingest-time
+    # density metric and the per-point payload (payload_keys.SOURCE_BYTES) so the
+    # current-corpus density snapshot can recompute chunks-per-MB from Qdrant.
+    source_bytes = ingested_byte_size(content_bytes, content)
+
+    # Observability-only cost signals (card #624), independent of USAGE_METERING.
+    # Best-effort and self-contained in the helper so a metrics failure can never
+    # disturb indexing.
+    _record_ingest_vector_cost(
+        doc_type=doc_task.doc_type,
+        chunk_count=len(chunk_texts),
+        source_bytes=source_bytes,
+        dense_for_doc=dense_for_doc,
+        overhead=settings.vector_ram_hnsw_overhead_factor,
+    )
+
     # Prepare Qdrant points
     indexed_at = int(time.time())
     points = []
@@ -1832,6 +1896,11 @@ async def _index_document(
             sparse_emb, dense_embeddings, i, dense_enabled=dense_for_doc
         )
 
+        # Last page of a packed multi-page chunk (Deck #636); falls back to
+        # page_number for single-page and char-path chunks so the citation
+        # range is always set.
+        page_end = resolve_page_end(chunk)
+
         points.append(
             PointStruct(
                 id=point_id,
@@ -1868,6 +1937,10 @@ async def _index_document(
                     "chunk_start_offset": chunk.start_offset,
                     "chunk_end_offset": chunk.end_offset,
                     "metadata_version": 2,  # v2 includes position metadata
+                    # Raw source size (bytes) at ingestion — the denominator the
+                    # current-corpus density snapshot needs, previously discarded
+                    # after embedding. Same on every chunk of the document.
+                    payload_keys.SOURCE_BYTES: source_bytes,
                     # Decomposition payload keys (design §10.2), additive.
                     payload_keys.PROCESSOR_VERSION: "monolith-v1",
                     payload_keys.PARSED_AT: indexed_at,
@@ -1889,6 +1962,7 @@ async def _index_document(
                             "mime_type": content_type,  # From WebDAV response
                             "file_size": file_metadata.get("file_size"),
                             "page_number": chunk.page_number,
+                            "page_end": page_end,
                             "page_count": file_metadata.get("page_count"),
                             "author": file_metadata.get("author"),
                             "creation_date": file_metadata.get("creation_date"),

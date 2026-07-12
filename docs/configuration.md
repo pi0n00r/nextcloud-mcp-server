@@ -364,7 +364,7 @@ by a single unified search.
 
 | Tag | Env var (override the tag name) | Mode | Embedding endpoint |
 |-----|---------|------|--------------------|
-| `vector-index` | `VECTOR_SYNC_PDF_TAG` (default `vector-index`) | hybrid (dense + BM25 sparse) | **Required** (Ollama/Bedrock/OpenAI/Mistral/gateway) |
+| `vector-index` | `VECTOR_SYNC_TAG` (default `vector-index`) | hybrid (dense + BM25 sparse) | **Required** (Ollama/Bedrock/OpenAI/Mistral/gateway) |
 | `keyword-index` | `VECTOR_SYNC_KEYWORD_TAG` (default `keyword-index`) | keyword (BM25 sparse only) | **None** for those docs |
 
 Both tags are **on by default** — create the `vector-index` and/or `keyword-index`
@@ -639,6 +639,8 @@ VECTOR_SYNC_QUEUE_MAX_SIZE=10000      # Max queued documents (default: 10000)
 # Document chunking settings (for vector embeddings)
 DOCUMENT_CHUNK_SIZE=2048              # Characters per chunk (default: 2048)
 DOCUMENT_CHUNK_OVERLAP=200            # Overlapping characters between chunks (default: 200)
+DOCUMENT_CHUNK_PAGE_PACK=false        # Merge consecutive sub-budget PDF pages into one chunk (default: false)
+CHUNKING_CONFIG_VERSION=1             # Chunker config generation; bump on any chunker behaviour change (default: 1)
 ```
 
 > **Note:** The `VECTOR_SYNC_*` tuning parameters keep their names as they're implementation details. Only the user-facing feature flag was renamed to `ENABLE_SEMANTIC_SEARCH`.
@@ -726,9 +728,12 @@ HTTP — no ML dependencies are added to the server image. Run one via the
 ```dotenv
 ENABLE_DOCLING=false                  # master switch for the docling touchpoints
 DOCLING_API_URL=http://docling:5001   # docling-serve base URL (required)
-DOCLING_TIMEOUT=120                   # image/force conversion timeout (seconds)
+DOCLING_TIMEOUT=120                   # INTERACTIVE image/force read timeout (nc_webdav_read_file); keep client-friendly
 DOCLING_OCR_LANG=en,de                # engine-dependent codes (EasyOCR: en,de; Tesseract: eng,deu)
 DOCLING_DO_OCR=true                   # run OCR (vs. text-layer extraction only)
+DOCLING_PIPELINE=standard             # "standard" (classic OCR) | "vlm" (vision-language model)
+DOCLING_VLM_PRESET=                   # VLM preset name when DOCLING_PIPELINE=vlm (unset = docling-serve default)
+DOCUMENT_READ_TIMEOUT_SECONDS=        # opt-in cap on the interactive read parse; empty = disabled (see VLM note)
 ```
 
 **Required configuration per use case** (`auto` never selects docling — it needs
@@ -739,6 +744,8 @@ an explicit self-hosted URL):
 | Images auto-route to docling | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
 | Force docling on a text-layer PDF (`force_processor="docling"`) | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
 | Scanned / no-text-layer PDFs auto-OCR via docling | `DOCUMENT_OCR_ENABLED=true` + `DOCUMENT_OCR_PROVIDER=docling` + `DOCLING_API_URL` |
+| **VLM** for bulk PDF indexing (async, recommended) | scanned-PDF row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`) + raise `DOCUMENT_OCR_TIMEOUT_SECONDS` (e.g. 600–900) |
+| **VLM** for interactive image/force reads | image/force row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`); expect long blocking — see the VLM note below |
 
 The scanned-PDF row deliberately omits `ENABLE_DOCLING`/`ENABLE_DOCUMENT_PROCESSING`:
 that path rides the always-registered `ocr` tier during **indexing** (so it also
@@ -774,6 +781,45 @@ convert endpoint has an observed ~2 min practical ceiling (from our testing, not
 hard server-enforced limit), so a larger `DOCLING_TIMEOUT` (e.g. 300s for slow CPU
 OCR) simply lets a slow conversion finish; very large scans are future work (async
 submit/poll). See `docs/ADR-031-docling-document-parsing-backend.md`.
+
+**VLM pipeline (opt-in).** docling-serve can also transcribe with a
+vision-language model instead of classic OCR — often markedly better on messy
+scans, handwriting and complex layouts. The pipeline is **client-selected**: set
+`DOCLING_PIPELINE=vlm` and the docling client sends `pipeline=vlm` (plus
+`DOCLING_VLM_PRESET`, if set, and a lean `image_export_mode=placeholder`) on
+**both** the image and scanned-PDF touchpoints. Presets are defined by the
+docling-serve instance (e.g. `glm_ocr` backed by a local Ollama), so the client
+does not validate the name — an unknown preset surfaces as a docling error. Under
+`vlm` the classic `DOCLING_DO_OCR`/`DOCLING_OCR_LANG` knobs are inert and not sent.
+The default `standard` is byte-identical to the pre-VLM request, so leaving it
+unset changes nothing. The chosen pipeline is recorded in
+`parsing_metadata.docling_pipeline` while `parsing_method` stays `docling`.
+
+**VLM is much slower than classic OCR (~90–200s/page), so where you run it
+matters — and the two touchpoints have independent timeouts:**
+
+- **Bulk indexing (recommended for VLM):** with `DOCUMENT_OCR_PROVIDER=docling`,
+  scanned PDFs are transcribed on the **async ingest pipeline** (`mcp_role=worker`,
+  the `ingest-ocr` queue) and written to the search index. That path uses
+  **`DOCUMENT_OCR_TIMEOUT_SECONDS`** and never blocks a tool call — raise it freely
+  (e.g. 600–900s) for VLM.
+- **Interactive reads (`nc_webdav_read_file` on images / `force_processor="docling"`):**
+  these parse **synchronously** and block for up to **`DOCLING_TIMEOUT`**. Raising
+  `DOCLING_TIMEOUT` for VLM directly lengthens that block, and MCP clients usually
+  enforce a much shorter per-tool timeout (~30–60s) — so the client typically kills
+  the call before docling responds and you see a client timeout, not the tool's
+  base64 fallback. **Do not inflate `DOCLING_TIMEOUT` to force interactive VLM.**
+  Images are interactive-only (the ingest scanner is PDF-only), so interactive VLM
+  image reads inherently block.
+
+**`DOCUMENT_READ_TIMEOUT_SECONDS` (opt-in cap).** Set it to bound the synchronous
+parse inside `nc_webdav_read_file` (via `anyio.fail_after`), independent of
+`DOCLING_TIMEOUT` and of the worker path: when the cap trips, the tool returns
+base64 **fast** instead of hanging until the client times out. Default is empty
+(disabled) — no behavior change for existing reads. Set a client-friendly bound
+(e.g. 45–60s) if you want graceful fallback; leave it unset (and expect long calls)
+if you deliberately want interactive VLM with a tolerant client. It never affects
+the async ingest/worker path. See `docs/ADR-032-docling-vlm-pipeline.md`.
 
 #### OCR execution mode: synchronous vs batch (Deck #332)
 
@@ -1005,7 +1051,7 @@ aware of:
   an excluded folder) drops out of results immediately rather than waiting for
   the scanner sweep. The REPORT expands tagged folders via a `Depth: infinity`
   SEARCH, so deployments that tag whole directory trees pay that walk once per
-  search; configure `VECTOR_SYNC_PDF_TAG` to change the tag name. The `file`
+  search; configure `VECTOR_SYNC_TAG` to change the tag name. The `file`
   verifier's latency therefore scales with **both** the `Depth: infinity` folder
   expansion **and** the `EXCLUDED_TAGS` lookup: that lookup fans out ~2 WebDAV
   calls (1 PROPFIND + 1 REPORT) *per excluded tag*, concurrently, while holding
@@ -1047,8 +1093,8 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ENABLE_SEMANTIC_SEARCH` | ⚠️ Optional | `false` | Enable semantic search with background indexing (replaces `VECTOR_SYNC_ENABLED`) |
-| `VECTOR_SYNC_PDF_TAG` | ⚠️ Optional | `vector-index` | Nextcloud tag marking PDFs for **hybrid** (dense + BM25 sparse) indexing (ADR-031) |
-| `VECTOR_SYNC_KEYWORD_TAG` | ⚠️ Optional | `keyword-index` | Nextcloud tag marking PDFs for **keyword-only** (BM25 sparse) indexing into the same collection; on by default, set empty to disable. Hybrid wins if a file carries both tags (ADR-031) |
+| `VECTOR_SYNC_TAG` | ⚠️ Optional | `vector-index` | Nextcloud tag marking files for **hybrid** (dense + BM25 sparse) indexing (ADR-031) |
+| `VECTOR_SYNC_KEYWORD_TAG` | ⚠️ Optional | `keyword-index` | Nextcloud tag marking files for **keyword-only** (BM25 sparse) indexing into the same collection; on by default, set empty to disable. Hybrid wins if a file carries both tags (ADR-031) |
 | `QDRANT_URL` | ⚠️ Optional | - | Qdrant service URL (network mode) - mutually exclusive with `QDRANT_LOCATION` |
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
 | `QDRANT_API_KEY` | ⚠️ Optional | - | Qdrant API key (network mode only) |
@@ -1079,6 +1125,8 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `DOCUMENT_CHUNK_SIZE` | ⚠️ Optional | `2048` | Characters per chunk for document embedding |
 | `DOCUMENT_CHUNK_OVERLAP` | ⚠️ Optional | `200` | Overlapping characters between chunks (must be < chunk size) |
 | `DOCUMENT_CHUNK_PAGE_AWARE` | ⚠️ Optional | `true` | Split PDFs on page boundaries first (one chunk per page; oversized pages split within the page). Exact page numbers, clean snippets, and a predictable ~1 chunk/page when chunk size ≥ the largest page. Set `false` for the legacy char-based path. |
+| `DOCUMENT_CHUNK_PAGE_PACK` | ⚠️ Optional | `false` | Greedy page-packing (requires page-aware): merge consecutive sub-budget PDF pages into one chunk (page-range citation via `page_number`/`page_end`) instead of one-per-page. Cuts dense-vector density on lean-page/born-digital PDFs. Enabling it re-scales density fleet-wide — re-calibrate the storage rate first (Deck #636/#626). |
+| `CHUNKING_CONFIG_VERSION` | ⚠️ Optional | `1` | Chunker config generation stamped on the collection sentinel. Bump on any chunker behaviour change (size, overlap, page-aware, page-pack) so the pricing density reference can't silently go stale. |
 
 **Deprecated variables (still functional):**
 - `VECTOR_SYNC_ENABLED` - Use `ENABLE_SEMANTIC_SEARCH` instead (will be removed in v1.0.0)
