@@ -177,8 +177,8 @@ def configure_calendar_tools(mcp: FastMCP):
     @require_scopes("calendar.read")
     @instrument_tool
     async def nc_calendar_list_events(
-        calendar_name: str,
         ctx: Context,
+        calendar_name: str = "",
         start_date: str = "",
         end_date: str = "",
         limit: int = 50,
@@ -193,7 +193,8 @@ def configure_calendar_tools(mcp: FastMCP):
         """List events in a calendar (or all calendars) within date range with advanced filtering.
 
         Args:
-            calendar_name: Name of the calendar to search. Ignored if search_all_calendars=True.
+            calendar_name: Name of the calendar to search. Required unless
+                search_all_calendars=True, in which case it is ignored.
             ctx: MCP context
             start_date: Start date for search (YYYY-MM-DD format, e.g., "2025-01-01")
             end_date: End date for search (YYYY-MM-DD format, e.g., "2025-01-31")
@@ -209,6 +210,11 @@ def configure_calendar_tools(mcp: FastMCP):
         Returns:
             List of events matching the filters
         """
+        if not search_all_calendars and not calendar_name.strip():
+            raise ValueError(
+                "calendar_name is required when search_all_calendars is false"
+            )
+
         client = await get_client(ctx)
 
         # Convert YYYY-MM-DD format dates to datetime objects

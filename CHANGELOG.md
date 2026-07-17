@@ -5,6 +5,13 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.140.5 (2026-07-17)
+
+### Fix
+
+- **calendar**: allow all-calendar event searches without a calendar name while
+  requiring one for scoped searches
+
 ## v0.140.4 (2026-07-17)
 
 ### Fix
