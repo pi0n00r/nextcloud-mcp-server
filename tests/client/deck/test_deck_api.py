@@ -313,6 +313,55 @@ async def test_deck_create_card(mocker):
     mock_make_request.assert_called_once()
 
 
+async def test_deck_create_card_persists_duedate(mocker):
+    """Create follows up with an update because Deck ignores POST duedate."""
+    create_response = create_mock_deck_card_response(
+        card_id=789, title="Test Card", stack_id=456, order=37, duedate=None
+    )
+    get_response = create_mock_deck_card_response(
+        card_id=789, title="Test Card", stack_id=456, order=37, duedate=None
+    )
+    update_response = create_mock_response(status_code=200, json_data={})
+    verification_response = create_mock_deck_card_response(
+        card_id=789,
+        title="Test Card",
+        stack_id=456,
+        order=37,
+        description="Verified server state",
+        duedate="2025-07-15T17:00:00Z",
+    )
+
+    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_make_request = mocker.patch.object(DeckClient, "_make_request")
+    mock_make_request.side_effect = [
+        create_response,
+        get_response,
+        update_response,
+        verification_response,
+    ]
+
+    client = DeckClient(mock_client, "testuser")
+    card = await client.create_card(
+        board_id=123,
+        stack_id=456,
+        title="Test Card",
+        order=37,
+        duedate="2025-07-15T17:00:00Z",
+    )
+
+    assert card.duedate is not None
+    assert card.duedate.isoformat() == "2025-07-15T17:00:00+00:00"
+    assert card.description == "Verified server state"
+    assert card.order == 37
+    assert mock_make_request.call_count == 4
+    put_call = mock_make_request.call_args_list[2]
+    assert put_call.args[0] == "PUT"
+    assert put_call.kwargs["json"]["order"] == 37
+    assert put_call.kwargs["json"]["duedate"] == "2025-07-15T17:00:00Z"
+    verification_call = mock_make_request.call_args_list[3]
+    assert verification_call.args[0] == "GET"
+
+
 async def test_deck_get_card(mocker):
     """Test that get_card correctly parses the API response."""
     mock_response = create_mock_deck_card_response(
@@ -363,6 +412,30 @@ async def test_deck_update_card(mocker):
     assert put_call[0][0] == "PUT"
     assert "/boards/123/stacks/456/cards/789" in put_call[0][1]
     assert put_call[1]["json"]["title"] == "Updated Card"
+
+
+async def test_deck_update_card_converts_offset_duedate_to_utc(mocker):
+    """Offset due dates retain their instant when sent to Deck."""
+    get_response = create_mock_deck_card_response(
+        card_id=789, title="Original Card", stack_id=456, order=42
+    )
+    update_response = create_mock_response(status_code=200, json_data={})
+
+    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_make_request = mocker.patch.object(DeckClient, "_make_request")
+    mock_make_request.side_effect = [get_response, update_response]
+
+    client = DeckClient(mock_client, "testuser")
+    await client.update_card(
+        board_id=123,
+        stack_id=456,
+        card_id=789,
+        duedate="2025-07-15T13:00:00-04:00",
+    )
+
+    put_call = mock_make_request.call_args_list[1]
+    assert put_call.kwargs["json"]["duedate"] == "2025-07-15T17:00:00Z"
+    assert put_call.kwargs["json"]["order"] == 42
 
 
 # Label Tests

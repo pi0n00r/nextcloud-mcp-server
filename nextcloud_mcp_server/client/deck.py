@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from httpx import HTTPStatusError, RequestError
@@ -17,6 +18,19 @@ from nextcloud_mcp_server.models.deck import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_duedate(duedate: str) -> str:
+    """Convert an offset-aware due date to UTC for Deck's date parser."""
+    try:
+        parsed = datetime.fromisoformat(duedate.replace("Z", "+00:00"))
+    except ValueError:
+        return duedate
+
+    if parsed.utcoffset() is None:
+        return duedate
+
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class DeckClient(BaseNextcloudClient):
@@ -266,6 +280,7 @@ class DeckClient(BaseNextcloudClient):
         if description is not None:
             json_data["description"] = description
         if duedate is not None:
+            duedate = _normalize_duedate(duedate)
             json_data["duedate"] = duedate
         headers = self._get_deck_headers()
         response = await self._make_request(
@@ -274,7 +289,19 @@ class DeckClient(BaseNextcloudClient):
             json=json_data,
             headers=headers,
         )
-        return DeckCard(**response.json())
+        card = DeckCard(**response.json())
+
+        # Some Deck versions ignore duedate on create despite accepting it.
+        if duedate is not None and card.duedate is None:
+            await self.update_card(
+                board_id=board_id,
+                stack_id=stack_id,
+                card_id=card.id,
+                duedate=duedate,
+            )
+            card = await self.get_card(board_id, stack_id, card.id)
+
+        return card
 
     async def update_card(
         self,
@@ -306,11 +333,11 @@ class DeckClient(BaseNextcloudClient):
             "description": description
             if description is not None
             else (current_card.description or ""),
+            # Order defaults to 0 when omitted from Deck's full-replacement PUT.
+            "order": order if order is not None else current_card.order,
         }
-        if order is not None:
-            json_data["order"] = order
         if duedate is not None:
-            json_data["duedate"] = duedate
+            json_data["duedate"] = _normalize_duedate(duedate)
         if archived is not None:
             json_data["archived"] = archived
         if done is not None:
