@@ -160,6 +160,29 @@ class TestGetSettings:
 
     @patch.dict(
         os.environ,
+        {"VECTOR_SYNC_EMPTY_DISCOVERY_DELETE_THRESHOLD": "5"},
+        clear=True,
+    )
+    def test_get_settings_empty_discovery_threshold_from_env(self):
+        """VECTOR_SYNC_EMPTY_DISCOVERY_DELETE_THRESHOLD must reach settings.
+
+        Guards against the _DEFAULTS / _field_map omission that has silently
+        dropped env vars before (cf. OCR batch mode #332): the setting is added
+        in all three places (defaults, dataclass, field map).
+        """
+        _reload_config()
+        settings = get_settings()
+        assert settings.vector_sync_empty_discovery_delete_threshold == 5
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_empty_discovery_threshold_default(self):
+        """Default is 3 consecutive empty cycles before deletions are believed."""
+        _reload_config()
+        settings = get_settings()
+        assert settings.vector_sync_empty_discovery_delete_threshold == 3
+
+    @patch.dict(
+        os.environ,
         {
             "PYROSCOPE_ENABLED": "true",
             "PYROSCOPE_SERVER_ADDRESS": "alloy.alloy.svc.cluster.local:4041",
@@ -391,6 +414,53 @@ class TestChunkConfigValidation:
         from dynaconf import ValidationError
 
         with pytest.raises(ValidationError, match="DOCUMENT_CHUNK_OVERLAP"):
+            _reload_config()
+
+    def test_tier_concurrency_defaults_to_none(self):
+        """Unset per-tier overrides fall through to VECTOR_SYNC_PROCESSOR_WORKERS."""
+        with patch.dict(os.environ, {}, clear=True):
+            _reload_config()
+            settings = get_settings()
+            assert settings.vector_sync_fast_concurrency is None
+            assert settings.vector_sync_structured_concurrency is None
+
+    def test_tier_concurrency_valid_value_accepted(self):
+        """A positive per-tier override loads normally."""
+        with patch.dict(
+            os.environ,
+            {
+                "VECTOR_SYNC_FAST_CONCURRENCY": "2",
+                "VECTOR_SYNC_STRUCTURED_CONCURRENCY": "3",
+            },
+            clear=True,
+        ):
+            _reload_config()
+            settings = get_settings()
+            assert settings.vector_sync_fast_concurrency == 2
+            assert settings.vector_sync_structured_concurrency == 3
+
+    @patch.dict(
+        os.environ,
+        {"VECTOR_SYNC_FAST_CONCURRENCY": "0"},
+        clear=True,
+    )
+    def test_zero_fast_concurrency_raises_error(self):
+        """0 is rejected at startup rather than reaching the worker (>=1 when set)."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="VECTOR_SYNC_FAST_CONCURRENCY"):
+            _reload_config()
+
+    @patch.dict(
+        os.environ,
+        {"VECTOR_SYNC_STRUCTURED_CONCURRENCY": "-1"},
+        clear=True,
+    )
+    def test_negative_structured_concurrency_raises_error(self):
+        """A negative per-tier override raises ValidationError via dynaconf."""
+        from dynaconf import ValidationError
+
+        with pytest.raises(ValidationError, match="VECTOR_SYNC_STRUCTURED_CONCURRENCY"):
             _reload_config()
 
     def test_small_chunk_size_warning(self, caplog):

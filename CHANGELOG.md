@@ -5,6 +5,74 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.140.3 (2026-07-16)
+
+### Refactor
+
+- **tests**: use item.path over the legacy item.fspath
+
+## v0.140.2 (2026-07-16)
+
+### Fix
+
+- **tests**: make CI actually run every test under tests/unit/
+
+## v0.140.1 (2026-07-16)
+
+### Fix
+
+- **ci**: retry pact publish + tighten ADR outage wording
+- **ci**: report measured elapsed time in broker-probe error
+- **ci**: probe pact broker before use + retry provider verification
+
+## v0.140.0 (2026-07-16)
+
+### Feat
+
+- **ingest**: safe per-tier worker concurrency (serialize pypdfium2/pymupdf) + overrides
+
+### Fix
+
+- **ingest**: serialize the pdf-preview PyMuPDF render + validate tier concurrency
+
+## v0.139.3 (2026-07-15)
+
+### Refactor
+
+- **usage**: round-2 review nits (batch drop-log detail)
+- **usage**: address round-1 review nits (semconv span attr, rollback test)
+
+### Perf
+
+- **usage**: batch per-document metering into one transaction + trace DB writes
+
+## v0.139.2 (2026-07-15)
+
+### Fix
+
+- **config,vector**: clear settings caches between tests; dedup bbox stamp
+- **vector**: stamp bbox_source on no-boundaries exit; dedup bbox test helpers
+
+### Perf
+
+- **ingest**: cut worker CPU + trace the highlight step
+
+## v0.139.1 (2026-07-15)
+
+### Fix
+
+- **scanner**: converge shared-file deletion tracking on acl_principals + fail-safe empty-discovery gate
+
+### Refactor
+
+- **scanner**: split _plan_file_deletions to clear SonarCloud findings
+
+## v0.139.0 (2026-07-15)
+
+### Feat
+
+- **metrics**: emit astrolabe_qdrant_source_bytes_total for corpus-weighted density
+
 ## v0.138.1 (2026-07-13)
 
 ### Fix

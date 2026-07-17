@@ -44,7 +44,7 @@ from nextcloud_mcp_server.observability.metrics import (
 )
 from nextcloud_mcp_server.observability.tracing import trace_operation
 from nextcloud_mcp_server.search.pdf_highlighter import PDFHighlighter
-from nextcloud_mcp_server.usage import UsageEventStore
+from nextcloud_mcp_server.usage import UsageEvent, UsageEventStore
 from nextcloud_mcp_server.utils.validation import is_valid_nextcloud_doc_id
 from nextcloud_mcp_server.vector import payload_keys
 from nextcloud_mcp_server.vector._errors import format_exception_group
@@ -482,69 +482,61 @@ async def record_indexing_usage(
         # doc types, which are never parsed.
         "pipeline_tier": pipeline_tier,
     }
+    # Build the document's events in the historical order (tokens -> pages ->
+    # pages_ocr -> bytes_*), then write them in ONE transaction. Each event used
+    # to be its own acquire() -> INSERT -> commit; on the NullPool + pgbouncer
+    # setup every such round-trip pays a full connection setup (~0.6-0.8s on
+    # cloudfleet), so ~5 events serialized into seconds on the ingest critical
+    # path. Batching collapses them to a single round-trip (Deck #667).
+    events: list[UsageEvent] = []
+
+    # tokens_embedded first (intentional ordering): captured before the
+    # conditional parsing/byte costs — don't reverse this in a refactor. Skipped
+    # for keyword docs (token_count == 0), which never embed, so no zero-value
+    # embedding row is written.
+    if token_count > 0:
+        events.append(
+            UsageEvent(metric="tokens_embedded", value=token_count, metadata=metadata)
+        )
+    # pages_embedded: parsed pages only, and only a strictly positive count. Text
+    # content has no page_count; a zero/negative count is skipped rather than
+    # writing a row that would misrepresent a no-parse document as billable
+    # parsing work.
+    if page_count and page_count > 0:
+        events.append(
+            UsageEvent(metric="pages_embedded", value=page_count, metadata=metadata)
+        )
+        # OCR pages are metered as a SEPARATE line (Deck #323) so the OCR tier's
+        # cost is billable independently of CPU-cheap parsing -- pages_embedded
+        # counts all parsed pages, pages_ocr only the OCR tier's. Gated on the
+        # tier so it's emitted exactly when the doc hit OCR.
+        if pipeline_tier == "ocr":
+            events.append(
+                UsageEvent(metric="pages_ocr", value=page_count, metadata=metadata)
+            )
+    # Byte-volume dimensions (card #401), recorded for every embedded document.
+    # Appended after the conditional pages block so the tokens-then-pages
+    # ordering above is preserved. Each is skipped on a non-positive count to
+    # avoid writing a zero-value billing row (the chunk_count guard already
+    # filtered truly-empty documents).
+    if bytes_ingested > 0:
+        events.append(
+            UsageEvent(metric="bytes_ingested", value=bytes_ingested, metadata=metadata)
+        )
+    if bytes_stored > 0:
+        events.append(
+            UsageEvent(metric="bytes_stored", value=bytes_stored, metadata=metadata)
+        )
+
     try:
         store = await UsageEventStore.shared()
         # enabled=True: the guard above already confirmed the flag, so the store
-        # skips a second uncached Settings build per record (ADR-024).
-        # record_usage_event swallows its own write failures, so the records are
-        # independent; one raising never blocks the other — acceptable under the
-        # (day, metric) SUM-aggregation billing model.
-
-        # tokens_embedded first (intentional ordering): captured before the
-        # conditional parsing/byte costs — don't reverse this in a refactor.
-        # Skipped for keyword docs (token_count == 0), which never embed, so no
-        # zero-value embedding row is written.
-        if token_count > 0:
-            await store.record_usage_event(
-                metric="tokens_embedded",
-                value=token_count,
-                metadata=metadata,
-                enabled=True,
-            )
-        # pages_embedded: parsed pages only, and only a strictly positive count.
-        # Text content has no page_count; a zero/negative count is skipped rather
-        # than writing a row that would misrepresent a no-parse document as
-        # billable parsing work.
-        if page_count and page_count > 0:
-            await store.record_usage_event(
-                metric="pages_embedded",
-                value=page_count,
-                metadata=metadata,
-                enabled=True,
-            )
-            # OCR pages are metered as a SEPARATE line (Deck #323) so the OCR
-            # tier's cost is billable independently of CPU-cheap parsing --
-            # pages_embedded counts all parsed pages, pages_ocr only the OCR tier's.
-            # Gated on the tier so it's emitted exactly when the doc hit OCR.
-            if pipeline_tier == "ocr":
-                await store.record_usage_event(
-                    metric="pages_ocr",
-                    value=page_count,
-                    metadata=metadata,
-                    enabled=True,
-                )
-        # Byte-volume dimensions (card #401), recorded for every embedded
-        # document. Appended after the conditional pages block so the
-        # tokens-then-pages ordering above is preserved. Each is skipped on a
-        # non-positive count to avoid writing a zero-value billing row (the
-        # chunk_count guard already filtered truly-empty documents).
-        if bytes_ingested > 0:
-            await store.record_usage_event(
-                metric="bytes_ingested",
-                value=bytes_ingested,
-                metadata=metadata,
-                enabled=True,
-            )
-        if bytes_stored > 0:
-            await store.record_usage_event(
-                metric="bytes_stored",
-                value=bytes_stored,
-                metadata=metadata,
-                enabled=True,
-            )
+        # skips a second uncached Settings build (ADR-024). One connection + one
+        # commit for the whole document instead of ~5 sequential round-trips.
+        await store.record_usage_events(events, enabled=True)
     except Exception:
         # Reached only when shared()/store construction itself raises
-        # (record_usage_event swallows its own write failures). Metering is on,
+        # (record_usage_events swallows its own write failures). Metering is on,
         # so warn rather than hide the "enabled but no billing data" case.
         logger.warning("usage metering hook (indexing embeddings) skipped")
 
@@ -1664,82 +1656,133 @@ async def _index_document(
             OCR_BLOCK_SPANS_KEY,
         )
 
-        ocr_block_spans = file_metadata.get(OCR_BLOCK_SPANS_KEY)
-        if ocr_block_spans:
-            spans = cast(list[dict[str, Any]], ocr_block_spans)
-            attributed = _ocr_chunk_bboxes(chunks, spans)
-            chunk_bboxes.update(attributed)
-            # Only stamp "ocr" when something was actually attributed — a non-empty
-            # spans list that overlaps no chunk leaves the source unset (nothing is
-            # stored either way; the payload gates on `i in chunk_bboxes`).
-            if attributed:
-                bbox_source = "ocr"
-                logger.info(
-                    "Attributed OCR bboxes for %s/%s chunks (%s blocks)",
-                    len(attributed),
-                    len(chunks),
-                    len(spans),
-                )
-            else:
-                # OCR returned geometry but none overlapped a chunk — unexpected
-                # (offset accounting / empty chunks); warn so it's visible.
-                logger.warning(
-                    "OCR returned %s blocks but none overlapped any of %s chunks; "
-                    "no pre-computed bboxes stored",
-                    len(spans),
-                    len(chunks),
-                )
-            # One path for the WHOLE document: when the OCR tier ran, surya OCRs
-            # every rendered page, so its blocks cover the whole doc — pymupdf has
-            # no text layer to add (a scanned doc) and we do NOT fall through to it,
-            # even when attribution found nothing. Caveat: a mixed native+OCR PDF
-            # gets OCR geometry only; native-page chunks won't also get pymupdf
-            # highlights. That's acceptable — escalation to OCR is a whole-document
-            # decision, so a mixed doc is rare, and unmatched blocks are logged in
-            # _pages_to_text for diagnosis.
-            return
-
+        # Envelope span so the WHOLE highlight step is visible in traces — both the
+        # OCR-attribution branch (previously untraced) and the pymupdf branch — and
+        # the off-thread bbox CPU no longer shows up as an unattributed gap.
         with trace_operation(
-            "vector_sync.compute_chunk_bboxes",
+            "vector_sync.generate_highlights",
             attributes={
                 _ATTR_CHUNK_COUNT: len(chunks),
+                "vector_sync.is_pdf": is_pdf,
                 "vector_sync.pdf_size": len(content_bytes),
             },
-        ):
-            chunk_data: list[tuple[int, int, int, int | None, str]] = [
-                (i, chunk.start_offset, chunk.end_offset, chunk.page_number, chunk.text)
-                for i, chunk in enumerate(chunks)
-                if chunk.page_number is not None
-            ]
+        ) as highlights_span:
 
-            page_boundaries = file_metadata.get("page_boundaries")
-            if not page_boundaries:
-                logger.warning(
-                    "No page boundaries available, skipping bbox computation"
-                )
+            def _stamp_bbox_source() -> None:
+                """Record which branch produced the bboxes on the envelope span.
+
+                Called on every exit path so a trace query by bbox_source never
+                finds a highlight span with the attribute missing.
+                """
+                if highlights_span is not None:
+                    highlights_span.set_attribute(
+                        "vector_sync.bbox_source", bbox_source or "none"
+                    )
+
+            ocr_block_spans = file_metadata.get(OCR_BLOCK_SPANS_KEY)
+            if ocr_block_spans:
+                spans = cast(list[dict[str, Any]], ocr_block_spans)
+                with trace_operation(
+                    "vector_sync.ocr_chunk_bboxes",
+                    attributes={
+                        _ATTR_CHUNK_COUNT: len(chunks),
+                        "vector_sync.ocr_block_count": len(spans),
+                    },
+                ):
+                    attributed = _ocr_chunk_bboxes(chunks, spans)
+                    chunk_bboxes.update(attributed)
+                    # Only stamp "ocr" when something was actually attributed — a
+                    # non-empty spans list that overlaps no chunk leaves the source
+                    # unset (nothing is stored either way; the payload gates on
+                    # `i in chunk_bboxes`).
+                    if attributed:
+                        bbox_source = "ocr"
+                        logger.info(
+                            "Attributed OCR bboxes for %s/%s chunks (%s blocks)",
+                            len(attributed),
+                            len(chunks),
+                            len(spans),
+                        )
+                    else:
+                        # OCR returned geometry but none overlapped a chunk —
+                        # unexpected (offset accounting / empty chunks); warn so it
+                        # is visible.
+                        logger.warning(
+                            "OCR returned %s blocks but none overlapped any of %s "
+                            "chunks; no pre-computed bboxes stored",
+                            len(spans),
+                            len(chunks),
+                        )
+                # One path for the WHOLE document: when the OCR tier ran, surya OCRs
+                # every rendered page, so its blocks cover the whole doc — pymupdf has
+                # no text layer to add (a scanned doc) and we do NOT fall through to
+                # it, even when attribution found nothing. Caveat: a mixed native+OCR
+                # PDF gets OCR geometry only; native-page chunks won't also get
+                # pymupdf highlights. That's acceptable — escalation to OCR is a
+                # whole-document decision, so a mixed doc is rare, and unmatched
+                # blocks are logged in _pages_to_text for diagnosis.
+                _stamp_bbox_source()
                 return
 
-            page_boundaries_list = cast(list[dict[str, Any]], page_boundaries)
+            with trace_operation(
+                "vector_sync.compute_chunk_bboxes",
+                attributes={
+                    _ATTR_CHUNK_COUNT: len(chunks),
+                    "vector_sync.pdf_size": len(content_bytes),
+                },
+            ):
+                chunk_data: list[tuple[int, int, int, int | None, str]] = [
+                    (
+                        i,
+                        chunk.start_offset,
+                        chunk.end_offset,
+                        chunk.page_number,
+                        chunk.text,
+                    )
+                    for i, chunk in enumerate(chunks)
+                    if chunk.page_number is not None
+                ]
 
-            logger.info("Computing chunk bboxes for %s PDF chunks", len(chunk_data))
+                page_boundaries = file_metadata.get("page_boundaries")
+                if not page_boundaries:
+                    logger.warning(
+                        "No page boundaries available, skipping bbox computation"
+                    )
+                    _stamp_bbox_source()
+                    return
 
-            batch_results = await anyio.to_thread.run_sync(  # type: ignore[attr-defined]
-                lambda: PDFHighlighter.compute_chunk_bboxes_batch(
-                    pdf_bytes=content_bytes,
-                    chunks=chunk_data,
-                    page_boundaries=page_boundaries_list,
-                    full_text=content,
+                page_boundaries_list = cast(list[dict[str, Any]], page_boundaries)
+
+                logger.info("Computing chunk bboxes for %s PDF chunks", len(chunk_data))
+
+                # pymupdf is not thread-safe; run the bbox batch under the shared
+                # MuPDF lock so concurrent ingest jobs serialize their native work.
+                def _compute_bboxes():
+                    from nextcloud_mcp_server.document_processors._native_locks import (  # noqa: PLC0415
+                        pymupdf_serialized,
+                    )
+
+                    with pymupdf_serialized():
+                        return PDFHighlighter.compute_chunk_bboxes_batch(
+                            pdf_bytes=content_bytes,
+                            chunks=chunk_data,
+                            page_boundaries=page_boundaries_list,
+                            full_text=content,
+                        )
+
+                batch_results = await anyio.to_thread.run_sync(  # type: ignore[attr-defined]
+                    _compute_bboxes
                 )
-            )
 
-            for chunk_index, (bboxes, _) in batch_results.items():
-                chunk_bboxes[chunk_index] = bboxes
-            if chunk_bboxes:
-                bbox_source = "pymupdf"
+                for chunk_index, (bboxes, _) in batch_results.items():
+                    chunk_bboxes[chunk_index] = bboxes
+                if chunk_bboxes:
+                    bbox_source = "pymupdf"
 
-            logger.info(
-                "Computed bboxes for %s/%s chunks", len(chunk_bboxes), len(chunks)
-            )
+                logger.info(
+                    "Computed bboxes for %s/%s chunks", len(chunk_bboxes), len(chunks)
+                )
+            _stamp_bbox_source()
 
     # Run all embedding/highlighting operations in parallel
     # - Dense embeddings: I/O bound (API call)

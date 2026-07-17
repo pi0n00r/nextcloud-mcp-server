@@ -1,4 +1,6 @@
 import atexit
+import copy
+import functools
 import logging
 import logging.config
 import os
@@ -111,6 +113,10 @@ _DEFAULTS: dict[str, Any] = {
     # Vector sync
     "vector_sync_scan_interval": 300,
     "vector_sync_processor_workers": 3,
+    # Optional per-tier concurrency overrides (None = fall back to
+    # vector_sync_processor_workers). Consumed by the `worker` CLI per --tier.
+    "vector_sync_fast_concurrency": None,
+    "vector_sync_structured_concurrency": None,
     "vector_sync_queue_max_size": 10000,
     "vector_sync_metrics_refresh_interval": 20,
     "vector_density_snapshot_enabled": True,
@@ -136,6 +142,15 @@ _DEFAULTS: dict[str, Any] = {
     # embedding cost) into the SAME collection as hybrid files; ``vector-index``
     # wins if a file carries both. Set empty to disable the second tag entirely.
     "vector_sync_keyword_tag": "keyword-index",
+    # Fail-safe against a flaky/empty tag-discovery read: number of *consecutive*
+    # scan cycles for which a given index mode's tag discovery must return zero
+    # files (while Qdrant still holds indexed points for that mode) before the
+    # scanner believes it and starts deleting. A transient empty read (e.g. a
+    # customer-hosted Nextcloud that intermittently answers the systemtag REPORT
+    # with an empty 207) is thereby treated as a failed read, not "all files
+    # gone" — preventing a delete/re-index churn loop. A sustained empty (a real
+    # mass-untag) still eventually deletes once the streak reaches this value.
+    "vector_sync_empty_discovery_delete_threshold": 3,
     # Verify-on-read concurrency cap (ADR-019)
     "verification_concurrency": 20,
     # Qdrant
@@ -474,6 +489,25 @@ _dynaconf = Dynaconf(
         Validator("QDRANT_INIT_BACKOFF_MAX", gte=0),
         Validator("VECTOR_SYNC_SCAN_INTERVAL", gte=1),
         Validator("VECTOR_SYNC_PROCESSOR_WORKERS", gte=1),
+        # Optional per-tier concurrency overrides (None = fall back to
+        # VECTOR_SYNC_PROCESSOR_WORKERS). Like the sibling above they must be
+        # >=1 when set — a 0/negative value would otherwise reach
+        # app.run_worker_async(concurrency=...) and fail with an opaque runtime
+        # error instead of a clear config error at startup.
+        Validator(
+            "VECTOR_SYNC_FAST_CONCURRENCY",
+            condition=lambda v: v is None or v >= 1,
+            messages={
+                "condition": "VECTOR_SYNC_FAST_CONCURRENCY must be >= 1 when set"
+            },
+        ),
+        Validator(
+            "VECTOR_SYNC_STRUCTURED_CONCURRENCY",
+            condition=lambda v: v is None or v >= 1,
+            messages={
+                "condition": "VECTOR_SYNC_STRUCTURED_CONCURRENCY must be >= 1 when set"
+            },
+        ),
         Validator("VECTOR_SYNC_QUEUE_MAX_SIZE", gte=1),
         Validator("VECTOR_SYNC_METRICS_REFRESH_INTERVAL", gte=1),
         Validator("VECTOR_DENSITY_SNAPSHOT_INTERVAL", gte=1),
@@ -552,6 +586,7 @@ def _reload_config():
     """
     _dynaconf.reload()
     _dynaconf.validators.validate_all()
+    _clear_settings_caches()
 
 
 _ephemeral_db_path: str | None = None
@@ -949,6 +984,11 @@ class Settings:
     vector_sync_enabled: bool = False
     vector_sync_scan_interval: int = 300  # seconds (5 minutes)
     vector_sync_processor_workers: int = 3
+    # Optional per-tier concurrency overrides for the ingest worker (None = use
+    # vector_sync_processor_workers). Only fast/structured are exposed; the
+    # CPU-heavy PDF paths are serialized (see document_processors/_native_locks).
+    vector_sync_fast_concurrency: int | None = None
+    vector_sync_structured_concurrency: int | None = None
     vector_sync_queue_max_size: int = 10000
     # Cadence for the periodic gauge publisher (vector/metrics_publisher.py):
     # outstanding-work + indexed documents/chunks. Decoupled from the consumer
@@ -986,6 +1026,16 @@ class Settings:
     # embedding). ``vector-index`` takes precedence when a file carries both tags.
     # Set empty to disable the second tag entirely.
     vector_sync_keyword_tag: str = "keyword-index"
+
+    # Fail-safe against a flaky/empty tag-discovery read. Number of *consecutive*
+    # scan cycles for which an index mode's tag discovery must return zero files
+    # (while Qdrant still holds indexed points for that mode) before the scanner
+    # believes it and deletes. Guards against a customer-hosted Nextcloud that
+    # intermittently answers the systemtag REPORT with an empty 207 — which would
+    # otherwise be read as "all files gone" and drive a delete/re-index churn
+    # loop. A sustained empty (a genuine mass-untag) still deletes once the streak
+    # reaches this value. See _plan_file_deletions in vector/scanner.py.
+    vector_sync_empty_discovery_delete_threshold: int = 3
 
     # Verify-on-read concurrency (ADR-019). Cap on parallel Nextcloud
     # round-trips during search-result verification fan-out. Lower this if the
@@ -1738,9 +1788,11 @@ def set_override(key: str, value) -> None:
     bool) land with the right type, matching settings.toml semantics.
     """
     _dynaconf.set(key, value, tomlfy=True)
+    _clear_settings_caches()
 
 
-def get_settings() -> Settings:
+@functools.cache
+def _build_settings() -> Settings:
     """Get application settings from dynaconf configuration.
 
     Settings are loaded from (last wins):
@@ -1814,6 +1866,8 @@ def get_settings() -> Settings:
         # Vector sync settings (ADR-007)
         "vector_sync_scan_interval": "VECTOR_SYNC_SCAN_INTERVAL",
         "vector_sync_processor_workers": "VECTOR_SYNC_PROCESSOR_WORKERS",
+        "vector_sync_fast_concurrency": "VECTOR_SYNC_FAST_CONCURRENCY",
+        "vector_sync_structured_concurrency": "VECTOR_SYNC_STRUCTURED_CONCURRENCY",
         "vector_sync_queue_max_size": "VECTOR_SYNC_QUEUE_MAX_SIZE",
         "vector_sync_metrics_refresh_interval": "VECTOR_SYNC_METRICS_REFRESH_INTERVAL",
         "vector_density_snapshot_enabled": "VECTOR_DENSITY_SNAPSHOT_ENABLED",
@@ -1825,6 +1879,7 @@ def get_settings() -> Settings:
         "health_ready_refresh_interval": "HEALTH_READY_REFRESH_INTERVAL",
         "vector_sync_tag": "VECTOR_SYNC_TAG",
         "vector_sync_keyword_tag": "VECTOR_SYNC_KEYWORD_TAG",
+        "vector_sync_empty_discovery_delete_threshold": "VECTOR_SYNC_EMPTY_DISCOVERY_DELETE_THRESHOLD",
         # Verify-on-read (ADR-019)
         "verification_concurrency": "VERIFICATION_CONCURRENCY",
         # Qdrant settings
@@ -1938,6 +1993,20 @@ def get_settings() -> Settings:
     return Settings(**kwargs)
 
 
+def get_settings() -> Settings:
+    """Return application settings, memoizing the dynaconf resolution.
+
+    The ~150-key dynaconf resolution in ``_build_settings`` is the ingest
+    worker's second CPU hotspot (it runs 5-7x per job). Memoize it and return a
+    shallow copy per call, so callers that mutate the returned object (e.g. the
+    OAuth registration flow in ``app.py``) keep the per-call-instance semantics
+    they had before caching. Caches are dropped by ``_reload_config`` (tests) and
+    ``set_override`` (CLI overrides).
+    """
+    return copy.copy(_build_settings())
+
+
+@functools.cache
 def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
     """Return the SSL verification setting for Nextcloud connections.
 
@@ -1953,6 +2022,16 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
         ctx = ssl.create_default_context(cafile=settings.nextcloud_ca_bundle)
         return ctx
     return True
+
+
+def _clear_settings_caches() -> None:
+    """Drop memoized settings and SSL state before the next config read.
+
+    Called by ``_reload_config`` (tests refresh after mutating os.environ) and
+    ``set_override`` (CLI runtime overrides) so those paths still take effect.
+    """
+    _build_settings.cache_clear()
+    get_nextcloud_ssl_verify.cache_clear()
 
 
 def get_procrastinate_conninfo(database_url: str | None = None) -> str:

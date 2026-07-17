@@ -358,6 +358,19 @@ vector_ingest_dropped_total = Counter(
     ["reason"],
 )
 
+# File deletions the scanner declined to enqueue because a tag-discovery cycle
+# returned zero files for an index mode while Qdrant still held indexed points
+# for it — treated as a flaky/empty read, not "all files gone" (see
+# _plan_file_deletions in vector/scanner.py). A rising rate here means the
+# tenant's Nextcloud is answering the systemtag REPORT with intermittent empties;
+# each increment is a deletion that was correctly withheld.
+vector_sync_deletions_suppressed_total = Counter(
+    "bridgette_vector_sync_deletions_suppressed_total",
+    "File deletions suppressed because tag discovery returned an implausible "
+    "empty result (treated as a failed read), by index mode",
+    ["index_mode"],  # hybrid | keyword
+)
+
 # --- Tier-0 classifier (shadow mode) -----------------------------------------
 #
 # The classifier runs a cheap pre-pass per PDF and recommends a starting tier.
@@ -561,6 +574,23 @@ chunk_density_snapshot_truncated = Gauge(
     "1 if the last chunk-density snapshot hit the document scan cap (partial)",
 )
 
+# Sum of ``source_bytes`` across documents currently resident in Qdrant, per
+# ``doc_type``. Covers exactly the same forward-only set as the density snapshot
+# histogram (documents without a usable source_bytes are excluded and surfaced via
+# ``chunk_density_uncovered_documents``). Enables a corpus-weighted (byte-weighted)
+# chunk density in Grafana — ``sum(indexed_chunks) / (sum(source_bytes) / 1e6)`` —
+# which is the pricing driver, vs the doc-weighted mean of the histogram. This is a
+# Gauge, not a Counter, because it falls when documents are deleted from the
+# collection; the ``_total`` name is fixed (the deployed dashboard query depends on
+# it) and denotes the aggregate over the corpus, not a monotonic counter.
+qdrant_source_bytes_total = Gauge(
+    "bridgette_qdrant_source_bytes_total",
+    "Total source_bytes across documents currently resident in Qdrant "
+    "(byte-weighted density denominator; forward-only — docs without source_bytes "
+    "are excluded, see bridgette_qdrant_chunk_density_uncovered_documents)",
+    ["doc_type"],
+)
+
 documents_indexed_total = Counter(
     "bridgette_documents_indexed_total",
     "Total documents indexed, by source type",
@@ -601,6 +631,22 @@ db_operation_duration_seconds = Histogram(
     ["db", "operation"],
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
 )
+
+# pypdfium2 / pymupdf are not thread-safe; concurrent ingest jobs serialize their
+# native calls on per-library locks (see document_processors/_native_locks.py).
+# This surfaces the resulting contention so per-tier `concurrency` can be tuned.
+pdf_native_lock_wait_seconds = Histogram(
+    "bridgette_pdf_native_lock_wait_seconds",
+    "Time spent waiting to acquire a native PDF library lock",
+    ["library"],  # library: pdfium | pymupdf
+    buckets=(0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+
+def record_pdf_native_lock_wait(library: str, seconds: float) -> None:
+    """Record the wait to acquire the PDFium/MuPDF serialization lock."""
+    pdf_native_lock_wait_seconds.labels(library=library).observe(seconds)
+
 
 # =============================================================================
 # External Dependency Health Metrics
@@ -771,6 +817,19 @@ def record_vector_sync_scan(documents_found: int) -> None:
         documents_found: Number of documents discovered in scan
     """
     vector_sync_documents_scanned_total.inc(documents_found)
+
+
+def record_vector_sync_deletions_suppressed(index_mode: str, count: int) -> None:
+    """
+    Record file deletions withheld this scan because tag discovery for an index
+    mode came back empty while Qdrant still held indexed points (a suspected
+    flaky read rather than a genuine mass-untag).
+
+    Args:
+        index_mode: The index mode whose deletions were suppressed (hybrid|keyword)
+        count: Number of would-be deletions withheld this cycle
+    """
+    vector_sync_deletions_suppressed_total.labels(index_mode=index_mode).inc(count)
 
 
 def record_vector_sync_processing(
@@ -1138,6 +1197,7 @@ def update_qdrant_chunk_density_snapshot(
     *,
     uncovered: dict[str, int] | None = None,
     truncated: bool = False,
+    source_bytes: dict[str, float] | None = None,
 ) -> None:
     """Publish one current-corpus chunk-density snapshot (GaugeHistogram + coverage).
 
@@ -1154,6 +1214,10 @@ def update_qdrant_chunk_density_snapshot(
     ``truncated`` (scan hit the document cap) update the companion coverage
     gauges. The uncovered gauge is fully reset each snapshot so a doc_type that
     falls back to zero uncovered does not leave a stale series.
+
+    ``source_bytes`` (doc_type -> sum of source_bytes over the covered documents)
+    updates ``bridgette_qdrant_source_bytes_total``, the byte-weighted density
+    denominator. It is reset-then-repopulated the same way as the uncovered gauge.
     """
     edges = [str(b) for b in CHUNK_DENSITY_BUCKETS] + ["+Inf"]
     snapshot: dict[str, tuple[list[tuple[str, float]], float]] = {}
@@ -1170,6 +1234,11 @@ def update_qdrant_chunk_density_snapshot(
     chunk_density_uncovered_documents.clear()
     for doc_type, count in (uncovered or {}).items():
         chunk_density_uncovered_documents.labels(doc_type=doc_type).set(count)
+
+    # Same reset-then-repopulate: a doc_type that leaves the corpus clears its series.
+    qdrant_source_bytes_total.clear()
+    for doc_type, total in (source_bytes or {}).items():
+        qdrant_source_bytes_total.labels(doc_type=doc_type).set(total)
 
     chunk_density_snapshot_truncated.set(1 if truncated else 0)
 
