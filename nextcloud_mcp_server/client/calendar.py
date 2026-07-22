@@ -3,10 +3,9 @@
 import datetime as dt
 import inspect
 import logging
-import re
 import uuid
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anyio
@@ -851,98 +850,99 @@ class CalendarClient:
             logger.error("Error updating todo %s: %s", todo_uid, e)
             raise
 
-    @staticmethod
-    def _todo_uid_needs_delete_neutralization(todo_uid: str) -> bool:
-        """Return True for legacy VTODO UIDs that Nextcloud treats as scheduled."""
-        return "@" in todo_uid or CalendarClient._todo_uid_is_delete_neutralized(
-            todo_uid
-        )
-
-    @staticmethod
-    def _todo_uid_is_delete_neutralized(todo_uid: str) -> bool:
-        """Return True only for deterministic UIDs produced by this repair."""
-        return re.fullmatch(r"legacy-delete-[0-9a-f]{32}", todo_uid) is not None
-
-    async def _delete_todo_without_scheduling(self, todo: Any) -> dict[str, Any]:
-        """Delete one resolved calendar resource without scheduling processing."""
-        response = await self._dav_client.delete(
+    async def _delete_todo_without_scheduling(self, todo: Any) -> Any:
+        """Delete one resolved calendar resource and retain the DAV response."""
+        return await self._dav_client.delete(
             str(todo.url), headers={"X-NC-Scheduling": "false"}
         )
-        if response.status == 404:
-            return {"status_code": 404}
-        if response.status not in (200, 204):
-            raise caldav_error.AuthorizationError(
-                f"DELETE without scheduling returned HTTP {response.status}"
-            )
-        return {"status_code": 204}
 
     @staticmethod
-    def _delete_neutralized_todo_uid(todo_uid: str) -> str:
-        """Build a deterministic bare UID used only to unlock legacy deletion."""
-        return f"legacy-delete-{uuid.uuid5(uuid.NAMESPACE_URL, todo_uid).hex}"
+    def _is_calendar_trashbin_collision(response: Any) -> bool:
+        """Recognize Nextcloud's specific stale calendar-trash failure."""
+        return (
+            response.status == 403
+            and "therefore this object can't be moved into the trashbin" in response.raw
+        )
 
-    def _neutralize_todo_uid_for_delete(
-        self, raw_ical: str, todo_uid: str
-    ) -> tuple[str, str]:
-        """Rewrite one VTODO UID to a bare value before deleting the object.
+    async def _purge_todo_trash_entries(self, todo_uid: str) -> int:
+        """Permanently remove stale trash entries with this exact VTODO UID.
 
-        Older Arbiter-created todos used email-shaped UIDs such as
-        ``task@bajaj.com``. Nextcloud Sabre treats those as scheduled/iMIP
-        objects and rejects bare DELETE. For a delete operation, rewriting the
-        UID on the exact resolved object to a deterministic bare value is a
-        scoped repair: it does not create a duplicate and it is attempted only
-        after the server has already rejected normal deletion.
+        Nextcloud server #61881 uses the same repair while creating a calendar
+        object: a deleted object with the requested UID is force-deleted before
+        creation continues. This client-side equivalent is reached only after
+        the server reports its exact trashbin URI-collision error.
         """
-        cal = Calendar.from_ical(raw_ical)
-        neutral_uid = self._delete_neutralized_todo_uid(todo_uid)
-        changed = False
-
-        for component in cal.walk():
-            if component.name != "VTODO":
-                continue
-            if str(component.get("uid", "")) != todo_uid:
-                continue
-            component["UID"] = neutral_uid
-            changed = True
-            break
-
-        if not changed:
-            raise ValueError(f"VTODO UID {todo_uid!r} not found in calendar object")
-
-        return cal.to_ical().decode("utf-8"), neutral_uid
-
-    async def _delete_todo_after_uid_neutralization(
-        self, todo: Any, todo_uid: str
-    ) -> dict[str, Any]:
-        """Neutralize a legacy UID and delete without scheduling if needed."""
-        await _maybe_await(todo.load(only_if_unloaded=True))
-        neutralized_ical, neutral_uid = self._neutralize_todo_uid_for_delete(
-            todo.data,  # type: ignore[arg-type]
-            todo_uid,
+        trash_url = urljoin(self._calendar_home_url, "trashbin/objects/")
+        ns_dav = "DAV:"
+        ns_caldav = "urn:ietf:params:xml:ns:caldav"
+        query = etree.Element(
+            f"{{{ns_caldav}}}calendar-query",
+            nsmap={"d": ns_dav, "c": ns_caldav},
         )
-        todo.data = neutralized_ical
-        await _maybe_await(todo.save())
-        try:
-            await _maybe_await(todo.delete())
-        except caldav_error.AuthorizationError:
-            # Nextcloud's scheduling classification can survive an in-place
-            # UID rewrite. Its Schedule plugin explicitly supports this
-            # request header for suppressing scheduling processing on a
-            # calendar-object delete. Keep this final escape hatch scoped to
-            # a legacy-shaped UID that has already failed DELETE twice.
-            response = await self._delete_todo_without_scheduling(todo)
-            if response["status_code"] == 404:
-                return response
-        logger.info(
-            "Deleted legacy scheduled-looking todo UID %s after neutralizing to %s",
-            todo_uid,
-            neutral_uid,
+        prop = etree.SubElement(query, f"{{{ns_dav}}}prop")
+        etree.SubElement(prop, f"{{{ns_dav}}}getetag")
+        etree.SubElement(prop, f"{{{ns_caldav}}}calendar-data")
+        root_filter = etree.SubElement(query, f"{{{ns_caldav}}}filter")
+        calendar_filter = etree.SubElement(
+            root_filter, f"{{{ns_caldav}}}comp-filter", name="VCALENDAR"
         )
-        return {
-            "status_code": 204,
-            "legacy_uid_neutralized": True,
-            "original_uid": todo_uid,
-        }
+        todo_filter = etree.SubElement(
+            calendar_filter, f"{{{ns_caldav}}}comp-filter", name="VTODO"
+        )
+        uid_filter = etree.SubElement(
+            todo_filter, f"{{{ns_caldav}}}prop-filter", name="UID"
+        )
+        text_match = etree.SubElement(
+            uid_filter,
+            f"{{{ns_caldav}}}text-match",
+            collation="i;octet",
+        )
+        text_match.text = todo_uid
+
+        response = await self._dav_client.request(
+            trash_url,
+            method="REPORT",
+            body=etree.tostring(query, encoding="unicode"),
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        )
+        if response.status != 207:
+            raise RuntimeError(
+                f"calendar trashbin query returned HTTP {response.status}"
+            )
+
+        document = etree.fromstring(response.raw.encode("utf-8"))
+        matching_urls: list[str] = []
+        for item in document.findall(f".//{{{ns_dav}}}response"):
+            href = item.findtext(f"{{{ns_dav}}}href")
+            raw_ical = item.findtext(f".//{{{ns_caldav}}}calendar-data")
+            if not href or not raw_ical:
+                continue
+            calendar_data = Calendar.from_ical(raw_ical)
+            if any(
+                component.name == "VTODO" and str(component.get("uid", "")) == todo_uid
+                for component in calendar_data.walk()
+            ):
+                matching_urls.append(urljoin(trash_url, href))
+
+        purged = 0
+        for resource_url in matching_urls:
+            delete_response = await self._dav_client.delete(resource_url)
+            if delete_response.status == 404:
+                continue
+            if delete_response.status not in (200, 204):
+                raise RuntimeError(
+                    f"calendar trashbin purge returned HTTP {delete_response.status}"
+                )
+            purged += 1
+
+        if purged:
+            logger.warning(
+                "Permanently purged %s stale calendar trash entr%s for VTODO UID %s",
+                purged,
+                "y" if purged == 1 else "ies",
+                todo_uid,
+            )
+        return purged
 
     async def delete_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
         """Delete a todo/task."""
@@ -960,43 +960,56 @@ class CalendarClient:
             logger.debug("Todo %s not found: %s", todo_uid, e)
             return {"status_code": 404}
         except caldav_error.AuthorizationError as e:
-            # NC Sabre can reject bare DELETE on iMIP-scheduled-looking VTODOs
-            # (legacy UIDs with @<domain> form). Rewrite that known original
-            # shape once; if a prior repair already persisted its exact
-            # deterministic UID, skip straight to scheduling-disabled DELETE.
-            # Failures remain a structured 403 rather than a raw exception.
+            # Retain the low-level DAV response so an exact Nextcloud
+            # calendar-trash URI collision can be distinguished from ordinary
+            # authorization failures. Scheduling suppression is harmless for a
+            # direct object delete and avoids conflating the two server paths.
             logger.debug(
-                "Todo %s DELETE rejected (%s) - checking legacy UID repair",
+                "Todo %s DELETE rejected (%s) - checking DAV response",
                 todo_uid,
                 e,
             )
             fallback_error: Exception | None = None
-            if self._todo_uid_needs_delete_neutralization(todo_uid):
-                try:
-                    if self._todo_uid_is_delete_neutralized(todo_uid):
-                        return await self._delete_todo_without_scheduling(todo)
-                    return await self._delete_todo_after_uid_neutralization(
-                        todo, todo_uid
-                    )
-                except caldav_error.NotFoundError:
+            try:
+                response = await self._delete_todo_without_scheduling(todo)
+                if response.status == 404:
                     return {"status_code": 404}
-                except Exception as repair_error:
-                    fallback_error = repair_error
-                    logger.warning(
-                        "Legacy UID neutralization failed for todo %s: %s",
-                        todo_uid,
-                        repair_error,
-                    )
+                if response.status in (200, 204):
+                    return {"status_code": 204}
+                if self._is_calendar_trashbin_collision(response):
+                    purged = await self._purge_todo_trash_entries(todo_uid)
+                    if purged:
+                        retry = await self._delete_todo_without_scheduling(todo)
+                        if retry.status == 404:
+                            return {"status_code": 404}
+                        if retry.status in (200, 204):
+                            return {
+                                "status_code": 204,
+                                "stale_trash_entries_purged": purged,
+                            }
+                        raise RuntimeError(
+                            "DELETE after calendar trashbin repair returned "
+                            f"HTTP {retry.status}"
+                        )
+            except caldav_error.NotFoundError:
+                return {"status_code": 404}
+            except Exception as repair_error:
+                fallback_error = repair_error
+                logger.warning(
+                    "Calendar trashbin repair failed for todo %s: %s",
+                    todo_uid,
+                    repair_error,
+                )
 
             response: dict[str, Any] = {
                 "status_code": 403,
                 "error": (
-                    "server rejected DELETE; VTODO may be iMIP-scheduled "
-                    "(legacy email-shaped or delete-neutralized UID)"
+                    "server rejected DELETE; no exact recoverable calendar "
+                    "trashbin collision was found"
                 ),
                 "suggestion": (
-                    "use update_todo with status=COMPLETED, or recreate with "
-                    "bare-string UID for DELETE compatibility"
+                    "inspect the Nextcloud CalDAV response and calendar "
+                    "trashbin before retrying"
                 ),
             }
             if fallback_error is not None:
