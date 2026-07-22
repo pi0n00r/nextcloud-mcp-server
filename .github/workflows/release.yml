@@ -3,7 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - v*
+      # Upstream package tags publish to PyPI. Bridgette product tags (v1.*)
+      # are released manually and must not attempt a duplicate PyPI upload.
+      - v0.*
   workflow_call:
     inputs:
       tag:
