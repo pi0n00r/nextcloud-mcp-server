@@ -850,6 +850,69 @@ class CalendarClient:
             logger.error("Error updating todo %s: %s", todo_uid, e)
             raise
 
+    @staticmethod
+    def _todo_uid_needs_delete_neutralization(todo_uid: str) -> bool:
+        """Return True for legacy VTODO UIDs that Nextcloud treats as scheduled."""
+        return "@" in todo_uid
+
+    @staticmethod
+    def _delete_neutralized_todo_uid(todo_uid: str) -> str:
+        """Build a deterministic bare UID used only to unlock legacy deletion."""
+        return f"legacy-delete-{uuid.uuid5(uuid.NAMESPACE_URL, todo_uid).hex}"
+
+    def _neutralize_todo_uid_for_delete(
+        self, raw_ical: str, todo_uid: str
+    ) -> tuple[str, str]:
+        """Rewrite one VTODO UID to a bare value before deleting the object.
+
+        Older Arbiter-created todos used email-shaped UIDs such as
+        ``task@bajaj.com``. Nextcloud Sabre treats those as scheduled/iMIP
+        objects and rejects bare DELETE. For a delete operation, rewriting the
+        UID on the exact resolved object to a deterministic bare value is a
+        scoped repair: it does not create a duplicate and it is attempted only
+        after the server has already rejected normal deletion.
+        """
+        cal = Calendar.from_ical(raw_ical)
+        neutral_uid = self._delete_neutralized_todo_uid(todo_uid)
+        changed = False
+
+        for component in cal.walk():
+            if component.name != "VTODO":
+                continue
+            if str(component.get("uid", "")) != todo_uid:
+                continue
+            component["UID"] = neutral_uid
+            changed = True
+            break
+
+        if not changed:
+            raise ValueError(f"VTODO UID {todo_uid!r} not found in calendar object")
+
+        return cal.to_ical().decode("utf-8"), neutral_uid
+
+    async def _delete_todo_after_uid_neutralization(
+        self, todo: Any, todo_uid: str
+    ) -> dict[str, Any]:
+        """Neutralize a legacy scheduled-looking UID, save, then delete."""
+        await _maybe_await(todo.load(only_if_unloaded=True))
+        neutralized_ical, neutral_uid = self._neutralize_todo_uid_for_delete(
+            todo.data,  # type: ignore[arg-type]
+            todo_uid,
+        )
+        todo.data = neutralized_ical
+        await _maybe_await(todo.save())
+        await _maybe_await(todo.delete())
+        logger.info(
+            "Deleted legacy scheduled-looking todo UID %s after neutralizing to %s",
+            todo_uid,
+            neutral_uid,
+        )
+        return {
+            "status_code": 204,
+            "legacy_uid_neutralized": True,
+            "original_uid": todo_uid,
+        }
+
     async def delete_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
         """Delete a todo/task."""
         await self._ensure_calendar_home()
@@ -866,17 +929,33 @@ class CalendarClient:
             logger.debug("Todo %s not found: %s", todo_uid, e)
             return {"status_code": 404}
         except caldav_error.AuthorizationError as e:
-            # NC Sabre rejects bare DELETE on iMIP-scheduled VTODOs (UID with
-            # @<domain> form) without going through an iTip CANCEL flow; the
-            # rejection surfaces as 403 Forbidden. Return a structured response
-            # with a workaround suggestion instead of letting the raw caldav
-            # exception bubble to the MCP caller.
+            # NC Sabre can reject bare DELETE on iMIP-scheduled-looking VTODOs
+            # (legacy UIDs with @<domain> form). For that known shape, rewrite
+            # the UID on the exact resolved object to a bare value, save, then
+            # delete. If the scoped repair fails, return the structured 403 the
+            # caller can handle rather than bubbling the raw caldav exception.
             logger.debug(
-                "Todo %s DELETE rejected (%s) - likely iMIP-scheduled",
+                "Todo %s DELETE rejected (%s) - checking legacy UID repair",
                 todo_uid,
                 e,
             )
-            return {
+            fallback_error: Exception | None = None
+            if self._todo_uid_needs_delete_neutralization(todo_uid):
+                try:
+                    return await self._delete_todo_after_uid_neutralization(
+                        todo, todo_uid
+                    )
+                except caldav_error.NotFoundError:
+                    return {"status_code": 404}
+                except Exception as repair_error:
+                    fallback_error = repair_error
+                    logger.warning(
+                        "Legacy UID neutralization failed for todo %s: %s",
+                        todo_uid,
+                        repair_error,
+                    )
+
+            response: dict[str, Any] = {
                 "status_code": 403,
                 "error": (
                     "server rejected DELETE; VTODO may be iMIP-scheduled "
@@ -887,6 +966,9 @@ class CalendarClient:
                     "bare-string UID for DELETE compatibility"
                 ),
             }
+            if fallback_error is not None:
+                response["fallback_error"] = str(fallback_error)
+            return response
 
     async def search_todos_across_calendars(
         self, filters: dict[str, Any] | None = None

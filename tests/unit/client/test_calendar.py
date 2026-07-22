@@ -7,6 +7,8 @@ ourselves — we pass the raw credential plus an explicit ``auth_type`` and let
 caldav build whichever auth its backend needs.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -329,6 +331,79 @@ def _calendar_client(mocker):
 
     return CalendarClient("https://cloud.example.org", "alice", password="app-pw")
 
+
+async def test_delete_todo_neutralizes_legacy_domain_uid_after_authorization_error(mocker):
+    """Legacy email-shaped task UIDs are repaired on DELETE after NC rejects them."""
+    from caldav.lib import error as caldav_error
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "arbiter-cpow-drift-isla-relations.yaml@example.invalid"
+    ical = (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "BEGIN:VTODO\r\n"
+        f"UID:{uid}\r\n"
+        "SUMMARY:Legacy Arbiter task\r\n"
+        "STATUS:NEEDS-ACTION\r\n"
+        "END:VTODO\r\n"
+        "END:VCALENDAR\r\n"
+    )
+
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    todo = SimpleNamespace(
+        data=ical,
+        load=mocker.AsyncMock(),
+        save=mocker.AsyncMock(),
+        delete=mocker.AsyncMock(
+            side_effect=[caldav_error.AuthorizationError("Forbidden"), None]
+        ),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result["status_code"] == 204
+    assert result["legacy_uid_neutralized"] is True
+    assert result["original_uid"] == uid
+    assert todo.delete.await_count == 2
+    todo.load.assert_awaited_once_with(only_if_unloaded=True)
+    todo.save.assert_awaited_once()
+    assert f"UID:{uid}" not in todo.data
+    parsed = client._parse_ical_todo(todo.data)
+    assert parsed is not None
+    assert parsed["uid"].startswith("legacy-delete-")
+    assert "@" not in parsed["uid"]
+    assert parsed["summary"] == "Legacy Arbiter task"
+
+
+async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
+    """Only scheduled-looking legacy UIDs trigger the repair path."""
+    from caldav.lib import error as caldav_error
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "plain-arbiter-uid"
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    todo = SimpleNamespace(
+        data="",
+        load=mocker.AsyncMock(),
+        save=mocker.AsyncMock(),
+        delete=mocker.AsyncMock(
+            side_effect=caldav_error.AuthorizationError("Forbidden")
+        ),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result["status_code"] == 403
+    assert "legacy_uid_neutralized" not in result
+    todo.load.assert_not_called()
+    todo.save.assert_not_called()
+    todo.delete.assert_awaited_once()
 
 def test_event_reminders_round_trip_and_preserve_on_unrelated_update(mocker):
     client = _calendar_client(mocker)
