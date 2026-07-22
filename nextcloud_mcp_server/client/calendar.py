@@ -3,6 +3,7 @@
 import datetime as dt
 import inspect
 import logging
+import re
 import uuid
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -853,7 +854,27 @@ class CalendarClient:
     @staticmethod
     def _todo_uid_needs_delete_neutralization(todo_uid: str) -> bool:
         """Return True for legacy VTODO UIDs that Nextcloud treats as scheduled."""
-        return "@" in todo_uid
+        return "@" in todo_uid or CalendarClient._todo_uid_is_delete_neutralized(
+            todo_uid
+        )
+
+    @staticmethod
+    def _todo_uid_is_delete_neutralized(todo_uid: str) -> bool:
+        """Return True only for deterministic UIDs produced by this repair."""
+        return re.fullmatch(r"legacy-delete-[0-9a-f]{32}", todo_uid) is not None
+
+    async def _delete_todo_without_scheduling(self, todo: Any) -> dict[str, Any]:
+        """Delete one resolved calendar resource without scheduling processing."""
+        response = await self._dav_client.delete(
+            str(todo.url), headers={"X-NC-Scheduling": "false"}
+        )
+        if response.status == 404:
+            return {"status_code": 404}
+        if response.status not in (200, 204):
+            raise caldav_error.AuthorizationError(
+                f"DELETE without scheduling returned HTTP {response.status}"
+            )
+        return {"status_code": 204}
 
     @staticmethod
     def _delete_neutralized_todo_uid(todo_uid: str) -> str:
@@ -893,7 +914,7 @@ class CalendarClient:
     async def _delete_todo_after_uid_neutralization(
         self, todo: Any, todo_uid: str
     ) -> dict[str, Any]:
-        """Neutralize a legacy scheduled-looking UID, save, then delete."""
+        """Neutralize a legacy UID and delete without scheduling if needed."""
         await _maybe_await(todo.load(only_if_unloaded=True))
         neutralized_ical, neutral_uid = self._neutralize_todo_uid_for_delete(
             todo.data,  # type: ignore[arg-type]
@@ -901,7 +922,17 @@ class CalendarClient:
         )
         todo.data = neutralized_ical
         await _maybe_await(todo.save())
-        await _maybe_await(todo.delete())
+        try:
+            await _maybe_await(todo.delete())
+        except caldav_error.AuthorizationError:
+            # Nextcloud's scheduling classification can survive an in-place
+            # UID rewrite. Its Schedule plugin explicitly supports this
+            # request header for suppressing scheduling processing on a
+            # calendar-object delete. Keep this final escape hatch scoped to
+            # a legacy-shaped UID that has already failed DELETE twice.
+            response = await self._delete_todo_without_scheduling(todo)
+            if response["status_code"] == 404:
+                return response
         logger.info(
             "Deleted legacy scheduled-looking todo UID %s after neutralizing to %s",
             todo_uid,
@@ -930,10 +961,10 @@ class CalendarClient:
             return {"status_code": 404}
         except caldav_error.AuthorizationError as e:
             # NC Sabre can reject bare DELETE on iMIP-scheduled-looking VTODOs
-            # (legacy UIDs with @<domain> form). For that known shape, rewrite
-            # the UID on the exact resolved object to a bare value, save, then
-            # delete. If the scoped repair fails, return the structured 403 the
-            # caller can handle rather than bubbling the raw caldav exception.
+            # (legacy UIDs with @<domain> form). Rewrite that known original
+            # shape once; if a prior repair already persisted its exact
+            # deterministic UID, skip straight to scheduling-disabled DELETE.
+            # Failures remain a structured 403 rather than a raw exception.
             logger.debug(
                 "Todo %s DELETE rejected (%s) - checking legacy UID repair",
                 todo_uid,
@@ -942,6 +973,8 @@ class CalendarClient:
             fallback_error: Exception | None = None
             if self._todo_uid_needs_delete_neutralization(todo_uid):
                 try:
+                    if self._todo_uid_is_delete_neutralized(todo_uid):
+                        return await self._delete_todo_without_scheduling(todo)
                     return await self._delete_todo_after_uid_neutralization(
                         todo, todo_uid
                     )
@@ -959,7 +992,7 @@ class CalendarClient:
                 "status_code": 403,
                 "error": (
                     "server rejected DELETE; VTODO may be iMIP-scheduled "
-                    "(UID with @<domain> form)"
+                    "(legacy email-shaped or delete-neutralized UID)"
                 ),
                 "suggestion": (
                     "use update_todo with status=COMPLETED, or recreate with "

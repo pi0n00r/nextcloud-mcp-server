@@ -381,6 +381,142 @@ async def test_delete_todo_neutralizes_legacy_domain_uid_after_authorization_err
     assert parsed["summary"] == "Legacy Arbiter task"
 
 
+async def test_delete_todo_second_403_retries_with_scheduling_disabled(mocker):
+    """Persisted NC scheduling state is bypassed only after both DELETEs fail."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "arbiter-legacy-task@bajaj.com"
+    ical = (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "BEGIN:VTODO\r\n"
+        f"UID:{uid}\r\n"
+        "SUMMARY:Retained legacy task\r\n"
+        "STATUS:NEEDS-ACTION\r\n"
+        "END:VTODO\r\n"
+        "END:VCALENDAR\r\n"
+    )
+
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(return_value=SimpleNamespace(status=204))
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        data=ical,
+        load=mocker.AsyncMock(),
+        save=mocker.AsyncMock(),
+        delete=mocker.AsyncMock(
+            side_effect=[
+                caldav_error.AuthorizationError("Forbidden"),
+                caldav_error.AuthorizationError("Still forbidden"),
+            ]
+        ),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result == {
+        "status_code": 204,
+        "legacy_uid_neutralized": True,
+        "original_uid": uid,
+    }
+    assert todo.delete.await_count == 2
+    todo.save.assert_awaited_once()
+    client._dav_client.delete.assert_awaited_once_with(
+        todo.url, headers={"X-NC-Scheduling": "false"}
+    )
+
+
+async def test_delete_todo_already_neutralized_uses_scheduling_disabled_delete(mocker):
+    """A deployed repair UID skips another lossy load/save cycle."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "legacy-delete-0123456789abcdef0123456789abcdef"
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(return_value=SimpleNamespace(status=204))
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        load=mocker.AsyncMock(),
+        save=mocker.AsyncMock(),
+        delete=mocker.AsyncMock(
+            side_effect=caldav_error.AuthorizationError("Forbidden")
+        ),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result == {"status_code": 204}
+    todo.delete.assert_awaited_once()
+    todo.load.assert_not_called()
+    todo.save.assert_not_called()
+    client._dav_client.delete.assert_awaited_once_with(
+        todo.url, headers={"X-NC-Scheduling": "false"}
+    )
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        "legacy-delete-0123456789abcdef0123456789abcde",
+        "legacy-delete-0123456789abcdef0123456789abcdef0",
+        "legacy-delete-0123456789abcdef0123456789abcdeg",
+        "legacy-delete-0123456789ABCDEF0123456789ABCDEF",
+        "prefix-legacy-delete-0123456789abcdef0123456789abcdef",
+    ],
+)
+def test_malformed_delete_neutralized_uids_are_ineligible(uid):
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    assert CalendarClient._todo_uid_needs_delete_neutralization(uid) is False
+
+
+async def test_delete_todo_scheduling_disabled_failure_remains_structured_403(mocker):
+    """Unexpected low-level statuses stay inside delete_todo's response contract."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "legacy-delete-0123456789abcdef0123456789abcdef"
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(return_value=SimpleNamespace(status=500))
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        load=mocker.AsyncMock(),
+        save=mocker.AsyncMock(),
+        delete=mocker.AsyncMock(
+            side_effect=caldav_error.AuthorizationError("Forbidden")
+        ),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result["status_code"] == 403
+    assert "DELETE without scheduling returned HTTP 500" in result["fallback_error"]
+    todo.load.assert_not_called()
+    todo.save.assert_not_called()
+    client._dav_client.delete.assert_awaited_once_with(
+        todo.url, headers={"X-NC-Scheduling": "false"}
+    )
+
+
 async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
     """Only scheduled-looking legacy UIDs trigger the repair path."""
     from caldav.lib import error as caldav_error
@@ -391,6 +527,7 @@ async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
     client = CalendarClient.__new__(CalendarClient)
     client._ensure_calendar_home = mocker.AsyncMock()
     client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(delete=mocker.AsyncMock())
     todo = SimpleNamespace(
         data="",
         load=mocker.AsyncMock(),
@@ -408,6 +545,7 @@ async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
     todo.load.assert_not_called()
     todo.save.assert_not_called()
     todo.delete.assert_awaited_once()
+    client._dav_client.delete.assert_not_called()
 
 
 def test_event_reminders_round_trip_and_preserve_on_unrelated_update(mocker):

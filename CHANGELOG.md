@@ -10,7 +10,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 ### Fork Fix
 
 - **calendar**: delete legacy scheduled-looking VTODOs after Nextcloud
-  rejects bare DELETE by neutralizing the exact task UID and retrying
+  rejects bare DELETE by neutralizing the exact task UID, then using
+  Nextcloud's scheduling-disabled DELETE for retained legacy resources
 
 ### Feat
 
