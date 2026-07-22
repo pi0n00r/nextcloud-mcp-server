@@ -1547,6 +1547,55 @@ async def setup_oauth_config_for_multi_user_basic(
     return (token_verifier, refresh_token_storage, client_id, client_secret)
 
 
+def _split_csv(raw: str | None) -> list[str]:
+    """Split a comma-separated setting into a clean list of entries."""
+    if not raw:
+        return []
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def build_transport_security(settings: Settings) -> TransportSecuritySettings:
+    """Build the MCP transport-security settings from configuration.
+
+    DNS rebinding protection is off unless MCP_DNS_REBINDING_PROTECTION is set.
+    That default is deliberate and preserves this fork's historical behavior:
+    FastMCP auto-enables Host validation for loopback binds with a
+    localhost-only allowlist, which rejects the service DNS names that
+    containerized deployments (Docker Compose, k8s) legitimately present.
+
+    Because this server always passes an explicit TransportSecuritySettings,
+    FastMCP's auto-enablement never applies — protection was previously off for
+    *every* bind address, including 0.0.0.0. Operators exposing the server
+    beyond a trusted network can now turn it back on and enumerate the
+    Host/Origin values their clients present.
+    """
+    if not settings.mcp_dns_rebinding_protection:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    allowed_hosts = _split_csv(settings.mcp_dns_rebinding_allowed_hosts)
+    allowed_origins = _split_csv(settings.mcp_dns_rebinding_allowed_origins)
+    if not allowed_hosts:
+        # The middleware's Host check fails closed, so an empty allowlist
+        # rejects every request. Surface that as a warning rather than letting
+        # the deployment look mysteriously dead.
+        logger.warning(
+            "MCP_DNS_REBINDING_PROTECTION is enabled but "
+            "MCP_DNS_REBINDING_ALLOWED_HOSTS is empty; every request will be "
+            "rejected. Set the hosts your clients present, e.g. "
+            "'nextcloud-mcp:*,127.0.0.1:*,localhost:*'."
+        )
+    logger.info(
+        "MCP DNS rebinding protection enabled (%d allowed host(s), %d allowed origin(s))",
+        len(allowed_hosts),
+        len(allowed_origins),
+    )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
 def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None = None):
     # Initialize observability (logging will be configured by uvicorn)
     settings = get_settings()
@@ -1795,11 +1844,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             lifespan=oauth_lifespan,
             token_verifier=token_verifier,
             auth=auth_settings,
-            # Disable DNS rebinding protection for containerized deployments (k8s, Docker)
-            # MCP 1.23+ auto-enables this for localhost, breaking k8s service DNS names
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=False
-            ),
+            # Off by default for containerized deployments (k8s, Docker), whose
+            # service DNS names MCP 1.23+ localhost auto-enablement rejects.
+            # Opt back in with MCP_DNS_REBINDING_PROTECTION.
+            transport_security=build_transport_security(settings),
         )
     else:
         # BasicAuth modes (single-user or multi-user)
@@ -1807,11 +1855,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         mcp = FastMCP(
             "Nextcloud MCP",
             lifespan=app_lifespan_basic,
-            # Disable DNS rebinding protection for containerized deployments (k8s, Docker)
-            # MCP 1.23+ auto-enables this for localhost, breaking k8s service DNS names
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=False
-            ),
+            # Off by default for containerized deployments (k8s, Docker), whose
+            # service DNS names MCP 1.23+ localhost auto-enablement rejects.
+            # Opt back in with MCP_DNS_REBINDING_PROTECTION.
+            transport_security=build_transport_security(settings),
         )
 
     @mcp.resource("nc://capabilities")

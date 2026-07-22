@@ -291,6 +291,43 @@ already provides equivalent authentication.
 
 ---
 
+## Transport Security — DNS Rebinding Protection (Optional)
+
+DNS rebinding lets a page the user visits in a browser resolve an attacker's
+hostname to a private address and then issue requests to a server on the
+user's network. MCP's transport middleware defends against this by validating
+the `Host` (and optionally `Origin`) header against an allowlist.
+
+**Default: off.** This server always passes explicit transport settings to
+FastMCP, so FastMCP's own "auto-enable for loopback binds" never applies —
+protection is off for every bind address unless you turn it on. The default is
+deliberate: MCP 1.23+ auto-enablement ships a localhost-only allowlist, which
+rejects the service DNS names that containerized deployments (Docker Compose,
+Kubernetes) legitimately present in `Host`.
+
+Turn it on whenever the transport is reachable beyond a trusted network:
+
+```dotenv
+MCP_DNS_REBINDING_PROTECTION=true
+# Every Host value your clients present. Comma-separated.
+# ``host:*`` matches that host on any port.
+MCP_DNS_REBINDING_ALLOWED_HOSTS=nextcloud-mcp:*,127.0.0.1:*,localhost:*
+# Optional. An absent Origin header is always allowed (same-origin requests).
+MCP_DNS_REBINDING_ALLOWED_ORIGINS=https://your-client.example.com
+```
+
+Requests with a `Host` outside the allowlist are rejected with
+`421 Misdirected Request`; a disallowed `Origin` yields `403 Forbidden`.
+
+> **Host validation fails closed.** Enabling protection with an empty
+> `MCP_DNS_REBINDING_ALLOWED_HOSTS` rejects *every* request. The server logs a
+> warning at startup for that combination — enumerate your hosts, including the
+> Docker/Kubernetes service name if clients reach the server that way.
+
+Leave all three unset to keep the previous behavior exactly.
+
+---
+
 ## Health & Readiness Probes
 
 The server exposes two Kubernetes probe endpoints:
