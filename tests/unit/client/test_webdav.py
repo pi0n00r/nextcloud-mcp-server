@@ -690,6 +690,30 @@ async def test_read_file_accepts_matching_content_length(mocker):
 
 
 @pytest.mark.unit
+async def test_read_file_accepts_gzip_response_shorter_than_content_length(mocker):
+    """A gzip response's Content-Length is the compressed wire size, not the
+    decompressed body httpx hands back in ``response.content`` — comparing
+    the two would misfire on every compressible file Nextcloud gzips (#1099).
+    """
+    mock_http_client = AsyncMock()
+    client = WebDAVClient(mock_http_client, "testuser")
+
+    body = b'{"key": "value"} ' * 2000  # compressible enough to be gzipped
+    mock_response = AsyncMock()
+    mock_response.content = body  # httpx already decompressed this
+    mock_response.headers = {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "content-length": "128",  # compressed size on the wire, << len(body)
+    }
+    mock_response.raise_for_status = mocker.Mock()
+    mock_http_client.request = AsyncMock(return_value=mock_response)
+
+    content, _, _ = await client.read_file("Documents/index.json")
+    assert content == body
+
+
+@pytest.mark.unit
 async def test_read_file_skips_check_without_content_length(mocker):
     """A header-less (e.g. chunked) response must not raise — nothing to compare."""
     mock_http_client = AsyncMock()
@@ -885,3 +909,59 @@ async def test_find_by_tag_escapes_special_chars_in_tag(mocker):
     )
     assert "R&amp;D" in where
     assert "R&D" not in where  # no bare ampersand
+
+
+@pytest.mark.unit
+async def test_get_fileid_parses_oc_fileid(mocker):
+    """get_fileid returns the oc:fileid of a folder path (ADR-033 Phase 3)."""
+    client = WebDAVClient(AsyncMock(), "testuser")
+    mocker.patch.object(client, "_ensure_principal_id", AsyncMock())
+    resp = mocker.Mock()
+    resp.content = b"""<?xml version="1.0"?>
+    <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:response>
+            <d:href>/remote.php/dav/files/testuser/Documents/</d:href>
+            <d:propstat><d:prop><oc:fileid>98765</oc:fileid></d:prop></d:propstat>
+        </d:response>
+    </d:multistatus>"""
+    resp.raise_for_status = mocker.Mock()
+    mocker.patch.object(client, "_make_request", AsyncMock(return_value=resp))
+
+    assert await client.get_fileid("/Documents") == "98765"
+
+
+@pytest.mark.unit
+async def test_get_fileid_returns_none_on_404(mocker):
+    """A gone/inaccessible path resolves to None so the caller degrades."""
+    from httpx import HTTPStatusError, Response
+
+    client = WebDAVClient(AsyncMock(), "testuser")
+    mocker.patch.object(client, "_ensure_principal_id", AsyncMock())
+    resp404 = mocker.Mock(spec=Response)
+    resp404.status_code = 404
+    mocker.patch.object(
+        client,
+        "_make_request",
+        AsyncMock(
+            side_effect=HTTPStatusError("x", request=mocker.Mock(), response=resp404)
+        ),
+    )
+
+    assert await client.get_fileid("/gone") is None
+
+
+@pytest.mark.unit
+async def test_get_fileid_returns_none_when_absent(mocker):
+    """A response with no oc:fileid element yields None, not an error."""
+    client = WebDAVClient(AsyncMock(), "testuser")
+    mocker.patch.object(client, "_ensure_principal_id", AsyncMock())
+    resp = mocker.Mock()
+    resp.content = b"""<?xml version="1.0"?>
+    <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:response><d:href>/remote.php/dav/files/testuser/x/</d:href>
+        <d:propstat><d:prop></d:prop></d:propstat></d:response>
+    </d:multistatus>"""
+    resp.raise_for_status = mocker.Mock()
+    mocker.patch.object(client, "_make_request", AsyncMock(return_value=resp))
+
+    assert await client.get_fileid("/x") is None

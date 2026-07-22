@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import anyio
 import click
@@ -41,7 +41,6 @@ from nextcloud_mcp_server.api import (
     get_app_password_status,
     get_chunk_context,
     get_installed_apps,
-    get_pdf_preview,
     get_server_status,
     get_user_access,
     get_user_session,
@@ -165,18 +164,7 @@ _GATEWAY_GATE_OPEN_PREFIXES = (
 
 
 class GatewaySecretMiddleware:
-    """Optional pre-shared-secret gate for exposed MCP deployments.
-
-    When ``MCP_GATEWAY_SECRET`` is configured, every HTTP request outside the
-    open prefixes must present the shared secret using either
-    ``X-MCP-Gateway-Secret: <secret>`` or ``Authorization: Bearer <secret>``.
-    This gives deployments that publish the MCP transport through a reverse
-    proxy or tunnel a simple outer auth gate before requests reach application
-    routes or stored Nextcloud credentials.
-
-    The middleware is fail-open by construction: callers only install it when
-    a non-empty secret is configured, preserving existing behavior by default.
-    """
+    """Optional pre-shared-secret gate for exposed MCP deployments."""
 
     def __init__(self, app: ASGIApp, secret: str) -> None:
         assert secret, "GatewaySecretMiddleware requires a non-empty secret"
@@ -599,25 +587,76 @@ async def _check_nextcloud_health() -> None:
 
 
 async def _check_qdrant_health() -> None:
-    """Probe Qdrant ``/readyz`` (network mode) and record the result.
+    """Probe Qdrant (network mode) and record the result in the readiness cache.
 
     Qdrant Cloud's auth gateway 403s unauthenticated requests, so forward the
     same api-key the configured client uses (see vector/qdrant_client.py).
+
+    Probes the tenant's **collection** (``GET /collections/{name}``) rather than
+    the cluster's ``/readyz``. That matters because the deployed api-key is a
+    *collection-scoped* JWT: a token that is expired, revoked, or scoped to the
+    wrong collection still sails past ``/readyz`` (which only proves the cluster
+    is up), so a cluster-level probe reports "ok" while every real query fails.
+    Probing the collection exercises the credential we actually depend on, and
+    additionally catches the collection having been deleted out from under us.
+
+    PRECONDITION: the caller (:func:`_refresh_dependency_health`) only schedules
+    this when ``vector_sync_enabled`` **and** ``qdrant_url`` are both set — the
+    no-``qdrant_url`` case is reported as ``"embedded"`` there, and with vector
+    sync off nothing populates ``checks.qdrant`` at all. So there is deliberately
+    no ``/readyz`` fallback here: with vector sync on there is always a collection
+    to probe, and a branch for the other case would be unreachable code that a
+    unit test could only "cover" by calling this function directly and bypassing
+    the gate — proving nothing about the running server. If that gate ever
+    changes, revisit this function rather than adding a branch here.
+
+    Deliberately still NON-gating for Kubernetes readiness (see the
+    ``/health/ready`` handler): this only populates the reported snapshot, so a
+    Qdrant blip never pulls a single-replica Pod out of its Service (Deck #302).
+    The control plane reads ``checks.qdrant`` from that body to decide whether a
+    JWT rotation actually reached this Pod — before this change there was no
+    signal anywhere that could distinguish a working token from a dead one
+    (astrolabe-cloud-website board 6 #723).
     """
     settings = get_settings()
     qdrant_url = settings.qdrant_url
     if not qdrant_url:
         return
     headers = {"api-key": settings.qdrant_api_key} if settings.qdrant_api_key else {}
+
     start = time.time()
+    probe_desc = "qdrant"
     try:
+        # Resolving the collection name is INSIDE the guard: get_collection_name()
+        # can raise (it derives from the embedding provider / hostname), and an
+        # escaping exception would propagate out of this task. Because the caller
+        # runs it via tg.start_soon, that also cancels the sibling Nextcloud probe
+        # for the cycle — and, worse, leaves checks.qdrant simply not updated
+        # rather than reporting unhealthy, which is the silent-skip this probe
+        # exists to eliminate. A config error is an unhealthy dependency, and is
+        # reported through the same channel as a dead JWT.
+        collection = settings.get_collection_name()
+        # quote() because this is the one place the collection name is spliced
+        # into a URL path rather than handed to the qdrant-client SDK (which
+        # encodes internally). The explicit-override branch of
+        # get_collection_name() does no sanitisation, so an operator-set
+        # QDRANT_COLLECTION containing "/" would otherwise silently probe a
+        # different path.
+        probe_url = f"{qdrant_url}/collections/{quote(collection, safe='')}"
+        probe_desc = f"collection {collection}"
+
         async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{qdrant_url}/readyz", headers=headers)
+            response = await client.get(probe_url, headers=headers)
         healthy = response.status_code == 200
-        detail = "ok" if healthy else f"error: status {response.status_code}"
+        # Keep the healthy detail exactly "ok" — the control plane's rotate-verify
+        # gates on that literal. Failures name what was probed, so an operator can
+        # tell a dead JWT (401/403) from a missing collection (404) at a glance.
+        detail = (
+            "ok" if healthy else f"error: status {response.status_code} ({probe_desc})"
+        )
     except Exception as e:  # noqa: BLE001 - any failure is "unhealthy"
         healthy = False
-        detail = f"error: {e}"
+        detail = f"error: {e} ({probe_desc})"
     _readiness_cache.update("qdrant", healthy, detail)
     set_dependency_health("qdrant", healthy)
     record_dependency_check("qdrant", time.time() - start)
@@ -1672,7 +1711,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 logger.debug("Full traceback:\\n%s", traceback.format_exc())
                 logger.warning(
                     "Management API will be unavailable. "
-                    "Webhook management from management UI will not work."
+                    "Webhook management from Astrolabe admin UI will not work."
                 )
                 # Set to None to indicate failure
                 multi_user_token_verifier = None
@@ -2033,7 +2072,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             app.state.storage = basic_auth_storage
 
             # For multi-user BasicAuth with offline access, create oauth_context for management APIs
-            # This allows management client to use management APIs with OAuth bearer tokens
+            # This allows Astrolabe to use management APIs with OAuth bearer tokens
             if settings.enable_multi_user_basic_auth and settings.enable_offline_access:
                 # Check if we have OAuth credentials AND infrastructure from setup
                 if (
@@ -2077,13 +2116,13 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     logger.warning(
                         "OAuth infrastructure setup failed - management API will be unavailable. "
                         "This is expected if OIDC discovery failed or token verifier creation failed. "
-                        "Webhook management from management UI will not work."
+                        "Webhook management from Astrolabe admin UI will not work."
                     )
                 else:
                     logger.warning(
                         "OAuth credentials not available - management API will be unavailable. "
                         "This is expected if DCR failed or static credentials were not provided. "
-                        "Webhook management from management UI will not work."
+                        "Webhook management from Astrolabe admin UI will not work."
                     )
 
             # Also share with browser_app for webhook routes
@@ -2629,7 +2668,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
     # Add management API endpoints for Nextcloud PHP app
     # Tier 1: Public endpoints (no auth required)
-    # These let management client show basic server status even in single-user BasicAuth mode
+    # These let Astrolabe show basic server status even in single-user BasicAuth mode
     routes.append(Route("/api/v1/status", get_server_status, methods=["GET"]))
     routes.append(
         Route(
@@ -2699,8 +2738,6 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         routes.append(
             Route("/api/v1/chunk-context", get_chunk_context, methods=["GET"])
         )
-        # PDF preview endpoint for management client (server-side rendering)
-        routes.append(Route("/api/v1/pdf-preview", get_pdf_preview, methods=["GET"]))
         # ADR-018: Unified search endpoint for Nextcloud PHP app integration
         routes.append(Route("/api/v1/search", unified_search, methods=["POST"]))
         routes.append(Route("/api/v1/apps", get_installed_apps, methods=["GET"]))
@@ -2711,7 +2748,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             Route("/api/v1/webhooks/{webhook_id}", delete_webhook, methods=["DELETE"])
         )
         # Vector-sync admin: purge indexed vectors by doc type (admin consent —
-        # called by management client when a source is disabled for semantic search).
+        # called by Astrolabe when a source is disabled for semantic search).
         # Gated on vector_sync_enabled: without it there is no Qdrant client, so
         # the purge would 500 rather than no-op.
         if settings.vector_sync_enabled:
@@ -2745,7 +2782,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             "/api/v1/users/{user_id}/app-password, /api/v1/users/{user_id}/access, "
             "/api/v1/users/{user_id}/scopes, /api/v1/scopes, "
             "/api/v1/vector-viz/search, /api/v1/search, /api/v1/apps, "
-            "/api/v1/webhooks, /api/v1/pdf-preview"
+            "/api/v1/webhooks"
         )
 
     # Note: Metrics endpoint is NOT exposed on main HTTP port for security reasons.
@@ -3068,8 +3105,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         return response
 
     # Log the inbound User-Agent on management API and webhook receiver routes
-    # so we can tell which a management client build is
-    # talking to the backend. Management clients may send ``Nextcloud-Management-Client/<version>``.
+    # so we can tell which management client build is
+    # talking to the backend.
     _UA_LOGGED_PATH_PREFIXES = ("/api/v1/", "/webhooks/nextcloud")
 
     @app.middleware("http")
@@ -3140,9 +3177,9 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             "BasicAuthMiddleware enabled - multi-user BasicAuth pass-through mode active"
         )
 
-    # Outermost gate: pre-shared-secret check (Piranesi P1 fda535d). Wraps
-    # everything else so an unauthenticated funnel request is rejected before
-    # reaching CORS / BasicAuth / the MCP transport. Fail-open when unset.
+    # Outermost gate: pre-shared-secret check. Wraps everything else so an
+    # unauthenticated transport request is rejected before reaching CORS,
+    # BasicAuth, or MCP routes. Fail-open when unset.
     gateway_secret = os.getenv("MCP_GATEWAY_SECRET", "").strip()
     if gateway_secret:
         app = GatewaySecretMiddleware(app, gateway_secret)

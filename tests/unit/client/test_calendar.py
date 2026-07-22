@@ -332,9 +332,12 @@ def _calendar_client(mocker):
     return CalendarClient("https://cloud.example.org", "alice", password="app-pw")
 
 
-async def test_delete_todo_neutralizes_legacy_domain_uid_after_authorization_error(mocker):
+async def test_delete_todo_neutralizes_legacy_domain_uid_after_authorization_error(
+    mocker,
+):
     """Legacy email-shaped task UIDs are repaired on DELETE after NC rejects them."""
     from caldav.lib import error as caldav_error
+
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "arbiter-cpow-drift-isla-relations.yaml@example.invalid"
@@ -381,6 +384,7 @@ async def test_delete_todo_neutralizes_legacy_domain_uid_after_authorization_err
 async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
     """Only scheduled-looking legacy UIDs trigger the repair path."""
     from caldav.lib import error as caldav_error
+
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "plain-arbiter-uid"
@@ -404,6 +408,7 @@ async def test_delete_todo_keeps_structured_403_for_non_legacy_uid(mocker):
     todo.load.assert_not_called()
     todo.save.assert_not_called()
     todo.delete.assert_awaited_once()
+
 
 def test_event_reminders_round_trip_and_preserve_on_unrelated_update(mocker):
     client = _calendar_client(mocker)

@@ -16,10 +16,12 @@ import mimetypes
 import uuid
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
+import anyio
 from httpx import HTTPStatusError, RemoteProtocolError, Response
 
 from nextcloud_mcp_server.observability.metrics import (
@@ -69,58 +71,53 @@ def _is_compressed_etag_variant(
     )
 
 
-def _read_complete_body(response: Response, label: str) -> bytes:
-    """Return the response body, raising on a short read vs ``Content-Length``.
+class OversizeDownload(Exception):
+    """A streamed download exceeded its byte budget and was aborted."""
 
-    A truncated/desynced response on a pooled keep-alive connection can hand
-    back an empty/short body that the document parser then reads as ``0 chars``
-    and the vector-sync processor permanently dead-letters (#965). Compare the
-    received byte count against the declared ``Content-Length`` and raise a
-    retryable :class:`httpx.RemoteProtocolError` on a mismatch. The WebDAV GET
-    callers retry that transport error once before surfacing it, so a stale
-    pooled connection does not become a permanent false read while genuine
-    repeated short reads still fail. A missing or malformed header (e.g.
-    ``Transfer-Encoding: chunked``) skips the check so legitimately header-less
-    responses never raise.
-    """
+
+def _read_complete_body(response: Response, label: str) -> bytes:
+    """Return the response body, raising on a short read vs ``Content-Length``."""
     content = response.content
-    if response.headers.get("content-encoding"):
-        # httpx exposes decoded response.content while some servers report the
-        # compressed wire Content-Length. Treat encoded bodies as unsuitable
-        # for byte-count comparison; httpx still raises on genuine truncation.
-        return content
+    _verify_content_length(response, len(content), label)
+    return content
+
+
+def _expected_content_length(response: Response) -> int | None:
+    """The comparable ``Content-Length``, or ``None`` when the check can't apply."""
+    content_encoding = response.headers.get("content-encoding")
+    if content_encoding is not None and content_encoding.lower() != "identity":
+        return None
     declared = response.headers.get("content-length")
     if declared is None:
-        return content
+        return None
     try:
         expected = int(declared)
     except ValueError:
-        # Malformed header — nothing reliable to compare against, so don't
-        # raise spuriously; let the (possibly fine) body through.
-        return content
+        return None
     if expected < 0:
-        # Degenerate header (negative length) — can't be a real short-read
-        # signal and would always trip the check below; ignore it.
-        return content
-    if len(content) != expected:
-        document_download_truncated_total.inc()
-        # Log here, not just in the message: both callers funnel this through a
-        # generic ``except Exception`` that would otherwise report it as an
-        # opaque "Unexpected error reading file".
-        logger.warning(
-            "Truncated download for %r: expected %d bytes, got %d "
-            "(stale pooled connection or short WebDAV response - see #965)",
-            label,
-            expected,
-            len(content),
-        )
-        raise RemoteProtocolError(
-            f"Truncated download for {label!r}: expected {expected} bytes, "
-            f"got {len(content)} (stale pooled connection or short WebDAV response; "
-            "see #965)",
-            request=response.request,
-        )
-    return content
+        return None
+    return expected
+
+
+def _verify_content_length(response: Response, received: int, label: str) -> None:
+    """Raise :class:`RemoteProtocolError` when ``received`` is a short read."""
+    expected = _expected_content_length(response)
+    if expected is None or received == expected:
+        return
+    document_download_truncated_total.inc()
+    logger.warning(
+        "Truncated download for %r: expected %d bytes, got %d "
+        "(stale pooled connection or short WebDAV response - see #965)",
+        label,
+        expected,
+        received,
+    )
+    raise RemoteProtocolError(
+        f"Truncated download for {label!r}: expected {expected} bytes, "
+        f"got {received} (stale pooled connection or short WebDAV response; "
+        "see #965)",
+        request=response.request,
+    )
 
 
 # Paging defaults for WebDAV SEARCH. Nextcloud's SEARCH returns a server-default
@@ -491,6 +488,37 @@ class WebDAVClient(BaseNextcloudClient):
         except Exception as e:
             logger.error(f"Unexpected error listing directory '{webdav_path}': {e}")
             raise e
+
+    async def stream_to_file(
+        self, path: str, dest: Path, *, max_bytes: int | None = None
+    ) -> Tuple[int, str]:
+        """Stream a WebDAV GET straight to ``dest``, never holding the whole body."""
+        await self._ensure_principal_id()
+        webdav_path = self._webdav_path(path)
+
+        logger.debug("Streaming file to %s: %s", dest, path)
+        written = 0
+        try:
+            async with self._stream_request("GET", webdav_path) as response:
+                content_type = response.headers.get(
+                    "content-type", "application/octet-stream"
+                )
+                async with await anyio.open_file(dest, "wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        written += len(chunk)
+                        if max_bytes is not None and written > max_bytes:
+                            raise OversizeDownload(
+                                f"Download of {path!r} exceeded {max_bytes} bytes "
+                                f"(aborted after {written})"
+                            )
+                        await fh.write(chunk)
+                _verify_content_length(response, written, path)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+
+        logger.debug("Streamed '%s' to %s (%s bytes)", path, dest, written)
+        return written, content_type
 
     async def read_file(self, path: str) -> Tuple[bytes, str, Optional[str]]:
         """Read a file's content via WebDAV GET. Returns (content, content_type, etag).
@@ -1575,6 +1603,33 @@ class WebDAVClient(BaseNextcloudClient):
             limit=1,
         )
         return len(results) > 0
+
+    async def get_fileid(self, path: str) -> str | None:
+        """Return the Nextcloud fileid of a file/folder path, or None if absent."""
+        await self._ensure_principal_id()
+        webdav_path = self._webdav_path(path)
+        propfind_body = (
+            '<?xml version="1.0"?>'
+            '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+            "<d:prop><oc:fileid/></d:prop></d:propfind>"
+        )
+        headers = {"Depth": "0", "Content-Type": "text/xml", "OCS-APIRequest": "true"}
+        try:
+            response = await self._make_request(
+                "PROPFIND", webdav_path, content=propfind_body, headers=headers
+            )
+            response.raise_for_status()
+        except HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        root = ET.fromstring(response.content)
+        for elem in root.iter():
+            if isinstance(elem.tag, str) and elem.tag.rsplit("}", 1)[-1] == "fileid":
+                text = (elem.text or "").strip()
+                if text:
+                    return text
+        return None
 
     async def _get_file_info_by_id(self, file_id: int) -> Dict[str, Any]:
         """Get file information by Nextcloud file ID using WebDAV.

@@ -242,12 +242,12 @@ qdrant_operations_total = Counter(
 )
 
 # =============================================================================
-# Astrolabe Document-Processing Pipeline Metrics
+# Bridgette Document-Processing Pipeline Metrics
 # =============================================================================
 #
 # Product-signal metrics for the document-processing pipeline
 # (scan -> fetch -> parse -> chunk -> embed -> Qdrant upsert). These use the
-# ``astrolabe_`` prefix to distinguish the indexing/product pipeline from the
+# ``bridgette_`` prefix to distinguish the indexing/product pipeline from the
 # ``mcp_`` protocol metrics above. The tenant dimension is NOT a label here --
 # it is supplied by the Kubernetes ``namespace`` label at scrape time.
 #
@@ -292,6 +292,48 @@ document_bytes_processed_total = Counter(
     "bridgette_document_bytes_processed_total",
     "Total bytes of source documents parsed",
     ["processor", "tier"],
+)
+
+# Size distribution of everything a tenant offers for ingest, observed BEFORE the
+# oversize gate so the over-cap tail -- the part that decides caps, spool sizing
+# and worker memory -- is visible rather than silently dropped. Sizing decisions
+# were previously made from a one-off manual crawl (866 files / 66.84 GB, 51%
+# over cap); this makes the same picture a query for every tenant.
+#
+# Buckets are exponential to 2 GiB: an observed corpus spanned 1 MB to 1040 MB,
+# so the tail buckets carry real signal and must not collapse into +Inf.
+# Deliberately NOT labelled by tenant -- Prometheus already attaches the
+# namespace/pod, and a tenant label here would multiply series per bucket.
+document_ingest_size_bytes = Histogram(
+    "bridgette_document_ingest_size_bytes",
+    "Source size of documents offered for ingest, before the oversize gate",
+    ["doc_type"],
+    buckets=(
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        64 * 1024 * 1024,
+        128 * 1024 * 1024,
+        256 * 1024 * 1024,
+        512 * 1024 * 1024,
+        1024 * 1024 * 1024,
+        2048 * 1024 * 1024,
+    ),
+)
+
+document_ingest_rejected_total = Counter(
+    "bridgette_document_ingest_rejected_total",
+    "Documents rejected before parsing, by reason",
+    ["doc_type", "reason"],  # reason: oversize
+)
+
+document_parse_mode_total = Counter(
+    "bridgette_document_parse_mode_total",
+    "Structured-tier parses by extraction mode",
+    ["mode"],  # markdown | text_only
 )
 
 # --- Escalation (tiered-pipeline readiness; ~0 until extra tiers exist) --------
@@ -1025,6 +1067,41 @@ def record_document_parse_failed(reason: str) -> None:
         reason: ``timeout`` | ``oom`` | ``error``
     """
     document_parse_failed_total.labels(reason=reason).inc()
+
+
+def record_document_ingest_size(doc_type: str, size_bytes: int) -> None:
+    """Record the source size of a document offered for ingest.
+
+    Called before the oversize gate so the distribution includes documents that
+    are subsequently rejected -- they are exactly the ones that drive cap, spool
+    and memory sizing. A size of 0/None means the source did not report one, and
+    is skipped rather than recorded as a real zero, which would pile a false
+    spike into the smallest bucket.
+    """
+    if size_bytes > 0:
+        document_ingest_size_bytes.labels(doc_type=doc_type).observe(size_bytes)
+
+
+def record_document_ingest_rejected(doc_type: str, reason: str) -> None:
+    """Record a document rejected before parsing (currently ``oversize``).
+
+    Paired with :func:`record_document_ingest_size` so "what fraction of this
+    tenant's corpus is over cap" is a ratio of two metrics rather than an
+    investigation.
+    """
+    document_ingest_rejected_total.labels(doc_type=doc_type, reason=reason).inc()
+
+
+def record_document_parse_mode(mode: str) -> None:
+    """Record which extraction mode the structured tier used.
+
+    Deliberately NOT folded into ``document_parse_failed_total``: skipping
+    markdown is a successful parse, not a failure. Without its own signal the
+    page gate (``document_markdown_max_pages``) is invisible -- there is no way
+    to tell "markdown is off for most of this tenant" from "markdown is running
+    fine", which is exactly the question an operator asks after tuning it.
+    """
+    document_parse_mode_total.labels(mode=mode).inc()
 
 
 def record_document_dead_lettered(reason: str) -> None:

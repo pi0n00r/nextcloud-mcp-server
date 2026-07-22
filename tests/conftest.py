@@ -2997,7 +2997,7 @@ async def test_user_in_group(nc_client: NextcloudClient, test_user, test_group):
 
 
 @pytest.fixture(scope="session")
-async def configure_astrolabe_for_mcp_server(nc_client):
+async def configure_bridgette_for_mcp_server(nc_client):
     """Configure Astrolabe app to connect to a specific MCP server.
 
     This fixture dynamically configures the Astrolabe app's MCP server settings
@@ -3005,8 +3005,8 @@ async def configure_astrolabe_for_mcp_server(nc_client):
     server deployments (mcp-oauth, mcp-keycloak, mcp-multi-user-basic, etc.).
 
     Usage:
-        async def test_my_integration(configure_astrolabe_for_mcp_server):
-            await configure_astrolabe_for_mcp_server(
+        async def test_my_integration(configure_bridgette_for_mcp_server):
+            await configure_bridgette_for_mcp_server(
                 mcp_server_internal_url="http://mcp-oauth:8001",
                 mcp_server_public_url="http://localhost:8001"
             )
@@ -3194,7 +3194,7 @@ async def configure_astrolabe_for_mcp_server(nc_client):
                 "php",
                 "/var/www/html/occ",
                 "config:system:set",
-                "astrolabe_client_id",
+                "bridgette_client_id",
                 "--value",
                 client_id,
             ],
@@ -3212,7 +3212,7 @@ async def configure_astrolabe_for_mcp_server(nc_client):
                 "php",
                 "/var/www/html/occ",
                 "config:system:set",
-                "astrolabe_client_secret",
+                "bridgette_client_secret",
                 "--value",
                 client_secret,
             ],

@@ -25,12 +25,12 @@ jobs:
       tag: ${{ steps.bump.outputs.tag }}
     steps:
       - name: Check out
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
 
@@ -105,7 +105,8 @@ jobs:
       tag: ${{ needs.bump-version.outputs.tag }}
     permissions:
       id-token: write
-      contents: read
+      # write: the reusable workflow creates the GitHub Release for this tag.
+      contents: write
 
   docker:
     needs: bump-version
@@ -116,3 +117,16 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+  # Must be called from here rather than triggered by the tag push: tags pushed
+  # with GITHUB_TOKEN do not trigger workflows, which is the same reason
+  # `release` and `docker` above are workflow_call rather than `on: push: tags`.
+  pact-record-deployment:
+    # Gated on `docker` as well as the bump: the record asserts "this version is
+    # in production", which is only true once the image has actually published.
+    needs: [bump-version, docker]
+    if: needs.bump-version.outputs.bumped == 'true'
+    uses: ./.github/workflows/pact-record-deployment.yml
+    secrets: inherit
+    permissions:
+      contents: read

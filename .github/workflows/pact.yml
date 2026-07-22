@@ -34,10 +34,10 @@ jobs:
     # Skip on forks / when broker is not configured.
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Generate consumer pacts
         run: uv run pytest -v -m contract tests/contract/
@@ -63,7 +63,7 @@ jobs:
           # now and is no longer maintained). The cargo-dist installer appends
           # its bin dir ($HOME/.pact/bin) to $GITHUB_PATH, so `pact` is on PATH
           # for the broker steps below.
-          curl -fsSL https://github.com/pact-foundation/pact-cli/releases/download/v0.10.5/pact-installer.sh | sh
+          curl -fsSL https://github.com/pact-foundation/pact-cli/releases/download/v0.10.7/pact-installer.sh | sh
           echo "$HOME/.pact/bin" >> "$GITHUB_PATH"
           "$HOME/.pact/bin/pact" --help > /dev/null
 
@@ -109,15 +109,15 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       # Stand up the MCP server. NOTE: single-user only exposes the *public*
       # management endpoints (/api/v1/status, /api/v1/vector-sync/status) — see
       # app.py:2248. The authenticated surface astrolabe also consumes
-      # (/api/v1/search, /webhooks, /apps, /chunk-context, /pdf-preview) needs
+      # (/api/v1/search, /webhooks, /apps, /chunk-context) needs
       # an OAuth-capable profile (login-flow) plus Bearer-token injection into
       # the verifier (Verifier.add_custom_header). That is the phase-4 follow-up;
       # this job currently verifies the public-endpoint pacts.
@@ -184,7 +184,7 @@ jobs:
     # --broker-base-url, e.g. after a secret rotation or on a fork).
     if: ${{ github.ref == 'refs/heads/master' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Join tailnet
         if: ${{ env.PACT_BROKER != '' }}
@@ -212,7 +212,7 @@ jobs:
           # now and is no longer maintained). The cargo-dist installer appends
           # its bin dir ($HOME/.pact/bin) to $GITHUB_PATH, so `pact` is on PATH
           # for the broker steps below.
-          curl -fsSL https://github.com/pact-foundation/pact-cli/releases/download/v0.10.5/pact-installer.sh | sh
+          curl -fsSL https://github.com/pact-foundation/pact-cli/releases/download/v0.10.7/pact-installer.sh | sh
           echo "$HOME/.pact/bin" >> "$GITHUB_PATH"
           "$HOME/.pact/bin/pact" --help > /dev/null
 

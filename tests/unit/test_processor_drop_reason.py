@@ -2,7 +2,7 @@
 
 ``processor._drop_reason`` maps a terminal indexing failure to a metric label
 so the transient backend-pod-rollover causes (connection / timeout) are
-alertable on ``astrolabe_vector_ingest_dropped_total`` distinctly from
+alertable on ``bridgette_vector_ingest_dropped_total`` distinctly from
 persistent faults.
 """
 

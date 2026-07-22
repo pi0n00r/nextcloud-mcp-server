@@ -47,7 +47,7 @@ def test_parse_empty_list_returns_empty_set():
     assert _parse_enabled_doc_types(_payload([])) == set()
 
 
-def test_parse_missing_astrolabe_block_returns_none():
+def test_parse_missing_bridgette_block_returns_none():
     payload = {"ocs": {"data": {"capabilities": {}}}}
     assert _parse_enabled_doc_types(payload) is None
 

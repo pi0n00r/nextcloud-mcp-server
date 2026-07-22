@@ -48,7 +48,7 @@ async def document_is_searchable(
         if note_id is not None:
             # str-coerce both sides: nc_semantic_search returns int ids today,
             # but the Astrolabe API serialises some ids as strings — match the
-            # defensive comparison in _poll_astrolabe_search_for_note so a future
+            # defensive comparison in _poll_bridgette_search_for_note so a future
             # schema change can't silently break the match.
             if str(r.get("id")) == str(note_id):
                 if r.get("doc_type") == "note":

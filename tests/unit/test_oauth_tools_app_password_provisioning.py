@@ -23,7 +23,7 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def _no_astrolabe_settings(mocker):
+def _no_bridgette_settings(mocker):
     """Disable the astrolabe-status branch so the app_passwords store is hit."""
     mocker.patch.object(
         oauth_tools,
@@ -33,7 +33,7 @@ def _no_astrolabe_settings(mocker):
 
 
 async def test_status_reports_provisioned_for_app_password_store(
-    mocker, _no_astrolabe_settings
+    mocker, _no_bridgette_settings
 ):
     """A Login Flow v2 app password in storage => is_provisioned with the
     app_password credential type (was previously reported as not provisioned)."""
@@ -58,7 +58,7 @@ async def test_status_reports_provisioned_for_app_password_store(
     storage.get_refresh_token.assert_not_awaited()  # app password short-circuits
 
 
-async def test_revoke_deletes_app_password(mocker, _no_astrolabe_settings):
+async def test_revoke_deletes_app_password(mocker, _no_bridgette_settings):
     """Revoke must delete the app password from storage (not just refresh tokens)."""
     storage = MagicMock()
     storage.get_app_password_with_scopes = AsyncMock(return_value={"scopes": None})
@@ -76,7 +76,7 @@ async def test_revoke_deletes_app_password(mocker, _no_astrolabe_settings):
     oauth_tools.invalidate_scope_cache.assert_called_once_with("tester")
 
 
-async def test_revoke_noop_when_nothing_provisioned(mocker, _no_astrolabe_settings):
+async def test_revoke_noop_when_nothing_provisioned(mocker, _no_bridgette_settings):
     """No credential of any kind => graceful no-op, no deletion attempted."""
     storage = MagicMock()
     storage.get_app_password_with_scopes = AsyncMock(return_value=None)
