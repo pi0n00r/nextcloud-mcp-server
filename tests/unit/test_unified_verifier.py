@@ -17,6 +17,13 @@ from nextcloud_mcp_server.config import Settings
 
 pytestmark = pytest.mark.unit
 
+# PyJWT raises InsecureKeyLengthWarning when an HMAC key is shorter than the
+# RFC 7518 §3.2 minimum of 32 bytes for HS256. CI runs `pytest -W error`, so the
+# previous 6-byte "secret" turned that warning into a hard failure. These tokens
+# are never decoded — they are opaque cache keys — but the key still has to
+# clear the length floor to keep the suite green.
+HS256_TEST_KEY = "unit-test-hs256-signing-key-32b!"  # exactly 32 bytes
+
 
 @pytest.fixture
 def base_settings():
@@ -167,7 +174,7 @@ class TestTokenCaching:
             "exp": int(time.time() + 3600),
             "client_id": "test-client-id",
         }
-        test_token = jwt.encode(payload, "secret", algorithm="HS256")
+        test_token = jwt.encode(payload, HS256_TEST_KEY, algorithm="HS256")
 
         # Create AccessToken and cache it
         access_token = verifier._create_access_token(test_token, payload)
@@ -191,7 +198,7 @@ class TestTokenCaching:
             "exp": int(time.time() - 100),  # Expired 100 seconds ago
             "client_id": "test-client-id",
         }
-        test_token = jwt.encode(payload, "secret", algorithm="HS256")
+        test_token = jwt.encode(payload, HS256_TEST_KEY, algorithm="HS256")
 
         # Create and cache
         access_token = verifier._create_access_token(test_token, payload)
@@ -211,7 +218,7 @@ class TestTokenCaching:
             "sub": "testuser",
             "exp": int(time.time() + 3600),
         }
-        test_token = jwt.encode(payload, "secret", algorithm="HS256")
+        test_token = jwt.encode(payload, HS256_TEST_KEY, algorithm="HS256")
         verifier._create_access_token(test_token, payload)
 
         # Clear cache
@@ -455,7 +462,7 @@ class TestVerifyTokenFlow:
             "scope": "openid profile",
             "exp": int(time.time() + 3600),
         }
-        token = jwt.encode(payload, "secret", algorithm="HS256")
+        token = jwt.encode(payload, HS256_TEST_KEY, algorithm="HS256")
 
         # First call - should cache
         result1 = verifier._create_access_token(token, payload)
