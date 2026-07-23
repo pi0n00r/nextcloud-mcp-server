@@ -53,9 +53,28 @@ def _unquote_etag(etag: Optional[str]) -> Optional[str]:
 
 
 def _quote_etag(etag: str) -> str:
-    if etag == "*" or (etag.startswith('"') and etag.endswith('"')):
-        return etag
-    return f'"{etag}"'
+    """Return one syntactically valid entity-tag without double quoting."""
+    value = etag.strip()
+    if value == "*":
+        return value
+
+    prefix = ""
+    if value.startswith("W/"):
+        prefix = "W/"
+        value = value[2:]
+
+    if value.startswith('"') and value.endswith('"'):
+        opaque = value[1:-1]
+    else:
+        opaque = value
+    if not opaque or '"' in opaque or "\r" in opaque or "\n" in opaque:
+        raise ValueError("Invalid ETag value")
+    return f'{prefix}"{opaque}"'
+
+
+def _tagged_destination_if_header(destination: str, etag: str) -> str:
+    """Build RFC 4918 tagged-list syntax for the MOVE Destination resource."""
+    return f"<{destination}> ([{_quote_etag(etag)}])"
 
 
 def _is_compressed_etag_variant(
@@ -773,18 +792,9 @@ class WebDAVClient(BaseNextcloudClient):
         The final MOVE's HTTP conditional headers apply to its ``.file`` source,
         not its Destination. Therefore create-only uses ``Overwrite: F`` and
         explicit force uses ``Overwrite: T``. Exact destination-etag matching
-        would require a tagged WebDAV ``If`` header; until Nextcloud/Sabre support
-        is verified in an integration substrate, that mode fails before MKCOL.
+        uses ``Overwrite: T`` plus an RFC 4918 tagged ``If`` condition naming
+        the absolute Destination URI, so the final MOVE remains atomic.
         """
-        if if_match not in (None, "*"):
-            return {
-                "status_code": 409,
-                "error_kind": "chunked_etag_precondition_unverified",
-                "message": "Exact-etag overwrite for a chunked upload is not "
-                "enabled because destination-tagged WebDAV If semantics have not "
-                "been verified against Nextcloud/Sabre. No upload was attempted.",
-            }
-
         chunk_id = uuid.uuid4().hex
         upload_root = f"/remote.php/dav/uploads/{self.username}/{chunk_id}"
         final_dest_path = self._webdav_path(path)
@@ -826,6 +836,10 @@ class WebDAVClient(BaseNextcloudClient):
             "Content-Type": content_type,
             "Overwrite": "F" if if_match is None else "T",
         }
+        if if_match not in (None, "*"):
+            move_headers["If"] = _tagged_destination_if_header(
+                destination, if_match
+            )
         try:
             move_resp = await self._make_request(
                 "MOVE", f"{upload_root}/.file", headers=move_headers
@@ -833,7 +847,10 @@ class WebDAVClient(BaseNextcloudClient):
             move_resp.raise_for_status()
         except HTTPStatusError as error:
             conflict = _write_conflict_result(
-                if_match, error.response.status_code, path
+                if_match,
+                error.response.status_code,
+                path,
+                server_etag=_unquote_etag(error.response.headers.get("etag")),
             )
             if conflict is not None:
                 return conflict

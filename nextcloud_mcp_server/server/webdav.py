@@ -270,9 +270,8 @@ def configure_webdav_tools(mcp: FastMCP):
             if_match: Controls overwrite safety. Omit it to create a new file
                 and fail if the path exists. Pass an etag from
                 ``nc_webdav_read_file`` to overwrite only if unchanged. Pass
-                ``"*"`` for explicit force. Exact-etag writes above the
-                chunking threshold fail before upload until destination-tagged
-                WebDAV ``If`` support is verified against Nextcloud/SabreDAV.
+                ``"*"`` for explicit force. These semantics remain atomic above
+                the chunking threshold through destination-aware MOVE headers.
 
         Returns:
             Dict with status_code and write metadata on success. Known

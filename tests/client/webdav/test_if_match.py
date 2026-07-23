@@ -181,11 +181,22 @@ async def test_T4b_write_file_star_is_explicit_force():
 
 
 @pytest.mark.parametrize(
-    ("if_match", "overwrite"),
-    [(None, "F"), ("*", "T")],
+    ("if_match", "overwrite", "condition"),
+    [
+        (None, "F", None),
+        ("*", "T", None),
+        (
+            "destination-etag",
+            "T",
+            '<http://test/remote.php/dav/files/test-user/large.bin> '
+            '(["destination-etag"])',
+        ),
+    ],
 )
-async def test_T5_chunked_move_uses_destination_overwrite(if_match, overwrite):
-    """MOVE controls its Destination with Overwrite, not source preconditions."""
+async def test_T5_chunked_move_uses_destination_conditions(
+    if_match, overwrite, condition
+):
+    """All three intents are enforced atomically on the final Destination."""
     c = _make_client()
     c.CHUNK_THRESHOLD = 1
     requests = []
@@ -201,20 +212,47 @@ async def test_T5_chunked_move_uses_destination_overwrite(if_match, overwrite):
     assert move[2]["Overwrite"] == overwrite
     assert "If-Match" not in move[2]
     assert "If-None-Match" not in move[2]
+    if condition is None:
+        assert "If" not in move[2]
+    else:
+        assert move[2]["If"] == condition
     assert result["status_code"] == 204
 
 
-async def test_T5b_chunked_exact_etag_fails_before_upload():
-    """Exact destination ETag mode stays unavailable until tagged If is verified."""
+@pytest.mark.parametrize(
+    ("etag", "entity_tag"),
+    [
+        ("destination-etag", '"destination-etag"'),
+        ('"destination-etag"', '"destination-etag"'),
+        ('W/"destination-etag"', 'W/"destination-etag"'),
+    ],
+)
+async def test_T5b_chunked_exact_etag_encodes_destination_and_quotes_once(
+    etag, entity_tag
+):
+    """Tagged If names the encoded absolute Destination and quotes safely."""
     c = _make_client()
     c.CHUNK_THRESHOLD = 1
-    c._make_request = AsyncMock()
+    requests = []
 
-    result = await c.write_file("/large.bin", b"large", if_match="destination-etag")
+    async def fake_request(method, url, content=None, headers=None):
+        requests.append((method, url, headers or {}))
+        return _mock_response(201 if method == "MKCOL" else 204)
 
-    assert result["status_code"] == 409
-    assert result["error_kind"] == "chunked_etag_precondition_unverified"
-    c._make_request.assert_not_awaited()
+    c._make_request = fake_request
+    result = await c.write_file(
+        "/Folder #1/report %.bin", b"large", if_match=etag
+    )
+
+    move = next(request for request in requests if request[0] == "MOVE")
+    destination = (
+        "http://test/remote.php/dav/files/test-user/"
+        "Folder%20%231/report%20%25.bin"
+    )
+    assert move[2]["Destination"] == destination
+    assert move[2]["Overwrite"] == "T"
+    assert move[2]["If"] == f"<{destination}> ([{entity_tag}])"
+    assert result["status_code"] == 204
 
 
 @pytest.mark.parametrize(
@@ -222,7 +260,9 @@ async def test_T5b_chunked_exact_etag_fails_before_upload():
     [
         (None, 412, "already_exists"),
         ("*", 412, "missing_destination"),
+        ("destination-etag", 412, "precondition_failed"),
         (None, 423, "locked"),
+        ("destination-etag", 423, "locked"),
     ],
 )
 async def test_T5c_chunked_move_returns_structured_conflict(
@@ -244,3 +284,48 @@ async def test_T5c_chunked_move_returns_structured_conflict(
 
     assert result["status_code"] == status
     assert result["error_kind"] == error_kind
+
+
+@pytest.mark.parametrize(
+    ("status", "error_kind", "server_etag"),
+    [
+        (412, "precondition_failed", "server-current-etag"),
+        (423, "locked", None),
+    ],
+)
+async def test_T5d_exact_etag_conflict_does_not_retry_or_fallback(
+    status, error_kind, server_etag
+):
+    """A failed atomic MOVE is returned once; no unconditional MOVE follows."""
+    c = _make_client()
+    c.CHUNK_THRESHOLD = 1
+    requests = []
+
+    async def fake_request(method, url, content=None, headers=None):
+        requests.append((method, url, headers or {}))
+        if method == "MOVE":
+            request = Request(method, url)
+            response_headers = (
+                {"etag": '"server-current-etag"'} if server_etag else {}
+            )
+            response = Response(
+                status,
+                headers=response_headers,
+                request=request,
+            )
+            raise HTTPStatusError(str(status), request=request, response=response)
+        return _mock_response(201 if method == "MKCOL" else 204)
+
+    c._make_request = fake_request
+    result = await c.write_file(
+        "/large.bin", b"large", if_match="destination-etag"
+    )
+
+    assert [request[0] for request in requests] == ["MKCOL", "PUT", "MOVE"]
+    move_headers = requests[-1][2]
+    assert move_headers["Overwrite"] == "T"
+    assert move_headers["If"].endswith('(["destination-etag"])')
+    assert result["status_code"] == status
+    assert result["error_kind"] == error_kind
+    if server_etag:
+        assert result["server_etag"] == server_etag

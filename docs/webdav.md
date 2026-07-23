@@ -71,7 +71,7 @@ final MOVE. The `if_match` argument selects one of three modes:
 | `if_match`            | Behaviour |
 |-----------------------|-----------|
 | omitted (`None`)      | **Create-only.** Fails if the path already exists. |
-| an `etag`             | **Safe overwrite.** Fails if the file changed since that etag was read. See the chunked limitation below. |
+| an `etag`             | **Safe overwrite.** Fails if the file changed since that etag was read. |
 | `"*"`                 | **Explicit force.** Uses `If-Match: *` for a simple PUT and `Overwrite: T` for a chunked final MOVE. |
 
 To change an existing file, read it first to obtain its `etag`
@@ -105,10 +105,9 @@ await nc_webdav_write_file("Documents/notes.md", "# Regenerated", if_match="*")
 For chunked uploads, RFC 4918 makes ordinary `If-Match` apply to the MOVE
 source (`.file`), not its Destination. Create-only therefore uses
 `Overwrite: F`; explicit force uses `Overwrite: T`. Exact destination-ETag
-overwrite requires a tagged WebDAV `If` condition. Until that behavior is
-verified against Nextcloud/SabreDAV, an exact-ETag chunked write fails before
-creating an upload collection or sending any bytes. This limitation is
-deliberate: the tool does not claim race safety it cannot establish.
+overwrite uses `Overwrite: T` plus a tagged WebDAV `If` condition naming the
+absolute Destination URI. The condition is evaluated on the final MOVE, so the
+update remains atomic without a preflight read or an unconditional fallback.
 
 ### Write Size Limit
 

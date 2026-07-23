@@ -13,9 +13,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 existing file. Omitting if_match now creates a file and fails if it already
 exists; to overwrite, pass the etag from nc_webdav_read_file, or if_match="*"
 to force it. The fork preserves A.2 chunked uploads: create-only uses
-`Overwrite: F`, force uses `Overwrite: T`, and exact destination-ETag chunked
-writes fail before upload until tagged WebDAV `If` support is verified against
-Nextcloud/SabreDAV.
+`Overwrite: F`, force uses `Overwrite: T`, and exact destination-ETag updates
+use `Overwrite: T` with an RFC 4918 tagged WebDAV `If` condition on the final
+MOVE.
 
 ### Fix
 
