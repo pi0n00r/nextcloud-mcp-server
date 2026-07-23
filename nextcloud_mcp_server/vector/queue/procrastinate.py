@@ -407,7 +407,15 @@ def _is_transient_infra_error(exc: BaseException) -> bool:
     """
     import httpx  # noqa: PLC0415
 
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+    if isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+        ),
+    ):
         return True
     try:
         import openai  # noqa: PLC0415

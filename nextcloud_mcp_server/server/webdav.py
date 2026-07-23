@@ -8,7 +8,6 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.client.webdav import EtagConflictError
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models import DirectoryListing, FileInfo, SearchFilesResponse
@@ -268,15 +267,17 @@ def configure_webdav_tools(mcp: FastMCP):
             path: Full path where to write the file
             content: File content (text or base64 for binary)
             content_type: MIME type (auto-detected if not provided, use 'type;base64' for binary)
-            if_match: Optional ETag from a prior read_file response. When set,
-                the PUT carries an HTTP If-Match precondition. Closes P1.1.
+            if_match: Controls overwrite safety. Omit it to create a new file
+                and fail if the path exists. Pass an etag from
+                ``nc_webdav_read_file`` to overwrite only if unchanged. Pass
+                ``"*"`` for explicit force. Exact-etag writes above the
+                chunking threshold fail before upload until destination-tagged
+                WebDAV ``If`` support is verified against Nextcloud/SabreDAV.
 
         Returns:
-            On success: Dict with status_code (and bytes_written, plus etag if
-            the server returned one on the PUT response).
-            On 412 Precondition Failed (If-Match mismatch): Dict with
-            status_code=412, error_kind='precondition_failed', and server_etag
-            (the current server ETag, if surfaceable).
+            Dict with status_code and write metadata on success. Known
+            precondition, lock, and unsupported chunk-condition results surface
+            as ``ToolError`` with an actionable message.
         """
         client = await get_client(ctx)
 
@@ -292,17 +293,23 @@ def configure_webdav_tools(mcp: FastMCP):
         else:
             content_bytes = content.encode("utf-8")
 
-        try:
-            return await client.webdav.write_file(
-                path, content_bytes, content_type, if_match=if_match
-            )
-        except EtagConflictError as e:
-            return {
-                "status_code": 412,
-                "error_kind": "precondition_failed",
-                "server_etag": e.current_etag,
-                "message": str(e),
-            }
+        max_mb = get_settings().webdav_write_max_mb
+        if max_mb:
+            size_mb = len(content_bytes) / (1024 * 1024)
+            if size_mb > max_mb:
+                raise ToolError(
+                    f"Refusing to write {path!r}: {size_mb:.1f} MB exceeds the "
+                    f"configured WEBDAV_WRITE_MAX_MB ({max_mb} MB). Raise the "
+                    "limit only when that write size is operator-approved."
+                )
+
+        result = await client.webdav.write_file(
+            path, content_bytes, content_type, if_match=if_match
+        )
+        if result.get("status_code", 200) >= 400:
+            message = result.get("message", "WebDAV write failed")
+            raise ToolError(f"{message} ({path!r})")
+        return result
 
     @mcp.tool(
         title="Create Directory",

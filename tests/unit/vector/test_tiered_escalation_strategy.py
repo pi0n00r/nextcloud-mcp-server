@@ -94,6 +94,35 @@ class TestTieredEscalationStrategy:
         assert decision.queue is None
         assert decision.retry_at is not None
 
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            httpx.RemoteProtocolError("stale response"),
+            httpx.ReadError("pooled connection reset"),
+        ],
+    )
+    def test_stale_get_transport_retries_same_queue_under_cap(self, exception):
+        decision = self._strategy(max_transient=5).get_retry_decision(
+            exception=exception, job=_job(attempts=1)
+        )
+        assert decision is not None
+        assert decision.queue is None
+        assert decision.retry_at is not None
+
+    def test_stale_get_transport_stops_at_transient_cap(self):
+        decision = self._strategy(max_transient=5).get_retry_decision(
+            exception=httpx.ReadError("pooled connection reset"),
+            job=_job(attempts=5),
+        )
+        assert decision is None
+
+    def test_local_protocol_error_is_not_classified_as_stale_transport(self):
+        decision = self._strategy().get_retry_decision(
+            exception=httpx.LocalProtocolError("invalid request framing"),
+            job=_job(attempts=1),
+        )
+        assert decision is None
+
     def test_transient_backoff_progression(self):
         # min(4 * 2**(attempts-1), 300): 4, 8, 16, ... capped at 300s.
         # procrastinate sets retry_at = utcnow() + wait at call time. Bracketing

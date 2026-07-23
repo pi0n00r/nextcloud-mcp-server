@@ -142,7 +142,11 @@ _DEFAULTS: dict[str, Any] = {
     # System tag that marks files for hybrid (dense + BM25 sparse) indexing.
     # The scanner indexes files carrying this tag; verify-on-read gates results
     # on current membership of this tag (ADR-019).
-    "vector_sync_tag": "vector-index",
+    # Resolved by _get_vector_sync_tag() so the deprecated
+    # VECTOR_SYNC_PDF_TAG input can remain a fallback without obscuring whether
+    # VECTOR_SYNC_TAG was explicitly configured.
+    "vector_sync_tag": None,
+    "vector_sync_pdf_tag": None,
     # System tag that marks files for keyword-only (BM25 sparse) indexing.
     # Defaults to ``keyword-index`` (symmetric with ``vector_sync_tag``), so
     # a user who creates + applies that tag gets keyword-only indexing out of the
@@ -218,6 +222,12 @@ _DEFAULTS: dict[str, Any] = {
     # "oversize" instead of burning the OCR timeout to 0 chars on a pathological
     # file. 0 disables the guard.
     "document_max_pdf_size_mb": 50.0,
+    # Pre-flight cap (MB) on nc_webdav_write_file's content: a huge PUT built
+    # from a single in-memory MCP tool argument (no chunked/streaming upload
+    # exists for writes, unlike the read-side stream_to_file path) risks
+    # timing out or exhausting memory rather than failing predictably. 0
+    # disables the guard.
+    "webdav_write_max_mb": 50.0,
     # Page ceiling for markdown reconstruction (see document_markdown_max_pages).
     "document_markdown_max_pages": 150,
     # Pages per pypdfium2 extraction window (see document_parse_page_window).
@@ -567,7 +577,22 @@ _dynaconf = Dynaconf(
         # Non-negative
         Validator("DOCUMENT_CHUNK_OVERLAP", gte=0),
         # Non-empty strings
-        Validator("VECTOR_SYNC_TAG", len_min=1),
+        Validator(
+            "VECTOR_SYNC_TAG",
+            condition=lambda v: v is None or (isinstance(v, str) and len(v) >= 1),
+            messages={
+                "condition": "VECTOR_SYNC_TAG must be a non-empty string when set"
+            },
+        ),
+        Validator(
+            "VECTOR_SYNC_PDF_TAG",
+            condition=lambda v: v is None or (isinstance(v, str) and len(v) >= 1),
+            messages={
+                "condition": (
+                    "VECTOR_SYNC_PDF_TAG must be a non-empty string when set"
+                )
+            },
+        ),
         # VECTOR_SYNC_KEYWORD_TAG is optional (empty disables keyword-only
         # discovery), so no len_min — but when set it must be a usable tag name.
         # WEBHOOK_SECRET is optional (None disables webhooks — GHSA-8vh3-g2qg-2h2c),
@@ -1170,6 +1195,9 @@ class Settings:
     # being handed to the fast/OCR tiers, where a pathological large file burns
     # the OCR timeout for 0 chars. 0 disables the guard.
     document_max_pdf_size_mb: float = 50.0
+    # Pre-flight cap (MB) on nc_webdav_write_file's content (see _DEFAULTS
+    # for rationale). 0 disables the guard.
+    webdav_write_max_mb: float = 50.0
     # Page ceiling above which the structured tier skips pymupdf4llm.to_markdown
     # and returns the raw text layer instead. 0 disables markdown entirely
     # (every document takes the raw-text path), matching how
@@ -1892,6 +1920,23 @@ def set_override(key: str, value) -> None:
     _clear_settings_caches()
 
 
+def _get_vector_sync_tag() -> str:
+    """Resolve the hybrid-index tag with the modern key taking precedence."""
+    modern = _dynaconf.get("VECTOR_SYNC_TAG")
+    if modern is not None:
+        return modern
+
+    legacy = _dynaconf.get("VECTOR_SYNC_PDF_TAG")
+    if legacy is not None:
+        logger.warning(
+            "VECTOR_SYNC_PDF_TAG is deprecated; use VECTOR_SYNC_TAG. "
+            "Using the legacy value for vector_sync_tag."
+        )
+        return legacy
+
+    return "vector-index"
+
+
 @functools.cache
 def _build_settings() -> Settings:
     """Get application settings from dynaconf configuration.
@@ -1982,7 +2027,6 @@ def _build_settings() -> Settings:
         "vector_sync_user_poll_interval": "VECTOR_SYNC_USER_POLL_INTERVAL",
         "vector_sync_orphan_sweep_enabled": "VECTOR_SYNC_ORPHAN_SWEEP_ENABLED",
         "health_ready_refresh_interval": "HEALTH_READY_REFRESH_INTERVAL",
-        "vector_sync_tag": "VECTOR_SYNC_TAG",
         "vector_sync_keyword_tag": "VECTOR_SYNC_KEYWORD_TAG",
         "vector_sync_empty_discovery_delete_threshold": "VECTOR_SYNC_EMPTY_DISCOVERY_DELETE_THRESHOLD",
         # Verify-on-read (ADR-019)
@@ -2024,6 +2068,7 @@ def _build_settings() -> Settings:
         "document_parse_timeout_seconds": "DOCUMENT_PARSE_TIMEOUT_SECONDS",
         "document_read_timeout_seconds": "DOCUMENT_READ_TIMEOUT_SECONDS",
         "document_max_pdf_size_mb": "DOCUMENT_MAX_PDF_SIZE_MB",
+        "webdav_write_max_mb": "WEBDAV_WRITE_MAX_MB",
         "document_markdown_max_pages": "DOCUMENT_MARKDOWN_MAX_PAGES",
         "document_parse_mem_limit_mb": "DOCUMENT_PARSE_MEM_LIMIT_MB",
         "document_parse_page_window": "DOCUMENT_PARSE_PAGE_WINDOW",
@@ -2099,6 +2144,7 @@ def _build_settings() -> Settings:
     # Smart dependency overrides (always set, regardless of dynaconf)
     kwargs["vector_sync_enabled"] = enable_semantic_search
     kwargs["enable_offline_access"] = enable_background_operations
+    kwargs["vector_sync_tag"] = _get_vector_sync_tag()
 
     return Settings(**kwargs)
 

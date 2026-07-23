@@ -38,7 +38,13 @@ logger = logging.getLogger(__name__)
     "--host", "-h", default="127.0.0.1", show_default=True, help="Server host"
 )
 @click.option(
-    "--port", "-p", type=int, default=8000, show_default=True, help="Server port"
+    "--port",
+    "-p",
+    type=int,
+    envvar="PORT",
+    default=8000,
+    show_default=True,
+    help="Server port",
 )
 @click.option(
     "--log-level",

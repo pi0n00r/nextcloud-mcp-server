@@ -838,3 +838,42 @@ class TestNextcloudBrowserUrl:
         """Returns None when no Nextcloud URL is configured at all."""
         settings = Settings()
         assert settings.nextcloud_browser_url is None
+
+
+class TestVectorSyncTagCompatibility:
+    """Pin the deprecated PDF-tag input without weakening modern precedence."""
+
+    @patch.dict(
+        os.environ,
+        {"VECTOR_SYNC_PDF_TAG": "legacy-pdf-index"},
+        clear=True,
+    )
+    def test_legacy_only_supplies_tag_and_warns(self, caplog):
+        caplog.set_level(logging.WARNING, logger="nextcloud_mcp_server.config")
+        _reload_config()
+
+        assert get_settings().vector_sync_tag == "legacy-pdf-index"
+        assert "VECTOR_SYNC_PDF_TAG is deprecated" in caplog.text
+
+    @patch.dict(
+        os.environ,
+        {
+            "VECTOR_SYNC_TAG": "modern-index",
+            "VECTOR_SYNC_PDF_TAG": "legacy-pdf-index",
+        },
+        clear=True,
+    )
+    def test_modern_tag_wins_when_both_are_set(self, caplog):
+        caplog.set_level(logging.WARNING, logger="nextcloud_mcp_server.config")
+        _reload_config()
+
+        assert get_settings().vector_sync_tag == "modern-index"
+        assert "VECTOR_SYNC_PDF_TAG is deprecated" not in caplog.text
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_default_tag_is_unchanged(self, caplog):
+        caplog.set_level(logging.WARNING, logger="nextcloud_mcp_server.config")
+        _reload_config()
+
+        assert get_settings().vector_sync_tag == "vector-index"
+        assert "VECTOR_SYNC_PDF_TAG is deprecated" not in caplog.text

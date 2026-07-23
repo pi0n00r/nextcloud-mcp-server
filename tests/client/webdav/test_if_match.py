@@ -14,9 +14,10 @@
 Covers:
   T1 — read_file returns (content, content_type, etag) tuple; etag stripped of quotes
   T2 — write_file with if_match adds If-Match header; succeeds when server accepts
-  T3 — write_file with if_match raises EtagConflictError on 412 with server_etag
+  T3 — write_file with if_match returns a structured conflict on 412
   T3b — a transport-added -gzip ETag retries once with the authoritative ETag
-  T4 — write_file WITHOUT if_match preserves current behavior (no If-Match header)
+  T4 — write_file WITHOUT if_match is create-only
+  T5 — chunked MOVE uses destination-aware Overwrite semantics
 """
 
 from __future__ import annotations
@@ -26,13 +27,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import HTTPStatusError, Request, Response
 
-from nextcloud_mcp_server.client.webdav import EtagConflictError, WebDAVClient
+from nextcloud_mcp_server.client.webdav import WebDAVClient
 
 
 def _make_client():
     """Construct a WebDAVClient with mocked httpx + minimal config."""
     c = WebDAVClient.__new__(WebDAVClient)
     c._client = MagicMock()
+    c._client.base_url = "http://test"
     c.username = "test-user"
     c._principal_discovered = True
     c._principal_id = "test-user"
@@ -91,8 +93,8 @@ async def test_T2_write_file_with_if_match_adds_header():
     assert result.get("etag") == "new-etag-xyz"
 
 
-async def test_T3_write_file_412_raises_etag_conflict():
-    """write_file with stale if_match → 412 → EtagConflictError carrying current server etag."""
+async def test_T3_write_file_412_returns_etag_conflict():
+    """A stale exact ETag returns a structured conflict with the server ETag."""
     c = _make_client()
 
     async def fake_request(method, url, content=None, headers=None):
@@ -101,9 +103,10 @@ async def test_T3_write_file_412_raises_etag_conflict():
         raise HTTPStatusError("412", request=req, response=resp)
 
     c._make_request = fake_request
-    with pytest.raises(EtagConflictError) as exc_info:
-        await c.write_file("/file.txt", b"data", if_match="stale-etag")
-    assert exc_info.value.current_etag == "server-current-etag"
+    result = await c.write_file("/file.txt", b"data", if_match="stale-etag")
+    assert result["status_code"] == 412
+    assert result["error_kind"] == "precondition_failed"
+    assert result["server_etag"] == "server-current-etag"
 
 
 async def test_T3b_gzip_etag_variant_retries_once_with_authoritative_etag():
@@ -141,14 +144,14 @@ async def test_T3c_gzip_retry_preserves_second_conflict():
         raise HTTPStatusError("412", request=req, response=resp)
 
     c._make_request = fake_request
-    with pytest.raises(EtagConflictError) as exc_info:
-        await c.write_file("/file.txt", b"data", if_match="abc123-gzip")
+    result = await c.write_file("/file.txt", b"data", if_match="abc123-gzip")
+    assert result["status_code"] == 412
+    assert result["error_kind"] == "precondition_failed"
+    assert result["server_etag"] == "changed-after-read"
 
-    assert exc_info.value.current_etag == "changed-after-read"
 
-
-async def test_T4_write_file_without_if_match_omits_header():
-    """write_file without if_match (default) does not add If-Match header — preserves prior behavior."""
+async def test_T4_write_file_without_if_match_is_create_only():
+    """The default sends If-None-Match: * and never silently overwrites."""
     c = _make_client()
     captured = {}
 
@@ -158,4 +161,86 @@ async def test_T4_write_file_without_if_match_omits_header():
 
     c._make_request = fake_request
     await c.write_file("/file.txt", b"data")
+    assert captured["headers"]["If-None-Match"] == "*"
     assert "If-Match" not in captured["headers"]
+
+
+async def test_T4b_write_file_star_is_explicit_force():
+    """The explicit force token is passed as an unquoted If-Match wildcard."""
+    c = _make_client()
+    captured = {}
+
+    async def fake_request(method, url, content=None, headers=None):
+        captured["headers"] = headers
+        return _mock_response(204)
+
+    c._make_request = fake_request
+    await c.write_file("/file.txt", b"data", if_match="*")
+    assert captured["headers"]["If-Match"] == "*"
+    assert "If-None-Match" not in captured["headers"]
+
+
+@pytest.mark.parametrize(
+    ("if_match", "overwrite"),
+    [(None, "F"), ("*", "T")],
+)
+async def test_T5_chunked_move_uses_destination_overwrite(if_match, overwrite):
+    """MOVE controls its Destination with Overwrite, not source preconditions."""
+    c = _make_client()
+    c.CHUNK_THRESHOLD = 1
+    requests = []
+
+    async def fake_request(method, url, content=None, headers=None):
+        requests.append((method, url, headers or {}))
+        return _mock_response(201 if method == "MKCOL" else 204)
+
+    c._make_request = fake_request
+    result = await c.write_file("/large.bin", b"large", if_match=if_match)
+
+    move = next(request for request in requests if request[0] == "MOVE")
+    assert move[2]["Overwrite"] == overwrite
+    assert "If-Match" not in move[2]
+    assert "If-None-Match" not in move[2]
+    assert result["status_code"] == 204
+
+
+async def test_T5b_chunked_exact_etag_fails_before_upload():
+    """Exact destination ETag mode stays unavailable until tagged If is verified."""
+    c = _make_client()
+    c.CHUNK_THRESHOLD = 1
+    c._make_request = AsyncMock()
+
+    result = await c.write_file("/large.bin", b"large", if_match="destination-etag")
+
+    assert result["status_code"] == 409
+    assert result["error_kind"] == "chunked_etag_precondition_unverified"
+    c._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("if_match", "status", "error_kind"),
+    [
+        (None, 412, "already_exists"),
+        ("*", 412, "missing_destination"),
+        (None, 423, "locked"),
+    ],
+)
+async def test_T5c_chunked_move_returns_structured_conflict(
+    if_match, status, error_kind
+):
+    """Known destination conflicts remain actionable on the final MOVE."""
+    c = _make_client()
+    c.CHUNK_THRESHOLD = 1
+
+    async def fake_request(method, url, content=None, headers=None):
+        if method == "MOVE":
+            request = Request(method, url)
+            response = Response(status, request=request)
+            raise HTTPStatusError(str(status), request=request, response=response)
+        return _mock_response(201 if method == "MKCOL" else 204)
+
+    c._make_request = fake_request
+    result = await c.write_file("/large.bin", b"large", if_match=if_match)
+
+    assert result["status_code"] == status
+    assert result["error_kind"] == error_kind

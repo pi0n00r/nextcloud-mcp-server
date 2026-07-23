@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
 import anyio
-from httpx import HTTPStatusError, RemoteProtocolError, Response
+from httpx import HTTPStatusError, ReadError, RemoteProtocolError, Response
 
 from nextcloud_mcp_server.observability.metrics import (
     document_download_truncated_total,
@@ -129,6 +129,7 @@ WEBDAV_SEARCH_PAGE_SIZE = 500
 # cap can never again silently hide files.
 WEBDAV_SEARCH_MAX_RESULTS = 50000
 WEBDAV_GET_MAX_ATTEMPTS = 2
+STALE_GET_ERRORS = (RemoteProtocolError, ReadError)
 
 
 def _encode_dav_path(path: str) -> str:
@@ -148,6 +149,56 @@ def _encode_dav_path(path: str) -> str:
     return quote(path, safe="/")
 
 
+def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
+    """Return the atomic precondition for a simple destination PUT."""
+    if if_match is None:
+        return {"If-None-Match": "*"}
+    if if_match == "*":
+        return {"If-Match": "*"}
+    return {"If-Match": _quote_etag(if_match)}
+
+
+def _write_conflict_result(
+    if_match: Optional[str],
+    status_code: int,
+    path: str,
+    *,
+    server_etag: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Map known write conflicts to actionable structured results."""
+    if status_code == 412:
+        if if_match is None:
+            return {
+                "status_code": 412,
+                "error_kind": "already_exists",
+                "message": "File already exists - read it first to get its etag "
+                "and pass if_match to overwrite safely, or pass if_match='*' to "
+                "overwrite deliberately",
+            }
+        if if_match == "*":
+            return {
+                "status_code": 412,
+                "error_kind": "missing_destination",
+                "message": "File does not exist - cannot force-overwrite a missing "
+                "file; omit if_match to create it",
+            }
+        return {
+            "status_code": 412,
+            "error_kind": "precondition_failed",
+            "server_etag": server_etag,
+            "message": "File was modified since the given etag was read "
+            "(concurrent edit) - re-read before writing",
+        }
+    if status_code == 423:
+        return {
+            "status_code": 423,
+            "error_kind": "locked",
+            "message": "File is locked by another client (for example, open in "
+            "the Nextcloud web editor) - not retried automatically",
+        }
+    return None
+
+
 class WebDAVClient(BaseNextcloudClient):
     """Client for Nextcloud WebDAV operations."""
 
@@ -157,13 +208,13 @@ class WebDAVClient(BaseNextcloudClient):
         self, webdav_path: str, label: str
     ) -> Tuple[Response, bytes]:
         """GET a WebDAV resource and retry one stale-transport/short-read error."""
-        last_exc: Optional[RemoteProtocolError] = None
+        last_exc: RemoteProtocolError | ReadError | None = None
         for attempt in range(1, WEBDAV_GET_MAX_ATTEMPTS + 1):
             try:
                 response = await self._make_request("GET", webdav_path)
                 response.raise_for_status()
                 return response, _read_complete_body(response, label)
-            except RemoteProtocolError as exc:
+            except STALE_GET_ERRORS as exc:
                 last_exc = exc
                 if attempt >= WEBDAV_GET_MAX_ATTEMPTS:
                     raise
@@ -406,6 +457,7 @@ class WebDAVClient(BaseNextcloudClient):
                 <d:getcontentlength/>
                 <d:getcontenttype/>
                 <d:getlastmodified/>
+                <d:getetag/>
                 <d:resourcetype/>
             </d:prop>
         </d:propfind>"""
@@ -468,6 +520,13 @@ class WebDAVClient(BaseNextcloudClient):
                 modified_elem = prop.find(".//{DAV:}getlastmodified")
                 modified = modified_elem.text if modified_elem is not None else None
 
+                etag_elem = prop.find(".//{DAV:}getetag")
+                etag = (
+                    _unquote_etag(etag_elem.text)
+                    if etag_elem is not None and etag_elem.text
+                    else None
+                )
+
                 items.append(
                     {
                         "name": name,
@@ -476,6 +535,7 @@ class WebDAVClient(BaseNextcloudClient):
                         "size": size if not is_directory else None,
                         "content_type": content_type,
                         "last_modified": modified,
+                        "etag": etag,
                     }
                 )
 
@@ -497,28 +557,50 @@ class WebDAVClient(BaseNextcloudClient):
         webdav_path = self._webdav_path(path)
 
         logger.debug("Streaming file to %s: %s", dest, path)
-        written = 0
-        try:
-            async with self._stream_request("GET", webdav_path) as response:
-                content_type = response.headers.get(
-                    "content-type", "application/octet-stream"
+        last_exc: RemoteProtocolError | ReadError | None = None
+        for attempt in range(1, WEBDAV_GET_MAX_ATTEMPTS + 1):
+            written = 0
+            try:
+                async with self._stream_request("GET", webdav_path) as response:
+                    content_type = response.headers.get(
+                        "content-type", "application/octet-stream"
+                    )
+                    # "wb" truncates on every attempt. A stale first stream can
+                    # never leave prefix bytes in the successful retry.
+                    async with await anyio.open_file(dest, "wb") as fh:
+                        async for chunk in response.aiter_bytes():
+                            written += len(chunk)
+                            if max_bytes is not None and written > max_bytes:
+                                raise OversizeDownload(
+                                    f"Download of {path!r} exceeded {max_bytes} bytes "
+                                    f"(aborted after {written})"
+                                )
+                            await fh.write(chunk)
+                    _verify_content_length(response, written, path)
+            except STALE_GET_ERRORS as exc:
+                dest.unlink(missing_ok=True)
+                last_exc = exc
+                if attempt >= WEBDAV_GET_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Retrying streamed WebDAV GET for %r after stale transport "
+                    "failure (%d/%d): %s",
+                    path,
+                    attempt,
+                    WEBDAV_GET_MAX_ATTEMPTS,
+                    exc,
                 )
-                async with await anyio.open_file(dest, "wb") as fh:
-                    async for chunk in response.aiter_bytes():
-                        written += len(chunk)
-                        if max_bytes is not None and written > max_bytes:
-                            raise OversizeDownload(
-                                f"Download of {path!r} exceeded {max_bytes} bytes "
-                                f"(aborted after {written})"
-                            )
-                        await fh.write(chunk)
-                _verify_content_length(response, written, path)
-        except BaseException:
-            dest.unlink(missing_ok=True)
-            raise
+                continue
+            except BaseException:
+                dest.unlink(missing_ok=True)
+                raise
 
-        logger.debug("Streamed '%s' to %s (%s bytes)", path, dest, written)
-        return written, content_type
+            logger.debug("Streamed '%s' to %s (%s bytes)", path, dest, written)
+            return written, content_type
+
+        raise last_exc or RuntimeError(
+            "Streamed WebDAV GET retry loop exited unexpectedly"
+        )
 
     async def read_file(self, path: str) -> Tuple[bytes, str, Optional[str]]:
         """Read a file's content via WebDAV GET. Returns (content, content_type, etag).
@@ -561,20 +643,19 @@ class WebDAVClient(BaseNextcloudClient):
     CHUNK_THRESHOLD = 1 * 1024 * 1024  # 1 MB
     CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
-    async def _conditional_request(
+    async def _conditional_put_request(
         self,
-        method: str,
         request_path: str,
         display_path: str,
         headers: Dict[str, str],
         if_match: Optional[str],
-        content: Optional[bytes] = None,
-    ) -> Response:
-        """Send a conditional write with one safe compressed-ETag retry."""
+        content: bytes,
+    ) -> Response | Dict[str, Any]:
+        """Send a fail-closed PUT with one safe compressed-ETag retry."""
 
         async def send(request_headers: Dict[str, str]) -> Response:
             response = await self._make_request(
-                method, request_path, content=content, headers=request_headers
+                "PUT", request_path, content=content, headers=request_headers
             )
             response.raise_for_status()
             return response
@@ -582,36 +663,35 @@ class WebDAVClient(BaseNextcloudClient):
         try:
             return await send(headers)
         except HTTPStatusError as error:
-            if error.response.status_code != 412:
-                raise
-
-            server_etag = _unquote_etag(
-                error.response.headers.get("etag") or error.response.headers.get("ETag")
-            )
-            if _is_compressed_etag_variant(if_match, server_etag):
+            status_code = error.response.status_code
+            server_etag = _unquote_etag(error.response.headers.get("etag"))
+            if status_code == 412 and _is_compressed_etag_variant(
+                if_match, server_etag
+            ):
                 assert server_etag is not None
                 retry_headers = {**headers, "If-Match": _quote_etag(server_etag)}
                 logger.info(
-                    "Retrying conditional %s for compressed ETag variant on %r",
-                    method,
+                    "Retrying conditional PUT for compressed ETag variant on %r",
                     display_path,
                 )
                 try:
                     return await send(retry_headers)
                 except HTTPStatusError as retry_error:
-                    if retry_error.response.status_code != 412:
-                        raise
+                    status_code = retry_error.response.status_code
                     server_etag = _unquote_etag(
                         retry_error.response.headers.get("etag")
-                        or retry_error.response.headers.get("ETag")
                     )
+                    error = retry_error
 
-            raise EtagConflictError(
-                f"412 Precondition Failed on {method} {display_path}: "
-                f"If-Match {if_match!r} did not match server "
-                f"(server_etag={server_etag!r})",
-                current_etag=server_etag,
-            ) from error
+            conflict = _write_conflict_result(
+                if_match,
+                status_code,
+                display_path,
+                server_etag=server_etag,
+            )
+            if conflict is not None:
+                return conflict
+            raise error
 
     async def write_file(
         self,
@@ -620,15 +700,11 @@ class WebDAVClient(BaseNextcloudClient):
         content_type: Optional[str] = None,
         if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Write content to a file via WebDAV PUT.
+        """Write a file with explicit create/overwrite semantics.
 
-        For content above CHUNK_THRESHOLD bytes, routes through NC chunked-upload v2.
-
-        Args:
-            if_match: Optional ETag for conditional PUT/MOVE. When set, the write
-                carries an If-Match precondition; on 412 Precondition Failed,
-                raises EtagConflictError with the server's current etag (if
-                surfaceable). Closes P1.1 backlog item.
+        ``None`` is create-only, an exact etag is race-safe overwrite, and ``"*"``
+        is explicit force-overwrite. Large writes retain the Nextcloud chunked
+        upload path; see :meth:`_write_file_chunked` for its MOVE constraints.
         """
         await self._ensure_principal_id()
 
@@ -653,17 +729,19 @@ class WebDAVClient(BaseNextcloudClient):
         if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Single-PUT write for small files."""
-        webdav_path = f"{self._get_webdav_base_path()}/{path.lstrip('/')}"
+        webdav_path = self._webdav_path(path)
         logger.debug(f"Writing file (simple PUT, {len(content)} bytes): {path}")
-        headers = {"Content-Type": content_type, "OCS-APIRequest": "true"}
-        if if_match is not None:
-            # NC expects quoted etags per RFC 7232; pass through if already quoted
-            # or wildcard, else add quotes
-            headers["If-Match"] = _quote_etag(if_match)
+        headers = {
+            "Content-Type": content_type,
+            "OCS-APIRequest": "true",
+            **_write_precondition_header(if_match),
+        }
         try:
-            response = await self._conditional_request(
-                "PUT", webdav_path, path, headers, if_match, content
+            response = await self._conditional_put_request(
+                webdav_path, path, headers, if_match, content
             )
+            if isinstance(response, dict):
+                return response
             result = {
                 "status_code": response.status_code,
                 "bytes_written": len(content),
@@ -673,8 +751,6 @@ class WebDAVClient(BaseNextcloudClient):
             if new_etag is not None:
                 result["etag"] = new_etag
             return result
-        except EtagConflictError:
-            raise
         except HTTPStatusError as e:
             logger.error(f"HTTP error writing file '{path}': {e}")
             raise
@@ -693,10 +769,25 @@ class WebDAVClient(BaseNextcloudClient):
         2. PUT each chunk as /remote.php/dav/uploads/<user>/<chunkid>/<00000001>
         3. MOVE /remote.php/dav/uploads/<user>/<chunkid>/.file
            with Destination header pointing at the final webdav path.
+
+        The final MOVE's HTTP conditional headers apply to its ``.file`` source,
+        not its Destination. Therefore create-only uses ``Overwrite: F`` and
+        explicit force uses ``Overwrite: T``. Exact destination-etag matching
+        would require a tagged WebDAV ``If`` header; until Nextcloud/Sabre support
+        is verified in an integration substrate, that mode fails before MKCOL.
         """
+        if if_match not in (None, "*"):
+            return {
+                "status_code": 409,
+                "error_kind": "chunked_etag_precondition_unverified",
+                "message": "Exact-etag overwrite for a chunked upload is not "
+                "enabled because destination-tagged WebDAV If semantics have not "
+                "been verified against Nextcloud/Sabre. No upload was attempted.",
+            }
+
         chunk_id = uuid.uuid4().hex
         upload_root = f"/remote.php/dav/uploads/{self.username}/{chunk_id}"
-        final_dest_path = f"{self._get_webdav_base_path()}/{path.lstrip('/')}"
+        final_dest_path = self._webdav_path(path)
 
         logger.info(
             f"Writing file (chunked, {len(content)} bytes, chunk_id={chunk_id}): {path}"
@@ -733,22 +824,31 @@ class WebDAVClient(BaseNextcloudClient):
             "Destination": destination,
             "OC-Total-Length": str(len(content)),
             "Content-Type": content_type,
+            "Overwrite": "F" if if_match is None else "T",
         }
-        if if_match is not None:
-            move_headers["If-Match"] = _quote_etag(if_match)
-        move_resp = await self._conditional_request(
-            "MOVE",
-            f"{upload_root}/.file",
-            path,
-            move_headers,
-            if_match,
-        )
-        return {
+        try:
+            move_resp = await self._make_request(
+                "MOVE", f"{upload_root}/.file", headers=move_headers
+            )
+            move_resp.raise_for_status()
+        except HTTPStatusError as error:
+            conflict = _write_conflict_result(
+                if_match, error.response.status_code, path
+            )
+            if conflict is not None:
+                return conflict
+            raise
+
+        result = {
             "status_code": move_resp.status_code,
             "bytes_written": bytes_written,
             "chunks": (len(content) + self.CHUNK_SIZE - 1) // self.CHUNK_SIZE,
             "chunk_id": chunk_id,
         }
+        new_etag = _unquote_etag(move_resp.headers.get("etag"))
+        if new_etag is not None:
+            result["etag"] = new_etag
+        return result
 
     async def create_directory(
         self, path: str, recursive: bool = False

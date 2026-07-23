@@ -307,6 +307,7 @@ services:
     ports:
       - 127.0.0.1:8002:8002
     environment:
+      - PORT=8002
       # Generic OIDC configuration (external IdP mode - Keycloak)
       # Provider auto-detected from OIDC_DISCOVERY_URL issuer
       # Using internal Docker hostname for discovery to get consistent issuer
@@ -359,6 +360,7 @@ services:
     ports:
       - 127.0.0.1:8004:8004
     environment:
+      - PORT=8004
       - NEXTCLOUD_HOST=http://app:80
       - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8004
       #- NEXTCLOUD_MCP_SERVER_URL=https://nextcloud-mcp-dev.tail148d5.ts.net

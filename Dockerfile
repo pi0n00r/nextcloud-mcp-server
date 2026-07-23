@@ -23,6 +23,7 @@ COPY . .
 RUN uv sync --locked --no-dev --no-editable --no-cache --extra postgres --extra observability
 
 ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
 # Dump a Python + C-level traceback to stderr on a fatal native fault
 # (SIGSEGV/SIGABRT/SIGFPE/SIGBUS). In-process native code -- pymupdf's
 # classify/metadata open and embedded Qdrant -- can segfault the interpreter
@@ -37,6 +38,6 @@ ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/health/live || exit 1
+    CMD ["/app/.venv/bin/python", "-m", "nextcloud_mcp_server.container_healthcheck"]
 
 ENTRYPOINT ["/app/.venv/bin/nextcloud-mcp-server", "run", "--host", "0.0.0.0"]

@@ -60,6 +60,16 @@ def _client(body: bytes, headers: dict[str, str] | None = None) -> WebDAVClient:
     return client
 
 
+class _FailingStream(httpx.AsyncByteStream):
+    def __init__(self, request: httpx.Request, error_type: type[httpx.RequestError]):
+        self._request = request
+        self._error_type = error_type
+
+    async def __aiter__(self):
+        yield b"stale-prefix"
+        raise self._error_type("stale pooled connection", request=self._request)
+
+
 # --- the shared guard: streaming and buffered paths must agree ----------------
 
 
@@ -150,6 +160,83 @@ async def test_streaming_compressed_response_skips_the_length_check(tmp_path):
     # httpx decodes transparently, so what lands on disk is the real document.
     assert dest.read_bytes() == raw
     assert written == len(raw)
+
+
+@pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
+async def test_stream_retries_stale_transport_with_clean_destination(
+    tmp_path, error_type
+):
+    """A partial first stream cannot survive in the successful retry output."""
+    body = b"fresh-complete-body"
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                stream=_FailingStream(request, error_type),
+                headers={"content-length": "999"},
+            )
+        return httpx.Response(
+            200,
+            content=body,
+            headers={"content-length": str(len(body))},
+        )
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://nc"
+    )
+    dest = tmp_path / "out.pdf"
+    dest.write_bytes(b"pre-existing-data")
+
+    written, _ = await _client_over(http).stream_to_file("/f.pdf", dest)
+
+    assert calls == [1, 1]
+    assert written == len(body)
+    assert dest.read_bytes() == body
+
+
+async def test_stream_stale_transport_is_retried_only_once(tmp_path):
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(
+            200,
+            stream=_FailingStream(request, httpx.ReadError),
+            headers={"content-length": "999"},
+        )
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://nc"
+    )
+    dest = tmp_path / "out.pdf"
+
+    with pytest.raises(httpx.ReadError):
+        await _client_over(http).stream_to_file("/f.pdf", dest)
+
+    assert calls == [1, 1]
+    assert not dest.exists()
+
+
+async def test_stream_does_not_retry_auth_status(tmp_path):
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(401, content=b"unauthorized")
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://nc"
+    )
+    dest = tmp_path / "out.pdf"
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await _client_over(http).stream_to_file("/f.pdf", dest)
+
+    assert calls == [1]
+    assert not dest.exists()
 
 
 async def test_max_bytes_aborts_and_removes_the_file(tmp_path):
