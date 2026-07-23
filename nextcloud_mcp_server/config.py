@@ -39,6 +39,14 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_public_issuer_url": None,
     "nextcloud_public_url": None,
     "cookie_secure": None,
+    # MCP transport security (DNS rebinding protection). Off by default so the
+    # containerized service-DNS deployments this fork targets keep working
+    # unchanged; opt in and enumerate the allowlists when the server is
+    # reachable beyond a trusted network. Comma-separated; entries support the
+    # MCP middleware's ``host:*`` wildcard-port syntax.
+    "mcp_dns_rebinding_protection": False,
+    "mcp_dns_rebinding_allowed_hosts": "",
+    "mcp_dns_rebinding_allowed_origins": "",
     # OAuth/OIDC
     "oidc_discovery_url": None,
     # Startup OIDC-discovery retry/backoff. Declared here (lowercase) so
@@ -930,6 +938,26 @@ class Settings:
     # scheme (https → True, else False). Set COOKIE_SECURE=true/false to
     # override.
     cookie_secure: bool | None = None
+
+    # MCP transport security (DNS rebinding protection).
+    #
+    # FastMCP auto-enables Host validation only when it is given no explicit
+    # transport_security AND binds a loopback address. This server always passes
+    # explicit settings, so protection is whatever these fields say regardless of
+    # bind address. Default False reproduces the historical behavior: MCP 1.23+
+    # localhost auto-enablement rejects the service DNS names that Docker/k8s
+    # deployments legitimately present in the Host header.
+    #
+    # Set MCP_DNS_REBINDING_PROTECTION=true when the server is reachable beyond a
+    # trusted network, and enumerate every Host/Origin your clients present. The
+    # allowlists are comma-separated and support the MCP middleware's ``host:*``
+    # wildcard-port syntax, e.g. "nextcloud-mcp:*,127.0.0.1:*,localhost:*".
+    #
+    # Host validation fails closed: enabling protection with an empty host
+    # allowlist rejects every request. get_app() logs a warning for that case.
+    mcp_dns_rebinding_protection: bool = False
+    mcp_dns_rebinding_allowed_hosts: str = ""
+    mcp_dns_rebinding_allowed_origins: str = ""
 
     # Nextcloud SSL/TLS settings
     nextcloud_verify_ssl: bool = True
@@ -1913,6 +1941,10 @@ def _build_settings() -> Settings:
         "nextcloud_public_issuer_url": "NEXTCLOUD_PUBLIC_ISSUER_URL",
         "nextcloud_public_url": "NEXTCLOUD_PUBLIC_URL",
         "cookie_secure": "COOKIE_SECURE",
+        # MCP transport security (DNS rebinding protection)
+        "mcp_dns_rebinding_protection": "MCP_DNS_REBINDING_PROTECTION",
+        "mcp_dns_rebinding_allowed_hosts": "MCP_DNS_REBINDING_ALLOWED_HOSTS",
+        "mcp_dns_rebinding_allowed_origins": "MCP_DNS_REBINDING_ALLOWED_ORIGINS",
         # Nextcloud SSL/TLS settings
         "nextcloud_verify_ssl": "NEXTCLOUD_VERIFY_SSL",
         "nextcloud_ca_bundle": "NEXTCLOUD_CA_BUNDLE",
