@@ -718,9 +718,7 @@ async def test_read_file_retries_once_after_truncated_body_then_succeeds(mocker)
 
 @pytest.mark.unit
 @pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
-async def test_read_file_retries_stale_transport_once_then_succeeds(
-    mocker, error_type
-):
+async def test_read_file_retries_stale_transport_once_then_succeeds(mocker, error_type):
     """Both stale pooled-GET failure shapes get one fresh request."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
@@ -954,9 +952,7 @@ async def test_write_file_returns_structured_result_on_stale_etag(mocker):
     mocker.patch.object(
         client,
         "_make_request",
-        AsyncMock(
-            side_effect=HTTPStatusError("x", request=request, response=resp412)
-        ),
+        AsyncMock(side_effect=HTTPStatusError("x", request=request, response=resp412)),
     )
 
     result = await client.write_file("Documents/notes.txt", b"new", if_match="stale")
@@ -975,9 +971,7 @@ async def test_write_file_returns_already_exists_on_create_conflict(mocker):
     mocker.patch.object(
         client,
         "_make_request",
-        AsyncMock(
-            side_effect=HTTPStatusError("x", request=request, response=resp412)
-        ),
+        AsyncMock(side_effect=HTTPStatusError("x", request=request, response=resp412)),
     )
 
     result = await client.write_file("Documents/notes.txt", b"new")
@@ -996,9 +990,7 @@ async def test_write_file_returns_missing_on_force_overwrite_of_absent_file(mock
     mocker.patch.object(
         client,
         "_make_request",
-        AsyncMock(
-            side_effect=HTTPStatusError("x", request=request, response=resp412)
-        ),
+        AsyncMock(side_effect=HTTPStatusError("x", request=request, response=resp412)),
     )
 
     result = await client.write_file("Documents/notes.txt", b"new", if_match="*")
@@ -1019,9 +1011,7 @@ async def test_write_file_returns_structured_result_on_locked(mocker):
     mocker.patch.object(
         client,
         "_make_request",
-        AsyncMock(
-            side_effect=HTTPStatusError("x", request=request, response=resp423)
-        ),
+        AsyncMock(side_effect=HTTPStatusError("x", request=request, response=resp423)),
     )
 
     result = await client.write_file("Documents/notes.txt", b"new")
@@ -1039,9 +1029,7 @@ async def test_write_file_still_raises_on_other_http_errors(mocker):
     mocker.patch.object(
         client,
         "_make_request",
-        AsyncMock(
-            side_effect=HTTPStatusError("x", request=request, response=resp500)
-        ),
+        AsyncMock(side_effect=HTTPStatusError("x", request=request, response=resp500)),
     )
 
     with pytest.raises(HTTPStatusError):

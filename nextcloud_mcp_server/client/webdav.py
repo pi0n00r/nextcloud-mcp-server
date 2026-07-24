@@ -759,17 +759,17 @@ class WebDAVClient(BaseNextcloudClient):
             response = await self._conditional_put_request(
                 webdav_path, path, headers, if_match, content
             )
-            if isinstance(response, dict):
-                return response
-            result = {
-                "status_code": response.status_code,
-                "bytes_written": len(content),
-            }
-            new_etag = response.headers.get("etag") or response.headers.get("ETag")
-            new_etag = _unquote_etag(new_etag)
-            if new_etag is not None:
-                result["etag"] = new_etag
-            return result
+            if isinstance(response, Response):
+                result = {
+                    "status_code": response.status_code,
+                    "bytes_written": len(content),
+                }
+                new_etag = response.headers.get("etag") or response.headers.get("ETag")
+                new_etag = _unquote_etag(new_etag)
+                if new_etag is not None:
+                    result["etag"] = new_etag
+                return result
+            return response
         except HTTPStatusError as e:
             logger.error(f"HTTP error writing file '{path}': {e}")
             raise
@@ -837,9 +837,7 @@ class WebDAVClient(BaseNextcloudClient):
             "Overwrite": "F" if if_match is None else "T",
         }
         if if_match not in (None, "*"):
-            move_headers["If"] = _tagged_destination_if_header(
-                destination, if_match
-            )
+            move_headers["If"] = _tagged_destination_if_header(destination, if_match)
         try:
             move_resp = await self._make_request(
                 "MOVE", f"{upload_root}/.file", headers=move_headers

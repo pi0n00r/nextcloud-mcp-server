@@ -43,7 +43,9 @@ def _option_value(argv: Sequence[str], *names: str) -> str | None:
     return None
 
 
-def _valid_port(value: object) -> int | None:
+def _valid_port(value: str | None) -> int | None:
+    if value is None:
+        return None
     try:
         port = int(value)
     except (TypeError, ValueError):

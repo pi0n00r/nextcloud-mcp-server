@@ -188,7 +188,7 @@ async def test_T4b_write_file_star_is_explicit_force():
         (
             "destination-etag",
             "T",
-            '<http://test/remote.php/dav/files/test-user/large.bin> '
+            "<http://test/remote.php/dav/files/test-user/large.bin> "
             '(["destination-etag"])',
         ),
     ],
@@ -240,14 +240,11 @@ async def test_T5b_chunked_exact_etag_encodes_destination_and_quotes_once(
         return _mock_response(201 if method == "MKCOL" else 204)
 
     c._make_request = fake_request
-    result = await c.write_file(
-        "/Folder #1/report %.bin", b"large", if_match=etag
-    )
+    result = await c.write_file("/Folder #1/report %.bin", b"large", if_match=etag)
 
     move = next(request for request in requests if request[0] == "MOVE")
     destination = (
-        "http://test/remote.php/dav/files/test-user/"
-        "Folder%20%231/report%20%25.bin"
+        "http://test/remote.php/dav/files/test-user/Folder%20%231/report%20%25.bin"
     )
     assert move[2]["Destination"] == destination
     assert move[2]["Overwrite"] == "T"
@@ -305,9 +302,7 @@ async def test_T5d_exact_etag_conflict_does_not_retry_or_fallback(
         requests.append((method, url, headers or {}))
         if method == "MOVE":
             request = Request(method, url)
-            response_headers = (
-                {"etag": '"server-current-etag"'} if server_etag else {}
-            )
+            response_headers = {"etag": '"server-current-etag"'} if server_etag else {}
             response = Response(
                 status,
                 headers=response_headers,
@@ -317,9 +312,7 @@ async def test_T5d_exact_etag_conflict_does_not_retry_or_fallback(
         return _mock_response(201 if method == "MKCOL" else 204)
 
     c._make_request = fake_request
-    result = await c.write_file(
-        "/large.bin", b"large", if_match="destination-etag"
-    )
+    result = await c.write_file("/large.bin", b"large", if_match="destination-etag")
 
     assert [request[0] for request in requests] == ["MKCOL", "PUT", "MOVE"]
     move_headers = requests[-1][2]

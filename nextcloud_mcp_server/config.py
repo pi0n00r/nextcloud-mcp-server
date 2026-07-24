@@ -588,9 +588,7 @@ _dynaconf = Dynaconf(
             "VECTOR_SYNC_PDF_TAG",
             condition=lambda v: v is None or (isinstance(v, str) and len(v) >= 1),
             messages={
-                "condition": (
-                    "VECTOR_SYNC_PDF_TAG must be a non-empty string when set"
-                )
+                "condition": ("VECTOR_SYNC_PDF_TAG must be a non-empty string when set")
             },
         ),
         # VECTOR_SYNC_KEYWORD_TAG is optional (empty disables keyword-only
