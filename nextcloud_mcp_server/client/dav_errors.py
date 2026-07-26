@@ -207,9 +207,10 @@ def _request_summary(response: Response) -> str:
 def dav_error_from_status_error(exc: HTTPStatusError) -> Optional[DavError]:
     """Build the typed DAV error for ``exc``, or ``None`` if it is not one.
 
-    A response qualifies when either its status is one this module maps
-    (412/423/507) or its body is a Sabre/DAV error document. Everything else —
-    notably the OCS JSON API, which has its own envelope — is left alone.
+    A response qualifies only when its body is a valid Sabre/DAV error
+    document. Status alone is insufficient because JSON/REST endpoints also
+    use 412/423/507 for non-DAV failures. WebDAV callers that own the protocol
+    boundary may still classify a bare status there.
 
     Args:
         exc: The ``HTTPStatusError`` raised by ``raise_for_status``.
@@ -221,15 +222,15 @@ def dav_error_from_status_error(exc: HTTPStatusError) -> Optional[DavError]:
     response = exc.response
     status_code = getattr(response, "status_code", None)
     detail = parse_dav_error(_response_body(response))
+    if detail is None:
+        return None
 
     error_type: Type[DavError] = DavError
     hint = ""
     if isinstance(status_code, int) and status_code in _STATUS_MAP:
         error_type, hint = _STATUS_MAP[status_code]
-    elif detail is None:
-        return None
 
-    described = detail.describe() if detail is not None else ""
+    described = detail.describe()
     parts = [f"{status_code} on {_request_summary(response)}"]
     if hint:
         parts.append(hint)

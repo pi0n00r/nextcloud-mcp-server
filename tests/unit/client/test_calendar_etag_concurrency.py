@@ -1,3 +1,5 @@
+"""Focused CalDAV ETag and optimistic-concurrency regression tests."""
+
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -8,8 +10,6 @@
 # AI-NOTICE:Escalation=warn
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
-
-"""Focused CalDAV ETag and optimistic-concurrency regression tests."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -143,6 +143,39 @@ async def test_todo_list_surfaces_exact_quoted_etag(client):
     assert listed[0]["etag"] == '"todo-v1"'
     assert b"calendar-data" in calendar.client.report.await_args.args[1]
     assert b"getetag" in calendar.client.report.await_args.args[1]
+
+
+async def test_get_todo_couples_content_and_exact_etag_in_one_report(client):
+    calendar = report_calendar(TODO_ICAL, '"todo-v1"')
+    client._get_calendar = lambda _name: calendar
+
+    fetched = await client.get_todo("main", "todo-1")
+
+    assert fetched["summary"] == "Original"
+    assert fetched["etag"] == '"todo-v1"'
+    calendar.client.report.assert_awaited_once()
+    assert b"calendar-data" in calendar.client.report.await_args.args[1]
+    assert b"getetag" in calendar.client.report.await_args.args[1]
+
+
+async def test_get_todo_never_fabricates_an_empty_etag(client):
+    calendar = report_calendar(TODO_ICAL, None)
+    client._get_calendar = lambda _name: calendar
+
+    with pytest.raises(CalendarEtagUnavailableError, match="REPORT response"):
+        await client.get_todo("main", "todo-1")
+
+
+@pytest.mark.parametrize(
+    "todo",
+    [
+        {"status": "COMPLETED", "completed": None},
+        {"status": "NEEDS-ACTION", "completed": "2026-07-26T00:00:00Z"},
+    ],
+)
+def test_open_task_filter_honours_status_or_completed_timestamp(client, todo):
+    assert client._todo_matches_filters(todo, {"include_completed": False}) is False
+    assert client._todo_matches_filters(todo, {"include_completed": True}) is True
 
 
 async def test_unbounded_event_list_uses_one_coupled_report_without_n_plus_one(client):

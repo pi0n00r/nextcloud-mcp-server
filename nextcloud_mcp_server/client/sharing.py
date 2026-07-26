@@ -74,7 +74,7 @@ class SharingClient(BaseNextcloudClient):
     async def create_share(
         self,
         path: str,
-        share_with: str,
+        share_with: str | None = None,
         share_type: int = 0,
         permissions: int = 1,
     ) -> dict[str, Any]:
@@ -82,13 +82,14 @@ class SharingClient(BaseNextcloudClient):
 
         Args:
             path: Path to file/folder to share (relative to user's files)
-            share_with: Recipient identifier — user id, group id, email address,
-                federated ``user@remote``, circle id, Talk conversation token or
-                Deck card id, depending on ``share_type``
+            share_with: Optional recipient identifier — user id, group id, email
+                address, federated ``user@remote``, circle id, Talk conversation
+                token or Deck card id, depending on ``share_type``. Omit this
+                only for a public link (``share_type=3``).
             share_type: OCS share type — see :class:`ShareType`. 0=user (default),
                 1=group, 4=email, 6=federated, 7=circle, 10=Talk, 12=Deck card.
-                Type 3 (public link) is rejected here because it takes no
-                recipient; use :meth:`create_public_link` instead.
+                Type 3 creates a public link and requires ``share_with`` to be
+                omitted.
             permissions: Share permissions:
                 - 1 = read
                 - 2 = update
@@ -108,15 +109,18 @@ class SharingClient(BaseNextcloudClient):
         """
         validate_share_with(share_type, share_with)
 
+        payload: dict[str, Any] = {
+            "path": path,
+            "shareType": share_type,
+            "permissions": permissions,
+        }
+        if share_with is not None:
+            payload["shareWith"] = share_with
+
         response = await self._client.post(
             "/ocs/v2.php/apps/files_sharing/api/v1/shares",
             headers=self._OCS_HEADERS,
-            data={
-                "path": path,
-                "shareType": share_type,
-                "shareWith": share_with,
-                "permissions": permissions,
-            },
+            data=payload,
         )
         response.raise_for_status()
         data = response.json()

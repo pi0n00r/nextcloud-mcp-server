@@ -21,13 +21,15 @@ client-side here.
 
 import pytest
 from httpx import AsyncClient
+from mcp.server.fastmcp import FastMCP
 
-from nextcloud_mcp_server.client.ocs import OCSAuthenticationError
+from nextcloud_mcp_server.client.ocs import OCSAuthenticationError, OCSError
 from nextcloud_mcp_server.client.sharing import SharingClient, validate_share_with
 from nextcloud_mcp_server.models.sharing import (
     SHARE_TYPES_REQUIRING_RECIPIENT,
     ShareType,
 )
+from nextcloud_mcp_server.server.sharing import configure_sharing_tools
 
 pytestmark = pytest.mark.unit
 
@@ -107,6 +109,21 @@ class TestValidateShareWith:
 
 
 class TestCreateShareValidation:
+    async def test_public_link_without_recipient_reaches_wire_without_share_with(
+        self, sharing_client, mocker
+    ):
+        sharing_client._client.post.return_value = _ok_response(mocker, {"id": 10})
+
+        share = await sharing_client.create_share(
+            path="/report.pdf",
+            share_type=ShareType.PUBLIC_LINK,
+            permissions=3,
+        )
+
+        assert share["id"] == 10
+        data = sharing_client._client.post.call_args.kwargs["data"]
+        assert data == {"path": "/report.pdf", "shareType": 3, "permissions": 3}
+
     async def test_public_link_with_recipient_never_reaches_the_wire(
         self, sharing_client
     ):
@@ -189,3 +206,44 @@ class TestSharingOcsHeaders:
 
         with pytest.raises(OCSAuthenticationError, match="OCS-APIRequest"):
             await sharing_client.list_shares()
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda client: client.create_share("/x", "alice"),
+            lambda client: client.create_public_link("/x"),
+            lambda client: client.delete_share(7),
+            lambda client: client.get_share(7),
+            lambda client: client.list_shares(),
+            lambda client: client.update_share(7, permissions=1),
+        ],
+    )
+    async def test_malformed_envelopes_fail_closed_for_every_sharing_operation(
+        self, sharing_client, mocker, call
+    ):
+        response = mocker.Mock()
+        response.raise_for_status = mocker.Mock()
+        response.json.return_value = {"ocs": {"meta": {}, "data": {"id": 7}}}
+        for method in ("post", "delete", "get", "put"):
+            getattr(sharing_client._client, method).return_value = response
+
+        with pytest.raises(OCSError, match="malformed OCS envelope"):
+            await call(sharing_client)
+
+
+def test_registry_keeps_dedicated_public_link_capability_exposed():
+    mcp = FastMCP("sharing-registry")
+    configure_sharing_tools(mcp)
+    tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
+
+    assert "nc_share_create_public_link" in tools
+    assert "sharing.write" in getattr(
+        tools["nc_share_create_public_link"].fn, "_required_scopes"
+    )
+    assert (
+        tools["nc_share_create"].parameters["properties"]["share_type"]["default"] == 0
+    )
+    create_schema = tools["nc_share_create"].parameters
+    assert "ctx" not in create_schema["properties"]
+    assert "share_with" not in create_schema.get("required", [])
+    assert create_schema["properties"]["share_with"]["default"] is None

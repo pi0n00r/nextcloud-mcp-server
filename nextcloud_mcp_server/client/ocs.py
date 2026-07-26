@@ -100,9 +100,8 @@ def _meta(payload: Any) -> dict:
 def raise_for_ocs_status(payload: Any, *, context: str = "OCS API") -> None:
     """Raise if the OCS envelope in ``payload`` reports a failure.
 
-    A payload carrying no ``meta.statuscode`` is treated as success: some
-    endpoints (and every hand-rolled fixture) omit the meta block, and
-    inventing a failure from its absence would be worse than not checking.
+    The envelope fails closed: missing, malformed, and non-integer
+    ``meta.statuscode`` values are protocol errors, never evidence of success.
 
     Args:
         payload: Decoded JSON body of an OCS response.
@@ -114,8 +113,11 @@ def raise_for_ocs_status(payload: Any, *, context: str = "OCS API") -> None:
     """
     meta = _meta(payload)
     status_code = meta.get("statuscode")
-    if not isinstance(status_code, int):
-        return
+    if type(status_code) is not int:
+        raise OCSError(
+            f"{context} error: malformed OCS envelope "
+            "(ocs.meta.statuscode must be an integer)",
+        )
     if status_code in OCS_SUCCESS_STATUS_CODES:
         return
 

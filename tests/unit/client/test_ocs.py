@@ -75,13 +75,16 @@ class TestRaiseForOcsStatus:
             "not a dict",
         ],
     )
-    def test_missing_statuscode_is_treated_as_success(self, payload):
-        """Absence of a statuscode is not evidence of failure — inventing one
-        would break every endpoint (and fixture) that omits the meta block."""
-        raise_for_ocs_status(payload)
+    def test_missing_statuscode_fails_closed(self, payload):
+        with pytest.raises(OCSError, match="malformed OCS envelope"):
+            raise_for_ocs_status(payload)
 
-    def test_non_integer_statuscode_is_ignored(self):
-        raise_for_ocs_status({"ocs": {"meta": {"statuscode": "ok"}, "data": []}})
+    @pytest.mark.parametrize("statuscode", ["200", "ok", None, 200.0, True])
+    def test_non_integer_statuscode_fails_closed(self, statuscode):
+        with pytest.raises(OCSError, match="must be an integer"):
+            raise_for_ocs_status(
+                {"ocs": {"meta": {"statuscode": statuscode}, "data": []}}
+            )
 
 
 class TestOcsData:

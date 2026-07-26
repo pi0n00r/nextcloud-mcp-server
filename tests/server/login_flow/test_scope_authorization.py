@@ -105,6 +105,7 @@ async def test_read_only_token_filters_write_tools(nc_mcp_login_flow_client_read
         "nc_notes_search_notes",  # notes.read
         "nc_calendar_list_calendars",  # calendar.read
         "nc_calendar_get_event",  # calendar.read
+        "nc_calendar_get_todo",  # todo.read + calendar.read
     ]
 
     for tool in expected_read_tools:
@@ -275,6 +276,7 @@ async def test_write_only_token_filters_read_tools(nc_mcp_login_flow_client_writ
         "nc_notes_get_note",  # notes.read
         "nc_notes_search_notes",  # notes.read
         "nc_calendar_list_calendars",  # calendar.read
+        "nc_calendar_get_todo",  # todo.read + calendar.read
         "nc_calendar_get_event",  # calendar.read
     ]
 
@@ -405,6 +407,7 @@ async def test_tools_have_scope_decorators(nc_mcp_client):
         "nc_notes_search_notes",
         "nc_calendar_list_calendars",
         "nc_calendar_get_event",
+        "nc_calendar_get_todo",
         "nc_contacts_list_contacts",
         "nc_webdav_list_directory",
         "nc_webdav_read_file",
@@ -490,6 +493,7 @@ async def test_all_tools_classified():
         "nc_calendar_bulk_operations",
         "nc_calendar_manage_calendar",
         "nc_calendar_list_todos",
+        "nc_calendar_get_todo",
         "nc_calendar_create_todo",
         "nc_calendar_update_todo",
         "nc_calendar_delete_todo",

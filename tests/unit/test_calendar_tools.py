@@ -1,3 +1,5 @@
+"""Unit tests for the calendar MCP tool contract."""
+
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -8,8 +10,6 @@
 # AI-NOTICE:Escalation=warn
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
-
-"""Unit tests for the calendar MCP tool contract."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -92,6 +92,23 @@ def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
     assert "completed_at" in complete_properties
     assert "etag" in complete_properties
     assert "etag" in tools["nc_calendar_complete_todo"].parameters["required"]
+    assert "nc_calendar_get_todo" in tools
+    assert getattr(tools["nc_calendar_get_todo"].fn, "_required_scopes") == [
+        "todo.read",
+        "calendar.read",
+    ]
+    assert (
+        tools["nc_calendar_list_todos"].parameters["properties"]["include_completed"][
+            "default"
+        ]
+        is True
+    )
+    assert (
+        tools["nc_calendar_search_todos"].parameters["properties"]["include_completed"][
+            "default"
+        ]
+        is True
+    )
 
 
 async def test_complete_todo_accepts_completed_at_alias():
@@ -163,6 +180,65 @@ async def test_complete_todo_maps_etag_errors(error, message_pattern):
         )
 
     update_todo.assert_awaited_once()
+
+
+async def test_completion_verifies_after_forwarding_exact_etag():
+    mcp = FastMCP("test-calendar-completion-verification")
+    configure_calendar_tools(mcp)
+    tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
+        "nc_calendar_complete_todo"
+    ]
+    update_todo = AsyncMock(return_value={"href": "/todo.ics", "etag": '"todo-v2"'})
+    get_todo = AsyncMock(
+        return_value={"status": "COMPLETED", "completed": "2026-07-26T00:00:00Z"}
+    )
+    client = SimpleNamespace(
+        calendar=SimpleNamespace(update_todo=update_todo, get_todo=get_todo)
+    )
+
+    with patch(
+        "nextcloud_mcp_server.server.calendar.get_client",
+        new=AsyncMock(return_value=client),
+    ):
+        result = await tool.fn(
+            calendar_name="tasks",
+            todo_uid="todo-1",
+            ctx=_context(),
+            etag='"todo-v1"',
+        )
+
+    assert result.verified is True
+    assert result.etag == '"todo-v2"'
+    assert update_todo.await_args.args[3] == '"todo-v1"'
+    get_todo.assert_awaited_once_with("tasks", "todo-1")
+
+
+async def test_readback_failure_does_not_weaken_or_mask_successful_write():
+    mcp = FastMCP("test-calendar-completion-readback-failure")
+    configure_calendar_tools(mcp)
+    tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
+        "nc_calendar_complete_todo"
+    ]
+    update_todo = AsyncMock(return_value={"etag": '"todo-v2"'})
+    get_todo = AsyncMock(side_effect=RuntimeError("REPORT unavailable"))
+    client = SimpleNamespace(
+        calendar=SimpleNamespace(update_todo=update_todo, get_todo=get_todo)
+    )
+
+    with patch(
+        "nextcloud_mcp_server.server.calendar.get_client",
+        new=AsyncMock(return_value=client),
+    ):
+        result = await tool.fn(
+            calendar_name="tasks",
+            todo_uid="todo-1",
+            ctx=_context(),
+            etag='"todo-v1"',
+        )
+
+    assert result.verified is False
+    assert "REPORT unavailable" in result.verification_error
+    assert update_todo.await_args.args[3] == '"todo-v1"'
 
 
 async def test_list_events_all_calendars_without_calendar_name(

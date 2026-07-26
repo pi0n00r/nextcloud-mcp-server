@@ -8,6 +8,7 @@ All helpers accept a SQLAlchemy URL (``sqlite+aiosqlite:///...`` or
 ``postgresql+psycopg://...``). When called without an explicit URL they fall
 back to :func:`nextcloud_mcp_server.config.get_database_url`.
 """
+
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -18,7 +19,6 @@ back to :func:`nextcloud_mcp_server.config.get_database_url`.
 # AI-NOTICE:Escalation=warn
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
-
 import logging
 import threading
 from pathlib import Path

@@ -103,27 +103,29 @@ def configure_sharing_tools(mcp: FastMCP):
     @instrument_tool
     async def nc_share_create(
         path: str,
-        share_with: str,
         ctx: Context,
+        share_with: str | None = None,
         share_type: int = 0,
         permissions: int = 1,
     ) -> str:
         """Create a share for a file or folder in Nextcloud.
 
-        Share a file or folder with another user or group. The authenticated user
+        Share a file or folder with a recipient, or explicitly create a public
+        link with ``share_type=3`` and no ``share_with``. The authenticated user
         must own the file/folder being shared.
 
         Args:
             path: Path to file/folder to share (relative to your files, e.g., "/document.txt")
-            share_with: Recipient identifier, interpreted according to
+            share_with: Optional recipient identifier, interpreted according to
                 share_type: user id, group id, email address, federated
-                "user@remote", circle id, Talk conversation token, or Deck card id
+                "user@remote", circle id, Talk conversation token, or Deck card
+                id. Required and nonblank for recipient share types; omit for
+                share_type 3.
             share_type: OCS share type:
                 - 0 = user (default)
                 - 1 = group
-                - 3 = public link — REJECTED here: a public link addresses
-                  nobody and Nextcloud silently ignores share_with, so use
-                  nc_share_create_public_link instead
+                - 3 = public link — allowed only when share_with is omitted;
+                  permissions remain configurable on this generic tool
                 - 4 = email
                 - 6 = federated (server-to-server)
                 - 7 = circle

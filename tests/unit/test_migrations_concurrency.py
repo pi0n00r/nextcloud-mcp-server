@@ -1,3 +1,5 @@
+"""Regression tests for process-wide Alembic command serialization."""
+
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -8,8 +10,6 @@
 # AI-NOTICE:Escalation=warn
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
-
-"""Regression tests for process-wide Alembic command serialization."""
 
 from __future__ import annotations
 

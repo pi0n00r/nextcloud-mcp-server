@@ -118,14 +118,22 @@ class TestStatusMapping:
             (507, DavInsufficientStorage, "quota is exhausted"),
         ],
     )
-    def test_mapped_statuses_get_their_own_type(
+    def test_mapped_dav_statuses_get_their_own_type(
         self, status_code, expected_type, hint_fragment
     ):
-        error = dav_error_from_status_error(_status_error(status_code))
+        error = dav_error_from_status_error(
+            _status_error(status_code, _dav_body("Sabre\\DAV\\Exception", "failure"))
+        )
         assert isinstance(error, expected_type)
         assert hint_fragment in str(error)
         # Every DAV error stays catchable by pre-existing handlers.
         assert isinstance(error, HTTPStatusError)
+
+    @pytest.mark.parametrize("status_code", [412, 423, 507])
+    def test_non_dav_json_status_is_left_as_http_status_error(self, status_code):
+        original = _status_error(status_code, b'{"error":"REST failure"}')
+        assert dav_error_from_status_error(original) is None
+        assert type(original) is HTTPStatusError
 
     def test_message_carries_method_path_and_server_detail(self):
         error = dav_error_from_status_error(

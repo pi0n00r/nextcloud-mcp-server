@@ -1,5 +1,16 @@
 """CalDAV client for Nextcloud calendar and task operations using caldav library."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import datetime as dt
 import inspect
 import logging
@@ -1157,7 +1168,7 @@ class CalendarClient:
     async def list_todos(
         self, calendar_name: str, filters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        """List todos/tasks in a calendar."""
+        """List todos/tasks, optionally excluding completed VTODOs."""
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
 
@@ -1183,6 +1194,30 @@ class CalendarClient:
 
         logger.debug("Found %s todos", len(result))
         return result
+
+    async def get_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
+        """Fetch one VTODO by UID with REPORT-coupled content and exact ETag."""
+        await self._ensure_calendar_home()
+        calendar = self._get_calendar(calendar_name)
+        todos = await self._search_calendar_objects(calendar, "VTODO")
+
+        for todo in todos:
+            if not todo.data:
+                continue
+            todo_dict = self._parse_ical_todo(todo.data)  # type: ignore[arg-type]
+            if todo_dict is None or todo_dict.get("uid") != todo_uid:
+                continue
+            etag = getattr(todo, "props", {}).get(dav.GetEtag.tag)
+            if not etag:
+                raise CalendarEtagUnavailableError(
+                    f"Cannot read todo {todo_uid}: the REPORT response supplied "
+                    "no ETag. Retry only after the server provides an exact ETag."
+                )
+            todo_dict["href"] = str(todo.url)
+            todo_dict["etag"] = etag
+            return todo_dict
+
+        raise caldav_error.NotFoundError(f"{todo_uid} not found on server")
 
     async def create_todo(
         self, calendar_name: str, todo_data: dict[str, Any]
@@ -2373,6 +2408,12 @@ class CalendarClient:
     ) -> bool:
         """Check if a todo matches the provided filters."""
         try:
+            if filters.get("include_completed") is False and (
+                str(todo.get("status", "")).upper() == "COMPLETED"
+                or bool(todo.get("completed"))
+            ):
+                return False
+
             # Filter by status
             if "status" in filters:
                 if todo.get("status", "").upper() != filters["status"].upper():

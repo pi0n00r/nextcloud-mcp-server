@@ -628,6 +628,7 @@ class TestLoginFlowConnectivity:
             "nc_calendar_get_event",
             "nc_calendar_delete_event",
             "nc_calendar_list_todos",
+            "nc_calendar_get_todo",
             "nc_calendar_create_todo",
             "nc_calendar_update_todo",
             "nc_calendar_delete_todo",
