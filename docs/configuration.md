@@ -311,20 +311,25 @@ Turn it on whenever the transport is reachable beyond a trusted network:
 MCP_DNS_REBINDING_PROTECTION=true
 # Every Host value your clients present. Comma-separated.
 # ``host:*`` matches that host on any port.
-MCP_DNS_REBINDING_ALLOWED_HOSTS=nextcloud-mcp:*,127.0.0.1:*,localhost:*
+MCP_ALLOWED_HOSTS=nextcloud-mcp:*,127.0.0.1:*,localhost:*
 # Optional. An absent Origin header is always allowed (same-origin requests).
-MCP_DNS_REBINDING_ALLOWED_ORIGINS=https://your-client.example.com
+MCP_ALLOWED_ORIGINS=https://your-client.example.com
+# Optional CORS allowlist. The legacy-compatible default is "*".
+CORS_ALLOW_ORIGINS=https://your-client.example.com
 ```
 
 Requests with a `Host` outside the allowlist are rejected with
 `421 Misdirected Request`; a disallowed `Origin` yields `403 Forbidden`.
 
-> **Host validation fails closed.** Enabling protection with an empty
-> `MCP_DNS_REBINDING_ALLOWED_HOSTS` rejects *every* request. The server logs a
-> warning at startup for that combination — enumerate your hosts, including the
-> Docker/Kubernetes service name if clients reach the server that way.
+> **Host validation fails closed.** Enabling protection without
+> `MCP_ALLOWED_HOSTS` stops startup with a configuration error. Enumerate every
+> host clients present, including Docker or Kubernetes service names.
 
 Leave all three unset to keep the previous behavior exactly.
+
+The pre-0.151.0 fork names `MCP_DNS_REBINDING_ALLOWED_HOSTS` and
+`MCP_DNS_REBINDING_ALLOWED_ORIGINS` remain accepted as deprecated fallbacks.
+The upstream names above take precedence when both forms are set.
 
 ---
 
@@ -686,34 +691,42 @@ CHUNKING_CONFIG_VERSION=1             # Chunker config generation; bump on any c
 
 > **Note:** The `VECTOR_SYNC_*` tuning parameters keep their names as they're implementation details. Only the user-facing feature flag was renamed to `ENABLE_SEMANTIC_SEARCH`.
 
-#### Enabling document parsing — `ENABLE_DOCUMENT_PROCESSING` (master switch)
+#### Reading documents — a per-call decision, not a server switch
 
-`ENABLE_DOCUMENT_PROCESSING` is the master switch for the parsing subsystem and
-is **off by default**. Set it *before* configuring `unstructured`, the OCR tier,
-or docling below — otherwise those processors are never registered and parsing
-silently no-ops (a common first-run trip-up):
+**There is no master switch.** Whether to extract text from a document is decided
+by the caller, per read, through `nc_webdav_read_file`'s `parse_document`
+argument — the server cannot know whether an agent wants a PDF's text or its
+bytes. (`ENABLE_DOCUMENT_PROCESSING` was removed in **0.151.0**; it is ignored if
+still set.)
 
-```dotenv
-ENABLE_DOCUMENT_PROCESSING=true       # register optional processors + on-demand parsing (default: false)
-```
+| `parse_document` | What you get |
+|---|---|
+| `"auto"` (default) | The document's text via the tiered pipeline: `fast` (text layer) → `structured` or `ocr` when the classifier says the text layer is unusable. |
+| `"markdown"` | Reconstructed structure (headings, tables) via the `structured` tier, bounded by `DOCUMENT_MARKDOWN_MAX_PAGES`. |
+| `"raw"` | No parse: text files decoded, anything else base64. |
 
-What it controls:
+The built-in PDF tiers (`pypdfium2_fast` → `fast`, `pymupdf` → `structured`, and
+the `ocr` tier) are always available. The optional processors — `unstructured`,
+`tesseract`, `custom`, **docling** — are each registered from their own
+`ENABLE_*` flag at startup; configuring none of them means the parse stack is not
+even imported.
 
-- **Registers the optional processors** — `unstructured`, `tesseract`, `custom`,
-  and **docling** — into the shared registry at startup
-  (`initialize_document_processors()`). The built-in PDF tiers
-  (`pypdfium2_fast` → `fast`, `pymupdf` → `structured`, and the `ocr` tier) are
-  always registered independently of this flag.
-- **Gates on-demand parsing in `nc_webdav_read_file`.** With it **off** the tool
-  returns the raw file (base64) and a `force_processor=…` argument is rejected as
-  an unknown processor (the parse registry is empty). With it **on**, the tool
-  parses the file inline and honours `force_processor`.
+Every read reports what it actually produced, so a degraded extraction is never
+presented as the whole document:
 
-Consequently the docling **image** and **force-PDF** touchpoints (which flow
-through the registry / `nc_webdav_read_file`) require this flag; the automatic
-**scanned-PDF OCR** touchpoint rides the always-registered `ocr` tier, so it needs
-only `DOCUMENT_OCR_ENABLED` + `DOCUMENT_OCR_PROVIDER` (see the recipe table under
-_Docling_ below).
+- `parse_status` — `parsed` / `failed` / `skipped` / `not_applicable`
+- `parse_tier`, `parse_processor` — which tier produced the content
+- `content_format` — `markdown`, `text` or `base64`
+- `parse_notes` — plain statements when something degraded: OCR not enabled,
+  markdown structure not reconstructed (with the page count and the ceiling), the
+  size cap, a failed or timed-out parse.
+
+What still bounds an interactive read: `DOCUMENT_MAX_PDF_SIZE_MB` (parse cap; the
+download is aborted at twice that), `DOCUMENT_READ_TIMEOUT_SECONDS` (wall-clock
+cap on the synchronous parse), `DOCUMENT_OCR_ENABLED` (the expensive tier stays
+opt-in) and `DOCUMENT_MARKDOWN_MAX_PAGES=0` (disables markdown outright). The
+document is streamed to a spool file and parsed from there, so a large read does
+not scale the server's memory.
 
 #### Document parsing robustness (PDF)
 
@@ -728,7 +741,13 @@ DOCUMENT_MAX_PDF_SIZE_MB=50           # Pre-parse size cap; 0 disables (default:
 DOCUMENT_PARSE_PAGE_WINDOW=100        # Pages per extraction window; 0 disables (default: 100)
 DOCUMENT_PARSE_PROCESS_SLOTS=2        # Concurrent isolated parse subprocesses (default: 2)
 DOCUMENT_MARKDOWN_MAX_PAGES=150       # Structured-tier markdown page ceiling; 0 disables markdown (default: 150)
+PYMUPDF_EXTRACT_IMAGES=true           # Extract embedded images during markdown reconstruction (default: true)
+PYMUPDF_IMAGE_DIR=                    # Where extracted images are written; empty = system temp dir
 ```
+
+`PYMUPDF_*` tune the built-in `structured` tier, which is always available — there
+is no enable flag for it. Image extraction only happens on the markdown path, so
+a document past `DOCUMENT_MARKDOWN_MAX_PAGES` writes no images regardless.
 
 `DOCUMENT_PARSE_PROCESS_SLOTS` bounds how many isolated parse subprocesses run at
 once. Without it anyio defaults to an `os.cpu_count()`-wide pool, which is
@@ -886,37 +905,38 @@ an explicit self-hosted URL):
 
 | Use case | Minimal env |
 |---|---|
-| Images auto-route to docling | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
-| Force docling on a text-layer PDF (`force_processor="docling"`) | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
+| Images auto-route to docling | `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
 | Scanned / no-text-layer PDFs auto-OCR via docling | `DOCUMENT_OCR_ENABLED=true` + `DOCUMENT_OCR_PROVIDER=docling` + `DOCLING_API_URL` |
 | **VLM** for bulk PDF indexing (async, recommended) | scanned-PDF row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`) + raise `DOCUMENT_OCR_TIMEOUT_SECONDS` (e.g. 600–900) |
-| **VLM** for interactive image/force reads | image/force row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`); expect long blocking — see the VLM note below |
+| **VLM** for interactive image reads | image row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`); expect long blocking — see the VLM note below |
 
-The scanned-PDF row deliberately omits `ENABLE_DOCLING`/`ENABLE_DOCUMENT_PROCESSING`:
-that path rides the always-registered `ocr` tier during **indexing** (so it also
-needs `ENABLE_SEMANTIC_SEARCH=true`), not the on-demand registry. The image and
-force-PDF rows need the `ENABLE_DOCUMENT_PROCESSING` master switch (see above).
+The scanned-PDF row omits `ENABLE_DOCLING`: that path rides the
+always-registered `ocr` tier rather than the standalone image processor. When it
+runs during **indexing** it also needs `ENABLE_SEMANTIC_SEARCH=true`; on an
+interactive `nc_webdav_read_file` it needs nothing further.
 
-Docling plugs in at three points:
+Docling plugs in at two points — it is an **OCR provider**, never a tier of its
+own, so a PDF reaches it through the OCR tier and nowhere else:
 
 - **Images (automatic).** With `ENABLE_DOCLING=true` + `DOCLING_API_URL` set,
   image files (`image/jpeg`, `image/png`, `image/tiff`, `image/bmp`, `image/gif`,
   `image/webp`) always route to docling — it registers at a higher priority than
   `unstructured`. `DOCLING_DO_OCR` toggles OCR on this image path only (the scanned-PDF
-  OCR backend always OCRs). Requires
-  `ENABLE_DOCUMENT_PROCESSING=true`. If `DOCLING_API_URL` is unset the processor is
+  OCR backend always OCRs). If `DOCLING_API_URL` is unset the processor is
   not registered, so a bare `ENABLE_DOCLING` never shadows other image processors
   with a dead endpoint.
 - **Scanned PDFs (automatic).** Set `DOCUMENT_OCR_ENABLED=true` +
   `DOCUMENT_OCR_PROVIDER=docling`. PDFs whose text layer the tier-0 classifier
   finds missing/unusable escalate to the OCR tier and are transcribed by docling.
   Born-digital (text-layer) PDFs still use the cheap local `fast`/`structured`
-  tiers — docling is only paid for genuine scans.
-- **Text-layer PDFs (on demand).** Pass `force_processor="docling"` to the
-  `nc_webdav_read_file` MCP tool to re-parse *any* file with docling even when it
-  already has a text layer — useful when that layer misses tables/figures or is
-  incomplete. Docling returns markdown, preserving table structure. An unknown or
-  unconfigured processor name returns a clear tool error.
+  tiers — docling is only paid for genuine scans. This applies to both indexing
+  and an interactive `nc_webdav_read_file`.
+
+  For a text-layer PDF whose layer misses tables or figures, ask the read for
+  `parse_document="markdown"`: the `structured` tier (pymupdf4llm) reconstructs
+  table structure locally, without a docling round-trip. (Before 0.151.0 this was
+  `force_processor="docling"`, which asked the caller to name an extraction
+  engine it had no basis to choose.)
 
 Office formats (DOCX/PPTX/XLSX) deliberately stay with `unstructured` — docling
 is scoped to the image/scan/handwriting use case here. OCR language codes are
@@ -948,7 +968,7 @@ matters — and the two touchpoints have independent timeouts:**
   the `ingest-ocr` queue) and written to the search index. That path uses
   **`DOCUMENT_OCR_TIMEOUT_SECONDS`** and never blocks a tool call — raise it freely
   (e.g. 600–900s) for VLM.
-- **Interactive reads (`nc_webdav_read_file` on images / `force_processor="docling"`):**
+- **Interactive reads (`nc_webdav_read_file` on images):**
   these parse **synchronously** and block for up to **`DOCLING_TIMEOUT`**. Raising
   `DOCLING_TIMEOUT` for VLM directly lengthens that block, and MCP clients usually
   enforce a much shorter per-tool timeout (~30–60s) — so the client typically kills

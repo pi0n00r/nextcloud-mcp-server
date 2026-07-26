@@ -1,115 +1,174 @@
-"""Tests for configurable MCP transport security (DNS rebinding protection).
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-The server always passes an explicit ``TransportSecuritySettings`` to FastMCP,
-so FastMCP's loopback auto-enablement never applies. These tests pin the
-resulting behavior: off by default (unchanged for existing deployments), and
-correctly populated when an operator opts in.
-"""
+"""Tests for configurable MCP transport security and CORS."""
+
+from __future__ import annotations
 
 import logging
 
 import httpx
+import pytest
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
-from nextcloud_mcp_server.app import _split_csv, build_transport_security
+from nextcloud_mcp_server.app import (
+    _split_csv,
+    build_cors_origins,
+    build_transport_security,
+)
 from nextcloud_mcp_server.config import Settings
+
+pytestmark = pytest.mark.unit
 
 
 class TestSplitCsv:
-    """The comma-separated allowlist parser."""
+    """Comma-separated transport and CORS setting parsing."""
 
-    def test_empty_string_is_empty_list(self):
-        assert _split_csv("") == []
-
-    def test_none_is_empty_list(self):
-        assert _split_csv(None) == []
-
-    def test_single_entry(self):
-        assert _split_csv("localhost:*") == ["localhost:*"]
-
-    def test_strips_surrounding_whitespace(self):
-        assert _split_csv(" a:* , b:* ") == ["a:*", "b:*"]
-
-    def test_drops_blank_entries(self):
-        """A trailing comma or double comma must not yield an empty host."""
-        assert _split_csv("a:*,,b:*,") == ["a:*", "b:*"]
-
-    def test_whitespace_only_is_empty_list(self):
-        assert _split_csv("   ") == []
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, []),
+            ("", []),
+            ("   ", []),
+            ("*", ["*"]),
+            ("localhost:*", ["localhost:*"]),
+            (" a:* , b:* ", ["a:*", "b:*"]),
+            ("a:*,,b:*,", ["a:*", "b:*"]),
+        ],
+    )
+    def test_split_csv(self, raw, expected):
+        assert _split_csv(raw) == expected
 
 
 class TestBuildTransportSecurity:
     """Translation of Settings into TransportSecuritySettings."""
 
     def test_disabled_by_default(self):
-        """Default config must reproduce the historical always-off behavior."""
         result = build_transport_security(Settings())
+
         assert result.enable_dns_rebinding_protection is False
 
-    def test_allowlists_ignored_while_disabled(self):
-        """Allowlists set without the enable flag must not silently switch it on."""
+    def test_allowlists_do_not_enable_protection(self, caplog):
         settings = Settings(
-            mcp_dns_rebinding_allowed_hosts="nextcloud-mcp:*",
-            mcp_dns_rebinding_allowed_origins="https://example.com",
+            mcp_allowed_hosts="nextcloud-mcp:*",
+            mcp_allowed_origins="https://example.com",
         )
-        result = build_transport_security(settings)
-        assert result.enable_dns_rebinding_protection is False
 
-    def test_enabled_populates_allowlists(self):
+        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
+            result = build_transport_security(settings)
+
+        assert result.enable_dns_rebinding_protection is False
+        assert "have no effect" in caplog.text
+
+    def test_enabled_populates_canonical_allowlists(self):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="nextcloud-mcp:*,127.0.0.1:*",
-            mcp_dns_rebinding_allowed_origins="https://example.com",
+            mcp_allowed_hosts="nextcloud-mcp:*,127.0.0.1:*",
+            mcp_allowed_origins="https://example.com",
         )
+
         result = build_transport_security(settings)
+
         assert result.enable_dns_rebinding_protection is True
         assert result.allowed_hosts == ["nextcloud-mcp:*", "127.0.0.1:*"]
         assert result.allowed_origins == ["https://example.com"]
 
     def test_enabled_without_origins_is_allowed(self):
-        """Origin is optional: the middleware permits an absent Origin header."""
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="localhost:*",
+            mcp_allowed_hosts="localhost:*",
         )
+
         result = build_transport_security(settings)
+
         assert result.enable_dns_rebinding_protection is True
         assert result.allowed_origins == []
 
-    def test_enabled_with_empty_hosts_warns(self, caplog):
-        """Host validation fails closed; an empty allowlist must not be silent."""
-        settings = Settings(mcp_dns_rebinding_protection=True)
-        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
-            result = build_transport_security(settings)
-        assert result.enable_dns_rebinding_protection is True
-        assert result.allowed_hosts == []
-        assert "every request will be rejected" in caplog.text
+    def test_enabled_with_empty_hosts_fails_at_startup(self):
+        with pytest.raises(ValueError, match="MCP_ALLOWED_HOSTS"):
+            build_transport_security(Settings(mcp_dns_rebinding_protection=True))
 
-    def test_enabled_with_hosts_does_not_warn(self):
+    def test_deprecated_fork_allowlists_remain_compatible(self, caplog):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="localhost:*",
+            mcp_dns_rebinding_allowed_hosts="legacy.internal:*",
+            mcp_dns_rebinding_allowed_origins="https://legacy.example",
         )
-        result = build_transport_security(settings)
-        assert result.allowed_hosts == ["localhost:*"]
+
+        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
+            result = build_transport_security(settings)
+
+        assert result.allowed_hosts == ["legacy.internal:*"]
+        assert result.allowed_origins == ["https://legacy.example"]
+        assert "deprecated" in caplog.text
+
+    def test_canonical_allowlists_override_deprecated_aliases(self, caplog):
+        settings = Settings(
+            mcp_dns_rebinding_protection=True,
+            mcp_allowed_hosts="canonical.internal:*",
+            mcp_dns_rebinding_allowed_hosts="legacy.internal:*",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
+            result = build_transport_security(settings)
+
+        assert result.allowed_hosts == ["canonical.internal:*"]
+        assert "using MCP_ALLOWED_HOSTS" in caplog.text
+
+
+class TestCorsOrigins:
+    """CORS remains permissive by default and accepts explicit allowlists."""
+
+    def test_default_remains_wildcard(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
+            origins = build_cors_origins(Settings())
+
+        assert origins == ["*"]
+        assert "allows any origin with credentials" in caplog.text
+
+    def test_explicit_origins_are_parsed(self, caplog):
+        settings = Settings(
+            cors_allow_origins="https://one.example, https://two.example"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="nextcloud_mcp_server.app"):
+            origins = build_cors_origins(settings)
+
+        assert origins == ["https://one.example", "https://two.example"]
+        assert "allows any origin with credentials" not in caplog.text
+
+    def test_empty_value_preserves_legacy_wildcard(self):
+        assert build_cors_origins(Settings(cors_allow_origins="")) == ["*"]
 
 
 class TestSettingsDefaults:
-    """The new fields default to the pre-change behavior."""
+    """Transport and CORS defaults preserve pre-merge behavior."""
 
-    def test_protection_defaults_off(self):
-        assert Settings().mcp_dns_rebinding_protection is False
-
-    def test_allowlists_default_empty(self):
+    def test_transport_defaults(self):
         settings = Settings()
+
+        assert settings.mcp_dns_rebinding_protection is False
+        assert settings.mcp_allowed_hosts == ""
+        assert settings.mcp_allowed_origins == ""
         assert settings.mcp_dns_rebinding_allowed_hosts == ""
         assert settings.mcp_dns_rebinding_allowed_origins == ""
 
+    def test_cors_defaults_to_wildcard(self):
+        assert Settings().cors_allow_origins == "*"
+
 
 def _guarded_app(settings: Settings):
-    """Build a tiny ASGI app guarded by the same MCP transport middleware."""
+    """Build a tiny ASGI app guarded by the MCP transport middleware."""
     security = TransportSecurityMiddleware(build_transport_security(settings))
 
     async def app(scope, receive, send):
@@ -139,7 +198,7 @@ class TestTransportSecurityRequests:
     async def test_rejects_host_outside_allowlist(self):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="bridgette.internal:*",
+            mcp_allowed_hosts="mcp.internal:*",
         )
 
         response = await _request(settings, host="attacker.example:9000")
@@ -150,23 +209,23 @@ class TestTransportSecurityRequests:
     async def test_accepts_allowed_host_without_origin(self):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="bridgette.internal:*",
+            mcp_allowed_hosts="mcp.internal:*",
         )
 
-        response = await _request(settings, host="bridgette.internal:9000")
+        response = await _request(settings, host="mcp.internal:9000")
 
         assert response.status_code == 200
 
     async def test_rejects_origin_outside_allowlist(self):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="bridgette.internal:*",
-            mcp_dns_rebinding_allowed_origins="https://operator.example",
+            mcp_allowed_hosts="mcp.internal:*",
+            mcp_allowed_origins="https://operator.example",
         )
 
         response = await _request(
             settings,
-            host="bridgette.internal:9000",
+            host="mcp.internal:9000",
             origin="https://attacker.example",
         )
 
@@ -176,25 +235,24 @@ class TestTransportSecurityRequests:
     async def test_accepts_allowed_origin(self):
         settings = Settings(
             mcp_dns_rebinding_protection=True,
-            mcp_dns_rebinding_allowed_hosts="bridgette.internal:*",
-            mcp_dns_rebinding_allowed_origins="https://operator.example",
+            mcp_allowed_hosts="mcp.internal:*",
+            mcp_allowed_origins="https://operator.example",
         )
 
         response = await _request(
             settings,
-            host="bridgette.internal:9000",
+            host="mcp.internal:9000",
             origin="https://operator.example",
         )
 
         assert response.status_code == 200
 
-    async def test_enabled_with_empty_hosts_fails_closed(self):
-        response = await _request(
-            Settings(mcp_dns_rebinding_protection=True),
-            host="bridgette.internal:9000",
-        )
-
-        assert response.status_code == 421
+    async def test_enabled_with_empty_hosts_refuses_to_build(self):
+        with pytest.raises(ValueError, match="MCP_ALLOWED_HOSTS"):
+            await _request(
+                Settings(mcp_dns_rebinding_protection=True),
+                host="mcp.internal:9000",
+            )
 
     async def test_default_off_preserves_existing_host_behavior(self):
         response = await _request(Settings(), host="arbitrary.internal:9000")

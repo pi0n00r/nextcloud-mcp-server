@@ -17,7 +17,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
@@ -46,10 +46,19 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
-def _unquote_etag(etag: Optional[str]) -> Optional[str]:
-    if etag and etag.startswith('"') and etag.endswith('"'):
-        return etag[1:-1]
-    return etag
+def _normalize_etag(raw: Optional[str]) -> Optional[str]:
+    """Return an ETag without transport quotes, preserving a weak prefix."""
+    if raw is None:
+        return None
+
+    value = raw.strip()
+    prefix = ""
+    if value.startswith("W/"):
+        prefix = "W/"
+        value = value[2:]
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return f"{prefix}{value}"
 
 
 def _quote_etag(etag: str) -> str:
@@ -81,8 +90,8 @@ def _is_compressed_etag_variant(
     if_match: Optional[str], server_etag: Optional[str]
 ) -> bool:
     """Return true only for the exact transport-added ``-gzip`` variant."""
-    client_etag = _unquote_etag(if_match)
-    authoritative_etag = _unquote_etag(server_etag)
+    client_etag = _normalize_etag(if_match)
+    authoritative_etag = _normalize_etag(server_etag)
     return bool(
         client_etag
         and authoritative_etag
@@ -166,6 +175,65 @@ def _encode_dav_path(path: str) -> str:
     ``%25`` (correct) rather than being mistaken for an existing escape.
     """
     return quote(path, safe="/")
+
+
+def _destination_precondition_header(
+    destination_webdav_path: str, if_destination_match: str
+) -> dict[str, str]:
+    """Build the tagged-list ``If:`` header that conditions the *destination*.
+
+    ``If-Match`` is the obvious choice here and it is **wrong**: per RFC 9110 it
+    applies to the request-URI, which for MOVE/COPY is the *source*. Conditioning
+    the destination needs RFC 4918 §10.4's tagged-list form, where the resource
+    the condition applies to is named explicitly::
+
+        If: <destination-uri> (["etag"])
+
+    Three details are load-bearing, all dictated by sabre/dav's parser
+    (``Server::getIfConditions``)::
+
+        /(?:\\<(?P<uri>.*?)\\>\\s)?\\((?P<not>Not\\s)?...(?:\\[(?P<etag>[^\\]]*)\\])?\\)/im
+
+    * the **space after ``>``** is required by the regex — without it the URI is
+      not captured and the condition silently applies to the request-URI instead,
+      i.e. it guards the wrong resource;
+    * the etag **keeps its quotes inside the brackets**, because the comparison is
+      ``$node->getETag() == $token['etag']`` and Nextcloud's ``Node::getETag()``
+      returns a quoted value;
+    * the URI is resolved with ``calculateUri()``, so it must be the same
+      percent-encoded absolute DAV path used in ``Destination``.
+    """
+    return {
+        "If": _tagged_destination_if_header(
+            destination_webdav_path, if_destination_match
+        )
+    }
+
+
+def _validate_destination_precondition(
+    if_destination_match: Optional[str], overwrite: bool
+) -> None:
+    """Reject combinations the WebDAV ``If:`` grammar cannot express.
+
+    Raised at the client boundary rather than silently reinterpreted, so a
+    caller never believes a guard is in force when it is not.
+    """
+    if if_destination_match is None:
+        return
+    if if_destination_match == "*":
+        raise ValueError(
+            "if_destination_match='*' is not expressible: RFC 4918's tagged-list "
+            "If: grammar has no wildcard, and 'the destination must exist' cannot "
+            "be asserted this way — an If: condition naming a missing URI returns "
+            "404, not 412. Use overwrite=True without a destination etag."
+        )
+    if not overwrite:
+        raise ValueError(
+            "if_destination_match with overwrite=False is contradictory: the etag "
+            "asserts which version of the destination to replace, while "
+            "overwrite=False refuses to replace it at all. Pass overwrite=True to "
+            "replace exactly that version."
+        )
 
 
 def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
@@ -263,6 +331,7 @@ class WebDAVClient(BaseNextcloudClient):
 
     async def delete_resource(self, path: str) -> Dict[str, Any]:
         """Delete a resource (file or directory) via WebDAV DELETE."""
+        await self._ensure_principal_id()
         # Ensure path ends with a slash if it's a directory
         if not path.endswith("/"):
             path_with_slash = f"{path}/"
@@ -350,6 +419,7 @@ class WebDAVClient(BaseNextcloudClient):
         mime_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add/Update an attachment to a note via WebDAV PUT."""
+        await self._ensure_principal_id()
         # Construct paths based on provided category. Encode via _webdav_path so
         # categories/filenames with '#', commas or spaces don't truncate/404.
         category_path_part = f"{category}/" if category else ""
@@ -427,6 +497,7 @@ class WebDAVClient(BaseNextcloudClient):
         self, note_id: int, filename: str, category: Optional[str] = None
     ) -> Tuple[bytes, str]:
         """Fetch a specific attachment from a note via WebDAV GET."""
+        await self._ensure_principal_id()
         category_path_part = f"{category}/" if category else ""
         attachment_dir_segment = f".attachments.{note_id}"
         attachment_path = self._webdav_path(
@@ -541,7 +612,7 @@ class WebDAVClient(BaseNextcloudClient):
 
                 etag_elem = prop.find(".//{DAV:}getetag")
                 etag = (
-                    _unquote_etag(etag_elem.text)
+                    _normalize_etag(etag_elem.text)
                     if etag_elem is not None and etag_elem.text
                     else None
                 )
@@ -570,8 +641,27 @@ class WebDAVClient(BaseNextcloudClient):
 
     async def stream_to_file(
         self, path: str, dest: Path, *, max_bytes: int | None = None
-    ) -> Tuple[int, str]:
-        """Stream a WebDAV GET straight to ``dest``, never holding the whole body."""
+    ) -> Tuple[int, str, Optional[str]]:
+        """Stream a WebDAV GET straight to ``dest``, never holding the whole body.
+
+        :meth:`read_file` buffers the entire response (``response.content``), so
+        peak memory scales with file size -- a 531 MB PDF OOMKilled an ingest
+        worker mid-download. Streaming keeps resident memory at one chunk
+        regardless of how large the document is.
+
+        ``max_bytes`` aborts the transfer as soon as the limit is exceeded and
+        removes the partial file. This is the guard that survives an absent or
+        untrue ``Content-Length``: the pre-flight size gate can only act on what
+        the server advertised at scan time, whereas this acts on what actually
+        arrives.
+
+        Returns ``(bytes_written, content_type, etag)`` -- the same triple
+        :meth:`read_file` returns, so a caller that streams a document can still
+        hand the etag back as ``write_file``'s ``if_match`` (or report it) without
+        a second request. The etag is ``None`` if the server sent no ``ETag``.
+        Raises :class:`OversizeDownload` if ``max_bytes`` is exceeded, or
+        :class:`httpx.RemoteProtocolError` on a short read (#965).
+        """
         await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)
 
@@ -584,6 +674,7 @@ class WebDAVClient(BaseNextcloudClient):
                     content_type = response.headers.get(
                         "content-type", "application/octet-stream"
                     )
+                    etag = _normalize_etag(response.headers.get("etag"))
                     # "wb" truncates on every attempt. A stale first stream can
                     # never leave prefix bytes in the successful retry.
                     async with await anyio.open_file(dest, "wb") as fh:
@@ -615,7 +706,7 @@ class WebDAVClient(BaseNextcloudClient):
                 raise
 
             logger.debug("Streamed '%s' to %s (%s bytes)", path, dest, written)
-            return written, content_type
+            return written, content_type, etag
 
         raise last_exc or RuntimeError(
             "Streamed WebDAV GET retry loop exited unexpectedly"
@@ -638,9 +729,7 @@ class WebDAVClient(BaseNextcloudClient):
             content_type = response.headers.get(
                 "content-type", "application/octet-stream"
             )
-            etag = response.headers.get("etag") or response.headers.get("ETag")
-            if etag and etag.startswith('"') and etag.endswith('"'):
-                etag = etag[1:-1]
+            etag = _normalize_etag(response.headers.get("etag"))
 
             logger.debug(
                 f"Successfully read file '{path}' ({len(content)} bytes, etag={etag!r})"
@@ -683,7 +772,7 @@ class WebDAVClient(BaseNextcloudClient):
             return await send(headers)
         except HTTPStatusError as error:
             status_code = error.response.status_code
-            server_etag = _unquote_etag(error.response.headers.get("etag"))
+            server_etag = _normalize_etag(error.response.headers.get("etag"))
             if status_code == 412 and _is_compressed_etag_variant(
                 if_match, server_etag
             ):
@@ -697,7 +786,7 @@ class WebDAVClient(BaseNextcloudClient):
                     return await send(retry_headers)
                 except HTTPStatusError as retry_error:
                     status_code = retry_error.response.status_code
-                    server_etag = _unquote_etag(
+                    server_etag = _normalize_etag(
                         retry_error.response.headers.get("etag")
                     )
                     error = retry_error
@@ -759,17 +848,15 @@ class WebDAVClient(BaseNextcloudClient):
             response = await self._conditional_put_request(
                 webdav_path, path, headers, if_match, content
             )
-            if isinstance(response, Response):
-                result = {
-                    "status_code": response.status_code,
-                    "bytes_written": len(content),
-                }
-                new_etag = response.headers.get("etag") or response.headers.get("ETag")
-                new_etag = _unquote_etag(new_etag)
-                if new_etag is not None:
-                    result["etag"] = new_etag
-                return result
-            return response
+            if isinstance(response, dict):
+                return cast(Dict[str, Any], response)
+            return {
+                "status_code": response.status_code,
+                "bytes_written": len(content),
+                "etag": _normalize_etag(
+                    response.headers.get("etag") or response.headers.get("oc-etag")
+                ),
+            }
         except HTTPStatusError as e:
             logger.error(f"HTTP error writing file '{path}': {e}")
             raise
@@ -796,7 +883,9 @@ class WebDAVClient(BaseNextcloudClient):
         the absolute Destination URI, so the final MOVE remains atomic.
         """
         chunk_id = uuid.uuid4().hex
-        upload_root = f"/remote.php/dav/uploads/{self.username}/{chunk_id}"
+        upload_root = (
+            f"/remote.php/dav/uploads/{self._principal_or_username()}/{chunk_id}"
+        )
         final_dest_path = self._webdav_path(path)
 
         logger.info(
@@ -848,7 +937,7 @@ class WebDAVClient(BaseNextcloudClient):
                 if_match,
                 error.response.status_code,
                 path,
-                server_etag=_unquote_etag(error.response.headers.get("etag")),
+                server_etag=_normalize_etag(error.response.headers.get("etag")),
             )
             if conflict is not None:
                 return conflict
@@ -859,10 +948,10 @@ class WebDAVClient(BaseNextcloudClient):
             "bytes_written": bytes_written,
             "chunks": (len(content) + self.CHUNK_SIZE - 1) // self.CHUNK_SIZE,
             "chunk_id": chunk_id,
+            "etag": _normalize_etag(
+                move_resp.headers.get("etag") or move_resp.headers.get("oc-etag")
+            ),
         }
-        new_etag = _unquote_etag(move_resp.headers.get("etag"))
-        if new_etag is not None:
-            result["etag"] = new_etag
         return result
 
     async def create_directory(
@@ -914,8 +1003,146 @@ class WebDAVClient(BaseNextcloudClient):
             logger.error(f"Unexpected error creating directory '{path}': {e}")
             raise e
 
+    @staticmethod
+    def _transfer_conflict_result(
+        status_code: int,
+        if_destination_match: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Map a known MOVE/COPY conflict status to a structured result, else None.
+
+        Mirrors ``_write_conflict_result``. ``None`` means "not a conflict we
+        model" — the caller re-raises.
+
+        404 and 412 mean different things depending on whether a destination etag
+        was sent, because sabre resolves the tagged ``If:`` URI with
+        ``getNodeForPath``: a missing destination raises NotFound and surfaces as
+        404, not 412.
+        """
+        if status_code == 404:
+            if if_destination_match is not None:
+                return {
+                    "status_code": 404,
+                    "message": (
+                        "Source not found, or the destination whose etag was "
+                        "asserted does not exist (an If: condition naming a "
+                        "missing URI yields 404, not 412)."
+                    ),
+                }
+            return {"status_code": 404, "message": "Source resource not found"}
+        if status_code == 412:
+            if if_destination_match is not None:
+                return {
+                    "status_code": 412,
+                    "message": (
+                        "Destination changed since that etag was read — re-read "
+                        "it before retrying. Note the etag condition applies to "
+                        "files only: a directory destination always fails this "
+                        "check."
+                    ),
+                }
+            return {
+                "status_code": 412,
+                "message": "Destination already exists and overwrite is false",
+            }
+        if status_code == 409:
+            return {
+                "status_code": 409,
+                "message": "Parent directory of destination doesn't exist",
+            }
+        return None
+
+    async def _transfer_resource(
+        self,
+        method: str,
+        source_path: str,
+        destination_path: str,
+        overwrite: bool = False,
+        *,
+        if_destination_match: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Shared implementation of WebDAV MOVE and COPY.
+
+        The two verbs differ only in the HTTP method and log wording — path
+        normalisation, header construction, the destination precondition and the
+        conflict mapping are identical, so they live here rather than being
+        maintained (and drifting) in two places.
+        """
+        await self._ensure_principal_id()
+        source_webdav_path = self._webdav_path(source_path)
+        destination_webdav_path = self._webdav_path(destination_path)
+
+        # Ensure paths have consistent trailing slashes for directories
+        if source_path.endswith("/") and not destination_path.endswith("/"):
+            destination_webdav_path += "/"
+        elif not source_path.endswith("/") and destination_path.endswith("/"):
+            source_webdav_path += "/"
+
+        logger.debug(
+            "%s resource from '%s' to '%s'", method, source_path, destination_path
+        )
+
+        _validate_destination_precondition(if_destination_match, overwrite)
+
+        headers = {
+            "OCS-APIRequest": "true",
+            "Destination": destination_webdav_path,
+            "Overwrite": "T" if overwrite else "F",
+        }
+        if if_destination_match is not None:
+            headers.update(
+                _destination_precondition_header(
+                    destination_webdav_path, if_destination_match
+                )
+            )
+
+        try:
+            response = await self._make_request(
+                method, source_webdav_path, headers=headers
+            )
+            response.raise_for_status()
+            logger.debug(
+                "%s succeeded from '%s' to '%s'", method, source_path, destination_path
+            )
+            return {"status_code": response.status_code}
+
+        except HTTPStatusError as e:
+            conflict = self._transfer_conflict_result(
+                e.response.status_code, if_destination_match
+            )
+            if conflict is not None:
+                logger.debug(
+                    "%s conflict (%s) from '%s' to '%s'",
+                    method,
+                    e.response.status_code,
+                    source_path,
+                    destination_path,
+                )
+                return conflict
+            logger.error(
+                "HTTP error on %s from '%s' to '%s': %s",
+                method,
+                source_path,
+                destination_path,
+                e,
+            )
+            raise e
+        except Exception as e:
+            logger.error(
+                "Unexpected error on %s from '%s' to '%s': %s",
+                method,
+                source_path,
+                destination_path,
+                e,
+            )
+            raise e
+
     async def move_resource(
-        self, source_path: str, destination_path: str, overwrite: bool = False
+        self,
+        source_path: str,
+        destination_path: str,
+        overwrite: bool = False,
+        *,
+        if_destination_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Move or rename a resource (file or directory) via WebDAV MOVE.
 
@@ -923,71 +1150,38 @@ class WebDAVClient(BaseNextcloudClient):
             source_path: The path of the file or directory to move
             destination_path: The new path for the file or directory
             overwrite: Whether to overwrite the destination if it exists
+            if_destination_match: Optional ETag of the destination. When given,
+                the move replaces the destination only if it is still that exact
+                version, closing the window where ``overwrite=True`` clobbers a
+                file someone else changed in the meantime.
+
+                Requires ``overwrite=True`` (the two are contradictory otherwise)
+                and does not accept ``"*"``; both raise ``ValueError``.
+
+                Two limitations, both from sabre/dav and neither hideable: the
+                etag condition is evaluated only for files
+                (``$node instanceof IFile``), so a **directory** destination
+                always fails it with 412; and an ``If:`` condition naming a URI
+                that does not exist yields **404, not 412**.
 
         Returns:
             Dict with status_code and optional message
         """
-        source_webdav_path = self._webdav_path(source_path)
-        destination_webdav_path = self._webdav_path(destination_path)
-
-        # Ensure paths have consistent trailing slashes for directories
-        if source_path.endswith("/") and not destination_path.endswith("/"):
-            destination_webdav_path += "/"
-        elif not source_path.endswith("/") and destination_path.endswith("/"):
-            source_webdav_path += "/"
-
-        logger.debug(f"Moving resource from '{source_path}' to '{destination_path}'")
-
-        headers = {
-            "OCS-APIRequest": "true",
-            "Destination": destination_webdav_path,
-            "Overwrite": "T" if overwrite else "F",
-        }
-
-        try:
-            response = await self._make_request(
-                "MOVE", source_webdav_path, headers=headers
-            )
-            response.raise_for_status()
-
-            logger.debug(
-                f"Successfully moved resource from '{source_path}' to '{destination_path}'"
-            )
-            return {"status_code": response.status_code}
-
-        except HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.debug(f"Source resource '{source_path}' not found")
-                return {"status_code": 404, "message": "Source resource not found"}
-            elif e.response.status_code == 412:
-                logger.debug(
-                    f"Destination '{destination_path}' already exists and overwrite is false"
-                )
-                return {
-                    "status_code": 412,
-                    "message": "Destination already exists and overwrite is false",
-                }
-            elif e.response.status_code == 409:
-                logger.debug(
-                    f"Parent directory of destination '{destination_path}' doesn't exist"
-                )
-                return {
-                    "status_code": 409,
-                    "message": "Parent directory of destination doesn't exist",
-                }
-            else:
-                logger.error(
-                    f"HTTP error moving resource from '{source_path}' to '{destination_path}': {e}"
-                )
-                raise e
-        except Exception as e:
-            logger.error(
-                f"Unexpected error moving resource from '{source_path}' to '{destination_path}': {e}"
-            )
-            raise e
+        return await self._transfer_resource(
+            "MOVE",
+            source_path,
+            destination_path,
+            overwrite,
+            if_destination_match=if_destination_match,
+        )
 
     async def copy_resource(
-        self, source_path: str, destination_path: str, overwrite: bool = False
+        self,
+        source_path: str,
+        destination_path: str,
+        overwrite: bool = False,
+        *,
+        if_destination_match: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Copy a resource (file or directory) via WebDAV COPY.
 
@@ -995,68 +1189,30 @@ class WebDAVClient(BaseNextcloudClient):
             source_path: The path of the file or directory to copy
             destination_path: The destination path for the copy
             overwrite: Whether to overwrite the destination if it exists
+            if_destination_match: Optional ETag of the destination. When given,
+                the copy replaces the destination only if it is still that exact
+                version, closing the window where ``overwrite=True`` clobbers a
+                file someone else changed in the meantime.
+
+                Requires ``overwrite=True`` (the two are contradictory otherwise)
+                and does not accept ``"*"``; both raise ``ValueError``.
+
+                Two limitations, both from sabre/dav and neither hideable: the
+                etag condition is evaluated only for files
+                (``$node instanceof IFile``), so a **directory** destination
+                always fails it with 412; and an ``If:`` condition naming a URI
+                that does not exist yields **404, not 412**.
 
         Returns:
             Dict with status_code and optional message
         """
-        source_webdav_path = self._webdav_path(source_path)
-        destination_webdav_path = self._webdav_path(destination_path)
-
-        # Ensure paths have consistent trailing slashes for directories
-        if source_path.endswith("/") and not destination_path.endswith("/"):
-            destination_webdav_path += "/"
-        elif not source_path.endswith("/") and destination_path.endswith("/"):
-            source_webdav_path += "/"
-
-        logger.debug(f"Copying resource from '{source_path}' to '{destination_path}'")
-
-        headers = {
-            "OCS-APIRequest": "true",
-            "Destination": destination_webdav_path,
-            "Overwrite": "T" if overwrite else "F",
-        }
-
-        try:
-            response = await self._make_request(
-                "COPY", source_webdav_path, headers=headers
-            )
-            response.raise_for_status()
-
-            logger.debug(
-                f"Successfully copied resource from '{source_path}' to '{destination_path}'"
-            )
-            return {"status_code": response.status_code}
-
-        except HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.debug(f"Source resource '{source_path}' not found")
-                return {"status_code": 404, "message": "Source resource not found"}
-            elif e.response.status_code == 412:
-                logger.debug(
-                    f"Destination '{destination_path}' already exists and overwrite is false"
-                )
-                return {
-                    "status_code": 412,
-                    "message": "Destination already exists and overwrite is false",
-                }
-            elif e.response.status_code == 409:
-                logger.debug(
-                    f"Parent directory of destination '{destination_path}' doesn't exist"
-                )
-                return {
-                    "status_code": 409,
-                    "message": "Parent directory of destination doesn't exist",
-                }
-            else:
-                logger.error(
-                    f"HTTP error copying resource from '{source_path}' to '{destination_path}': {e}"
-                )
-                raise e
-        except Exception as e:
-            logger.error(
-                f"Unexpected error copying resource from '{source_path}' to '{destination_path}': {e}"
-            )
-            raise e
+        return await self._transfer_resource(
+            "COPY",
+            source_path,
+            destination_path,
+            overwrite,
+            if_destination_match=if_destination_match,
+        )
 
     async def search_files(
         self,
@@ -1082,6 +1238,7 @@ class WebDAVClient(BaseNextcloudClient):
         Returns:
             List of file/directory dictionaries with requested properties
         """
+        await self._ensure_principal_id()
         # Default properties if not specified
         if properties is None:
             properties = [
@@ -1447,7 +1604,7 @@ class WebDAVClient(BaseNextcloudClient):
                 elif tag == "getlastmodified":
                     item["last_modified"] = value
                 elif tag == "getetag":
-                    item["etag"] = value.strip('"') if value else None
+                    item["etag"] = _normalize_etag(value) if value else None
                 elif tag == "fileid":
                     item["file_id"] = int(value) if value else None
                 elif tag == "favorite":
@@ -1819,7 +1976,7 @@ class WebDAVClient(BaseNextcloudClient):
 
         etag_elem = prop.find(".//{DAV:}getetag")
         etag = (
-            etag_elem.text.strip('"')
+            _normalize_etag(etag_elem.text)
             if etag_elem is not None and etag_elem.text
             else None
         )
@@ -1941,6 +2098,7 @@ class WebDAVClient(BaseNextcloudClient):
         Returns:
             List of file info dictionaries with path, size, content_type, etc.
         """
+        await self._ensure_principal_id()
         # Use WebDAV REPORT method with systemtag filter. resourcetype is
         # included so callers can distinguish folders from files (needed for
         # recursive exclusion of tagged directories — see issue #710).
@@ -2086,6 +2244,7 @@ class WebDAVClient(BaseNextcloudClient):
                 distinguish a definitive absence (HTTP 404) from a
                 brittle response (None).
         """
+        await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)
 
         propfind_body = """<?xml version="1.0"?>
@@ -2159,7 +2318,7 @@ class WebDAVClient(BaseNextcloudClient):
             "last_modified": lastmodified_elem.text
             if lastmodified_elem is not None
             else None,
-            "etag": etag_elem.text.strip('"')
+            "etag": _normalize_etag(etag_elem.text)
             if etag_elem is not None and etag_elem.text
             else None,
             "is_directory": is_directory,

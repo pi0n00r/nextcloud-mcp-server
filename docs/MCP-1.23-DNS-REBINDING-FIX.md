@@ -55,13 +55,17 @@ Configure the gate with:
 
 ```dotenv
 MCP_DNS_REBINDING_PROTECTION=true
-MCP_DNS_REBINDING_ALLOWED_HOSTS=nextcloud-mcp:*,localhost:*,127.0.0.1:*
-MCP_DNS_REBINDING_ALLOWED_ORIGINS=https://operator.example.com
+MCP_ALLOWED_HOSTS=nextcloud-mcp:*,localhost:*,127.0.0.1:*
+MCP_ALLOWED_ORIGINS=https://operator.example.com
 ```
 
 Every Host value presented by clients or reverse proxies must be listed.
 Origin is optional for non-browser same-origin requests; when present, it must
 match the Origin allowlist.
+
+The pre-0.151.0 fork names `MCP_DNS_REBINDING_ALLOWED_HOSTS` and
+`MCP_DNS_REBINDING_ALLOWED_ORIGINS` remain accepted only as deprecated
+compatibility aliases. New deployments must use the canonical names above.
 
 ## Impact
 
