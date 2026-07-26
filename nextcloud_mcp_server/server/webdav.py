@@ -265,7 +265,9 @@ def configure_webdav_tools(mcp: FastMCP):
     @mcp.tool(
         title="Write File",
         annotations=ToolAnnotations(
-            idempotentHint=True,  # HTTP PUT without version control is idempotent
+            # Fail-closed create and conditional overwrite preconditions are
+            # consumed by a successful write, so repeating the call can fail.
+            idempotentHint=False,
             openWorldHint=True,
         ),
     )
