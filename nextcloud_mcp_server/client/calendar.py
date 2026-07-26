@@ -1,5 +1,16 @@
 """CalDAV client for Nextcloud calendar and task operations using caldav library."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import datetime as dt
 import inspect
 import logging
@@ -12,7 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import anyio
 import httpx
 import recurring_ical_events
-from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent
+from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent, AsyncTodo
 from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
 from icalendar import Alarm, Calendar, Timezone, vDDDTypes, vRecur
@@ -21,6 +32,7 @@ from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]
 
 from ..config import get_nextcloud_ssl_verify
+from .entity_tag import StrongEntityTagError, require_strong_entity_tag
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +290,12 @@ class CalendarClient:
         self, obj: Any, caller_etag: str, *, kind: str, uid: str
     ) -> str:
         """Validate the ETag coupled to the REPORT calendar data."""
+        try:
+            caller_etag = require_strong_entity_tag(
+                caller_etag, operation=f"update_{kind}"
+            )
+        except StrongEntityTagError as exc:
+            raise CalendarEtagUnavailableError(str(exc)) from exc
         current_etag = getattr(obj, "etag", None)
         if not current_etag:
             current_etag = getattr(obj, "props", {}).get(dav.GetEtag.tag)
@@ -288,13 +306,16 @@ class CalendarClient:
                 "Read the object again and retry only after the server provides "
                 "a strong ETag."
             )
-        if current_etag.startswith("W/"):
-            raise CalendarEtagUnavailableError(
-                f"Cannot update {kind} {uid}: the server supplied weak ETag "
-                f"{current_etag}, which cannot be used with If-Match. Read the "
-                "object again and retry only after the server provides a strong ETag."
+        try:
+            current_etag = require_strong_entity_tag(
+                current_etag, operation=f"update_{kind} server ETag"
             )
-        if caller_etag and caller_etag != current_etag:
+        except StrongEntityTagError as exc:
+            raise CalendarEtagUnavailableError(
+                f"Cannot update {kind} {uid}: {exc}. Read the object again and "
+                "retry only after the server provides a strong ETag."
+            ) from exc
+        if caller_etag != current_etag:
             raise CalendarEtagConflictError(
                 f"{kind.capitalize()} {uid} changed since it was read",
                 current_etag=current_etag,
@@ -637,7 +658,7 @@ class CalendarClient:
             # everything to UTC and erase the original timezone context.
             do_expand = bool(start_datetime and end_datetime)
         else:
-            events = await calendar.events()  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+            events = await self._search_calendar_objects(calendar, "VEVENT")
             do_expand = False
 
         result = []
@@ -730,9 +751,25 @@ class CalendarClient:
         if end_datetime and end_datetime.tzinfo is None:
             end_datetime = end_datetime.replace(tzinfo=dt.UTC)
 
-        # Build comp-filter with time-range (mirrors sync Calendar.build_search_xml_query)
-        inner_comp_filter = cdav.CompFilter(name="VEVENT")
-        inner_comp_filter += cdav.TimeRange(start_datetime, end_datetime)
+        return await self._search_calendar_objects(
+            calendar,
+            "VEVENT",
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+        )
+
+    async def _search_calendar_objects(
+        self,
+        calendar: AsyncCalendar,
+        component: str,
+        *,
+        start_datetime: dt.datetime | None = None,
+        end_datetime: dt.datetime | None = None,
+    ) -> list:
+        """REPORT calendar-data and getetag together for one component type."""
+        inner_comp_filter = cdav.CompFilter(name=component)
+        if start_datetime or end_datetime:
+            inner_comp_filter += cdav.TimeRange(start_datetime, end_datetime)
         outer_comp_filter = cdav.CompFilter(name="VCALENDAR") + inner_comp_filter
         filter_element = cdav.Filter() + outer_comp_filter
 
@@ -746,6 +783,17 @@ class CalendarClient:
         )
         assert calendar.client is not None
         response = await calendar.client.report(str(calendar.url), body, depth=1)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+        status = getattr(response, "status", 207)
+        if status == 404:
+            raise caldav_error.NotFoundError(
+                url=str(calendar.url),
+                reason=getattr(response, "reason", "Calendar not found"),
+            )
+        if status >= 400:
+            raise caldav_error.DAVError(
+                url=str(calendar.url),
+                reason=getattr(response, "reason", f"HTTP {status}"),
+            )
 
         # Parse response (same pattern as AsyncCalendar.search)
         objects = []
@@ -757,7 +805,8 @@ class CalendarClient:
                 continue
             cal_data = props.get(cdav.CalendarData.tag)
             if cal_data:
-                obj = AsyncEvent(
+                object_class = AsyncEvent if component == "VEVENT" else AsyncTodo
+                obj = object_class(
                     client=calendar.client,
                     url=calendar.url.join(href),  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]  # url is always set for calendars
                     data=cal_data,
@@ -795,7 +844,7 @@ class CalendarClient:
         calendar_name: str,
         event_uid: str,
         event_data: dict[str, Any],
-        etag: str = "",
+        etag: str,
     ) -> dict[str, Any]:
         """Update an existing calendar event."""
         await self._ensure_calendar_home()
@@ -882,46 +931,41 @@ class CalendarClient:
         except caldav_error.AuthorizationError:
             if kind != "todo":
                 raise
-            response = await self._dav_client.delete(
-                str(obj.url), headers={"X-NC-Scheduling": "false"}
-            )
-            if response.status == 404:
-                return {"status_code": 404}
-            if response.status in (200, 204):
-                return {"status_code": 204}
-            if self._is_calendar_trashbin_collision(response):
-                purged = await self._purge_todo_trash_entries(uid)
-                if purged:
-                    retry = await self._dav_client.delete(
-                        str(obj.url), headers={"X-NC-Scheduling": "false"}
-                    )
-                    if retry.status in (200, 204):
-                        return {
-                            "status_code": 204,
-                            "stale_trash_entries_purged": purged,
-                        }
-            return {
-                "status_code": response.status,
-                "error": "server rejected DELETE",
-            }
+            repaired = await self._repair_todo_trash_collision(obj, uid)
+            if repaired is not None:
+                return repaired
+            return self._delete_refusal_result(403, kind, uid)
         except caldav_error.DeleteError as e:
             status = self._status_from_dav_error(e)
             if kind == "todo":
                 repaired = await self._repair_todo_trash_collision(obj, uid)
                 if repaired is not None:
                     return repaired
-            logger.warning(
-                "Server refused to delete %s %s (status %s)",
-                kind,
-                uid,
-                status if status is not None else "unknown",
-            )
-            return {
-                "success": False,
-                "status_code": status if status is not None else 500,
-                "message": self._delete_refusal_message(status, kind),
-                "reason": str(e),
-            }
+            return self._delete_refusal_result(status, kind, uid, reason=str(e))
+
+    def _delete_refusal_result(
+        self,
+        status: int | None,
+        kind: str,
+        uid: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the stable refusal shape used by calendar delete tools."""
+        logger.warning(
+            "Server refused to delete %s %s (status %s)",
+            kind,
+            uid,
+            status if status is not None else "unknown",
+        )
+        result: dict[str, Any] = {
+            "success": False,
+            "status_code": status if status is not None else 500,
+            "message": self._delete_refusal_message(status, kind),
+        }
+        if reason is not None:
+            result["reason"] = reason
+        return result
 
     @staticmethod
     def _is_calendar_trashbin_collision(response: Any) -> bool:
@@ -998,19 +1042,38 @@ class CalendarClient:
     async def _repair_todo_trash_collision(
         self, todo: Any, todo_uid: str
     ) -> dict[str, Any] | None:
-        """Repair only the server's exact stale-trash collision, never generic 403s."""
+        """Purge an exact-UID trash collision and retry one refused todo delete.
+
+        ``caldav`` raises ``AuthorizationError`` before returning a low-level
+        403 response, so the response body cannot always be inspected here.
+        In that real transport path, the exact-UID trash query is the gate:
+        without a matching stale object, no purge or retry is performed.
+        """
         try:
-            response = await self._dav_client.delete(
-                str(todo.url), headers={"X-NC-Scheduling": "false"}
-            )
-            if not self._is_calendar_trashbin_collision(response):
-                return None
+            try:
+                response = await self._dav_client.delete(
+                    str(todo.url), headers={"X-NC-Scheduling": "false"}
+                )
+            except caldav_error.AuthorizationError:
+                response = None
+
+            if response is not None:
+                if response.status == 404:
+                    return {"status_code": 404}
+                if response.status in (200, 204):
+                    return {"status_code": 204}
+                if not self._is_calendar_trashbin_collision(response):
+                    return None
+
             purged = await self._purge_todo_trash_entries(todo_uid)
             if not purged:
                 return None
-            retry = await self._dav_client.delete(
-                str(todo.url), headers={"X-NC-Scheduling": "false"}
-            )
+            try:
+                retry = await self._dav_client.delete(
+                    str(todo.url), headers={"X-NC-Scheduling": "false"}
+                )
+            except caldav_error.AuthorizationError:
+                return None
             if retry.status == 404:
                 return {"status_code": 404}
             if retry.status in (200, 204):
@@ -1130,12 +1193,12 @@ class CalendarClient:
     async def list_todos(
         self, calendar_name: str, filters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        """List todos/tasks in a calendar."""
+        """List todos/tasks, optionally excluding completed VTODOs."""
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
 
         # Get all todos including completed ones (filtering is done client-side)
-        todos = await calendar.todos(include_completed=True)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+        todos = await self._search_calendar_objects(calendar, "VTODO")
 
         result = []
         for todo in todos:
@@ -1156,6 +1219,30 @@ class CalendarClient:
 
         logger.debug("Found %s todos", len(result))
         return result
+
+    async def get_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
+        """Fetch one VTODO by UID with REPORT-coupled content and exact ETag."""
+        await self._ensure_calendar_home()
+        calendar = self._get_calendar(calendar_name)
+        todos = await self._search_calendar_objects(calendar, "VTODO")
+
+        for todo in todos:
+            if not todo.data:
+                continue
+            todo_dict = self._parse_ical_todo(todo.data)  # type: ignore[arg-type]
+            if todo_dict is None or todo_dict.get("uid") != todo_uid:
+                continue
+            etag = getattr(todo, "props", {}).get(dav.GetEtag.tag)
+            if not etag:
+                raise CalendarEtagUnavailableError(
+                    f"Cannot read todo {todo_uid}: the REPORT response supplied "
+                    "no ETag. Retry only after the server provides an exact ETag."
+                )
+            todo_dict["href"] = str(todo.url)
+            todo_dict["etag"] = etag
+            return todo_dict
+
+        raise caldav_error.NotFoundError(f"{todo_uid} not found on server")
 
     async def create_todo(
         self, calendar_name: str, todo_data: dict[str, Any]
@@ -1184,7 +1271,7 @@ class CalendarClient:
         calendar_name: str,
         todo_uid: str,
         todo_data: dict[str, Any],
-        etag: str = "",
+        etag: str,
     ) -> dict[str, Any]:
         """Update an existing todo/task."""
         await self._ensure_calendar_home()
@@ -2346,6 +2433,12 @@ class CalendarClient:
     ) -> bool:
         """Check if a todo matches the provided filters."""
         try:
+            if filters.get("include_completed") is False and (
+                str(todo.get("status", "")).upper() == "COMPLETED"
+                or bool(todo.get("completed"))
+            ):
+                return False
+
             # Filter by status
             if "status" in filters:
                 if todo.get("status", "").upper() != filters["status"].upper():
@@ -2405,8 +2498,18 @@ class CalendarClient:
 
             for event in events:
                 try:
+                    try:
+                        event_etag = require_strong_entity_tag(
+                            event.get("etag"),
+                            operation=f"bulk update event {event['uid']}",
+                        )
+                    except StrongEntityTagError as exc:
+                        raise CalendarEtagUnavailableError(str(exc)) from exc
                     await self.update_event(
-                        event["calendar_name"], event["uid"], update_data
+                        event["calendar_name"],
+                        event["uid"],
+                        update_data,
+                        event_etag,
                     )
                     updated_count += 1
                     results.append(

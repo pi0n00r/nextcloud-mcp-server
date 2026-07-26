@@ -1,5 +1,16 @@
 """MCP tools for Nextcloud file/folder sharing operations."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -92,22 +103,36 @@ def configure_sharing_tools(mcp: FastMCP):
     @instrument_tool
     async def nc_share_create(
         path: str,
-        share_with: str,
         ctx: Context,
+        share_with: str | None = None,
         share_type: int = 0,
         permissions: int = 1,
     ) -> str:
         """Create a share for a file or folder in Nextcloud.
 
-        Share a file or folder with another user or group. The authenticated user
+        Share a file or folder with a recipient, or explicitly create a public
+        link with ``share_type=3`` and no ``share_with``. The authenticated user
         must own the file/folder being shared.
 
         Args:
             path: Path to file/folder to share (relative to your files, e.g., "/document.txt")
-            share_with: Username (for user share) or group name (for group share)
-            share_type: Share type - 0 for user (default), 1 for group, 3 for
-                public link (prefer nc_share_create_public_link for short-lived,
-                read-only download links with managed expiry)
+            share_with: Optional recipient identifier, interpreted according to
+                share_type: user id, group id, email address, federated
+                "user@remote", circle id, Talk conversation token, or Deck card
+                id. Required and nonblank for recipient share types; omit for
+                share_type 3.
+            share_type: OCS share type:
+                - 0 = user (default)
+                - 1 = group
+                - 3 = public link — allowed only when share_with is omitted;
+                  permissions remain configurable on this generic tool
+                - 4 = email
+                - 6 = federated (server-to-server)
+                - 7 = circle
+                - 10 = Talk conversation
+                - 12 = Deck card
+                Types 4/6/7/10/12 require the corresponding app to be enabled
+                on the server.
             permissions: Share permissions (default: 1 for read-only):
                 - 1 = read
                 - 2 = update
@@ -119,6 +144,10 @@ def configure_sharing_tools(mcp: FastMCP):
 
         Returns:
             JSON string with share information including share ID
+
+        Raises:
+            ValueError: If share_type is 3 (public link) with a share_with
+                recipient, or a recipient-typed share omits share_with.
         """
         client = await get_client(ctx)
         share_data = await client.sharing.create_share(

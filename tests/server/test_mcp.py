@@ -1,3 +1,16 @@
+"""Integration coverage for the complete MCP registry."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import json
 import logging
 import uuid
@@ -58,6 +71,7 @@ async def test_mcp_connectivity(nc_mcp_client: ClientSession):
         "nc_calendar_bulk_operations",
         "nc_calendar_manage_calendar",
         "nc_calendar_list_todos",
+        "nc_calendar_get_todo",
         "nc_calendar_create_todo",
         "nc_calendar_update_todo",
         "nc_calendar_delete_todo",
@@ -757,6 +771,7 @@ async def test_mcp_calendar_workflow(
         update_data = {
             "calendar_name": calendar_name,
             "event_uid": event_uid,
+            "etag": found_event["etag"],
             "title": updated_title,
             "description": updated_description,
             "priority": 1,

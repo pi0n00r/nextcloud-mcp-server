@@ -1,5 +1,16 @@
 """Integration tests for Calendar VTODO (task) MCP tools."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import json
 import logging
 import uuid
@@ -75,6 +86,7 @@ async def test_mcp_todo_complete_workflow(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
                 "summary": "MCP Test Task Updated",
                 "status": "IN-PROCESS",
                 "priority": 1,
@@ -308,6 +320,8 @@ async def test_mcp_todo_status_transitions(
             {"summary": "Status Transition Test", "status": "NEEDS-ACTION"},
         )
         todo_uid = result["uid"]
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        todo = next(t for t in todos if t["uid"] == todo_uid)
 
         # Transition: NEEDS-ACTION → IN-PROCESS
         logger.info("Transitioning todo to IN-PROCESS via MCP")
@@ -316,6 +330,7 @@ async def test_mcp_todo_status_transitions(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": todo["etag"],
                 "status": "IN-PROCESS",
                 "percent_complete": 25,
             },
@@ -335,6 +350,7 @@ async def test_mcp_todo_status_transitions(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": todo["etag"],
                 "status": "COMPLETED",
                 "percent_complete": 100,
                 "completed": completed_time,
@@ -448,6 +464,7 @@ async def test_mcp_todo_categories(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
                 "categories": "updated,new-category",
             },
         )
@@ -569,10 +586,12 @@ async def test_mcp_complete_todo_sets_all_three_properties(
     )
     assert create_result.isError is False
     todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
 
     complete_result = await nc_mcp_client.call_tool(
         "nc_calendar_complete_todo",
-        {"calendar_name": calendar_name, "todo_uid": todo_uid},
+        {"calendar_name": calendar_name, "todo_uid": todo_uid, "etag": etag},
     )
     assert complete_result.isError is False
     payload = json.loads(complete_result.content[0].text)
@@ -601,12 +620,15 @@ async def test_mcp_complete_todo_accepts_explicit_timestamp(
     )
     assert create_result.isError is False
     todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
 
     complete_result = await nc_mcp_client.call_tool(
         "nc_calendar_complete_todo",
         {
             "calendar_name": calendar_name,
             "todo_uid": todo_uid,
+            "etag": etag,
             "completed": "2026-01-01T09:00:00+00:00",
         },
     )

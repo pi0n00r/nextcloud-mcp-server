@@ -30,6 +30,7 @@ from nextcloud_mcp_server.observability.metrics import (
 )
 
 from .base import BaseNextcloudClient
+from .dav_errors import DavError
 
 logger = logging.getLogger(__name__)
 
@@ -245,44 +246,105 @@ def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
     return {"If-Match": _quote_etag(if_match)}
 
 
+def _dav_detail_text(error: BaseException) -> Optional[str]:
+    """Return the parsed DAV explanation carried by ``error``, if it has one."""
+    if not isinstance(error, DavError) or error.detail is None:
+        return None
+    return error.detail.describe() or None
+
+
+def _with_server_detail(
+    result: Dict[str, Any], server_detail: Optional[str]
+) -> Dict[str, Any]:
+    """Append the server's own DAV explanation to a conflict result.
+
+    Sabre names the concrete failure in the response body (``s:exception`` /
+    ``s:message``). Our status-derived message says what the caller should do;
+    the server's says what actually went wrong. Both are worth keeping.
+    """
+    if not server_detail:
+        return result
+    result["server_detail"] = server_detail
+    result["message"] = f"{result['message']} [server said: {server_detail}]"
+    return result
+
+
 def _write_conflict_result(
     if_match: Optional[str],
     status_code: int,
     path: str,
     *,
     server_etag: Optional[str] = None,
+    server_detail: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Map known write conflicts to actionable structured results."""
+    """Map known write conflicts to actionable structured results.
+
+    Args:
+        if_match: The precondition the write carried, if any.
+        status_code: HTTP status of the failed write.
+        path: Display path, for the caller's benefit.
+        server_etag: The server's current ETag, when it surfaced one.
+        server_detail: The parsed ``s:exception``/``s:message`` pair from the
+            DAV error body, when the server sent one.
+
+    Returns:
+        A structured result dict, or ``None`` if the status is not a known
+        write conflict (the caller then re-raises).
+    """
     if status_code == 412:
         if if_match is None:
-            return {
-                "status_code": 412,
-                "error_kind": "already_exists",
-                "message": "File already exists - read it first to get its etag "
-                "and pass if_match to overwrite safely, or pass if_match='*' to "
-                "overwrite deliberately",
-            }
+            return _with_server_detail(
+                {
+                    "status_code": 412,
+                    "error_kind": "already_exists",
+                    "message": "File already exists - read it first to get its etag "
+                    "and pass if_match to overwrite safely, or pass if_match='*' to "
+                    "overwrite deliberately",
+                },
+                server_detail,
+            )
         if if_match == "*":
-            return {
+            return _with_server_detail(
+                {
+                    "status_code": 412,
+                    "error_kind": "missing_destination",
+                    "message": "File does not exist - cannot force-overwrite a missing "
+                    "file; omit if_match to create it",
+                },
+                server_detail,
+            )
+        return _with_server_detail(
+            {
                 "status_code": 412,
-                "error_kind": "missing_destination",
-                "message": "File does not exist - cannot force-overwrite a missing "
-                "file; omit if_match to create it",
-            }
-        return {
-            "status_code": 412,
-            "error_kind": "precondition_failed",
-            "server_etag": server_etag,
-            "message": "File was modified since the given etag was read "
-            "(concurrent edit) - re-read before writing",
-        }
+                "error_kind": "precondition_failed",
+                "server_etag": server_etag,
+                "message": "File was modified since the given etag was read "
+                "(concurrent edit) - re-read before writing",
+            },
+            server_detail,
+        )
     if status_code == 423:
-        return {
-            "status_code": 423,
-            "error_kind": "locked",
-            "message": "File is locked by another client (for example, open in "
-            "the Nextcloud web editor) - not retried automatically",
-        }
+        return _with_server_detail(
+            {
+                "status_code": 423,
+                "error_kind": "locked",
+                "message": "File is locked by another client (for example, open in "
+                "the Nextcloud web editor) - not retried automatically",
+            },
+            server_detail,
+        )
+    if status_code == 507:
+        # Quota, not a transient fault: retrying writes the same bytes into the
+        # same full account. Say so, so the caller stops instead of looping.
+        return _with_server_detail(
+            {
+                "status_code": 507,
+                "error_kind": "insufficient_storage",
+                "message": "Insufficient storage - the account or folder quota is "
+                "exhausted; free space or raise the quota, retrying will not help",
+            },
+            server_detail,
+        )
     return None
 
 
@@ -796,6 +858,7 @@ class WebDAVClient(BaseNextcloudClient):
                 status_code,
                 display_path,
                 server_etag=server_etag,
+                server_detail=_dav_detail_text(error),
             )
             if conflict is not None:
                 return conflict

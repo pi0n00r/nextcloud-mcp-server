@@ -1,5 +1,16 @@
 """Base client for Nextcloud operations with shared authentication."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 import time
 import xml.etree.ElementTree as ET
@@ -16,6 +27,8 @@ from nextcloud_mcp_server.observability.metrics import (
     record_nextcloud_api_retry,
 )
 from nextcloud_mcp_server.observability.tracing import trace_nextcloud_api_call
+
+from .dav_errors import dav_error_from_status_error
 
 #: Marks a request whose body the caller intends to consume incrementally.
 #:
@@ -274,6 +287,14 @@ class BaseNextcloudClient(ABC):
 
         Returns:
             Response object
+
+        Raises:
+            DavError: For a WebDAV/CalDAV/CardDAV failure, carrying the
+                server's ``s:exception``/``s:message`` explanation. It
+                subclasses ``HTTPStatusError``, so existing handlers are
+                unaffected.
+            HTTPStatusError: For any other failing status.
+            RequestError: On a transport failure.
         """
         url = self._resolve_url(url)
         logger.debug("Making %s request to %s", method, url)
@@ -318,6 +339,15 @@ class BaseNextcloudClient(ABC):
                 status_code=status_code,
                 duration=duration,
             )
+
+            # A DAV failure explains itself in the response body; promote that
+            # explanation into the exception rather than discarding it. The
+            # replacement subclasses HTTPStatusError, so callers matching on
+            # the old type (and retry_on_429 above) are unaffected.
+            if isinstance(e, HTTPStatusError):
+                dav_error = dav_error_from_status_error(e)
+                if dav_error is not None:
+                    raise dav_error from e
 
             # Re-raise the exception
             raise

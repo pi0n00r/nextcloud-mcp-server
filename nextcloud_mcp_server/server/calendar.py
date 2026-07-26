@@ -1,3 +1,16 @@
+"""MCP tools for Nextcloud calendar and VTODO operations."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import datetime as dt
 import logging
 from typing import Any, Optional
@@ -46,6 +59,23 @@ def _completion_payload(completed: str | None = None) -> dict[str, Any]:
         "completed": completed
         or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
     }
+
+
+async def _verify_todo_completed(
+    client: Any, calendar_name: str, todo_uid: str
+) -> tuple[bool, str | None]:
+    """Read back completion without masking a successful conditional write."""
+    try:
+        stored = await client.calendar.get_todo(calendar_name, todo_uid)
+    except Exception as exc:  # noqa: BLE001 - verification must not mask the write
+        logger.warning("Could not verify completed todo %s: %s", todo_uid, exc)
+        return False, f"read-back failed: {exc}"
+
+    if str(stored.get("status", "")).upper() == "COMPLETED" or bool(
+        stored.get("completed")
+    ):
+        return True, None
+    return False, "server read-back is not completed"
 
 
 def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
@@ -354,6 +384,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         event_uid: str,
         ctx: Context,
+        etag: str,
         # All the same parameters as create_event but optional
         title: str | None = None,
         start_datetime: str | None = None,
@@ -377,7 +408,6 @@ def configure_calendar_tools(mcp: FastMCP):
         color: str | None = None,
         timezone: str | None = None,
         reminders: list[dict[str, Any]] | None = None,
-        etag: str = "",
     ):
         """Update any aspect of an existing event.
 
@@ -1070,6 +1100,7 @@ def configure_calendar_tools(mcp: FastMCP):
         min_priority: Optional[int] = None,
         categories: Optional[str] = None,
         summary_contains: Optional[str] = None,
+        include_completed: bool = True,
     ) -> ListTodosResponse:
         """List todos/tasks in a calendar with optional filtering.
 
@@ -1096,6 +1127,8 @@ def configure_calendar_tools(mcp: FastMCP):
             filters["categories"] = [cat.strip() for cat in categories.split(",")]
         if summary_contains is not None:
             filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
 
         todos_data = await client.calendar.list_todos(
             calendar_name, filters if filters else None
@@ -1105,6 +1138,19 @@ def configure_calendar_tools(mcp: FastMCP):
         return ListTodosResponse(
             todos=todos, calendar_name=calendar_name, total_count=len(todos)
         )
+
+    @mcp.tool(
+        title="Get Todo Task",
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    )
+    @require_scopes("todo.read", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_get_todo(
+        calendar_name: str, todo_uid: str, ctx: Context
+    ) -> Todo:
+        """Read one todo by UID with its exact REPORT-coupled ETag."""
+        client = await get_client(ctx)
+        return Todo(**(await client.calendar.get_todo(calendar_name, todo_uid)))
 
     @mcp.tool(
         title="Create Todo Task",
@@ -1168,6 +1214,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         todo_uid: str,
         ctx: Context,
+        etag: str,
         summary: Optional[str] = None,
         description: Optional[str] = None,
         status: Optional[str] = None,
@@ -1178,7 +1225,6 @@ def configure_calendar_tools(mcp: FastMCP):
         completed: Optional[str] = None,
         categories: Optional[str] = None,
         reminders: list[dict[str, Any]] | None = None,
-        etag: str = "",
     ):
         """Update an existing todo/task.
 
@@ -1261,6 +1307,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         todo_uid: str,
         ctx: Context,
+        etag: str,
         completed: Optional[str] = None,
         completed_at: Optional[str] = None,
     ) -> CompleteTodoResponse:
@@ -1275,6 +1322,7 @@ def configure_calendar_tools(mcp: FastMCP):
             calendar_name: Name of the calendar containing the todo
             todo_uid: UID of the todo to complete
             ctx: MCP context
+            etag: Exact strong ETag returned by a todo read or list operation.
             completed: Completion timestamp (ISO format). Defaults to now (UTC).
             completed_at: Backward-compatible alias for ``completed``.
 
@@ -1293,7 +1341,28 @@ def configure_calendar_tools(mcp: FastMCP):
         if completed is None:
             completed = completed_at
         payload = _completion_payload(completed)
-        result = await client.calendar.update_todo(calendar_name, todo_uid, payload)
+        try:
+            result = await client.calendar.update_todo(
+                calendar_name, todo_uid, payload, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar todo {todo_uid} was modified since it was read."
+                f"{current} Read the todo again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the todo again before retrying."
+            ) from exc
+        verified, verification_error = await _verify_todo_completed(
+            client, calendar_name, todo_uid
+        )
         return CompleteTodoResponse(
             uid=todo_uid,
             calendar_name=calendar_name,
@@ -1301,6 +1370,9 @@ def configure_calendar_tools(mcp: FastMCP):
             percent_complete=payload["percent_complete"],
             completed=payload["completed"],
             href=result.get("href", ""),
+            etag=result.get("etag"),
+            verified=verified,
+            verification_error=verification_error,
         )
 
     @mcp.tool(
@@ -1353,6 +1425,7 @@ def configure_calendar_tools(mcp: FastMCP):
         min_priority: Optional[int] = None,
         categories: Optional[str] = None,
         summary_contains: Optional[str] = None,
+        include_completed: bool = True,
     ):
         """Search todos across all calendars with optional filtering.
 
@@ -1378,6 +1451,8 @@ def configure_calendar_tools(mcp: FastMCP):
             filters["categories"] = [cat.strip() for cat in categories.split(",")]
         if summary_contains is not None:
             filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
 
         todos_data = await client.calendar.search_todos_across_calendars(
             filters if filters else None

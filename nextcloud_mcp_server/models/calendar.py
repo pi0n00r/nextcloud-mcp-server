@@ -1,5 +1,16 @@
 """Pydantic models for Calendar app responses."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
@@ -297,6 +308,13 @@ class CompleteTodoResponse(BaseResponse):
     )
     completed: str = Field(description="ISO-8601 COMPLETED timestamp that was written")
     href: str = Field(default="", description="CalDAV href of the todo")
+    etag: Optional[str] = Field(None, description="ETag returned by the write")
+    verified: bool = Field(
+        default=False, description="Whether read-back confirmed completion"
+    )
+    verification_error: Optional[str] = Field(
+        None, description="Why completion read-back could not be confirmed"
+    )
 
 
 class DeleteTodoResponse(StatusResponse):

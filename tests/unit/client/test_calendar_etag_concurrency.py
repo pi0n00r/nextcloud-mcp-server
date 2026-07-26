@@ -1,3 +1,5 @@
+"""Focused CalDAV ETag and optimistic-concurrency regression tests."""
+
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Author=Gary Bajaj
@@ -9,13 +11,12 @@
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-"""Focused CalDAV ETag and optimistic-concurrency regression tests."""
-
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from caldav.elements import cdav, dav
+from caldav.lib import error as caldav_error
 
 from nextcloud_mcp_server.client.calendar import (
     CalendarClient,
@@ -76,6 +77,26 @@ class CalendarUrl:
         return f"https://cloud.example.org{href}"
 
 
+def report_calendar(component_data, etag):
+    report_response = SimpleNamespace(
+        status=207,
+        expand_simple_props=lambda _requested: {
+            "/remote.php/dav/calendars/alice/main/object.ics": {
+                dav.GetEtag.tag: etag,
+                cdav.CalendarData.tag: component_data,
+            }
+        },
+    )
+    client = SimpleNamespace(
+        report=AsyncMock(return_value=report_response),
+        url=CalendarUrl(),
+    )
+    return SimpleNamespace(
+        client=client,
+        url=CalendarUrl(),
+    )
+
+
 @pytest.fixture
 def client(mocker):
     mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
@@ -103,7 +124,7 @@ async def test_uid_lookup_requests_getetag_in_search_report(client):
 
 async def test_event_read_and_list_surface_exact_weak_quoted_etag(client):
     event = DavObject("event-1", EVENT_ICAL, 'W/"event-v1"')
-    calendar = SimpleNamespace(events=AsyncMock(return_value=[event]))
+    calendar = report_calendar(EVENT_ICAL, 'W/"event-v1"')
     client._get_calendar = lambda _name: calendar
     client._async_object_by_uid = AsyncMock(return_value=event)
 
@@ -116,14 +137,59 @@ async def test_event_read_and_list_surface_exact_weak_quoted_etag(client):
 
 
 async def test_todo_list_surfaces_exact_quoted_etag(client):
-    todo = DavObject("todo-1", TODO_ICAL, '"todo-v1"')
-    client._get_calendar = lambda _name: SimpleNamespace(
-        todos=AsyncMock(return_value=[todo])
-    )
+    calendar = report_calendar(TODO_ICAL, '"todo-v1"')
+    client._get_calendar = lambda _name: calendar
 
     listed = await client.list_todos("main")
 
     assert listed[0]["etag"] == '"todo-v1"'
+    assert b"calendar-data" in calendar.client.report.await_args.args[1]
+    assert b"getetag" in calendar.client.report.await_args.args[1]
+
+
+async def test_get_todo_couples_content_and_exact_etag_in_one_report(client):
+    calendar = report_calendar(TODO_ICAL, '"todo-v1"')
+    client._get_calendar = lambda _name: calendar
+
+    fetched = await client.get_todo("main", "todo-1")
+
+    assert fetched["summary"] == "Original"
+    assert fetched["etag"] == '"todo-v1"'
+    calendar.client.report.assert_awaited_once()
+    assert b"calendar-data" in calendar.client.report.await_args.args[1]
+    assert b"getetag" in calendar.client.report.await_args.args[1]
+
+
+async def test_get_todo_never_fabricates_an_empty_etag(client):
+    calendar = report_calendar(TODO_ICAL, None)
+    client._get_calendar = lambda _name: calendar
+
+    with pytest.raises(CalendarEtagUnavailableError, match="REPORT response"):
+        await client.get_todo("main", "todo-1")
+
+
+@pytest.mark.parametrize(
+    "todo",
+    [
+        {"status": "COMPLETED", "completed": None},
+        {"status": "NEEDS-ACTION", "completed": "2026-07-26T00:00:00Z"},
+    ],
+)
+def test_open_task_filter_honours_status_or_completed_timestamp(client, todo):
+    assert client._todo_matches_filters(todo, {"include_completed": False}) is False
+    assert client._todo_matches_filters(todo, {"include_completed": True}) is True
+
+
+async def test_unbounded_event_list_uses_one_coupled_report_without_n_plus_one(client):
+    calendar = report_calendar(EVENT_ICAL, '"event-v1"')
+    client._get_calendar = lambda _name: calendar
+
+    listed = await client.get_calendar_events("main")
+
+    assert listed[0]["etag"] == '"event-v1"'
+    calendar.client.report.assert_awaited_once()
+    assert b"calendar-data" in calendar.client.report.await_args.args[1]
+    assert b"getetag" in calendar.client.report.await_args.args[1]
 
 
 @pytest.mark.parametrize(
@@ -143,7 +209,7 @@ async def test_update_emits_exact_if_match_and_preserves_calendar_data(
     client._dav_client.put.return_value = response(etag='"opaque-v2"')
 
     update = getattr(client, f"update_{kind}")
-    result = await update("main", uid, {"summary": "Changed"})
+    result = await update("main", uid, {"summary": "Changed"}, '"opaque-v1"')
 
     headers = client._dav_client.put.await_args.kwargs["headers"]
     assert headers["If-Match"] == '"opaque-v1"'
@@ -194,6 +260,32 @@ async def test_weak_etag_fails_closed_before_merge_or_put(
     client._dav_client.put.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "etag",
+    ["", "opaque", "*", ' "opaque"', '"opaque" ', '"a","b"', '"bad\nvalue"'],
+)
+@pytest.mark.parametrize(
+    ("kind", "uid", "ical", "merge_name"),
+    [
+        ("event", "event-1", EVENT_ICAL, "_merge_ical_properties"),
+        ("todo", "todo-1", TODO_ICAL, "_merge_ical_todo_properties"),
+    ],
+)
+async def test_malformed_caller_etag_fails_before_network_mutation(
+    client, mocker, etag, kind, uid, ical, merge_name
+):
+    obj = DavObject(uid, ical, '"current"')
+    client._get_calendar = lambda _name: SimpleNamespace()
+    client._async_object_by_uid = AsyncMock(return_value=obj)
+    merge = mocker.patch.object(client, merge_name)
+
+    with pytest.raises(CalendarEtagUnavailableError):
+        await getattr(client, f"update_{kind}")("main", uid, {}, etag)
+
+    merge.assert_not_called()
+    client._dav_client.put.assert_not_awaited()
+
+
 async def test_stale_caller_etag_fails_before_mutation(client, mocker):
     event = DavObject("event-1", EVENT_ICAL, '"current"')
     client._get_calendar = lambda _name: SimpleNamespace()
@@ -235,7 +327,7 @@ async def test_missing_server_etag_fails_closed(client, mocker):
     mocker.patch.object(client, "_merge_ical_properties", return_value=EVENT_ICAL)
 
     with pytest.raises(CalendarEtagUnavailableError) as caught:
-        await client.update_event("main", "event-1", {})
+        await client.update_event("main", "event-1", {}, '"event-v1"')
 
     assert caught.value.as_dict()["error"] == "etag_unavailable"
     client._dav_client.put.assert_not_awaited()
@@ -243,12 +335,13 @@ async def test_missing_server_etag_fails_closed(client, mocker):
 
 async def test_date_range_report_requests_and_retains_exact_etag(client, mocker):
     report_response = SimpleNamespace(
+        status=207,
         expand_simple_props=lambda requested: {
             "/remote.php/dav/calendars/alice/main/event-1.ics": {
                 dav.GetEtag.tag: 'W/"report-v1"',
                 cdav.CalendarData.tag: EVENT_ICAL,
             }
-        }
+        },
     )
     report = AsyncMock(return_value=report_response)
     calendar = SimpleNamespace(
@@ -264,6 +357,19 @@ async def test_date_range_report_requests_and_retains_exact_etag(client, mocker)
     event_class.assert_called_once()
     assert event_class.call_args.kwargs["props"] == {dav.GetEtag.tag: 'W/"report-v1"'}
     assert objects == [event_class.return_value]
+
+
+async def test_report_404_preserves_not_found_error(client):
+    report = AsyncMock(
+        return_value=SimpleNamespace(status=404, reason="Calendar not found")
+    )
+    calendar = SimpleNamespace(
+        client=SimpleNamespace(report=report),
+        url=CalendarUrl(),
+    )
+
+    with pytest.raises(caldav_error.NotFoundError, match="Calendar not found"):
+        await client._search_calendar_objects(calendar, "VEVENT")
 
 
 async def test_successful_put_without_etag_header_refetches_new_etag(client, mocker):
@@ -288,6 +394,36 @@ async def test_cross_origin_object_url_is_rejected_before_put(client, mocker):
     mocker.patch.object(client, "_merge_ical_properties", return_value=EVENT_ICAL)
 
     with pytest.raises(ValueError, match="configured origin"):
-        await client.update_event("main", "event-1", {})
+        await client.update_event("main", "event-1", {}, '"event-v1"')
 
     client._dav_client.put.assert_not_awaited()
+
+
+async def test_bulk_update_propagates_each_search_result_etag(client):
+    client.search_events_across_calendars = AsyncMock(
+        return_value=[
+            {
+                "calendar_name": "main",
+                "uid": "one",
+                "title": "One",
+                "etag": '"one-v1"',
+            },
+            {"calendar_name": "main", "uid": "two", "title": "Two"},
+            {
+                "calendar_name": "main",
+                "uid": "three",
+                "title": "Three",
+                "etag": 'W/"three-v1"',
+            },
+        ]
+    )
+    client.update_event = AsyncMock(return_value={"status_code": 200})
+
+    result = await client.bulk_update_events({}, {"title": "Changed"})
+
+    client.update_event.assert_any_await(
+        "main", "one", {"title": "Changed"}, '"one-v1"'
+    )
+    assert client.update_event.await_count == 1
+    assert result["updated_count"] == 1
+    assert result["failed_count"] == 2

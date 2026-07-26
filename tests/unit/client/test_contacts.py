@@ -9,6 +9,17 @@ Lossless update behavior is covered separately by
 upstream's projection-based ``_merge_vcard_properties`` write path.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -692,3 +703,22 @@ async def test_update_contact_keeps_legacy_optional_etag_contract(mocker):
 
     assert client._do_patch.await_args.kwargs["etag"] == ""
     assert client._do_patch.await_args.kwargs["legacy_optional_etag"] is True
+
+
+@pytest.mark.parametrize("server_etag", ["", 'W/"weak"'])
+async def test_legacy_update_contact_refuses_missing_or_weak_server_etag(
+    write_client, server_etag
+):
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, server_etag)
+
+    with (
+        pytest.warns(DeprecationWarning),
+        pytest.raises(EtagPreconditionError),
+    ):
+        await write_client.update_contact(
+            addressbook="contacts",
+            uid="mankind",
+            contact_data={"fn": "After"},
+        )
+
+    write_client._make_request.assert_not_awaited()

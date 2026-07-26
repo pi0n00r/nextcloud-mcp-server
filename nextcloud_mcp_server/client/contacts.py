@@ -45,6 +45,10 @@ from httpx import HTTPStatusError
 from pythonvCard4.vcard import Contact
 
 from .base import BaseNextcloudClient
+from .entity_tag import (
+    StrongEntityTagError,
+    require_strong_entity_tag,
+)
 from .vcard_parser import VCard, patch_vcard
 
 logger = logging.getLogger(__name__)
@@ -258,35 +262,16 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
-class EtagPreconditionError(ValueError):
+class EtagPreconditionError(StrongEntityTagError):
     """Raised when a mandatory CardDAV If-Match value is not a strong ETag."""
 
 
 def _require_strong_etag(etag: str | None, *, operation: str) -> str:
-    """Return the caller ETag verbatim after fail-closed boundary validation."""
-    if etag is None or not etag.strip():
-        raise EtagPreconditionError(
-            f"{operation} requires a non-blank strong ETag for If-Match"
-        )
-    if etag.startswith("W/"):
-        raise EtagPreconditionError(
-            f"{operation} requires a strong ETag; weak ETags cannot be used "
-            "with If-Match"
-        )
-    if (
-        len(etag) < 2
-        or etag[0] != '"'
-        or etag[-1] != '"'
-        or any(
-            char == '"' or ord(char) < 0x21 or ord(char) == 0x7F or ord(char) > 0xFF
-            for char in etag[1:-1]
-        )
-    ):
-        raise EtagPreconditionError(
-            f"{operation} requires exactly one syntactically valid strong "
-            "HTTP entity-tag"
-        )
-    return etag
+    """Preserve the historical CardDAV exception while using shared validation."""
+    try:
+        return require_strong_entity_tag(etag, operation=operation)
+    except StrongEntityTagError as exc:
+        raise EtagPreconditionError(str(exc)) from exc
 
 
 class VerifyMismatchError(Exception):
@@ -639,12 +624,12 @@ class ContactsClient(BaseNextcloudClient):
         )
         if_match = etag
         if attempt:
-            if legacy_optional_etag:
-                if_match = current_etag
-            else:
-                if_match = _require_strong_etag(
-                    current_etag, operation="patch_contact conflict retry"
-                )
+            operation = (
+                "update_contact server ETag"
+                if legacy_optional_etag
+                else "patch_contact conflict retry"
+            )
+            if_match = _require_strong_etag(current_etag, operation=operation)
         headers = {"Content-Type": "text/vcard; charset=utf-8"}
         if if_match:
             headers["If-Match"] = if_match

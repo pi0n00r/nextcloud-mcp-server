@@ -43,11 +43,13 @@ async def test_mcp_update_event_extended_fields(
         logger.info("Created base event via MCP: %s", event_uid)
 
         # 2. Update with all four extended fields via MCP
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
         update_result = await nc_mcp_client.call_tool(
             "nc_calendar_update_event",
             {
                 "calendar_name": calendar_name,
                 "event_uid": event_uid,
+                "etag": etag,
                 "categories": "work,meeting",
                 "recurrence_rule": "FREQ=WEEKLY;COUNT=4",
                 "attendees": "alice@example.com,bob@example.com",
@@ -59,7 +61,7 @@ async def test_mcp_update_event_extended_fields(
         )
 
         # 3. Verify via direct client
-        event, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
+        event, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
 
         # Categories
         assert "work" in event.get("categories", ""), (
@@ -92,6 +94,7 @@ async def test_mcp_update_event_extended_fields(
             {
                 "calendar_name": calendar_name,
                 "event_uid": event_uid,
+                "etag": etag,
                 "categories": "",
                 "recurrence_rule": "",
                 "attendees": "",

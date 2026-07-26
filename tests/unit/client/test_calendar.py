@@ -367,19 +367,16 @@ async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "arbiter-cpow-drift@example.invalid"
-    collision = SimpleNamespace(
-        status=403,
-        raw=(
-            "A calendar object with URI arbiter-deleted.ics already exists in "
-            "calendar 10, therefore this object can't be moved into the trashbin"
-        ),
+    low_level_403 = caldav_error.AuthorizationError(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        reason="Forbidden",
     )
     client = CalendarClient.__new__(CalendarClient)
     client._ensure_calendar_home = mocker.AsyncMock()
     client._get_calendar = mocker.Mock(return_value=object())
     client._dav_client = SimpleNamespace(
         delete=mocker.AsyncMock(
-            side_effect=[collision, SimpleNamespace(status=204, raw="")]
+            side_effect=[low_level_403, SimpleNamespace(status=204, raw="")]
         )
     )
     todo = SimpleNamespace(
@@ -406,22 +403,26 @@ async def test_delete_todo_unrelated_403_does_not_purge_trash(mocker):
     client = CalendarClient.__new__(CalendarClient)
     client._ensure_calendar_home = mocker.AsyncMock()
     client._get_calendar = mocker.Mock(return_value=object())
+    low_level_403 = caldav_error.AuthorizationError(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        reason="Forbidden",
+    )
     client._dav_client = SimpleNamespace(
-        delete=mocker.AsyncMock(
-            return_value=SimpleNamespace(status=403, raw="Access denied")
-        )
+        delete=mocker.AsyncMock(side_effect=low_level_403)
     )
     todo = SimpleNamespace(
         url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
         delete=mocker.AsyncMock(side_effect=caldav_error.AuthorizationError("403")),
     )
     client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
-    client._purge_todo_trash_entries = mocker.AsyncMock()
+    client._purge_todo_trash_entries = mocker.AsyncMock(return_value=0)
 
     result = await client.delete_todo("persona", uid)
 
     assert result["status_code"] == 403
-    client._purge_todo_trash_entries.assert_not_awaited()
+    assert result["success"] is False
+    client._purge_todo_trash_entries.assert_awaited_once_with(uid)
+    assert client._dav_client.delete.await_count == 1
 
 
 async def test_purge_todo_trash_entries_deletes_only_exact_uid_matches(mocker):

@@ -5,6 +5,17 @@ which reuses a session-scoped calendar to avoid Nextcloud rate limiting issues.
 Each test cleans up its own events/todos but shares the same calendar.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -264,8 +275,9 @@ async def test_update_event(nc_client: NextcloudClient, temporary_event: dict):
     }
 
     try:
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
         result = await nc_client.calendar.update_event(
-            calendar_name, event_uid, updated_data
+            calendar_name, event_uid, updated_data, etag
         )
         assert result["uid"] == event_uid
 
@@ -310,9 +322,12 @@ async def test_update_event_extended_fields(
             "attendees": "alice@example.com,bob@example.com",
             "reminder_minutes": 15,
         }
-        await nc_client.calendar.update_event(calendar_name, event_uid, updated_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, updated_data, etag
+        )
 
-        retrieved, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
+        retrieved, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
 
         # Verify categories
         assert "work" in retrieved.get("categories", "")
@@ -336,7 +351,9 @@ async def test_update_event_extended_fields(
             "attendees": "",
             "reminder_minutes": 0,
         }
-        await nc_client.calendar.update_event(calendar_name, event_uid, cleared_data)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, cleared_data, etag
+        )
 
         cleared, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
 

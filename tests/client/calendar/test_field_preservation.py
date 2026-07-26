@@ -4,6 +4,17 @@ This test module demonstrates data loss issues when non-supported fields
 are present in calendar events and contacts during round-trip operations.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -90,7 +101,10 @@ END:VCALENDAR"""
             "description": "Updated description - custom fields should be preserved",
         }
 
-        await nc_client.calendar.update_event(calendar_name, event_uid, update_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, update_data, etag
+        )
         logger.info("Updated event %s through MCP client", event_uid)
 
         # Reload the event to see if custom fields survived
@@ -387,7 +401,10 @@ END:VCALENDAR"""
 
         # Now perform a simple update through MCP
         update_data = {"location": "Conference Room B"}  # Simple location change
-        await nc_client.calendar.update_event(calendar_name, event_uid, update_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, update_data, etag
+        )
 
         # Reload the event to check what survived the round-trip
         await event.load()

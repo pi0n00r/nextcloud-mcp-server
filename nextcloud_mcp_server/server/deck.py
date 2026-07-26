@@ -1,3 +1,16 @@
+"""MCP tools for Nextcloud Deck operations."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 from typing import Literal, cast
 
@@ -38,6 +51,7 @@ from nextcloud_mcp_server.models.deck import (
     StackOperationResponse,
     StackOverview,
 )
+from nextcloud_mcp_server.models.sharing import ShareType
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
@@ -291,7 +305,7 @@ def _shape_comments(
 # fires this exact request — see Deck app's
 # src/components/card/AttachmentList.vue:223-238 and lib/Service/FilesAppService.php.
 # The file is NOT copied; the share row binds the file's existing path to the card.
-_SHARE_TYPE_DECK = 12
+_SHARE_TYPE_DECK = ShareType.DECK
 
 
 def _resolve_note_path(notes_folder: str, category: str, title: str) -> str:

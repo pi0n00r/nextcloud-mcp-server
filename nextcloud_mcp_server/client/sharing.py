@@ -1,11 +1,65 @@
 """Nextcloud OCS Sharing API client for file/folder sharing operations."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 from typing import Any
 
+from nextcloud_mcp_server.models.sharing import (
+    SHARE_TYPES_REQUIRING_RECIPIENT,
+    ShareType,
+)
+
 from .base import BaseNextcloudClient, retry_on_429
+from .ocs import ocs_data, raise_for_ocs_status
 
 logger = logging.getLogger(__name__)
+
+
+def validate_share_with(share_type: int, share_with: str | None) -> None:
+    """Check the ``shareType``/``shareWith`` pairing before it reaches the wire.
+
+    Nextcloud does not reject a public link that carries a recipient: it
+    ignores ``shareWith`` and returns a perfectly valid anonymous link, so the
+    caller believes it shared with a named user when it published the file to
+    anyone holding the URL. That silence is the reason this check exists on the
+    client side. The inverse case (a recipient type with no ``shareWith``) does
+    fail server-side, but with a generic OCS 400 that says nothing useful.
+
+    Args:
+        share_type: OCS ``shareType`` value (see :class:`ShareType`).
+        share_with: Recipient identifier, if any.
+
+    Raises:
+        ValueError: If a public link carries a recipient, or a recipient-typed
+            share is missing one.
+    """
+    has_recipient = bool(share_with and share_with.strip())
+
+    if share_type == ShareType.PUBLIC_LINK and has_recipient:
+        raise ValueError(
+            "shareType 3 (public link) must not carry shareWith: a public link "
+            "addresses nobody, and Nextcloud silently ignores the recipient — "
+            f"the file would be published to anyone with the URL, not shared "
+            f"with {share_with!r}. Use shareType 0 (user) or 1 (group) to share "
+            "with a recipient, or create_public_link() for an anonymous link."
+        )
+
+    if share_type in SHARE_TYPES_REQUIRING_RECIPIENT and not has_recipient:
+        raise ValueError(
+            f"shareType {share_type} requires a non-empty shareWith recipient "
+            "(user id, group id, email, circle id, conversation token, or card "
+            "id, depending on the type)"
+        )
 
 
 class SharingClient(BaseNextcloudClient):
@@ -13,11 +67,14 @@ class SharingClient(BaseNextcloudClient):
 
     app_name = "sharing"
 
+    #: Every OCS call needs this header or Nextcloud's CSRF check answers 997.
+    _OCS_HEADERS = {"OCS-APIRequest": "true", "Accept": "application/json"}
+
     @retry_on_429
     async def create_share(
         self,
         path: str,
-        share_with: str,
+        share_with: str | None = None,
         share_type: int = 0,
         permissions: int = 1,
     ) -> dict[str, Any]:
@@ -25,8 +82,14 @@ class SharingClient(BaseNextcloudClient):
 
         Args:
             path: Path to file/folder to share (relative to user's files)
-            share_with: Username (for user share) or group name (for group share)
-            share_type: Share type (0=user, 1=group, 3=public link)
+            share_with: Optional recipient identifier — user id, group id, email
+                address, federated ``user@remote``, circle id, Talk conversation
+                token or Deck card id, depending on ``share_type``. Omit this
+                only for a public link (``share_type=3``).
+            share_type: OCS share type — see :class:`ShareType`. 0=user (default),
+                1=group, 4=email, 6=federated, 7=circle, 10=Talk, 12=Deck card.
+                Type 3 creates a public link and requires ``share_with`` to be
+                omitted.
             permissions: Share permissions:
                 - 1 = read
                 - 2 = update
@@ -40,35 +103,37 @@ class SharingClient(BaseNextcloudClient):
             Share data including share ID
 
         Raises:
+            ValueError: If the ``share_type``/``share_with`` pairing is invalid.
+            OCSError: If the OCS envelope reports a failure.
             HTTPStatusError: If the request fails
         """
+        validate_share_with(share_type, share_with)
+
+        payload: dict[str, Any] = {
+            "path": path,
+            "shareType": share_type,
+            "permissions": permissions,
+        }
+        if share_with is not None:
+            payload["shareWith"] = share_with
+
         response = await self._client.post(
             "/ocs/v2.php/apps/files_sharing/api/v1/shares",
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
-            data={
-                "path": path,
-                "shareType": share_type,
-                "shareWith": share_with,
-                "permissions": permissions,
-            },
+            headers=self._OCS_HEADERS,
+            data=payload,
         )
         response.raise_for_status()
         data = response.json()
 
-        # OCS API v2 uses HTTP-style status codes (200 for success)
-        # OCS API v1 used custom codes (100 for success)
-        ocs_status = data["ocs"]["meta"]["statuscode"]
-        if ocs_status not in (100, 200):
-            ocs_message = data["ocs"]["meta"].get("message", "Unknown error")
-            raise RuntimeError(f"OCS API error (code {ocs_status}): {ocs_message}")
-
-        share_data = data["ocs"]["data"]
+        share_data = ocs_data(data, context="OCS create_share")
 
         # Handle case where data might be an empty list on error
         if not share_data or (isinstance(share_data, list) and len(share_data) == 0):
-            ocs_message = data["ocs"]["meta"].get("message", "Unknown error")
+            meta = data["ocs"]["meta"]
+            ocs_message = meta.get("message", "Unknown error")
             raise RuntimeError(
-                f"Share creation failed: {ocs_message} (status {ocs_status})"
+                f"Share creation failed: {ocs_message} "
+                f"(status {meta.get('statuscode')})"
             )
 
         logger.info(
@@ -111,7 +176,9 @@ class SharingClient(BaseNextcloudClient):
         """
         data: dict[str, Any] = {
             "path": path,
-            "shareType": 3,
+            # No shareWith: a public link addresses nobody, and sending one
+            # would be silently ignored by the server.
+            "shareType": int(ShareType.PUBLIC_LINK),
             "permissions": permissions,
         }
         if expire_date is not None:
@@ -119,24 +186,21 @@ class SharingClient(BaseNextcloudClient):
 
         response = await self._client.post(
             "/ocs/v2.php/apps/files_sharing/api/v1/shares",
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            headers=self._OCS_HEADERS,
             data=data,
         )
         response.raise_for_status()
         result = response.json()
 
-        ocs_status = result["ocs"]["meta"]["statuscode"]
-        if ocs_status not in (100, 200):
-            ocs_message = result["ocs"]["meta"].get("message", "Unknown error")
-            raise RuntimeError(f"OCS API error (code {ocs_status}): {ocs_message}")
-
-        share_data = result["ocs"]["data"]
+        share_data = ocs_data(result, context="OCS create_public_link")
 
         # An empty list/dict means the share was not created despite an OK code.
         if not share_data or (isinstance(share_data, list) and len(share_data) == 0):
-            ocs_message = result["ocs"]["meta"].get("message", "Unknown error")
+            meta = result["ocs"]["meta"]
+            ocs_message = meta.get("message", "Unknown error")
             raise RuntimeError(
-                f"Public link creation failed: {ocs_message} (status {ocs_status})"
+                f"Public link creation failed: {ocs_message} "
+                f"(status {meta.get('statuscode')})"
             )
 
         logger.info(
@@ -160,15 +224,10 @@ class SharingClient(BaseNextcloudClient):
         """
         response = await self._client.delete(
             f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}",
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            headers=self._OCS_HEADERS,
         )
         response.raise_for_status()
-        data = response.json()
-
-        if data["ocs"]["meta"]["statuscode"] not in (100, 200):
-            raise RuntimeError(
-                f"OCS API error: {data['ocs']['meta'].get('message', 'Unknown error')}"
-            )
+        raise_for_ocs_status(response.json(), context="OCS delete_share")
 
         logger.info("Deleted share %s", share_id)
 
@@ -187,17 +246,11 @@ class SharingClient(BaseNextcloudClient):
         """
         response = await self._client.get(
             f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}",
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            headers=self._OCS_HEADERS,
         )
         response.raise_for_status()
-        data = response.json()
 
-        if data["ocs"]["meta"]["statuscode"] not in (100, 200):
-            raise RuntimeError(
-                f"OCS API error: {data['ocs']['meta'].get('message', 'Unknown error')}"
-            )
-
-        share_data = data["ocs"]["data"]
+        share_data = ocs_data(response.json(), context="OCS get_share")
         # The API returns a list with a single share, extract the first element
         if isinstance(share_data, list) and len(share_data) > 0:
             return share_data[0]
@@ -228,18 +281,12 @@ class SharingClient(BaseNextcloudClient):
         response = await self._client.get(
             "/ocs/v2.php/apps/files_sharing/api/v1/shares",
             params=params,
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            headers=self._OCS_HEADERS,
         )
         response.raise_for_status()
-        data = response.json()
-
-        if data["ocs"]["meta"]["statuscode"] not in (100, 200):
-            raise RuntimeError(
-                f"OCS API error: {data['ocs']['meta'].get('message', 'Unknown error')}"
-            )
 
         # Handle both single share and list of shares
-        shares_data = data["ocs"]["data"]
+        shares_data = ocs_data(response.json(), context="OCS list_shares")
         if isinstance(shares_data, dict):
             return [shares_data]
         return shares_data if shares_data else []
@@ -266,16 +313,11 @@ class SharingClient(BaseNextcloudClient):
 
         response = await self._client.put(
             f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}",
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            headers=self._OCS_HEADERS,
             data=data,
         )
         response.raise_for_status()
-        result = response.json()
 
-        if result["ocs"]["meta"]["statuscode"] not in (100, 200):
-            raise RuntimeError(
-                f"OCS API error: {result['ocs']['meta'].get('message', 'Unknown error')}"
-            )
-
+        updated = ocs_data(response.json(), context="OCS update_share")
         logger.info("Updated share %s", share_id)
-        return result["ocs"]["data"]
+        return updated
