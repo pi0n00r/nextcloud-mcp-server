@@ -52,3 +52,16 @@ def test_shipped_compose_profile_ports_match_health_resolution():
 
         assert environment["PORT"] == str(expected_port)
         assert resolve_health_port(argv, environment) == expected_port
+
+
+def test_login_flow_profile_allows_expected_management_clients():
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    environment = dict(
+        item.split("=", 1)
+        for item in compose["services"]["mcp-login-flow"]["environment"]
+    )
+
+    assert set(environment["ALLOWED_MGMT_CLIENT"].split(",")) == {
+        "astrolabeMcpClientOAuth00000000000",
+        "nextcloudMcpServerUIPublicClient",
+    }
