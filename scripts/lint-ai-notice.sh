@@ -44,10 +44,12 @@ FORK_TOUCHED=(
     "nextcloud_mcp_server/client/contacts.py"
     "nextcloud_mcp_server/client/vcard_parser.py"
     "nextcloud_mcp_server/client/webdav.py"
+    "nextcloud_mcp_server/migrations.py"
     "nextcloud_mcp_server/models/contacts.py"
     "nextcloud_mcp_server/server/contacts.py"
     "tests/client/contacts/test_byte_preserving.py"
     "tests/client/webdav/test_size_limit.py"
+    "tests/unit/test_migrations_concurrency.py"
 )
 
 failures=0

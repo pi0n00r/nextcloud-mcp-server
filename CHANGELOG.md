@@ -5,6 +5,14 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.151.1 (2026-07-26)
+
+### Fix
+
+- **storage**: serialize all in-process Alembic commands so concurrent MCP
+  sessions cannot corrupt Alembic's process-global context proxy and crash
+  with `KeyError: 'config'` or `KeyError: 'script'`
+
 ## v0.151.0 (2026-07-26)
 
 ### BREAKING CHANGE

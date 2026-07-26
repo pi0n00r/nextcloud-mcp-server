@@ -607,8 +607,11 @@ class RefreshTokenStorage:
         from scratch — the second one crashes with "relation already
         exists". On Postgres we acquire a session-level
         :func:`pg_advisory_lock` so the second pod blocks until the
-        first finishes. SQLite serializes writes via its own file lock
-        and needs no extra coordination, so this is a no-op there.
+        first finishes. SQLite serializes database writes via its own file
+        lock, so this cross-process lock is a no-op there. The separate
+        process-wide lock in ``migrations.py`` still serializes every backend:
+        it protects Alembic's Python-global context proxy, which a database
+        lock cannot protect.
 
         The lock is held on a separate connection from the engine pool
         so it survives the worker-thread ``to_thread.run_sync`` call
