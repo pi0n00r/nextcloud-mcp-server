@@ -771,6 +771,7 @@ async def test_mcp_calendar_workflow(
         update_data = {
             "calendar_name": calendar_name,
             "event_uid": event_uid,
+            "etag": found_event["etag"],
             "title": updated_title,
             "description": updated_description,
             "priority": 1,

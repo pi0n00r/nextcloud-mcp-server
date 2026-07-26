@@ -783,6 +783,17 @@ class CalendarClient:
         )
         assert calendar.client is not None
         response = await calendar.client.report(str(calendar.url), body, depth=1)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+        status = getattr(response, "status", 207)
+        if status == 404:
+            raise caldav_error.NotFoundError(
+                url=str(calendar.url),
+                reason=getattr(response, "reason", "Calendar not found"),
+            )
+        if status >= 400:
+            raise caldav_error.DAVError(
+                url=str(calendar.url),
+                reason=getattr(response, "reason", f"HTTP {status}"),
+            )
 
         # Parse response (same pattern as AsyncCalendar.search)
         objects = []

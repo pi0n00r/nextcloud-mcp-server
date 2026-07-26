@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from caldav.elements import cdav, dav
+from caldav.lib import error as caldav_error
 
 from nextcloud_mcp_server.client.calendar import (
     CalendarClient,
@@ -78,12 +79,13 @@ class CalendarUrl:
 
 def report_calendar(component_data, etag):
     report_response = SimpleNamespace(
+        status=207,
         expand_simple_props=lambda _requested: {
             "/remote.php/dav/calendars/alice/main/object.ics": {
                 dav.GetEtag.tag: etag,
                 cdav.CalendarData.tag: component_data,
             }
-        }
+        },
     )
     client = SimpleNamespace(
         report=AsyncMock(return_value=report_response),
@@ -333,12 +335,13 @@ async def test_missing_server_etag_fails_closed(client, mocker):
 
 async def test_date_range_report_requests_and_retains_exact_etag(client, mocker):
     report_response = SimpleNamespace(
+        status=207,
         expand_simple_props=lambda requested: {
             "/remote.php/dav/calendars/alice/main/event-1.ics": {
                 dav.GetEtag.tag: 'W/"report-v1"',
                 cdav.CalendarData.tag: EVENT_ICAL,
             }
-        }
+        },
     )
     report = AsyncMock(return_value=report_response)
     calendar = SimpleNamespace(
@@ -354,6 +357,19 @@ async def test_date_range_report_requests_and_retains_exact_etag(client, mocker)
     event_class.assert_called_once()
     assert event_class.call_args.kwargs["props"] == {dav.GetEtag.tag: 'W/"report-v1"'}
     assert objects == [event_class.return_value]
+
+
+async def test_report_404_preserves_not_found_error(client):
+    report = AsyncMock(
+        return_value=SimpleNamespace(status=404, reason="Calendar not found")
+    )
+    calendar = SimpleNamespace(
+        client=SimpleNamespace(report=report),
+        url=CalendarUrl(),
+    )
+
+    with pytest.raises(caldav_error.NotFoundError, match="Calendar not found"):
+        await client._search_calendar_objects(calendar, "VEVENT")
 
 
 async def test_successful_put_without_etag_header_refetches_new_etag(client, mocker):

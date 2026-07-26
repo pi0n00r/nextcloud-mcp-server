@@ -86,6 +86,7 @@ async def test_mcp_todo_complete_workflow(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
                 "summary": "MCP Test Task Updated",
                 "status": "IN-PROCESS",
                 "priority": 1,
@@ -319,6 +320,8 @@ async def test_mcp_todo_status_transitions(
             {"summary": "Status Transition Test", "status": "NEEDS-ACTION"},
         )
         todo_uid = result["uid"]
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        todo = next(t for t in todos if t["uid"] == todo_uid)
 
         # Transition: NEEDS-ACTION → IN-PROCESS
         logger.info("Transitioning todo to IN-PROCESS via MCP")
@@ -327,6 +330,7 @@ async def test_mcp_todo_status_transitions(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": todo["etag"],
                 "status": "IN-PROCESS",
                 "percent_complete": 25,
             },
@@ -346,6 +350,7 @@ async def test_mcp_todo_status_transitions(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": todo["etag"],
                 "status": "COMPLETED",
                 "percent_complete": 100,
                 "completed": completed_time,
@@ -459,6 +464,7 @@ async def test_mcp_todo_categories(
             {
                 "calendar_name": calendar_name,
                 "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
                 "categories": "updated,new-category",
             },
         )
