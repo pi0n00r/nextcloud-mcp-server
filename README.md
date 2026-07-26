@@ -5,7 +5,7 @@
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and the rest of your Nextcloud workspace through 147 MCP tools.
+Deck, Talk, and other Nextcloud application surfaces through 147 MCP tools.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -21,11 +21,11 @@ Deck, Talk, and the rest of your Nextcloud workspace through 147 MCP tools.
 
 Nextcloud MCP Server is a standalone bridge between MCP clients and an
 existing Nextcloud instance. It runs outside Nextcloud and exposes a broad,
-typed tool surface over the platform's supported APIs, including WebDAV,
-CalDAV, CardDAV, OCS, and application REST endpoints.
+typed tool surface over WebDAV, CalDAV, CardDAV, OCS, and application REST
+endpoints.
 
-This production-focused fork tracks the upstream project while maintaining
-hardened data paths for real-world automation:
+This production-focused fork maintains hardened data paths for real-world
+automation:
 
 - **Byte-preserving CardDAV updates** retain contact photos, folded fields,
   custom properties, and untouched vCard bytes.
@@ -47,14 +47,8 @@ hardened data paths for real-world automation:
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.0` |
 | **Application version** | `0.150.1` |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
-| **Authentication** | App passwords, multi-user Basic Auth, Login Flow v2 |
+| **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
-
-> [!NOTE]
-> This project is a standalone MCP server for external clients. For AI
-> features embedded inside Nextcloud, see
-> [Nextcloud Context Agent](https://github.com/nextcloud/context_agent) and the
-> [comparison guide](docs/comparison-context-agent.md).
 
 ## Quick Start
 
@@ -161,11 +155,9 @@ indexing infrastructure is enabled.
 ### Safety and access control
 
 - App-password isolation for single-user deployments
-- Explicit deployment modes for single-user and multi-user installations
 - Optional pre-shared gateway secret for HTTP transport
 - Configurable DNS-rebinding protection
 - Tag-based file and folder exclusion through `EXCLUDED_TAGS`
-- OAuth scope enforcement for Login Flow deployments
 
 ### Search and document processing
 
@@ -185,15 +177,10 @@ indexing infrastructure is enabled.
 
 ## Authentication
 
-| Mode | Use case |
-|---|---|
-| `single_user_basic` | Personal and dedicated-agent deployments using one Nextcloud app password |
-| `multi_user_basic` | Multiple callers supplying Nextcloud credentials per request |
-| `login_flow` | Shared deployments using Nextcloud Login Flow v2 and MCP OAuth |
-
-Start with `single_user_basic` unless the server is intentionally shared.
-Review the [authentication guide](docs/authentication.md) before exposing an
-HTTP deployment beyond a trusted local network.
+The stable profile connects to one existing Nextcloud account using an app
+password and `MCP_DEPLOYMENT_MODE=single_user_basic`. For HTTP deployments,
+configure the gateway secret and keep the service behind a trusted
+TLS-terminating reverse proxy.
 
 ## Documentation
 
@@ -202,7 +189,6 @@ HTTP deployment beyond a trusted local network.
 - [Container package](docs/container-package.md)
 - [Installation](docs/installation.md)
 - [Configuration](docs/configuration.md)
-- [Authentication](docs/authentication.md)
 - [Running the server](docs/running.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
@@ -251,7 +237,6 @@ integrations are welcome.
 
 - [Open an issue](https://github.com/pi0n00r/nextcloud-mcp-server/issues)
 - [Submit a pull request](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md)
 - Target this repository's `master` branch and preserve the documented data
   integrity contracts
 
