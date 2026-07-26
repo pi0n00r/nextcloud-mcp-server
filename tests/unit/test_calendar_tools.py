@@ -16,7 +16,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
+from nextcloud_mcp_server.client.calendar import (
+    CalendarEtagConflictError,
+    CalendarEtagUnavailableError,
+)
 from nextcloud_mcp_server.server.calendar import configure_calendar_tools
 
 pytestmark = pytest.mark.unit
@@ -79,6 +84,9 @@ def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
     ):
         assert "reminders" in tools[name].parameters["properties"]
 
+    assert "etag" in tools["nc_calendar_update_event"].parameters["properties"]
+    assert "etag" in tools["nc_calendar_update_todo"].parameters["properties"]
+
     complete_properties = tools["nc_calendar_complete_todo"].parameters["properties"]
     assert "completed" in complete_properties
     assert "completed_at" in complete_properties
@@ -129,6 +137,68 @@ async def test_list_events_all_calendars_without_calendar_name(
         filters=None,
     )
     calendar_client.calendar.get_calendar_events.assert_not_awaited()
+
+
+def test_event_summary_preserves_exact_etag():
+    from nextcloud_mcp_server.server.calendar import _event_dict_to_summary
+
+    summary = _event_dict_to_summary(
+        {
+            "uid": "event-1",
+            "title": "Event",
+            "start_datetime": "2026-07-26",
+            "etag": 'W/"opaque"',
+        }
+    )
+
+    assert summary.etag == 'W/"opaque"'
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "method_name", "uid_name", "uid"),
+    [
+        ("nc_calendar_update_event", "update_event", "event_uid", "event-1"),
+        ("nc_calendar_update_todo", "update_todo", "todo_uid", "todo-1"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("error", "message_pattern"),
+    [
+        (
+            CalendarEtagConflictError("changed", current_etag='"current-version"'),
+            'modified since it was read.*Current ETag: "current-version".*Read',
+        ),
+        (
+            CalendarEtagUnavailableError("server supplied no usable strong ETag"),
+            "no usable strong ETag.*update was not sent.*read",
+        ),
+    ],
+)
+async def test_update_tools_translate_etag_errors_to_actionable_toolerror(
+    tool_name, method_name, uid_name, uid, error, message_pattern
+):
+    mcp = FastMCP("test-calendar-etag-errors")
+    configure_calendar_tools(mcp)
+    tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
+    update = AsyncMock(side_effect=error)
+    client = SimpleNamespace(calendar=SimpleNamespace(**{method_name: update}))
+    kwargs = {
+        "calendar_name": "main",
+        uid_name: uid,
+        "ctx": _context(),
+        "etag": '"stale"',
+    }
+
+    with (
+        patch(
+            "nextcloud_mcp_server.server.calendar.get_client",
+            new=AsyncMock(return_value=client),
+        ),
+        pytest.raises(ToolError, match=message_pattern),
+    ):
+        await tools[tool_name].fn(**kwargs)
+
+    update.assert_awaited_once()
 
 
 @pytest.mark.parametrize("calendar_name", [None, "", "   "])
