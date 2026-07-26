@@ -931,46 +931,41 @@ class CalendarClient:
         except caldav_error.AuthorizationError:
             if kind != "todo":
                 raise
-            response = await self._dav_client.delete(
-                str(obj.url), headers={"X-NC-Scheduling": "false"}
-            )
-            if response.status == 404:
-                return {"status_code": 404}
-            if response.status in (200, 204):
-                return {"status_code": 204}
-            if self._is_calendar_trashbin_collision(response):
-                purged = await self._purge_todo_trash_entries(uid)
-                if purged:
-                    retry = await self._dav_client.delete(
-                        str(obj.url), headers={"X-NC-Scheduling": "false"}
-                    )
-                    if retry.status in (200, 204):
-                        return {
-                            "status_code": 204,
-                            "stale_trash_entries_purged": purged,
-                        }
-            return {
-                "status_code": response.status,
-                "error": "server rejected DELETE",
-            }
+            repaired = await self._repair_todo_trash_collision(obj, uid)
+            if repaired is not None:
+                return repaired
+            return self._delete_refusal_result(403, kind, uid)
         except caldav_error.DeleteError as e:
             status = self._status_from_dav_error(e)
             if kind == "todo":
                 repaired = await self._repair_todo_trash_collision(obj, uid)
                 if repaired is not None:
                     return repaired
-            logger.warning(
-                "Server refused to delete %s %s (status %s)",
-                kind,
-                uid,
-                status if status is not None else "unknown",
-            )
-            return {
-                "success": False,
-                "status_code": status if status is not None else 500,
-                "message": self._delete_refusal_message(status, kind),
-                "reason": str(e),
-            }
+            return self._delete_refusal_result(status, kind, uid, reason=str(e))
+
+    def _delete_refusal_result(
+        self,
+        status: int | None,
+        kind: str,
+        uid: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the stable refusal shape used by calendar delete tools."""
+        logger.warning(
+            "Server refused to delete %s %s (status %s)",
+            kind,
+            uid,
+            status if status is not None else "unknown",
+        )
+        result: dict[str, Any] = {
+            "success": False,
+            "status_code": status if status is not None else 500,
+            "message": self._delete_refusal_message(status, kind),
+        }
+        if reason is not None:
+            result["reason"] = reason
+        return result
 
     @staticmethod
     def _is_calendar_trashbin_collision(response: Any) -> bool:
@@ -1047,19 +1042,38 @@ class CalendarClient:
     async def _repair_todo_trash_collision(
         self, todo: Any, todo_uid: str
     ) -> dict[str, Any] | None:
-        """Repair only the server's exact stale-trash collision, never generic 403s."""
+        """Purge an exact-UID trash collision and retry one refused todo delete.
+
+        ``caldav`` raises ``AuthorizationError`` before returning a low-level
+        403 response, so the response body cannot always be inspected here.
+        In that real transport path, the exact-UID trash query is the gate:
+        without a matching stale object, no purge or retry is performed.
+        """
         try:
-            response = await self._dav_client.delete(
-                str(todo.url), headers={"X-NC-Scheduling": "false"}
-            )
-            if not self._is_calendar_trashbin_collision(response):
-                return None
+            try:
+                response = await self._dav_client.delete(
+                    str(todo.url), headers={"X-NC-Scheduling": "false"}
+                )
+            except caldav_error.AuthorizationError:
+                response = None
+
+            if response is not None:
+                if response.status == 404:
+                    return {"status_code": 404}
+                if response.status in (200, 204):
+                    return {"status_code": 204}
+                if not self._is_calendar_trashbin_collision(response):
+                    return None
+
             purged = await self._purge_todo_trash_entries(todo_uid)
             if not purged:
                 return None
-            retry = await self._dav_client.delete(
-                str(todo.url), headers={"X-NC-Scheduling": "false"}
-            )
+            try:
+                retry = await self._dav_client.delete(
+                    str(todo.url), headers={"X-NC-Scheduling": "false"}
+                )
+            except caldav_error.AuthorizationError:
+                return None
             if retry.status == 404:
                 return {"status_code": 404}
             if retry.status in (200, 204):
