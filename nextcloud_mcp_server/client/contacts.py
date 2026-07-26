@@ -827,6 +827,9 @@ def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str
         "url": getattr(contact, "url", None),
         "categories": getattr(contact, "categories", None),
         "photo": getattr(contact, "photo", None) or _first_custom(custom, "PHOTO"),
+        "adr": getattr(contact, "adr", None),
+        "n": getattr(contact, "n", None),
+        "custom": custom_fields,
         "custom_fields": custom_fields,
     }
 

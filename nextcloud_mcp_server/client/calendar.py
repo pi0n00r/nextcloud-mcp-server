@@ -3,6 +3,7 @@
 import datetime as dt
 import inspect
 import logging
+import re
 import uuid
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
@@ -657,7 +658,7 @@ class CalendarClient:
         await _maybe_await(event.load(only_if_unloaded=True))
 
         # Merge updates into existing iCal data
-        updated_ical = self._merge_ical_properties(event.data, event_data, event_uid)  # type: ignore[arg-type]
+        updated_ical = self._merge_ical_properties(event.data, event_data)  # type: ignore[arg-type]
         event.data = updated_ical  # type: ignore[misc]
 
         await _maybe_await(event.save())
@@ -670,21 +671,241 @@ class CalendarClient:
             "status_code": 200,
         }
 
-    async def delete_event(self, calendar_name: str, event_uid: str) -> dict[str, Any]:
-        """Delete a calendar event."""
+    @staticmethod
+    def _status_from_dav_error(exc: caldav_error.DAVError) -> int | None:
+        """Best-effort HTTP status from a caldav DAVError, or ``None``.
+
+        caldav offers nothing structured here. ``_post_delete`` raises
+        ``DeleteError(errmsg(r))``, and ``errmsg`` formats
+        ``"<status> <reason>\\n\\n<body>"`` — which lands in the exception's
+        ``url`` slot, because ``DAVError.__init__``'s first positional parameter
+        is ``url``. So the status is the leading integer of ``exc.url``, with
+        ``str(exc)`` as a fallback in case a future caldav populates it properly.
+
+        Returns ``None`` when nothing parses; callers must treat that as an
+        unknown refusal rather than substituting a plausible-looking code.
+        """
+        for candidate in (getattr(exc, "url", None), str(exc)):
+            if not candidate:
+                continue
+            match = re.search(r"\b(\d{3})\b", str(candidate))
+            if match:
+                return int(match.group(1))
+        return None
+
+    async def _delete_dav_object(
+        self,
+        calendar_name: str,
+        uid: str,
+        comp_filter: Any,
+        kind: str,
+    ) -> dict[str, Any]:
+        """Delete one CalDAV object, mapping refusals to a structured result.
+
+        Only ``NotFoundError`` used to be caught, so a 403 (Nextcloud refuses to
+        delete iMIP/scheduled objects) or a 409/412 (a stale entry in the calendar
+        trashbin colliding with the delete) escaped as a raw caldav traceback out
+        of the MCP tool.
+
+        Only ``DeleteError`` is treated as a refusal: it is precisely what
+        ``DAVObject._post_delete`` raises when the server rejects the DELETE.
+        caldav's other error classes are flat siblings under ``DAVError``, not
+        subclasses of it, so ``AuthorizationError`` (expired credential) and
+        ``RateLimitError`` (retryable) keep propagating instead of being flattened
+        into a per-object "the server refused this event" message. Catching the
+        ``DAVError`` base would have masked exactly those.
+        """
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
 
         try:
-            event = await self._async_object_by_uid(
-                calendar, event_uid, cdav.CompFilter("VEVENT")
-            )
-            await _maybe_await(event.delete())
-            logger.debug("Deleted event %s", event_uid)
-            return {"status_code": 204}
+            obj = await self._async_object_by_uid(calendar, uid, comp_filter)
+            await _maybe_await(obj.delete())
+            logger.debug("Deleted %s %s", kind, uid)
+            return {"success": True, "status_code": 204}
         except caldav_error.NotFoundError as e:
-            logger.debug("Event %s not found: %s", event_uid, e)
-            return {"status_code": 404}
+            logger.debug("%s %s not found: %s", kind.capitalize(), uid, e)
+            return {"success": True, "status_code": 404}
+        except caldav_error.AuthorizationError:
+            if kind != "todo":
+                raise
+            response = await self._dav_client.delete(
+                str(obj.url), headers={"X-NC-Scheduling": "false"}
+            )
+            if response.status == 404:
+                return {"status_code": 404}
+            if response.status in (200, 204):
+                return {"status_code": 204}
+            if self._is_calendar_trashbin_collision(response):
+                purged = await self._purge_todo_trash_entries(uid)
+                if purged:
+                    retry = await self._dav_client.delete(
+                        str(obj.url), headers={"X-NC-Scheduling": "false"}
+                    )
+                    if retry.status in (200, 204):
+                        return {
+                            "status_code": 204,
+                            "stale_trash_entries_purged": purged,
+                        }
+            return {
+                "status_code": response.status,
+                "error": "server rejected DELETE",
+            }
+        except caldav_error.DeleteError as e:
+            status = self._status_from_dav_error(e)
+            if kind == "todo":
+                repaired = await self._repair_todo_trash_collision(obj, uid)
+                if repaired is not None:
+                    return repaired
+            logger.warning(
+                "Server refused to delete %s %s (status %s)",
+                kind,
+                uid,
+                status if status is not None else "unknown",
+            )
+            return {
+                "success": False,
+                "status_code": status if status is not None else 500,
+                "message": self._delete_refusal_message(status, kind),
+                "reason": str(e),
+            }
+
+    @staticmethod
+    def _is_calendar_trashbin_collision(response: Any) -> bool:
+        """Recognize Nextcloud's exact stale calendar-trash refusal."""
+        return (
+            response.status == 403
+            and "therefore this object can't be moved into the trashbin" in response.raw
+        )
+
+    async def _purge_todo_trash_entries(self, todo_uid: str) -> int:
+        """Permanently remove stale trash entries with this exact VTODO UID."""
+        trash_url = urljoin(self._calendar_home_url, "trashbin/objects/")
+        ns_dav = "DAV:"
+        ns_caldav = "urn:ietf:params:xml:ns:caldav"
+        query = etree.Element(
+            f"{{{ns_caldav}}}calendar-query",
+            nsmap={"d": ns_dav, "c": ns_caldav},
+        )
+        prop = etree.SubElement(query, f"{{{ns_dav}}}prop")
+        etree.SubElement(prop, f"{{{ns_dav}}}getetag")
+        etree.SubElement(prop, f"{{{ns_caldav}}}calendar-data")
+        root_filter = etree.SubElement(query, f"{{{ns_caldav}}}filter")
+        calendar_filter = etree.SubElement(
+            root_filter, f"{{{ns_caldav}}}comp-filter", name="VCALENDAR"
+        )
+        todo_filter = etree.SubElement(
+            calendar_filter, f"{{{ns_caldav}}}comp-filter", name="VTODO"
+        )
+        uid_filter = etree.SubElement(
+            todo_filter, f"{{{ns_caldav}}}prop-filter", name="UID"
+        )
+        text_match = etree.SubElement(
+            uid_filter, f"{{{ns_caldav}}}text-match", collation="i;octet"
+        )
+        text_match.text = todo_uid
+
+        response = await self._dav_client.request(
+            trash_url,
+            method="REPORT",
+            body=etree.tostring(query, encoding="unicode"),
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        )
+        if response.status != 207:
+            raise RuntimeError(
+                f"calendar trashbin query returned HTTP {response.status}"
+            )
+
+        document = etree.fromstring(response.raw.encode("utf-8"))
+        matching_urls: list[str] = []
+        for item in document.findall(f".//{{{ns_dav}}}response"):
+            href = item.findtext(f"{{{ns_dav}}}href")
+            raw_ical = item.findtext(f".//{{{ns_caldav}}}calendar-data")
+            if not href or not raw_ical:
+                continue
+            calendar_data = Calendar.from_ical(raw_ical)
+            if any(
+                component.name == "VTODO" and str(component.get("uid", "")) == todo_uid
+                for component in calendar_data.walk()
+            ):
+                matching_urls.append(urljoin(trash_url, href))
+
+        purged = 0
+        for resource_url in matching_urls:
+            delete_response = await self._dav_client.delete(resource_url)
+            if delete_response.status == 404:
+                continue
+            if delete_response.status not in (200, 204):
+                raise RuntimeError(
+                    f"calendar trashbin purge returned HTTP {delete_response.status}"
+                )
+            purged += 1
+        return purged
+
+    async def _repair_todo_trash_collision(
+        self, todo: Any, todo_uid: str
+    ) -> dict[str, Any] | None:
+        """Repair only the server's exact stale-trash collision, never generic 403s."""
+        try:
+            response = await self._dav_client.delete(
+                str(todo.url), headers={"X-NC-Scheduling": "false"}
+            )
+            if not self._is_calendar_trashbin_collision(response):
+                return None
+            purged = await self._purge_todo_trash_entries(todo_uid)
+            if not purged:
+                return None
+            retry = await self._dav_client.delete(
+                str(todo.url), headers={"X-NC-Scheduling": "false"}
+            )
+            if retry.status == 404:
+                return {"status_code": 404}
+            if retry.status in (200, 204):
+                return {
+                    "status_code": 204,
+                    "stale_trash_entries_purged": purged,
+                }
+            raise RuntimeError(
+                f"DELETE after calendar trashbin repair returned HTTP {retry.status}"
+            )
+        except Exception as repair_error:
+            logger.warning(
+                "Calendar trashbin repair failed for todo %s: %s",
+                todo_uid,
+                repair_error,
+            )
+            return None
+
+    @staticmethod
+    def _delete_refusal_message(status: int | None, kind: str) -> str:
+        """Explain a delete refusal in terms of its likely cause."""
+        if status == 403:
+            return (
+                f"The server refused to delete this {kind}. Nextcloud rejects "
+                "deletion of scheduled (iMIP) objects — if you are an attendee, "
+                "decline the invitation instead; if you are the organizer, cancel "
+                "it so attendees are notified."
+            )
+        if status in (409, 412, 500):
+            return (
+                f"The server refused to delete this {kind}, most likely because a "
+                "previously-deleted object with the same UID is still in the "
+                "calendar trashbin. Empty the trashbin in the Nextcloud Calendar "
+                "UI and retry."
+            )
+        return f"The server refused to delete this {kind}" + (
+            f" (HTTP {status})." if status is not None else "."
+        )
+
+    async def delete_event(self, calendar_name: str, event_uid: str) -> dict[str, Any]:
+        """Delete a calendar event.
+
+        Returns a structured result rather than raising on a server refusal —
+        see :meth:`_delete_dav_object`.
+        """
+        return await self._delete_dav_object(
+            calendar_name, event_uid, cdav.CompFilter("VEVENT"), "event"
+        )
 
     async def get_event(
         self, calendar_name: str, event_uid: str
@@ -850,171 +1071,15 @@ class CalendarClient:
             logger.error("Error updating todo %s: %s", todo_uid, e)
             raise
 
-    async def _delete_todo_without_scheduling(self, todo: Any) -> Any:
-        """Delete one resolved calendar resource and retain the DAV response."""
-        return await self._dav_client.delete(
-            str(todo.url), headers={"X-NC-Scheduling": "false"}
-        )
-
-    @staticmethod
-    def _is_calendar_trashbin_collision(response: Any) -> bool:
-        """Recognize Nextcloud's specific stale calendar-trash failure."""
-        return (
-            response.status == 403
-            and "therefore this object can't be moved into the trashbin" in response.raw
-        )
-
-    async def _purge_todo_trash_entries(self, todo_uid: str) -> int:
-        """Permanently remove stale trash entries with this exact VTODO UID.
-
-        Nextcloud server #61881 uses the same repair while creating a calendar
-        object: a deleted object with the requested UID is force-deleted before
-        creation continues. This client-side equivalent is reached only after
-        the server reports its exact trashbin URI-collision error.
-        """
-        trash_url = urljoin(self._calendar_home_url, "trashbin/objects/")
-        ns_dav = "DAV:"
-        ns_caldav = "urn:ietf:params:xml:ns:caldav"
-        query = etree.Element(
-            f"{{{ns_caldav}}}calendar-query",
-            nsmap={"d": ns_dav, "c": ns_caldav},
-        )
-        prop = etree.SubElement(query, f"{{{ns_dav}}}prop")
-        etree.SubElement(prop, f"{{{ns_dav}}}getetag")
-        etree.SubElement(prop, f"{{{ns_caldav}}}calendar-data")
-        root_filter = etree.SubElement(query, f"{{{ns_caldav}}}filter")
-        calendar_filter = etree.SubElement(
-            root_filter, f"{{{ns_caldav}}}comp-filter", name="VCALENDAR"
-        )
-        todo_filter = etree.SubElement(
-            calendar_filter, f"{{{ns_caldav}}}comp-filter", name="VTODO"
-        )
-        uid_filter = etree.SubElement(
-            todo_filter, f"{{{ns_caldav}}}prop-filter", name="UID"
-        )
-        text_match = etree.SubElement(
-            uid_filter,
-            f"{{{ns_caldav}}}text-match",
-            collation="i;octet",
-        )
-        text_match.text = todo_uid
-
-        response = await self._dav_client.request(
-            trash_url,
-            method="REPORT",
-            body=etree.tostring(query, encoding="unicode"),
-            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-        )
-        if response.status != 207:
-            raise RuntimeError(
-                f"calendar trashbin query returned HTTP {response.status}"
-            )
-
-        document = etree.fromstring(response.raw.encode("utf-8"))
-        matching_urls: list[str] = []
-        for item in document.findall(f".//{{{ns_dav}}}response"):
-            href = item.findtext(f"{{{ns_dav}}}href")
-            raw_ical = item.findtext(f".//{{{ns_caldav}}}calendar-data")
-            if not href or not raw_ical:
-                continue
-            calendar_data = Calendar.from_ical(raw_ical)
-            if any(
-                component.name == "VTODO" and str(component.get("uid", "")) == todo_uid
-                for component in calendar_data.walk()
-            ):
-                matching_urls.append(urljoin(trash_url, href))
-
-        purged = 0
-        for resource_url in matching_urls:
-            delete_response = await self._dav_client.delete(resource_url)
-            if delete_response.status == 404:
-                continue
-            if delete_response.status not in (200, 204):
-                raise RuntimeError(
-                    f"calendar trashbin purge returned HTTP {delete_response.status}"
-                )
-            purged += 1
-
-        if purged:
-            logger.warning(
-                "Permanently purged %s stale calendar trash entr%s for VTODO UID %s",
-                purged,
-                "y" if purged == 1 else "ies",
-                todo_uid,
-            )
-        return purged
-
     async def delete_todo(self, calendar_name: str, todo_uid: str) -> dict[str, Any]:
-        """Delete a todo/task."""
-        await self._ensure_calendar_home()
-        calendar = self._get_calendar(calendar_name)
+        """Delete a todo/task.
 
-        try:
-            todo = await self._async_object_by_uid(
-                calendar, todo_uid, cdav.CompFilter("VTODO")
-            )
-            await _maybe_await(todo.delete())
-            logger.debug("Deleted todo %s", todo_uid)
-            return {"status_code": 204}
-        except caldav_error.NotFoundError as e:
-            logger.debug("Todo %s not found: %s", todo_uid, e)
-            return {"status_code": 404}
-        except caldav_error.AuthorizationError as e:
-            # Retain the low-level DAV response so an exact Nextcloud
-            # calendar-trash URI collision can be distinguished from ordinary
-            # authorization failures. Scheduling suppression is harmless for a
-            # direct object delete and avoids conflating the two server paths.
-            logger.debug(
-                "Todo %s DELETE rejected (%s) - checking DAV response",
-                todo_uid,
-                e,
-            )
-            fallback_error: Exception | None = None
-            try:
-                response = await self._delete_todo_without_scheduling(todo)
-                if response.status == 404:
-                    return {"status_code": 404}
-                if response.status in (200, 204):
-                    return {"status_code": 204}
-                if self._is_calendar_trashbin_collision(response):
-                    purged = await self._purge_todo_trash_entries(todo_uid)
-                    if purged:
-                        retry = await self._delete_todo_without_scheduling(todo)
-                        if retry.status == 404:
-                            return {"status_code": 404}
-                        if retry.status in (200, 204):
-                            return {
-                                "status_code": 204,
-                                "stale_trash_entries_purged": purged,
-                            }
-                        raise RuntimeError(
-                            "DELETE after calendar trashbin repair returned "
-                            f"HTTP {retry.status}"
-                        )
-            except caldav_error.NotFoundError:
-                return {"status_code": 404}
-            except Exception as repair_error:
-                fallback_error = repair_error
-                logger.warning(
-                    "Calendar trashbin repair failed for todo %s: %s",
-                    todo_uid,
-                    repair_error,
-                )
-
-            response: dict[str, Any] = {
-                "status_code": 403,
-                "error": (
-                    "server rejected DELETE; no exact recoverable calendar "
-                    "trashbin collision was found"
-                ),
-                "suggestion": (
-                    "inspect the Nextcloud CalDAV response and calendar "
-                    "trashbin before retrying"
-                ),
-            }
-            if fallback_error is not None:
-                response["fallback_error"] = str(fallback_error)
-            return response
+        Returns a structured result rather than raising on a server refusal —
+        see :meth:`_delete_dav_object`.
+        """
+        return await self._delete_dav_object(
+            calendar_name, todo_uid, cdav.CompFilter("VTODO"), "todo"
+        )
 
     async def search_todos_across_calendars(
         self, filters: dict[str, Any] | None = None
@@ -1065,21 +1130,62 @@ class CalendarClient:
             )
             return None
 
+    @staticmethod
+    def _stored_is_all_day(component, prop: str = "DTSTART") -> bool | None:
+        """Whether ``prop`` on the stored component is a DATE (all-day) value.
+
+        Returns ``None`` when the property is absent, so callers can distinguish
+        "unknown" from "timed" — the update path needs that difference to decide
+        whether to inherit the stored value type or fall back to a default.
+        """
+        value = component.get(prop)
+        if value is None:
+            return None
+        inner = getattr(value, "dt", None)
+        if inner is None:
+            return None
+        return isinstance(inner, dt.date) and not isinstance(inner, dt.datetime)
+
+    @staticmethod
+    def _stored_tzid(component, prop: str = "DTSTART") -> str | None:
+        """Return the TZID parameter on ``prop``, if the stored value carries one.
+
+        ``None`` for all-day, floating and UTC values — none of which should have
+        a zone inherited onto them.
+        """
+        value = component.get(prop)
+        if value is None:
+            return None
+        tzid = getattr(value, "params", {}).get("TZID")
+        return str(tzid) if tzid else None
+
     @classmethod
     def _parse_event_datetime(
-        cls, dt_str: str, tz_name: str | None = None
+        cls,
+        dt_str: str,
+        tz_name: str | None = None,
+        *,
+        inherited_tz: str | None = None,
     ) -> tuple[dt.datetime, ZoneInfo | None]:
         """Parse an ISO datetime string with optional TZID application.
 
         Returns ``(parsed_dt, applied_zoneinfo)`` where ``applied_zoneinfo``
-        is non-None only when ``tz_name`` was applied to a naive input — the
+        is non-None only when a zone was applied to a naive input — the
         caller uses this to know whether to emit a VTIMEZONE component.
+
+        ``tz_name`` is the caller's explicit request; ``inherited_tz`` is the TZID
+        already on the stored property. They are separate parameters on purpose:
+        passing the stored zone as ``tz_name`` would fire the "explicit offset;
+        ignoring timezone" warning spuriously on every offset-bearing update, and
+        would override a caller who deliberately wants floating time. Explicit
+        always wins over inherited.
         """
         parsed = dt.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
         zi = cls._resolve_timezone(tz_name) if tz_name else None
 
         if parsed.tzinfo is not None:
-            if zi is not None:
+            # Only complain about a zone the caller actually asked for.
+            if tz_name:
                 logger.warning(
                     "Datetime %r has an explicit offset; ignoring timezone=%r",
                     dt_str,
@@ -1090,102 +1196,66 @@ class CalendarClient:
         if zi is not None:
             return parsed.replace(tzinfo=zi), zi
 
+        if inherited_tz:
+            # Resolve quietly. A stored TZID is not guaranteed to be an IANA name:
+            # icalendar renders a fixed-offset tzinfo as TZID="UTC-04:00" with no
+            # VTIMEZONE, so inheriting one is expected to fail. Routing that
+            # through _resolve_timezone would log "Unknown IANA timezone", which
+            # reads as an error when the floating-time fallback below is the
+            # correct, harmless outcome. An explicit `timezone=` from the caller
+            # still warns — that one really is a mistake worth surfacing.
+            try:
+                inherited_zi = ZoneInfo(inherited_tz)
+            except (ZoneInfoNotFoundError, ValueError):
+                logger.debug(
+                    "Stored TZID %r is not an IANA name; not inheriting it",
+                    inherited_tz,
+                )
+                inherited_zi = None
+            if inherited_zi is not None:
+                # Inheriting is the expected behaviour, not a problem — debug, not
+                # warning. Without this, updating the time of a TZID-bound event
+                # without re-passing `timezone` silently produced floating time.
+                logger.debug(
+                    "Datetime %r is naive; inheriting stored TZID=%r",
+                    dt_str,
+                    inherited_tz,
+                )
+                return parsed.replace(tzinfo=inherited_zi), inherited_zi
+
         logger.warning(
             "Datetime %r is naive and no timezone was supplied — storing as RFC 5545 floating local time",
             dt_str,
         )
         return parsed, None
 
-    _TORONTO_TZ = ZoneInfo("America/Toronto")
-
-    @classmethod
-    def _parse_caldav_datetime(
-        cls, value: str, *, all_day: bool = False
-    ) -> dt.datetime | dt.date:
-        """Parse a CalDAV value without losing wall-clock timezone semantics.
-
-        All-day values become dates. Timed values must include an offset or
-        ``Z``. Fixed offsets matching Toronto on the target date are promoted
-        to ``America/Toronto`` so recurring and subsequently edited values keep
-        their wall-clock meaning across DST. Other offsets remain unchanged.
-        """
-        if all_day:
-            return dt.date.fromisoformat(value.split("T", maxsplit=1)[0])
-
-        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
-        try:
-            parsed = dt.datetime.fromisoformat(normalized)
-        except ValueError as exc:
-            raise ValueError(f"Datetime is not valid ISO 8601: {value!r}") from exc
-
-        if parsed.tzinfo is None:
-            raise ValueError(
-                f"Datetime missing timezone offset: {value!r}. "
-                "Provide Z or an explicit +/-HH:MM offset."
-            )
-
-        offset = parsed.utcoffset()
-        if isinstance(parsed.tzinfo, dt.timezone) and offset != dt.timedelta(0):
-            toronto_value = parsed.replace(tzinfo=cls._TORONTO_TZ)
-            if toronto_value.utcoffset() == offset:
-                parsed = toronto_value
-
-        return parsed
-
     @staticmethod
     def _decode_ical_value(value: Any) -> str:
-        """Return a JSON-friendly RFC5545 value string."""
-        if value is None:
-            return ""
         if hasattr(value, "to_ical"):
             raw = value.to_ical()
-            if isinstance(raw, bytes):
-                return raw.decode("utf-8")
-            return str(raw)
+            return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         return str(value)
 
     @classmethod
     def _extract_ical_values(cls, value: Any) -> list[str]:
-        """Return one or more JSON-friendly strings for a possibly repeated property."""
         if value is None:
             return []
-        if isinstance(value, list):
-            return [cls._decode_ical_value(item) for item in value]
-        return [cls._decode_ical_value(value)]
+        values = value if isinstance(value, list) else [value]
+        return [cls._decode_ical_value(item) for item in values]
 
     @staticmethod
     def _parse_alarm_datetime(value: str) -> dt.datetime:
-        """Parse an absolute alarm trigger datetime from ISO or basic iCalendar."""
         cleaned = value.strip().replace("Z", "+00:00")
         try:
             return dt.datetime.fromisoformat(cleaned)
         except ValueError:
-            # RFC5545 basic format, with optional UTC suffix.
             utc = value.strip().endswith("Z")
-            basic = value.strip().removesuffix("Z")
-            parsed = dt.datetime.strptime(basic, "%Y%m%dT%H%M%S")
-            if utc:
-                parsed = parsed.replace(tzinfo=dt.UTC)
-            return parsed
-
-    @staticmethod
-    def _format_alarm_datetime(value: dt.datetime, tzid: str | None = None) -> str:
-        """Return an ISO datetime, preserving simple UTC±HH:MM TZIDs as offsets."""
-        if value.tzinfo is not None:
-            return value.isoformat()
-        if tzid and tzid.startswith("UTC") and len(tzid) == 9:
-            sign = 1 if tzid[3] == "+" else -1
-            try:
-                hours = int(tzid[4:6])
-                minutes = int(tzid[7:9])
-            except ValueError:
-                return value.isoformat()
-            offset = dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
-            return value.replace(tzinfo=offset).isoformat()
-        return value.isoformat()
+            parsed = dt.datetime.strptime(
+                value.strip().removesuffix("Z"), "%Y%m%dT%H%M%S"
+            )
+            return parsed.replace(tzinfo=dt.UTC) if utc else parsed
 
     def _extract_valarms(self, component: Any) -> list[dict[str, Any]]:
-        """Extract VALARM components as ordered, JSON-friendly reminder dicts."""
         reminders: list[dict[str, Any]] = []
         for index, alarm in enumerate(
             sub for sub in component.subcomponents if sub.name == "VALARM"
@@ -1196,139 +1266,96 @@ class CalendarClient:
                 "index": index,
                 "action": str(alarm.get("action", "DISPLAY")),
             }
-
-            description = alarm.get("description")
-            if description is not None:
-                reminder["description"] = str(description)
-
-            summary = alarm.get("summary")
-            if summary is not None:
-                reminder["summary"] = str(summary)
-
+            for source, target in (
+                ("description", "description"),
+                ("summary", "summary"),
+            ):
+                value = alarm.get(source)
+                if value is not None:
+                    reminder[target] = str(value)
             repeat = alarm.get("repeat")
             if repeat is not None:
                 reminder["repeat"] = int(repeat)
-
             duration = alarm.get("duration")
-            duration_dt = getattr(duration, "dt", None)
             if duration is not None:
                 reminder["duration"] = self._decode_ical_value(duration)
+                duration_dt = getattr(duration, "dt", None)
                 if isinstance(duration_dt, dt.timedelta):
                     reminder["duration_seconds"] = int(duration_dt.total_seconds())
-
             attendees = self._extract_ical_values(alarm.get("attendee"))
             if attendees:
                 reminder["attendees"] = [
-                    attendee.replace("mailto:", "", 1) for attendee in attendees
+                    value.removeprefix("mailto:") for value in attendees
                 ]
-
             attachments = self._extract_ical_values(alarm.get("attach"))
             if attachments:
                 reminder["attachments"] = attachments
-
             if trigger is not None:
                 reminder["trigger"] = self._decode_ical_value(trigger)
                 params = getattr(trigger, "params", {}) or {}
-                related = params.get("RELATED")
-                if related:
-                    reminder["related"] = str(related)
-                value_param = params.get("VALUE")
-                if value_param:
-                    reminder["value"] = str(value_param)
-                tzid = params.get("TZID")
-                if tzid:
-                    reminder["trigger_tz"] = str(tzid)
-
+                if params.get("RELATED"):
+                    reminder["related"] = str(params["RELATED"])
                 if isinstance(trigger_dt, dt.datetime):
-                    reminder["trigger_at"] = self._format_alarm_datetime(
-                        trigger_dt, str(tzid) if tzid else None
-                    )
+                    reminder["trigger_at"] = trigger_dt.isoformat()
                 elif isinstance(trigger_dt, dt.timedelta):
-                    total_seconds = int(trigger_dt.total_seconds())
-                    reminder["offset_seconds"] = total_seconds
-                    if total_seconds < 0 and total_seconds % 60 == 0:
-                        reminder["minutes_before"] = abs(total_seconds) // 60
-
+                    seconds = int(trigger_dt.total_seconds())
+                    reminder["offset_seconds"] = seconds
+                    if seconds < 0 and seconds % 60 == 0:
+                        reminder["minutes_before"] = abs(seconds) // 60
             reminders.append(reminder)
         return reminders
 
     def _build_valarm(self, reminder: dict[str, Any]) -> Alarm:
-        """Build a VALARM component from a reminder dict."""
         alarm = Alarm()
         alarm.add("action", reminder.get("action", "DISPLAY"))
         alarm.add("description", reminder.get("description", "Event reminder"))
-
         if reminder.get("summary"):
             alarm.add("summary", str(reminder["summary"]))
-
         if "repeat" in reminder:
             alarm.add("repeat", int(reminder["repeat"]))
-
         if "duration_seconds" in reminder:
             alarm.add(
                 "duration", dt.timedelta(seconds=int(reminder["duration_seconds"]))
             )
         elif reminder.get("duration"):
             alarm.add("duration", vDDDTypes.from_ical(str(reminder["duration"])))
-
         attendees = reminder.get("attendees") or []
-        if isinstance(attendees, str):
-            attendees = [attendees]
-        for attendee in attendees:
-            attendee_value = str(attendee)
-            if not attendee_value.lower().startswith("mailto:"):
-                attendee_value = f"mailto:{attendee_value}"
-            alarm.add("attendee", attendee_value)
-
+        for attendee in [attendees] if isinstance(attendees, str) else attendees:
+            value = str(attendee)
+            alarm.add(
+                "attendee",
+                value if value.lower().startswith("mailto:") else f"mailto:{value}",
+            )
         attachments = reminder.get("attachments") or []
-        if isinstance(attachments, str):
-            attachments = [attachments]
-        for attachment in attachments:
+        for attachment in (
+            [attachments] if isinstance(attachments, str) else attachments
+        ):
             alarm.add("attach", str(attachment))
-
-        params: dict[str, str] = {}
-        related = reminder.get("related")
-        if related:
-            params["RELATED"] = str(related)
-
+        params = (
+            {"RELATED": str(reminder["related"])} if reminder.get("related") else {}
+        )
         if reminder.get("trigger_at"):
-            trigger_dt = self._parse_alarm_datetime(str(reminder["trigger_at"]))
             params["VALUE"] = "DATE-TIME"
-            alarm.add("trigger", trigger_dt, parameters=params)
+            trigger = self._parse_alarm_datetime(str(reminder["trigger_at"]))
         elif reminder.get("trigger"):
-            trigger_value = str(reminder["trigger"])
-            if trigger_value.startswith(("P", "-P", "+P")):
-                alarm.add(
-                    "trigger", vDDDTypes.from_ical(trigger_value), parameters=params
-                )
-            else:
-                params["VALUE"] = "DATE-TIME"
-                alarm.add(
-                    "trigger",
-                    self._parse_alarm_datetime(trigger_value),
-                    parameters=params,
-                )
+            raw_trigger = str(reminder["trigger"])
+            trigger = (
+                vDDDTypes.from_ical(raw_trigger)
+                if raw_trigger.startswith(("P", "-P", "+P"))
+                else self._parse_alarm_datetime(raw_trigger)
+            )
         elif "minutes_before" in reminder:
-            alarm.add(
-                "trigger",
-                dt.timedelta(minutes=-int(reminder["minutes_before"])),
-                parameters=params,
-            )
+            trigger = dt.timedelta(minutes=-int(reminder["minutes_before"]))
         elif "offset_seconds" in reminder:
-            alarm.add(
-                "trigger",
-                dt.timedelta(seconds=int(reminder["offset_seconds"])),
-                parameters=params,
-            )
+            trigger = dt.timedelta(seconds=int(reminder["offset_seconds"]))
         else:
-            alarm.add("trigger", dt.timedelta(minutes=-15), parameters=params)
-
+            trigger = dt.timedelta(minutes=-15)
+        alarm.add("trigger", trigger, parameters=params)
         return alarm
 
     def _sync_valarms_by_index(
         self, component: Any, reminders: list[dict[str, Any]]
     ) -> None:
-        """Synchronize VALARM subcomponents as an ordered list."""
         component.subcomponents = [
             sub for sub in component.subcomponents if sub.name != "VALARM"
         ]
@@ -1338,19 +1365,14 @@ class CalendarClient:
     def _add_reminders_or_legacy_alarm(
         self, component: Any, data: dict[str, Any], default_description: str
     ) -> None:
-        """Apply explicit reminders, else backward-compatible reminder_minutes."""
         if "reminders" in data:
             self._sync_valarms_by_index(component, data.get("reminders") or [])
-            return
-
-        reminder_minutes = data.get("reminder_minutes", 0)
-        if reminder_minutes > 0:
+        elif data.get("reminder_minutes", 0) > 0:
             component.add_component(
                 self._build_valarm(
                     {
-                        "action": "DISPLAY",
                         "description": default_description,
-                        "minutes_before": reminder_minutes,
+                        "minutes_before": data["reminder_minutes"],
                     }
                 )
             )
@@ -1420,9 +1442,6 @@ class CalendarClient:
             if recurrence_rule:
                 event.add("rrule", vRecur.from_ical(recurrence_rule))
 
-        # Add alarms/reminders. Explicit ``reminders`` is the full ordered
-        # VALARM list; ``reminder_minutes`` remains the backward-compatible
-        # shorthand for a single DISPLAY alarm.
         self._add_reminders_or_legacy_alarm(event, event_data, "Event reminder")
 
         # Add attendees
@@ -1519,148 +1538,280 @@ class CalendarClient:
             logger.error("Error parsing iCalendar event: %s", e)
             return None
 
+    @staticmethod
+    def _validate_all_day_flip(
+        target_all_day: bool, has_start: bool, has_end: bool
+    ) -> None:
+        """Reject flips between all-day and timed that can't produce valid iCal.
+
+        Only called when the update actually changes the value type.
+        """
+        if (has_start or has_end) and not (has_start and has_end):
+            raise ValueError(
+                "changing an event between all-day and timed requires both "
+                "start_datetime and end_datetime, so DTSTART and DTEND cannot "
+                "end up with mismatched value types"
+            )
+        if not has_start and not has_end and not target_all_day:
+            raise ValueError(
+                "converting an all-day event to a timed one requires "
+                "start_datetime and end_datetime — there is no defensible "
+                "time-of-day to invent"
+            )
+
+    def _apply_date_updates(
+        self, component, event_data: dict[str, Any]
+    ) -> set[ZoneInfo]:
+        """Write DTSTART/DTEND onto ``component``, preserving its stored shape.
+
+        Returns the set of zones applied, so the caller can emit the matching
+        VTIMEZONE components.
+
+        Two properties of the stored event are inherited when the caller does not
+        override them, because reading them from ``event_data`` alone is what made
+        updates lossy:
+
+        * **Value type.** ``all_day`` was previously read as
+          ``event_data.get("all_day", False)`` independently in each branch, so
+          updating an all-day event's start without re-passing ``all_day=True``
+          rewrote DTSTART as a naive DATE-TIME — RFC 5545 floating time — and could
+          leave DTSTART and DTEND with mismatched value types, which is invalid
+          iCalendar.
+        * **TZID.** Inherited *per property*: DTSTART and DTEND may legally carry
+          different zones, so sharing DTSTART's would silently relocate the end.
+        """
+        tz_name = event_data.get("timezone", "")
+        used_timezones: set[ZoneInfo] = set()
+
+        has_start = "start_datetime" in event_data
+        has_end = "end_datetime" in event_data
+        if not has_start and not has_end and "all_day" not in event_data:
+            return used_timezones
+
+        stored_all_day = self._stored_is_all_day(component, "DTSTART")
+        if stored_all_day is None:
+            stored_all_day = self._stored_is_all_day(component, "DTEND")
+
+        # Computed once. Falling back to the *stored* type is the fix: absent an
+        # explicit `all_day`, the event keeps the shape it already had.
+        if "all_day" in event_data:
+            target_all_day = bool(event_data["all_day"])
+        else:
+            target_all_day = bool(stored_all_day)
+
+        # ``stored_all_day is None`` means neither DTSTART nor DTEND gave a
+        # definitive type — a VEVENT with no dates at all. There is nothing to
+        # flip *from*, so flip validation is deliberately skipped rather than
+        # guessing; ``bool(None)`` then treats the target as timed, matching the
+        # pre-existing default.
+        flipping = stored_all_day is not None and target_all_day != stored_all_day
+
+        if flipping:
+            self._validate_all_day_flip(target_all_day, has_start, has_end)
+            if not has_start and not has_end:
+                # Timed -> all-day with no new datetimes is well defined: take the
+                # dates off the stored values. (The converse already raised.)
+                self._convert_component_to_all_day(component)
+                return used_timezones
+
+        if has_start:
+            self._write_date_property(
+                component,
+                "DTSTART",
+                event_data["start_datetime"],
+                target_all_day,
+                tz_name,
+                used_timezones,
+            )
+        if has_end:
+            self._write_date_property(
+                component,
+                "DTEND",
+                event_data["end_datetime"],
+                target_all_day,
+                tz_name,
+                used_timezones,
+            )
+
+        if target_all_day:
+            # Apply the same zero-length guard the implicit conversion path uses.
+            # An explicit ``all_day=True`` with start and end resolving to the same
+            # calendar date would otherwise write ``DTEND == DTSTART`` — the very
+            # zero-length DATE range this method rejects elsewhere.
+            self._clamp_all_day_end(component)
+
+        return used_timezones
+
+    def _write_date_property(
+        self,
+        component,
+        prop: str,
+        value: str,
+        all_day: bool,
+        tz_name: str,
+        used_timezones: set[ZoneInfo],
+    ) -> None:
+        """Write one DATE or DATE-TIME property, inheriting that property's TZID."""
+        if all_day:
+            component[prop] = vDDDTypes(
+                dt.datetime.fromisoformat(value.split("T")[0]).date()
+            )
+            return
+
+        parsed, zi = self._parse_event_datetime(
+            value, tz_name, inherited_tz=self._stored_tzid(component, prop)
+        )
+        if zi is not None:
+            used_timezones.add(zi)
+        component[prop] = vDDDTypes(parsed)
+
+    @staticmethod
+    def _clamp_all_day_end(component) -> None:
+        """Ensure an all-day ``DTEND`` is at least the day after ``DTSTART``.
+
+        ``DTEND == DTSTART`` is a zero-length DATE range and invalid per RFC 5545.
+        Shared by both routes that can produce one: the implicit timed -> all-day
+        conversion (``.date()`` on a 09:00-10:00 event collapses both ends onto the
+        same day) and an explicit ``all_day=True`` whose supplied start and end
+        resolve to the same calendar date. A no-op unless both are DATE values.
+        """
+        start_value = component.get("DTSTART")
+        end_value = component.get("DTEND")
+        if start_value is None or end_value is None:
+            return
+        start_date, end_date = start_value.dt, end_value.dt
+        if isinstance(start_date, dt.datetime) or isinstance(end_date, dt.datetime):
+            return  # not an all-day pair; nothing to clamp
+        if end_date <= start_date:
+            component["DTEND"] = vDDDTypes(start_date + dt.timedelta(days=1))
+
+    @classmethod
+    def _convert_component_to_all_day(cls, component) -> None:
+        """Re-write stored DTSTART/DTEND as DATE values."""
+        start_value = component.get("DTSTART")
+        if start_value is None:
+            return
+        start_date = start_value.dt
+        start_date = (
+            start_date.date() if isinstance(start_date, dt.datetime) else start_date
+        )
+        component["DTSTART"] = vDDDTypes(start_date)
+
+        end_value = component.get("DTEND")
+        if end_value is not None:
+            end_date = end_value.dt
+            end_date = (
+                end_date.date() if isinstance(end_date, dt.datetime) else end_date
+            )
+            component["DTEND"] = vDDDTypes(end_date)
+
+        cls._clamp_all_day_end(component)
+
     def _merge_ical_properties(
-        self, raw_ical: str, event_data: dict[str, Any], event_uid: str
+        self,
+        raw_ical: str,
+        event_data: dict[str, Any],
+        event_uid: str | None = None,
     ) -> str:
-        """Merge new event data into existing raw iCal while preserving all properties."""
-        try:
-            cal = Calendar.from_ical(raw_ical)
+        """Merge new event data into existing raw iCal while preserving all properties.
 
-            for component in cal.walk():
-                if component.name == "VEVENT":
-                    # Update only provided properties
-                    if "title" in event_data:
-                        component["SUMMARY"] = event_data["title"]
-                    if "description" in event_data:
-                        component["DESCRIPTION"] = event_data["description"]
-                    if "location" in event_data:
-                        component["LOCATION"] = event_data["location"]
-                    if "status" in event_data:
-                        component["STATUS"] = event_data["status"].upper()
-                    if "priority" in event_data:
-                        component["PRIORITY"] = event_data["priority"]
-                    if "privacy" in event_data:
-                        component["CLASS"] = event_data["privacy"].upper()
-                    if "url" in event_data:
-                        component["URL"] = event_data["url"]
+        The event's own ``UID`` is carried through from ``raw_ical`` like any other
+        preserved property, so no ``event_uid`` argument is needed. (One used to be
+        required solely by the removed rebuild fallback.)
 
-                    # Handle categories
-                    if "categories" in event_data:
-                        categories_str = event_data["categories"]
-                        if categories_str:
-                            component["CATEGORIES"] = [
-                                c.strip() for c in categories_str.split(",")
-                            ]
-                        elif "CATEGORIES" in component:
-                            del component["CATEGORIES"]
+        Raises on any merge failure rather than substituting a synthesised event.
+        This previously caught every exception and fell back to
+        ``_create_ical_event(event_data, ...)``, which rebuilds the event from the
+        *partial update dict* — destroying summary, location, attendees, alarms,
+        RRULE and every custom property the caller did not happen to pass, while
+        reporting success.
+        """
+        cal = Calendar.from_ical(raw_ical)
 
-                    # Handle recurrence rule
-                    if "recurrence_rule" in event_data:
-                        rrule_str = event_data["recurrence_rule"]
-                        if rrule_str:
-                            component["RRULE"] = vRecur.from_ical(rrule_str)
-                        elif "RRULE" in component:
-                            del component["RRULE"]
+        for component in cal.walk():
+            if component.name == "VEVENT":
+                # Update only provided properties
+                if "title" in event_data:
+                    component["SUMMARY"] = event_data["title"]
+                if "description" in event_data:
+                    component["DESCRIPTION"] = event_data["description"]
+                if "location" in event_data:
+                    component["LOCATION"] = event_data["location"]
+                if "status" in event_data:
+                    component["STATUS"] = event_data["status"].upper()
+                if "priority" in event_data:
+                    component["PRIORITY"] = event_data["priority"]
+                if "privacy" in event_data:
+                    component["CLASS"] = event_data["privacy"].upper()
+                if "url" in event_data:
+                    component["URL"] = event_data["url"]
 
-                    # Handle attendees
-                    if "attendees" in event_data:
-                        attendees_str = event_data["attendees"]
-                        # Remove all existing attendees first
-                        while "ATTENDEE" in component:
-                            del component["ATTENDEE"]
-                        if attendees_str:
-                            for email in attendees_str.split(","):
-                                if email.strip():
-                                    component.add("attendee", f"mailto:{email.strip()}")
+                # Handle categories
+                if "categories" in event_data:
+                    categories_str = event_data["categories"]
+                    if categories_str:
+                        component["CATEGORIES"] = [
+                            c.strip() for c in categories_str.split(",")
+                        ]
+                    elif "CATEGORIES" in component:
+                        del component["CATEGORIES"]
 
-                    # Handle reminders (VALARM). Omitted reminders preserve
-                    # existing alarms; ``reminders: []`` clears them.
-                    if "reminders" in event_data:
-                        self._sync_valarms_by_index(
-                            component, event_data.get("reminders") or []
+                # Handle recurrence rule
+                if "recurrence_rule" in event_data:
+                    rrule_str = event_data["recurrence_rule"]
+                    if rrule_str:
+                        component["RRULE"] = vRecur.from_ical(rrule_str)
+                    elif "RRULE" in component:
+                        del component["RRULE"]
+
+                # Handle attendees
+                if "attendees" in event_data:
+                    attendees_str = event_data["attendees"]
+                    # Remove all existing attendees first
+                    while "ATTENDEE" in component:
+                        del component["ATTENDEE"]
+                    if attendees_str:
+                        for email in attendees_str.split(","):
+                            if email.strip():
+                                component.add("attendee", f"mailto:{email.strip()}")
+
+                if "reminders" in event_data:
+                    self._sync_valarms_by_index(
+                        component, event_data.get("reminders") or []
+                    )
+                elif "reminder_minutes" in event_data:
+                    self._sync_valarms_by_index(component, [])
+                    if event_data["reminder_minutes"] > 0:
+                        component.add_component(
+                            self._build_valarm(
+                                {
+                                    "description": "Event reminder",
+                                    "minutes_before": event_data["reminder_minutes"],
+                                }
+                            )
                         )
-                    elif "reminder_minutes" in event_data:
-                        self._sync_valarms_by_index(component, [])
-                        minutes = event_data["reminder_minutes"]
-                        if minutes > 0:
-                            component.add_component(
-                                self._build_valarm(
-                                    {
-                                        "action": "DISPLAY",
-                                        "description": "Event reminder",
-                                        "minutes_before": minutes,
-                                    }
-                                )
-                            )
 
-                    # Handle dates. Offset-only values use the strict CalDAV
-                    # parser so Toronto wall-clock semantics survive DST.
-                    # An explicit timezone parameter retains the upstream
-                    # floating/TZID behavior implemented by _parse_event_datetime.
-                    tz_name = event_data.get("timezone", "")
-                    used_timezones: set[ZoneInfo] = set()
-                    if "start_datetime" in event_data:
-                        start_str = event_data["start_datetime"]
-                        all_day = event_data.get("all_day", False)
-                        if all_day:
-                            start_value = self._parse_caldav_datetime(
-                                start_str, all_day=True
-                            )
-                        elif tz_name:
-                            start_value, zi = self._parse_event_datetime(
-                                start_str, tz_name
-                            )
-                            if zi is not None:
-                                used_timezones.add(zi)
-                        else:
-                            start_value = self._parse_caldav_datetime(start_str)
-                            if isinstance(start_value, dt.datetime) and isinstance(
-                                start_value.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(start_value.tzinfo)
-                        component["DTSTART"] = vDDDTypes(start_value)
+                # Handle dates
+                used_timezones = self._apply_date_updates(component, event_data)
 
-                    if "end_datetime" in event_data:
-                        end_str = event_data["end_datetime"]
-                        all_day = event_data.get("all_day", False)
-                        if all_day:
-                            end_value = self._parse_caldav_datetime(
-                                end_str, all_day=True
-                            )
-                        elif tz_name:
-                            end_value, zi = self._parse_event_datetime(end_str, tz_name)
-                            if zi is not None:
-                                used_timezones.add(zi)
-                        else:
-                            end_value = self._parse_caldav_datetime(end_str)
-                            if isinstance(end_value, dt.datetime) and isinstance(
-                                end_value.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(end_value.tzinfo)
-                        component["DTEND"] = vDDDTypes(end_value)
+                # Update timestamps
+                now = dt.datetime.now(dt.UTC)
+                component["LAST-MODIFIED"] = vDDDTypes(now)
+                component["DTSTAMP"] = vDDDTypes(now)
 
-                    # Update timestamps
-                    now = dt.datetime.now(dt.UTC)
-                    component["LAST-MODIFIED"] = vDDDTypes(now)
-                    component["DTSTAMP"] = vDDDTypes(now)
+                # Ensure VTIMEZONE definitions exist for any TZID we just attached.
+                existing_tzids = {
+                    str(sub.get("TZID", ""))
+                    for sub in cal.subcomponents
+                    if sub.name == "VTIMEZONE"
+                }
+                for zi in used_timezones:
+                    if str(zi) not in existing_tzids:
+                        cal.add_component(Timezone.from_tzinfo(zi))
 
-                    # Ensure VTIMEZONE definitions exist for any TZID we just attached.
-                    existing_tzids = {
-                        str(sub.get("TZID", ""))
-                        for sub in cal.subcomponents
-                        if sub.name == "VTIMEZONE"
-                    }
-                    for zi in used_timezones:
-                        if str(zi) not in existing_tzids:
-                            cal.add_component(Timezone.from_tzinfo(zi))
+                break
 
-                    break
-
-            return cal.to_ical().decode("utf-8")
-
-        except Exception as e:
-            logger.error("Error merging iCal properties: %s", e)
-            return self._create_ical_event(event_data, event_uid)
+        return cal.to_ical().decode("utf-8")
 
     # ============= Helper Methods - Todo iCalendar =============
 
@@ -1698,7 +1849,6 @@ class CalendarClient:
         todo.add("uid", todo_uid)
         todo.add("summary", todo_data.get("summary", ""))
         todo.add("description", todo_data.get("description", ""))
-        used_timezones: set[ZoneInfo] = set()
 
         # Status
         status = todo_data.get("status", "NEEDS-ACTION").upper()
@@ -1715,29 +1865,19 @@ class CalendarClient:
         # Due date
         due = todo_data.get("due", "")
         if due:
-            due_dt = self._parse_caldav_datetime(due)
-            if isinstance(due_dt, dt.datetime) and isinstance(due_dt.tzinfo, ZoneInfo):
-                used_timezones.add(due_dt.tzinfo)
+            due_dt = self._ensure_timezone_aware(due)
             todo.add("due", vDDDTypes(due_dt))
 
         # Start date
         dtstart = todo_data.get("dtstart", "")
         if dtstart:
-            start_dt = self._parse_caldav_datetime(dtstart)
-            if isinstance(start_dt, dt.datetime) and isinstance(
-                start_dt.tzinfo, ZoneInfo
-            ):
-                used_timezones.add(start_dt.tzinfo)
+            start_dt = self._ensure_timezone_aware(dtstart)
             todo.add("dtstart", vDDDTypes(start_dt))
 
         # Completed timestamp
         completed = todo_data.get("completed", "")
         if completed:
-            completed_dt = self._parse_caldav_datetime(completed)
-            if isinstance(completed_dt, dt.datetime) and isinstance(
-                completed_dt.tzinfo, ZoneInfo
-            ):
-                used_timezones.add(completed_dt.tzinfo)
+            completed_dt = self._ensure_timezone_aware(completed)
             todo.add("completed", vDDDTypes(completed_dt))
 
         # Categories
@@ -1745,7 +1885,6 @@ class CalendarClient:
         if categories:
             todo.add("categories", categories.split(","))
 
-        # Add alarms/reminders
         self._add_reminders_or_legacy_alarm(todo, todo_data, "Todo reminder")
 
         # Add timestamps
@@ -1754,8 +1893,6 @@ class CalendarClient:
         todo.add("dtstamp", now)
         todo.add("last-modified", now)
 
-        for zi in used_timezones:
-            cal.add_component(Timezone.from_tzinfo(zi))
         cal.add_component(todo)
         return cal.to_ical().decode("utf-8")
 
@@ -1818,7 +1955,6 @@ class CalendarClient:
 
             for component in cal.walk():
                 if component.name == "VTODO":
-                    used_timezones: set[ZoneInfo] = set()
                     # Update only provided properties
                     if "summary" in todo_data:
                         component["SUMMARY"] = todo_data["summary"]
@@ -1839,11 +1975,7 @@ class CalendarClient:
                     if "due" in todo_data:
                         due_str = todo_data["due"]
                         if due_str:
-                            due_dt = self._parse_caldav_datetime(due_str)
-                            if isinstance(due_dt, dt.datetime) and isinstance(
-                                due_dt.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(due_dt.tzinfo)
+                            due_dt = self._ensure_timezone_aware(due_str)
                             component["DUE"] = vDDDTypes(due_dt)
                             logger.debug("Set DUE to %s", due_dt)
 
@@ -1851,11 +1983,7 @@ class CalendarClient:
                     if "dtstart" in todo_data:
                         dtstart_str = todo_data["dtstart"]
                         if dtstart_str:
-                            dtstart_dt = self._parse_caldav_datetime(dtstart_str)
-                            if isinstance(dtstart_dt, dt.datetime) and isinstance(
-                                dtstart_dt.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(dtstart_dt.tzinfo)
+                            dtstart_dt = self._ensure_timezone_aware(dtstart_str)
                             component["DTSTART"] = vDDDTypes(dtstart_dt)
                             logger.debug("Set DTSTART to %s", dtstart_dt)
 
@@ -1863,11 +1991,7 @@ class CalendarClient:
                     if "completed" in todo_data:
                         completed_str = todo_data["completed"]
                         if completed_str:
-                            completed_dt = self._parse_caldav_datetime(completed_str)
-                            if isinstance(completed_dt, dt.datetime) and isinstance(
-                                completed_dt.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(completed_dt.tzinfo)
+                            completed_dt = self._ensure_timezone_aware(completed_str)
                             component["COMPLETED"] = vDDDTypes(completed_dt)
                             logger.debug("Set COMPLETED to %s", completed_dt)
 
@@ -1880,22 +2004,18 @@ class CalendarClient:
                             ]
                             logger.debug("Set CATEGORIES to %s", categories_str)
 
-                    # Handle reminders (VALARM). Omitted reminders preserve
-                    # existing alarms; ``reminders: []`` clears them.
                     if "reminders" in todo_data:
                         self._sync_valarms_by_index(
                             component, todo_data.get("reminders") or []
                         )
                     elif "reminder_minutes" in todo_data:
                         self._sync_valarms_by_index(component, [])
-                        minutes = todo_data["reminder_minutes"]
-                        if minutes > 0:
+                        if todo_data["reminder_minutes"] > 0:
                             component.add_component(
                                 self._build_valarm(
                                     {
-                                        "action": "DISPLAY",
                                         "description": "Todo reminder",
-                                        "minutes_before": minutes,
+                                        "minutes_before": todo_data["reminder_minutes"],
                                     }
                                 )
                             )
@@ -1904,15 +2024,6 @@ class CalendarClient:
                     now = dt.datetime.now(dt.UTC)
                     component["LAST-MODIFIED"] = vDDDTypes(now)
                     component["DTSTAMP"] = vDDDTypes(now)
-
-                    existing_tzids = {
-                        str(sub.get("TZID", ""))
-                        for sub in cal.subcomponents
-                        if sub.name == "VTIMEZONE"
-                    }
-                    for zi in used_timezones:
-                        if str(zi) not in existing_tzids:
-                            cal.add_component(Timezone.from_tzinfo(zi))
 
                     break
 

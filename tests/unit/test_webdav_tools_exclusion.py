@@ -7,14 +7,14 @@ Their purpose is **not** to re-test the path-matching logic (covered in
 tool actually consults ``get_excluded_file_paths`` / ``is_path_excluded``
 at the right point and raises / filters as expected.
 
-The decorators on each tool (``@require_scopes``, ``@instrument_tool``)
-are transparent under our mocked ``Context`` (no ``access_token`` set →
-BasicAuth pass-through path).
+The decorators on each tool (``@require_scopes``, ``@instrument_tool``) are
+made transparent by the ``basicauth_mode`` fixture below, which pins the
+deployment mode so these tests exercise path exclusion rather than auth.
 """
 
 import base64
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import anyio
 import pytest
@@ -25,6 +25,28 @@ from nextcloud_mcp_server.models.webdav import WriteFileResponse
 from nextcloud_mcp_server.server.webdav import configure_webdav_tools
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def basicauth_mode():
+    """Pin ``require_scopes`` to the BasicAuth pass-through path.
+
+    These tests invoke tool functions directly, with no transport and so no
+    verified token. Under any OAuth-style mode the decorator now (correctly)
+    denies such a call, so the mode has to be explicit — otherwise the result
+    depends on ambient environment: ``enable_login_flow`` is derived from
+    ``MCP_DEPLOYMENT_MODE`` and defaults to **True** when no Nextcloud
+    credentials are set, so these tests passed on a developer machine with
+    ``NEXTCLOUD_USERNAME``/``PASSWORD`` exported and failed in CI without them.
+
+    Patched narrowly on the scope_authorization module so the WebDAV tools'
+    own ``get_settings()`` calls (size caps, exclusion tags) are untouched.
+    """
+    with patch(
+        "nextcloud_mcp_server.auth.scope_authorization.get_settings",
+        return_value=SimpleNamespace(enable_login_flow=False),
+    ):
+        yield
 
 
 @pytest.fixture
@@ -38,11 +60,14 @@ def webdav_tools() -> dict:
 def _mock_ctx(client) -> SimpleNamespace:
     """Build a minimal Context-shaped object for the tool decorators.
 
-    Setting ``request_context.access_token = None`` causes ``require_scopes``
-    to take the BasicAuth pass-through branch (see scope_authorization.py).
+    With no auth contextvar set and OAuth mode off, ``require_scopes`` takes
+    the BasicAuth pass-through branch (see scope_authorization.py). Note the
+    token is read from the SDK ``auth_context`` contextvar, never from
+    ``request_context`` — setting an ``access_token`` attribute here would
+    have no effect on the decorator.
     """
     ctx = SimpleNamespace()
-    ctx.request_context = SimpleNamespace(access_token=None)
+    ctx.request_context = SimpleNamespace()
     ctx._client = client  # only used by tools that fetch via get_client(ctx)
     return ctx
 
@@ -725,3 +750,65 @@ async def test_write_file_size_gate_disabled_when_max_mb_is_zero(
     await fn(path="/Public/notes.md", content="hi", ctx=_mock_ctx(fake_client))
 
     fake_client.webdav.write_file.assert_awaited_once()
+
+
+# ============= Typed responses for move/copy =============
+#
+# Both tools previously returned the client's raw dict with no return
+# annotation, which the CLAUDE.md response-pattern gate treats as a defect: raw
+# dicts bypass the success/timestamp envelope every other tool provides.
+
+
+@pytest.mark.parametrize(
+    "tool_name,verb",
+    [("nc_webdav_move_resource", "move"), ("nc_webdav_copy_resource", "copy")],
+)
+async def test_move_copy_return_typed_success(
+    webdav_tools, fake_client, patch_get_client, patch_excluded, tool_name, verb
+):
+    patch_get_client(fake_client)
+    patch_excluded(set())
+    getattr(fake_client.webdav, f"{verb}_resource").return_value = {"status_code": 201}
+
+    result = await webdav_tools[tool_name].fn(
+        source_path="/a.txt",
+        destination_path="/b.txt",
+        ctx=_mock_ctx(fake_client),
+        overwrite=False,
+    )
+
+    assert result.success is True
+    assert result.status_code == 201
+    assert result.source_path == "/a.txt"
+    assert result.destination_path == "/b.txt"
+    assert result.overwrite is False
+
+
+@pytest.mark.parametrize(
+    "tool_name,verb",
+    [("nc_webdav_move_resource", "move"), ("nc_webdav_copy_resource", "copy")],
+)
+@pytest.mark.parametrize("status", [404, 409, 412])
+async def test_move_copy_report_conflicts_as_unsuccessful(
+    webdav_tools, fake_client, patch_get_client, patch_excluded, tool_name, verb, status
+):
+    """The client returns rather than raises on these, so the typed response has
+    to carry the failure — otherwise a 412 would arrive inside a success
+    envelope."""
+    patch_get_client(fake_client)
+    patch_excluded(set())
+    getattr(fake_client.webdav, f"{verb}_resource").return_value = {
+        "status_code": status,
+        "message": "nope",
+    }
+
+    result = await webdav_tools[tool_name].fn(
+        source_path="/a.txt",
+        destination_path="/b.txt",
+        ctx=_mock_ctx(fake_client),
+        overwrite=False,
+    )
+
+    assert result.success is False
+    assert result.status_code == status
+    assert result.message == "nope"

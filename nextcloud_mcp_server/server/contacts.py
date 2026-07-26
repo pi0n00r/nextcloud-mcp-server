@@ -87,6 +87,38 @@ def _parse_vcard_fields(
     return fields
 
 
+def _parse_address_fields(raw_values: dict | list | None) -> list[ContactField]:
+    """Project ADR into a stable seven-component RFC 6350 shape."""
+    if not raw_values:
+        return []
+    items = [raw_values] if isinstance(raw_values, dict) else raw_values
+    fields: list[ContactField] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        components = item.get("value") or []
+        if isinstance(components, str):
+            components = components.split(";")
+        components = ([str(value) for value in components] + [""] * 7)[:7]
+        if not any(value.strip() for value in components):
+            continue
+        raw_types = item.get("type") or []
+        preferred = any(str(value).upper() == "PREF" for value in raw_types)
+        labels = [
+            str(value).lower() for value in raw_types if str(value).upper() != "PREF"
+        ]
+        fields.append(
+            ContactField(
+                type="address",
+                value=";".join(components),
+                label=", ".join(labels) if labels else None,
+                preferred=preferred,
+                components=components,
+            )
+        )
+    return fields
+
+
 def _raw_contact_to_model(raw: dict) -> Contact:
     contact_info = raw.get("contact")
     if contact_info is None:
@@ -121,17 +153,22 @@ def _raw_contact_to_model(raw: dict) -> Contact:
     nickname = contact_info.get("nickname")
     if nickname:
         custom_fields["nickname"] = nickname
+    custom_fields.update(contact_info.get("custom") or {})
+    name_parts = contact_info.get("n") or []
     return Contact(
         uid=raw.get("vcard_id") or raw.get("uid"),
         resource_path=raw.get("object_path"),
         fn=contact_info.get("fullname", ""),
         etag=raw.get("getetag") if "getetag" in raw else raw.get("etag"),
         vcard_text=raw.get("vcard_text"),
+        given_name=name_parts[1] or None if len(name_parts) > 1 else None,
+        family_name=name_parts[0] or None if name_parts else None,
         birthday=contact_info["birthday"].isoformat()
         if isinstance(contact_info.get("birthday"), date)
         else contact_info.get("birthday"),
         emails=emails,
         phones=phones,
+        addresses=_parse_address_fields(contact_info.get("adr")),
         organization=contact_info.get("org"),
         title=contact_info.get("title"),
         note=contact_info.get("note"),

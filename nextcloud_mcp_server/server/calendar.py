@@ -10,6 +10,9 @@ from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.calendar import (
     Calendar,
     CalendarEventSummary,
+    CompleteTodoResponse,
+    DeleteEventResponse,
+    DeleteTodoResponse,
     ListCalendarsResponse,
     ListEventsResponse,
     ListTodosResponse,
@@ -19,6 +22,25 @@ from nextcloud_mcp_server.models.calendar import (
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
+
+
+def _completion_payload(completed: str | None = None) -> dict[str, Any]:
+    """Assemble the three properties a VTODO needs to actually read as complete.
+
+    RFC 5545 treats STATUS, PERCENT-COMPLETE and COMPLETED as independent
+    properties, and ``_merge_ical_todo_properties`` gates each on its own key —
+    so setting ``status="COMPLETED"`` alone leaves PERCENT-COMPLETE at its old
+    value and writes no COMPLETED timestamp. Clients that surface progress or
+    completion dates then disagree about whether the task is done.
+
+    ``completed`` defaults to now in UTC.
+    """
+    return {
+        "status": "COMPLETED",
+        "percent_complete": 100,
+        "completed": completed
+        or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+    }
 
 
 def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
@@ -193,9 +215,9 @@ def configure_calendar_tools(mcp: FastMCP):
         """List events in a calendar (or all calendars) within date range with advanced filtering.
 
         Args:
+            ctx: MCP context
             calendar_name: Name of the calendar to search. Required unless
                 search_all_calendars=True, in which case it is ignored.
-            ctx: MCP context
             start_date: Start date for search (YYYY-MM-DD format, e.g., "2025-01-01")
             end_date: End date for search (YYYY-MM-DD format, e.g., "2025-01-31")
             limit: Maximum number of events to return
@@ -210,6 +232,10 @@ def configure_calendar_tools(mcp: FastMCP):
         Returns:
             List of events matching the filters
         """
+        # ``calendar_name`` is genuinely unused when searching every calendar
+        # (the response even reports it as None), so requiring it forced callers
+        # to invent a throwaway value. It stays required otherwise — falling back
+        # to a default calendar would silently search the wrong one.
         if not search_all_calendars and not calendar_name.strip():
             raise ValueError(
                 "calendar_name is required when search_all_calendars is false"
@@ -413,10 +439,23 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         event_uid: str,
         ctx: Context,
-    ):
-        """Delete a calendar event"""
+    ) -> DeleteEventResponse:
+        """Delete a calendar event.
+
+        A missing event is reported as success (status 404) so retries are safe.
+        A server *refusal* — a scheduled/iMIP object, or a stale entry in the
+        calendar trashbin holding the UID — comes back with ``success=False`` and
+        a message explaining the likely cause, rather than raising.
+        """
         client = await get_client(ctx)
-        return await client.calendar.delete_event(calendar_name, event_uid)
+        result = await client.calendar.delete_event(calendar_name, event_uid)
+        return DeleteEventResponse(
+            success=result.get("success", True),
+            status_code=result.get("status_code"),
+            message=result.get("message"),
+            deleted_uid=event_uid,
+            calendar_name=calendar_name,
+        )
 
     @mcp.tool(
         title="Create Meeting",
@@ -756,9 +795,23 @@ def configure_calendar_tools(mcp: FastMCP):
 
             for event in events:
                 try:
-                    await client.calendar.delete_event(
+                    outcome = await client.calendar.delete_event(
                         event.get("calendar_name", calendar_name), event["uid"]
                     )
+                    # A server refusal is now a structured result rather than an
+                    # exception, so it has to be counted explicitly — otherwise it
+                    # would be tallied as a successful delete.
+                    if not outcome.get("success", True):
+                        failed_count += 1
+                        results.append(
+                            {
+                                "uid": event["uid"],
+                                "status": "failed",
+                                "error": outcome.get("message", "delete refused"),
+                                "title": event.get("title", ""),
+                            }
+                        )
+                        continue
                     deleted_count += 1
                     results.append(
                         {
@@ -854,9 +907,30 @@ def configure_calendar_tools(mcp: FastMCP):
                     await client.calendar.create_event(target_calendar, event_data)
 
                     # Delete from source calendar
-                    await client.calendar.delete_event(
+                    outcome = await client.calendar.delete_event(
                         event.get("calendar_name", calendar_name), event["uid"]
                     )
+                    # The copy has already landed in the target. If the source
+                    # delete is refused, the event now exists in *both* calendars,
+                    # so this must be reported as a failure with the duplicate
+                    # named — counting it as "moved" would hide it.
+                    if not outcome.get("success", True):
+                        failed_count += 1
+                        results.append(
+                            {
+                                "uid": event["uid"],
+                                "status": "failed",
+                                "error": (
+                                    "copied to "
+                                    f"{target_calendar} but the source copy could "
+                                    "not be deleted, so the event now exists in "
+                                    "both calendars: "
+                                    f"{outcome.get('message', 'delete refused')}"
+                                ),
+                                "title": event.get("title", ""),
+                            }
+                        )
+                        continue
 
                     moved_count += 1
                     results.append(
@@ -1132,6 +1206,63 @@ def configure_calendar_tools(mcp: FastMCP):
         return await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
 
     @mcp.tool(
+        title="Complete Todo Task",
+        annotations=ToolAnnotations(
+            # Not idempotent: a second call with completed=None restamps COMPLETED
+            # with a fresh timestamp, so the same inputs produce a different card.
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    @require_scopes("todo.write", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_complete_todo(
+        calendar_name: str,
+        todo_uid: str,
+        ctx: Context,
+        completed: Optional[str] = None,
+        completed_at: Optional[str] = None,
+    ) -> CompleteTodoResponse:
+        """Mark a todo/task complete.
+
+        Sets STATUS, PERCENT-COMPLETE and COMPLETED together. Doing this through
+        nc_calendar_update_todo requires knowing that all three are needed and
+        setting each explicitly — passing status="COMPLETED" alone leaves
+        PERCENT-COMPLETE stale and writes no completion timestamp.
+
+        Args:
+            calendar_name: Name of the calendar containing the todo
+            todo_uid: UID of the todo to complete
+            ctx: MCP context
+            completed: Completion timestamp (ISO format). Defaults to now (UTC).
+            completed_at: Backward-compatible alias for ``completed``.
+
+        Returns:
+            CompleteTodoResponse carrying the three values actually written.
+        """
+        client = await get_client(ctx)
+        if (
+            completed is not None
+            and completed_at is not None
+            and completed != completed_at
+        ):
+            raise ValueError(
+                "completed and completed_at must match when both are provided"
+            )
+        if completed is None:
+            completed = completed_at
+        payload = _completion_payload(completed)
+        result = await client.calendar.update_todo(calendar_name, todo_uid, payload)
+        return CompleteTodoResponse(
+            uid=todo_uid,
+            calendar_name=calendar_name,
+            status=payload["status"],
+            percent_complete=payload["percent_complete"],
+            completed=payload["completed"],
+            href=result.get("href", ""),
+        )
+
+    @mcp.tool(
         title="Delete Todo Task",
         annotations=ToolAnnotations(
             destructiveHint=True, idempotentHint=True, openWorldHint=True
@@ -1143,8 +1274,13 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         todo_uid: str,
         ctx: Context,
-    ):
+    ) -> DeleteTodoResponse:
         """Delete a todo/task from a calendar.
+
+        A missing todo is reported as success (status 404) so retries are safe.
+        A server *refusal* — a scheduled/iMIP object, or a stale entry in the
+        calendar trashbin holding the UID — comes back with ``success=False`` and
+        a message explaining the likely cause, rather than raising.
 
         Args:
             calendar_name: Name of the calendar containing the todo
@@ -1152,52 +1288,17 @@ def configure_calendar_tools(mcp: FastMCP):
             ctx: MCP context
 
         Returns:
-            Dict with deletion status
+            DeleteTodoResponse carrying the status and, on refusal, why.
         """
         client = await get_client(ctx)
-        return await client.calendar.delete_todo(calendar_name, todo_uid)
-
-    @mcp.tool(
-        title="Complete Todo Task",
-        annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True),
-    )
-    @require_scopes("todo.write", "calendar.read")
-    @instrument_tool
-    async def nc_calendar_complete_todo(
-        calendar_name: str,
-        todo_uid: str,
-        ctx: Context,
-        completed_at: Optional[str] = None,
-    ):
-        """Mark a todo/task as completed.
-
-        Convenience wrapper around nc_calendar_update_todo that sets
-        STATUS=COMPLETED, PERCENT-COMPLETE=100, and the COMPLETED
-        timestamp in one call. Equivalent to invoking update_todo with
-        those three fields populated; useful for AI clients where
-        "complete this task" is a more natural phrasing than "set status
-        to COMPLETED, set percent_complete to 100, set completed
-        timestamp".
-
-        Args:
-            calendar_name: Name of the calendar containing the todo
-            todo_uid: UID of the todo to mark complete
-            ctx: MCP context
-            completed_at: Optional ISO 8601 completion timestamp.
-                Defaults to the current UTC time if not provided.
-
-        Returns:
-            Dict with the update result.
-        """
-        client = await get_client(ctx)
-        if completed_at is None:
-            completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-        todo_data = {
-            "status": "COMPLETED",
-            "percent_complete": 100,
-            "completed": completed_at,
-        }
-        return await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
+        result = await client.calendar.delete_todo(calendar_name, todo_uid)
+        return DeleteTodoResponse(
+            success=result.get("success", True),
+            status_code=result.get("status_code"),
+            message=result.get("message"),
+            deleted_uid=todo_uid,
+            calendar_name=calendar_name,
+        )
 
     @mcp.tool(
         title="Search Todo Tasks",

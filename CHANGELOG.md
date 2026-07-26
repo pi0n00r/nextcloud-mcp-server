@@ -5,6 +5,93 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.150.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- nc_webdav_move_resource and nc_webdav_copy_resource now return
+MoveResourceResponse / CopyResourceResponse instead of a raw dict. The
+status_code field keeps its meaning, so field-level consumers are unaffected;
+callers treating the result as a plain mapping must switch to attribute access.
+
+### Fix
+
+- **deck**: preserve order and due date on partial card updates
+
+### Refactor
+
+- **webdav**: typed responses for move and copy tools
+
+## v0.149.0 (2026-07-25)
+
+### Feat
+
+- **calendar**: optional calendar_name and a complete-todo tool
+
+## v0.148.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- OAuth scope enforcement now actually applies to tool calls.
+Sessions whose token or stored app-password scopes do not cover a tool were
+silently allowed and are now denied with InsufficientScopeError; under OAuth,
+a request arriving without a verified token is denied rather than treated as
+BasicAuth. Deployments relying on the previous permissive behaviour must grant
+the required scopes (nc_auth_update_scopes, or
+PATCH /api/v1/users/{user_id}/scopes).
+
+### Fix
+
+- **auth**: fail closed in check_scopes when OAuth has no token
+- **auth**: enforce @require_scopes at runtime
+
+## v0.147.2 (2026-07-25)
+
+### Fix
+
+- **calendar**: structured handling for CalDAV delete refusals
+
+## v0.147.1 (2026-07-25)
+
+### Fix
+
+- **calendar**: don't warn when a stored TZID isn't an IANA name
+- **calendar**: clamp all-day DTEND on the explicit flip path too
+- **calendar**: preserve value type and timezone when updating events
+
+### Refactor
+
+- **calendar**: address SonarCloud findings on the update path
+
+## v0.147.0 (2026-07-25)
+
+### Feat
+
+- **contacts**: pad ADR components to the documented seven
+- **contacts**: surface addresses, name parts and X-* extensions
+
+### Fix
+
+- **contacts**: copy the whole parameter section when rewriting a line
+- **contacts**: match TYPE parameter with a regex, not an upper-cased index
+- **contacts**: preserve lowercase TYPE parameters on rewrite
+- **contacts**: preserve vCard line folding on update
+
+## v0.146.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- nc_contacts_update_contact now returns an
+UpdateContactResponse instead of None, and no longer rebuilds the vCard from
+the supplied fields when the existing card cannot be fetched — it raises. A
+caller that relied on update creating a missing contact must call
+nc_contacts_create_contact instead.
+
+### Fix
+
+- **contacts**: don't report a landed update as failed
+- **contacts**: stop rebuilding vCards on update
+
 ## v0.145.1 (2026-07-24)
 
 ### Fix
