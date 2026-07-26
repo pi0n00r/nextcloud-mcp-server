@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
     "--host", "-h", default="127.0.0.1", show_default=True, help="Server host"
 )
 @click.option(
+    "--dual-stack",
+    is_flag=True,
+    default=False,
+    help="Allow an IPv6 listener to also accept IPv4 connections.",
+)
+@click.option(
     "--port",
     "-p",
     type=int,
@@ -128,6 +134,7 @@ logger = logging.getLogger(__name__)
 )
 def run(
     host: str,
+    dual_stack: bool,
     port: int,
     log_level: str,
     transport: str,
@@ -289,6 +296,7 @@ def run(
     uvicorn.run(
         app=app,
         host=host,
+        dual_stack=dual_stack,
         port=port,
         log_level=log_level,
         log_config=uvicorn_log_config,

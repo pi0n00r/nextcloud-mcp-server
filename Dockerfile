@@ -40,4 +40,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/app/.venv/bin/python", "-m", "nextcloud_mcp_server.container_healthcheck"]
 
-ENTRYPOINT ["/app/.venv/bin/nextcloud-mcp-server", "run", "--host", "0.0.0.0"]
+ENTRYPOINT ["/app/.venv/bin/nextcloud-mcp-server", "run", "--host", "::", "--dual-stack"]

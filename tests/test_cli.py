@@ -1,6 +1,5 @@
 """Tests for CLI options using Click's testing utilities."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +32,27 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture
+def captured_overrides(monkeypatch):
+    """Capture Dynaconf runtime overrides without leaking global state."""
+    overrides = {}
+    monkeypatch.setattr(
+        "nextcloud_mcp_server.cli.set_override",
+        lambda key, value: overrides.__setitem__(key, value),
+    )
+    return overrides
+
+
+@pytest.fixture
+def stop_before_server(monkeypatch):
+    """Stop CLI execution after options have been converted to overrides."""
+
+    def mock_get_app(*args, **kwargs):
+        raise SystemExit(0)
+
+    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
+
+
 def test_help_message_displays_all_options(runner):
     """Test that help message includes all new CLI options."""
     result = runner.invoke(run, ["--help"])
@@ -50,6 +70,35 @@ def test_help_message_displays_all_options(runner):
     assert "--oauth-client-id" in result.output
     assert "--oauth-client-secret" in result.output
     assert "--mcp-server-url" in result.output
+    assert "--dual-stack" in result.output
+
+
+def test_dual_stack_option_is_forwarded_to_uvicorn(
+    runner, clean_env, monkeypatch, captured_overrides
+):
+    """The opt-in listener flag reaches the maintained Uvicorn fork."""
+    monkeypatch.setenv("NEXTCLOUD_HOST", "https://cloud.example.com")
+    monkeypatch.setenv("NEXTCLOUD_USERNAME", "admin")
+    monkeypatch.setenv("NEXTCLOUD_PASSWORD", "secret")
+
+    captured = {}
+    monkeypatch.setattr(
+        "nextcloud_mcp_server.cli.get_app", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        "nextcloud_mcp_server.cli.get_uvicorn_logging_config",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "nextcloud_mcp_server.cli.uvicorn.run",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = runner.invoke(run, ["--host", "::", "--dual-stack"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "::"
+    assert captured["dual_stack"] is True
 
 
 def test_token_type_accepts_valid_values(runner, clean_env):
@@ -77,35 +126,10 @@ def test_token_type_rejects_invalid_values(runner, clean_env):
     assert "Invalid value" in result.output
 
 
-def test_cli_options_set_environment_variables(runner, clean_env, monkeypatch):
-    """Test that CLI options set environment variables correctly."""
-    # We need to mock the actual server startup to avoid connection errors
-    # Store the env vars that get set
-    captured_env = {}
-
-    def mock_get_app(*args, **kwargs):
-        # Capture environment variables after they're set by CLI
-        captured_env.update(
-            {
-                "NEXTCLOUD_HOST": os.environ.get("NEXTCLOUD_HOST"),
-                "NEXTCLOUD_USERNAME": os.environ.get("NEXTCLOUD_USERNAME"),
-                "NEXTCLOUD_PASSWORD": os.environ.get("NEXTCLOUD_PASSWORD"),
-                "NEXTCLOUD_OIDC_SCOPES": os.environ.get("NEXTCLOUD_OIDC_SCOPES"),
-                "NEXTCLOUD_OIDC_TOKEN_TYPE": os.environ.get(
-                    "NEXTCLOUD_OIDC_TOKEN_TYPE"
-                ),
-                "NEXTCLOUD_PUBLIC_ISSUER_URL": os.environ.get(
-                    "NEXTCLOUD_PUBLIC_ISSUER_URL"
-                ),
-                "NEXTCLOUD_MCP_SERVER_URL": os.environ.get("NEXTCLOUD_MCP_SERVER_URL"),
-            }
-        )
-        # Raise an exception to stop execution before uvicorn.run
-        raise SystemExit(0)
-
-    # Patch get_app to capture env vars
-    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
-
+def test_cli_options_set_runtime_overrides(
+    runner, clean_env, captured_overrides, stop_before_server
+):
+    """Test that CLI options set Dynaconf runtime overrides correctly."""
     _ = runner.invoke(
         run,
         [
@@ -126,42 +150,28 @@ def test_cli_options_set_environment_variables(runner, clean_env, monkeypatch):
         ],
     )
 
-    # Verify environment variables were set
-    assert captured_env["NEXTCLOUD_HOST"] == "https://test.example.com"
-    assert captured_env["NEXTCLOUD_USERNAME"] == "testuser"
-    assert captured_env["NEXTCLOUD_PASSWORD"] == "testpass"
-    assert captured_env["NEXTCLOUD_OIDC_SCOPES"] == "openid nc:read"
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
-    assert captured_env["NEXTCLOUD_PUBLIC_ISSUER_URL"] == "https://public.example.com"
-    assert captured_env["NEXTCLOUD_MCP_SERVER_URL"] == "http://test:8000"
+    assert captured_overrides["NEXTCLOUD_HOST"] == "https://test.example.com"
+    assert captured_overrides["NEXTCLOUD_USERNAME"] == "testuser"
+    assert captured_overrides["NEXTCLOUD_PASSWORD"] == "testpass"
+    assert captured_overrides["NEXTCLOUD_OIDC_SCOPES"] == "openid nc:read"
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
+    assert (
+        captured_overrides["NEXTCLOUD_PUBLIC_ISSUER_URL"]
+        == "https://public.example.com"
+    )
+    assert captured_overrides["NEXTCLOUD_MCP_SERVER_URL"] == "http://test:8000"
 
 
-def test_cli_options_override_environment_variables(runner, monkeypatch):
-    """Test that CLI options override environment variables."""
+def test_cli_options_override_environment_variables(
+    runner, monkeypatch, captured_overrides, stop_before_server
+):
+    """Test that CLI runtime overrides take precedence over environment values."""
     # Set environment variables
     monkeypatch.setenv("NEXTCLOUD_HOST", "https://from-env.example.com")
     monkeypatch.setenv("NEXTCLOUD_USERNAME", "envuser")
     monkeypatch.setenv("NEXTCLOUD_OIDC_SCOPES", "openid")
     monkeypatch.setenv("NEXTCLOUD_OIDC_TOKEN_TYPE", "bearer")
 
-    captured_env = {}
-
-    def mock_get_app(*args, **kwargs):
-        captured_env.update(
-            {
-                "NEXTCLOUD_HOST": os.environ.get("NEXTCLOUD_HOST"),
-                "NEXTCLOUD_USERNAME": os.environ.get("NEXTCLOUD_USERNAME"),
-                "NEXTCLOUD_OIDC_SCOPES": os.environ.get("NEXTCLOUD_OIDC_SCOPES"),
-                "NEXTCLOUD_OIDC_TOKEN_TYPE": os.environ.get(
-                    "NEXTCLOUD_OIDC_TOKEN_TYPE"
-                ),
-            }
-        )
-        raise SystemExit(0)
-
-    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
-
-    # Provide CLI options that should override env vars
     _ = runner.invoke(
         run,
         [
@@ -176,14 +186,15 @@ def test_cli_options_override_environment_variables(runner, monkeypatch):
         ],
     )
 
-    # Verify CLI options overrode env vars
-    assert captured_env["NEXTCLOUD_HOST"] == "https://from-cli.example.com"
-    assert captured_env["NEXTCLOUD_USERNAME"] == "cliuser"
-    assert captured_env["NEXTCLOUD_OIDC_SCOPES"] == "openid nc:write"
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
+    assert captured_overrides["NEXTCLOUD_HOST"] == "https://from-cli.example.com"
+    assert captured_overrides["NEXTCLOUD_USERNAME"] == "cliuser"
+    assert captured_overrides["NEXTCLOUD_OIDC_SCOPES"] == "openid nc:write"
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
 
 
-def test_environment_variables_used_when_cli_not_provided(runner, monkeypatch):
+def test_environment_variables_used_when_cli_not_provided(
+    runner, monkeypatch, captured_overrides, stop_before_server
+):
     """Test that environment variables are used when CLI options not provided."""
     # Set environment variables
     monkeypatch.setenv("NEXTCLOUD_HOST", "https://from-env.example.com")
@@ -193,64 +204,24 @@ def test_environment_variables_used_when_cli_not_provided(runner, monkeypatch):
     monkeypatch.setenv("NEXTCLOUD_OIDC_TOKEN_TYPE", "jwt")
     monkeypatch.setenv("NEXTCLOUD_PUBLIC_ISSUER_URL", "https://public-env.example.com")
 
-    captured_env = {}
-
-    def mock_get_app(*args, **kwargs):
-        captured_env.update(
-            {
-                "NEXTCLOUD_HOST": os.environ.get("NEXTCLOUD_HOST"),
-                "NEXTCLOUD_USERNAME": os.environ.get("NEXTCLOUD_USERNAME"),
-                "NEXTCLOUD_PASSWORD": os.environ.get("NEXTCLOUD_PASSWORD"),
-                "NEXTCLOUD_OIDC_SCOPES": os.environ.get("NEXTCLOUD_OIDC_SCOPES"),
-                "NEXTCLOUD_OIDC_TOKEN_TYPE": os.environ.get(
-                    "NEXTCLOUD_OIDC_TOKEN_TYPE"
-                ),
-                "NEXTCLOUD_PUBLIC_ISSUER_URL": os.environ.get(
-                    "NEXTCLOUD_PUBLIC_ISSUER_URL"
-                ),
-            }
-        )
-        raise SystemExit(0)
-
-    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
-
-    # Don't provide any CLI options - should use env vars
     _ = runner.invoke(run, [])
 
-    # Verify env vars were used
-    assert captured_env["NEXTCLOUD_HOST"] == "https://from-env.example.com"
-    assert captured_env["NEXTCLOUD_USERNAME"] == "envuser"
-    assert captured_env["NEXTCLOUD_PASSWORD"] == "envpass"
-    assert captured_env["NEXTCLOUD_OIDC_SCOPES"] == "openid email"
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
+    assert captured_overrides["NEXTCLOUD_HOST"] == "https://from-env.example.com"
+    assert captured_overrides["NEXTCLOUD_USERNAME"] == "envuser"
+    assert captured_overrides["NEXTCLOUD_PASSWORD"] == "envpass"
+    assert captured_overrides["NEXTCLOUD_OIDC_SCOPES"] == "openid email"
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "jwt"
     assert (
-        captured_env["NEXTCLOUD_PUBLIC_ISSUER_URL"] == "https://public-env.example.com"
+        captured_overrides["NEXTCLOUD_PUBLIC_ISSUER_URL"]
+        == "https://public-env.example.com"
     )
 
 
-def test_default_values(runner, clean_env, monkeypatch):
+def test_default_values(runner, clean_env, captured_overrides, stop_before_server):
     """Test that default values are used when neither CLI nor env vars provided."""
-    captured_env = {}
-
-    def mock_get_app(*args, **kwargs):
-        captured_env.update(
-            {
-                "NEXTCLOUD_OIDC_SCOPES": os.environ.get("NEXTCLOUD_OIDC_SCOPES"),
-                "NEXTCLOUD_OIDC_TOKEN_TYPE": os.environ.get(
-                    "NEXTCLOUD_OIDC_TOKEN_TYPE"
-                ),
-                "NEXTCLOUD_MCP_SERVER_URL": os.environ.get("NEXTCLOUD_MCP_SERVER_URL"),
-            }
-        )
-        raise SystemExit(0)
-
-    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
-
-    # Don't provide CLI options or env vars - should use defaults
     _ = runner.invoke(run, [])
 
-    # Verify default values
-    assert captured_env["NEXTCLOUD_OIDC_SCOPES"] == (
+    assert captured_overrides["NEXTCLOUD_OIDC_SCOPES"] == (
         "openid profile email "
         "notes.read notes.write "
         "calendar.read calendar.write "
@@ -262,30 +233,22 @@ def test_default_values(runner, clean_env, monkeypatch):
         "files.read files.write "
         "sharing.read sharing.write"
     )
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "bearer"
-    assert captured_env["NEXTCLOUD_MCP_SERVER_URL"] == "http://localhost:8000"
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] == "bearer"
+    assert captured_overrides["NEXTCLOUD_MCP_SERVER_URL"] == "http://localhost:8000"
 
 
-def test_oauth_token_type_case_normalization(runner, clean_env, monkeypatch):
+def test_oauth_token_type_case_normalization(
+    runner, clean_env, captured_overrides, stop_before_server
+):
     """Test that token type is normalized correctly regardless of input case."""
-    captured_env = {}
-
-    def mock_get_app(*args, **kwargs):
-        captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] = os.environ.get(
-            "NEXTCLOUD_OIDC_TOKEN_TYPE"
-        )
-        raise SystemExit(0)
-
-    monkeypatch.setattr("nextcloud_mcp_server.cli.get_app", mock_get_app)
-
     # Test uppercase JWT
     runner.invoke(run, ["--oauth-token-type", "JWT"])
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] in ["JWT", "jwt"]
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] in ["JWT", "jwt"]
 
     # Test mixed case Bearer
-    captured_env.clear()
+    captured_overrides.clear()
     runner.invoke(run, ["--oauth-token-type", "Bearer"])
-    assert captured_env["NEXTCLOUD_OIDC_TOKEN_TYPE"] in ["Bearer", "bearer"]
+    assert captured_overrides["NEXTCLOUD_OIDC_TOKEN_TYPE"] in ["Bearer", "bearer"]
 
 
 def test_help_includes_stdio_transport(runner):

@@ -38,13 +38,15 @@ The v0.150.0 upstream merge transferred ownership of several behaviors:
 | Deck updates | Preserve card order and due date during partial updates | Follow-up update when a Deck version ignores `duedate` during create |
 | WebDAV reads | Ignore decoded-versus-compressed `Content-Length` mismatches | Retry one stale pooled GET or verified short read |
 | WebDAV writes | Fail-closed simple PUTs with ETag preconditions | A.2 chunked upload and atomic destination ETag enforcement |
+| Container listener | Generic ASGI serving | Pin `pi0n00r/uvicorn` at `c5d334cb3014d72a43a893e848bbfdebb2665738`; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
 
 The left column is retired as fork patch debt: accept upstream changes there
 unless they regress the stated contract. The right column remains
 load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
 transport gateway-secret middleware, configurable DNS-rebinding protection,
 the explicit Mistral embedding timeout, and legacy Arbiter deletion repair
-remain active fork patches.
+remain active fork patches. The pinned Uvicorn commit is also load-bearing:
+upgrading or replacing it requires an IPv4 and IPv6 container-listener smoke.
 
 ## Repo layout
 

@@ -14,6 +14,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 - **calendar**: promote Toronto-matching fixed offsets to
   `America/Toronto`, preserve DST wall-clock semantics, and emit matching
   `VTIMEZONE` components for events and todos
+- **container**: pin the latest dual-stack-capable `pi0n00r/uvicorn` commit
+  and run its opt-in `--host :: --dual-stack` listener so the image accepts
+  IPv4 and IPv6 without a proxy sidecar
 
 ### Documentation
 
