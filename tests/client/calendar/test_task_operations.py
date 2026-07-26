@@ -171,8 +171,10 @@ async def test_update_todo(nc_client: NextcloudClient, temporary_todo: dict):
     }
 
     try:
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
         result = await nc_client.calendar.update_todo(
-            calendar_name, todo_uid, updated_data
+            calendar_name, todo_uid, updated_data, etag
         )
         assert result["uid"] == todo_uid
 
@@ -251,11 +253,14 @@ async def test_todo_status_transitions(
     todo_uid = result["uid"]
 
     try:
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
         # Transition: NEEDS-ACTION → IN-PROCESS
         await nc_client.calendar.update_todo(
             calendar_name,
             todo_uid,
             {"status": "IN-PROCESS", "percent_complete": 25},
+            etag,
         )
 
         todos = await nc_client.calendar.list_todos(calendar_name)
@@ -273,6 +278,7 @@ async def test_todo_status_transitions(
                 "percent_complete": 100,
                 "completed": completed_time,
             },
+            todo["etag"],
         )
 
         todos = await nc_client.calendar.list_todos(calendar_name)

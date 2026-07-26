@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import anyio
 import httpx
 import recurring_ical_events
-from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent
+from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent, AsyncTodo
 from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
 from icalendar import Alarm, Calendar, Timezone, vDDDTypes, vRecur
@@ -21,6 +21,7 @@ from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]
 
 from ..config import get_nextcloud_ssl_verify
+from .entity_tag import StrongEntityTagError, require_strong_entity_tag
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +279,12 @@ class CalendarClient:
         self, obj: Any, caller_etag: str, *, kind: str, uid: str
     ) -> str:
         """Validate the ETag coupled to the REPORT calendar data."""
+        try:
+            caller_etag = require_strong_entity_tag(
+                caller_etag, operation=f"update_{kind}"
+            )
+        except StrongEntityTagError as exc:
+            raise CalendarEtagUnavailableError(str(exc)) from exc
         current_etag = getattr(obj, "etag", None)
         if not current_etag:
             current_etag = getattr(obj, "props", {}).get(dav.GetEtag.tag)
@@ -288,13 +295,16 @@ class CalendarClient:
                 "Read the object again and retry only after the server provides "
                 "a strong ETag."
             )
-        if current_etag.startswith("W/"):
-            raise CalendarEtagUnavailableError(
-                f"Cannot update {kind} {uid}: the server supplied weak ETag "
-                f"{current_etag}, which cannot be used with If-Match. Read the "
-                "object again and retry only after the server provides a strong ETag."
+        try:
+            current_etag = require_strong_entity_tag(
+                current_etag, operation=f"update_{kind} server ETag"
             )
-        if caller_etag and caller_etag != current_etag:
+        except StrongEntityTagError as exc:
+            raise CalendarEtagUnavailableError(
+                f"Cannot update {kind} {uid}: {exc}. Read the object again and "
+                "retry only after the server provides a strong ETag."
+            ) from exc
+        if caller_etag != current_etag:
             raise CalendarEtagConflictError(
                 f"{kind.capitalize()} {uid} changed since it was read",
                 current_etag=current_etag,
@@ -637,7 +647,7 @@ class CalendarClient:
             # everything to UTC and erase the original timezone context.
             do_expand = bool(start_datetime and end_datetime)
         else:
-            events = await calendar.events()  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+            events = await self._search_calendar_objects(calendar, "VEVENT")
             do_expand = False
 
         result = []
@@ -730,9 +740,25 @@ class CalendarClient:
         if end_datetime and end_datetime.tzinfo is None:
             end_datetime = end_datetime.replace(tzinfo=dt.UTC)
 
-        # Build comp-filter with time-range (mirrors sync Calendar.build_search_xml_query)
-        inner_comp_filter = cdav.CompFilter(name="VEVENT")
-        inner_comp_filter += cdav.TimeRange(start_datetime, end_datetime)
+        return await self._search_calendar_objects(
+            calendar,
+            "VEVENT",
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+        )
+
+    async def _search_calendar_objects(
+        self,
+        calendar: AsyncCalendar,
+        component: str,
+        *,
+        start_datetime: dt.datetime | None = None,
+        end_datetime: dt.datetime | None = None,
+    ) -> list:
+        """REPORT calendar-data and getetag together for one component type."""
+        inner_comp_filter = cdav.CompFilter(name=component)
+        if start_datetime or end_datetime:
+            inner_comp_filter += cdav.TimeRange(start_datetime, end_datetime)
         outer_comp_filter = cdav.CompFilter(name="VCALENDAR") + inner_comp_filter
         filter_element = cdav.Filter() + outer_comp_filter
 
@@ -757,7 +783,8 @@ class CalendarClient:
                 continue
             cal_data = props.get(cdav.CalendarData.tag)
             if cal_data:
-                obj = AsyncEvent(
+                object_class = AsyncEvent if component == "VEVENT" else AsyncTodo
+                obj = object_class(
                     client=calendar.client,
                     url=calendar.url.join(href),  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]  # url is always set for calendars
                     data=cal_data,
@@ -795,7 +822,7 @@ class CalendarClient:
         calendar_name: str,
         event_uid: str,
         event_data: dict[str, Any],
-        etag: str = "",
+        etag: str,
     ) -> dict[str, Any]:
         """Update an existing calendar event."""
         await self._ensure_calendar_home()
@@ -1135,7 +1162,7 @@ class CalendarClient:
         calendar = self._get_calendar(calendar_name)
 
         # Get all todos including completed ones (filtering is done client-side)
-        todos = await calendar.todos(include_completed=True)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+        todos = await self._search_calendar_objects(calendar, "VTODO")
 
         result = []
         for todo in todos:
@@ -1184,7 +1211,7 @@ class CalendarClient:
         calendar_name: str,
         todo_uid: str,
         todo_data: dict[str, Any],
-        etag: str = "",
+        etag: str,
     ) -> dict[str, Any]:
         """Update an existing todo/task."""
         await self._ensure_calendar_home()
@@ -2405,8 +2432,18 @@ class CalendarClient:
 
             for event in events:
                 try:
+                    try:
+                        event_etag = require_strong_entity_tag(
+                            event.get("etag"),
+                            operation=f"bulk update event {event['uid']}",
+                        )
+                    except StrongEntityTagError as exc:
+                        raise CalendarEtagUnavailableError(str(exc)) from exc
                     await self.update_event(
-                        event["calendar_name"], event["uid"], update_data
+                        event["calendar_name"],
+                        event["uid"],
+                        update_data,
+                        event_etag,
                     )
                     updated_count += 1
                     results.append(

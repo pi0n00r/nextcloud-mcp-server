@@ -264,8 +264,9 @@ async def test_update_event(nc_client: NextcloudClient, temporary_event: dict):
     }
 
     try:
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
         result = await nc_client.calendar.update_event(
-            calendar_name, event_uid, updated_data
+            calendar_name, event_uid, updated_data, etag
         )
         assert result["uid"] == event_uid
 
@@ -310,9 +311,12 @@ async def test_update_event_extended_fields(
             "attendees": "alice@example.com,bob@example.com",
             "reminder_minutes": 15,
         }
-        await nc_client.calendar.update_event(calendar_name, event_uid, updated_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, updated_data, etag
+        )
 
-        retrieved, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
+        retrieved, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
 
         # Verify categories
         assert "work" in retrieved.get("categories", "")
@@ -336,7 +340,9 @@ async def test_update_event_extended_fields(
             "attendees": "",
             "reminder_minutes": 0,
         }
-        await nc_client.calendar.update_event(calendar_name, event_uid, cleared_data)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, cleared_data, etag
+        )
 
         cleared, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
 

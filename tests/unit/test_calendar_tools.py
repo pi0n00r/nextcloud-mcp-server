@@ -90,6 +90,8 @@ def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
     complete_properties = tools["nc_calendar_complete_todo"].parameters["properties"]
     assert "completed" in complete_properties
     assert "completed_at" in complete_properties
+    assert "etag" in complete_properties
+    assert "etag" in tools["nc_calendar_complete_todo"].parameters["required"]
 
 
 async def test_complete_todo_accepts_completed_at_alias():
@@ -107,6 +109,7 @@ async def test_complete_todo_accepts_completed_at_alias():
             calendar_name="tasks",
             todo_uid="todo-1",
             ctx=_context(),
+            etag='"todo-v1"',
             completed_at="2026-07-26T00:00:00+00:00",
         )
 
@@ -119,7 +122,47 @@ async def test_complete_todo_accepts_completed_at_alias():
             "percent_complete": 100,
             "completed": "2026-07-26T00:00:00+00:00",
         },
+        '"todo-v1"',
     )
+
+
+@pytest.mark.parametrize(
+    ("error", "message_pattern"),
+    [
+        (
+            CalendarEtagConflictError("changed", current_etag='"todo-v2"'),
+            'modified since it was read.*Current ETag: "todo-v2"',
+        ),
+        (
+            CalendarEtagUnavailableError("malformed ETag"),
+            "malformed ETag.*update was not sent",
+        ),
+    ],
+)
+async def test_complete_todo_maps_etag_errors(error, message_pattern):
+    mcp = FastMCP("test-calendar-completion-errors")
+    configure_calendar_tools(mcp)
+    tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
+        "nc_calendar_complete_todo"
+    ]
+    update_todo = AsyncMock(side_effect=error)
+    client = SimpleNamespace(calendar=SimpleNamespace(update_todo=update_todo))
+
+    with (
+        patch(
+            "nextcloud_mcp_server.server.calendar.get_client",
+            new=AsyncMock(return_value=client),
+        ),
+        pytest.raises(ToolError, match=message_pattern),
+    ):
+        await tool.fn(
+            calendar_name="tasks",
+            todo_uid="todo-1",
+            ctx=_context(),
+            etag='"todo-v1"',
+        )
+
+    update_todo.assert_awaited_once()
 
 
 async def test_list_events_all_calendars_without_calendar_name(

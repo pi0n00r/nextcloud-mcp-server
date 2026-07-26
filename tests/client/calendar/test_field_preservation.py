@@ -90,7 +90,10 @@ END:VCALENDAR"""
             "description": "Updated description - custom fields should be preserved",
         }
 
-        await nc_client.calendar.update_event(calendar_name, event_uid, update_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, update_data, etag
+        )
         logger.info("Updated event %s through MCP client", event_uid)
 
         # Reload the event to see if custom fields survived
@@ -387,7 +390,10 @@ END:VCALENDAR"""
 
         # Now perform a simple update through MCP
         update_data = {"location": "Conference Room B"}  # Simple location change
-        await nc_client.calendar.update_event(calendar_name, event_uid, update_data)
+        _, etag = await nc_client.calendar.get_event(calendar_name, event_uid)
+        await nc_client.calendar.update_event(
+            calendar_name, event_uid, update_data, etag
+        )
 
         # Reload the event to check what survived the round-trip
         await event.load()

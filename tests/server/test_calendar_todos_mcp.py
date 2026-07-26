@@ -569,10 +569,12 @@ async def test_mcp_complete_todo_sets_all_three_properties(
     )
     assert create_result.isError is False
     todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
 
     complete_result = await nc_mcp_client.call_tool(
         "nc_calendar_complete_todo",
-        {"calendar_name": calendar_name, "todo_uid": todo_uid},
+        {"calendar_name": calendar_name, "todo_uid": todo_uid, "etag": etag},
     )
     assert complete_result.isError is False
     payload = json.loads(complete_result.content[0].text)
@@ -601,12 +603,15 @@ async def test_mcp_complete_todo_accepts_explicit_timestamp(
     )
     assert create_result.isError is False
     todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
 
     complete_result = await nc_mcp_client.call_tool(
         "nc_calendar_complete_todo",
         {
             "calendar_name": calendar_name,
             "todo_uid": todo_uid,
+            "etag": etag,
             "completed": "2026-01-01T09:00:00+00:00",
         },
     )

@@ -354,6 +354,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         event_uid: str,
         ctx: Context,
+        etag: str,
         # All the same parameters as create_event but optional
         title: str | None = None,
         start_datetime: str | None = None,
@@ -377,7 +378,6 @@ def configure_calendar_tools(mcp: FastMCP):
         color: str | None = None,
         timezone: str | None = None,
         reminders: list[dict[str, Any]] | None = None,
-        etag: str = "",
     ):
         """Update any aspect of an existing event.
 
@@ -1168,6 +1168,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         todo_uid: str,
         ctx: Context,
+        etag: str,
         summary: Optional[str] = None,
         description: Optional[str] = None,
         status: Optional[str] = None,
@@ -1178,7 +1179,6 @@ def configure_calendar_tools(mcp: FastMCP):
         completed: Optional[str] = None,
         categories: Optional[str] = None,
         reminders: list[dict[str, Any]] | None = None,
-        etag: str = "",
     ):
         """Update an existing todo/task.
 
@@ -1261,6 +1261,7 @@ def configure_calendar_tools(mcp: FastMCP):
         calendar_name: str,
         todo_uid: str,
         ctx: Context,
+        etag: str,
         completed: Optional[str] = None,
         completed_at: Optional[str] = None,
     ) -> CompleteTodoResponse:
@@ -1275,6 +1276,7 @@ def configure_calendar_tools(mcp: FastMCP):
             calendar_name: Name of the calendar containing the todo
             todo_uid: UID of the todo to complete
             ctx: MCP context
+            etag: Exact strong ETag returned by a todo read or list operation.
             completed: Completion timestamp (ISO format). Defaults to now (UTC).
             completed_at: Backward-compatible alias for ``completed``.
 
@@ -1293,7 +1295,25 @@ def configure_calendar_tools(mcp: FastMCP):
         if completed is None:
             completed = completed_at
         payload = _completion_payload(completed)
-        result = await client.calendar.update_todo(calendar_name, todo_uid, payload)
+        try:
+            result = await client.calendar.update_todo(
+                calendar_name, todo_uid, payload, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar todo {todo_uid} was modified since it was read."
+                f"{current} Read the todo again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the todo again before retrying."
+            ) from exc
         return CompleteTodoResponse(
             uid=todo_uid,
             calendar_name=calendar_name,
