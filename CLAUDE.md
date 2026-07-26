@@ -25,6 +25,27 @@ The fix is in three places:
   bodies above `CHUNK_THRESHOLD` (1MB) through NC's chunked-upload v2
   endpoint, eliminating the silent-truncation failure mode.
 
+## Patch ownership after v0.150.0
+
+Do not preserve a historical fork commit merely because it was once needed.
+The v0.150.0 upstream merge transferred ownership of several behaviors:
+
+| Surface | Upstream-owned behavior | Fork behavior still required |
+|---|---|---|
+| Calendar date updates | Preserve stored all-day value type, TZID, and valid `DTEND` | Strict offset-required parser, Toronto/DST promotion, and ordered VALARM support |
+| Calendar ergonomics | Optional `calendar_name` for all-calendar searches; complete-todo tool | `completed_at` compatibility alias |
+| CalDAV deletion | Structured delete-refusal responses | Exact legacy scheduling retry and stale-trash collision purge |
+| Deck updates | Preserve card order and due date during partial updates | Follow-up update when a Deck version ignores `duedate` during create |
+| WebDAV reads | Ignore decoded-versus-compressed `Content-Length` mismatches | Retry one stale pooled GET or verified short read |
+| WebDAV writes | Fail-closed simple PUTs with ETag preconditions | A.2 chunked upload and atomic destination ETag enforcement |
+
+The left column is retired as fork patch debt: accept upstream changes there
+unless they regress the stated contract. The right column remains
+load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
+transport gateway-secret middleware, configurable DNS-rebinding protection,
+the explicit Mistral embedding timeout, and legacy Arbiter deletion repair
+remain active fork patches.
+
 ## Repo layout
 
 ```

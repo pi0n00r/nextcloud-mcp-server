@@ -5,6 +5,21 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.150.1 (2026-07-26)
+
+### Fix
+
+- **calendar**: restore strict offset-required CalDAV date parsing after the
+  upstream calendar merge
+- **calendar**: promote Toronto-matching fixed offsets to
+  `America/Toronto`, preserve DST wall-clock semantics, and emit matching
+  `VTIMEZONE` components for events and todos
+
+### Documentation
+
+- record which historical fork patches are now upstream-owned and which
+  residual behaviors remain load-bearing
+
 ## v0.150.0 (2026-07-25)
 
 ### BREAKING CHANGE
