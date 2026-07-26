@@ -25,11 +25,11 @@ The fix is in three places:
   bodies above `CHUNK_THRESHOLD` (1MB) through NC's chunked-upload v2
   endpoint, eliminating the silent-truncation failure mode.
 
-## Patch ownership after v0.151.0
+## Patch ownership after v0.151.1
 
 Do not preserve a historical fork commit merely because it was once needed.
 The v0.150.0 and v0.151.0 upstream merges transferred ownership of several
-behaviors:
+behaviors. v0.151.1 adds one fork-local concurrency guard:
 
 | Surface | Upstream-owned behavior | Fork behavior still required |
 |---|---|---|
@@ -41,6 +41,7 @@ behaviors:
 | WebDAV writes | Fail-closed simple PUTs with ETag preconditions and generic MOVE/COPY destination guards | A.2 chunked upload and atomic final-MOVE destination ETag enforcement |
 | Transport policy | Canonical `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, and `CORS_ALLOW_ORIGINS` configuration | Gateway-secret middleware and temporary aliases for the retired `MCP_DNS_REBINDING_ALLOWED_*` names |
 | Webhooks | Server-resolved callback URI, admin gate, and redacted logging | None |
+| Schema migrations | Alembic migration engine and revision scripts | Process-wide serialization of Alembic command entry points, in addition to the existing cross-pod database lock |
 | Container listener | Generic ASGI serving | Pin `pi0n00r/uvicorn` at `c5d334cb3014d72a43a893e848bbfdebb2665738`; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
 
 The left column is retired as fork patch debt: accept upstream changes there
@@ -48,8 +49,10 @@ unless they regress the stated contract. The right column remains
 load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
 transport gateway-secret middleware and legacy configuration aliases, the
 explicit Mistral embedding timeout, and legacy Arbiter deletion repair remain
-active fork patches. The pinned Uvicorn commit is also load-bearing: upgrading
-or replacing it requires an IPv4 and IPv6 container-listener smoke.
+active fork patches. Process-wide Alembic command serialization is
+load-bearing for concurrent MCP sessions. The pinned Uvicorn commit is also
+load-bearing: upgrading or replacing it requires an IPv4 and IPv6
+container-listener smoke.
 
 ## Repo layout
 

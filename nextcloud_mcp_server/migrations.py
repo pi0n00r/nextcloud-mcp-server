@@ -8,8 +8,19 @@ All helpers accept a SQLAlchemy URL (``sqlite+aiosqlite:///...`` or
 ``postgresql+psycopg://...``). When called without an explicit URL they fall
 back to :func:`nextcloud_mcp_server.config.get_database_url`.
 """
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import logging
+import threading
 from pathlib import Path
 
 from alembic.config import Config
@@ -20,6 +31,13 @@ from alembic import command
 from nextcloud_mcp_server.config import get_database_url, mask_db_password
 
 logger = logging.getLogger(__name__)
+
+# Alembic's EnvironmentContext installs command-scoped objects in the
+# process-global ``alembic.context`` proxy. Concurrent commands in worker
+# threads overwrite and remove each other's ``config``/``script`` entries.
+# Database locks cannot protect that Python state, so every Alembic command
+# entry point in this process shares one reentrant lock.
+_ALEMBIC_COMMAND_LOCK = threading.RLock()
 
 
 def _coerce_url(database_url: str | Path | None) -> str:
@@ -112,20 +130,22 @@ def upgrade_database(
     database_url: str | Path | None = None, revision: str = "head"
 ) -> None:
     """Upgrade database to a specific revision (default: latest)."""
-    config = get_alembic_config(database_url)
-    logger.info("Upgrading database to revision: %s", revision)
-    command.upgrade(config, revision)
-    logger.info("Database upgrade completed successfully")
+    with _ALEMBIC_COMMAND_LOCK:
+        config = get_alembic_config(database_url)
+        logger.info("Upgrading database to revision: %s", revision)
+        command.upgrade(config, revision)
+        logger.info("Database upgrade completed successfully")
 
 
 def downgrade_database(
     database_url: str | Path | None = None, revision: str = "-1"
 ) -> None:
     """Downgrade database to a specific revision (default: previous)."""
-    config = get_alembic_config(database_url)
-    logger.warning("Downgrading database to revision: %s", revision)
-    command.downgrade(config, revision)
-    logger.info("Database downgrade completed successfully")
+    with _ALEMBIC_COMMAND_LOCK:
+        config = get_alembic_config(database_url)
+        logger.warning("Downgrading database to revision: %s", revision)
+        command.downgrade(config, revision)
+        logger.info("Database downgrade completed successfully")
 
 
 def get_current_revision(database_url: str | Path | None = None) -> str | None:
@@ -169,16 +189,18 @@ def stamp_database(
 
     Useful for marking pre-Alembic databases as already at a known revision.
     """
-    config = get_alembic_config(database_url)
-    logger.info("Stamping database with revision: %s", revision)
-    command.stamp(config, revision)
-    logger.info("Database stamped successfully")
+    with _ALEMBIC_COMMAND_LOCK:
+        config = get_alembic_config(database_url)
+        logger.info("Stamping database with revision: %s", revision)
+        command.stamp(config, revision)
+        logger.info("Database stamped successfully")
 
 
 def show_migration_history(database_url: str | Path | None = None) -> None:
     """Display migration history."""
-    config = get_alembic_config(database_url)
-    command.history(config, verbose=True)
+    with _ALEMBIC_COMMAND_LOCK:
+        config = get_alembic_config(database_url)
+        command.history(config, verbose=True)
 
 
 def create_migration(message: str, autogenerate: bool = False) -> None:
@@ -195,14 +217,17 @@ def create_migration(message: str, autogenerate: bool = False) -> None:
         operations (``op.create_table``, ``op.add_column`` …) rather than
         raw SQL so they work on both SQLite and Postgres.
     """
-    config = get_alembic_config()
-    logger.info("Creating new migration: %s", message)
+    with _ALEMBIC_COMMAND_LOCK:
+        config = get_alembic_config()
+        logger.info("Creating new migration: %s", message)
 
-    if autogenerate:
-        logger.warning(
-            "Auto-generation is not supported (no SQLAlchemy models). "
-            "Migration will be created with empty upgrade/downgrade functions."
+        if autogenerate:
+            logger.warning(
+                "Auto-generation is not supported (no SQLAlchemy models). "
+                "Migration will be created with empty upgrade/downgrade functions."
+            )
+
+        command.revision(config, message=message, autogenerate=False)
+        logger.info(
+            "Migration created successfully. Edit the file to add SQL statements."
         )
-
-    command.revision(config, message=message, autogenerate=False)
-    logger.info("Migration created successfully. Edit the file to add SQL statements.")
