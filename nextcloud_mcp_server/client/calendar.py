@@ -1,5 +1,16 @@
 """CalDAV client for Nextcloud calendar and task operations using caldav library."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import datetime as dt
 import inspect
 import logging
@@ -755,7 +766,14 @@ class CalendarClient:
     async def list_todos(
         self, calendar_name: str, filters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        """List todos/tasks in a calendar."""
+        """List todos/tasks in a calendar.
+
+        Args:
+            calendar_name: Calendar to list.
+            filters: Optional client-side filters — ``status``,
+                ``min_priority``, ``categories``, ``summary_contains``, and
+                ``include_completed`` (set ``False`` to drop finished tasks).
+        """
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
 
@@ -781,6 +799,46 @@ class CalendarClient:
 
         logger.debug("Found %s todos", len(result))
         return result
+
+    async def get_todo(
+        self, calendar_name: str, todo_uid: str
+    ) -> dict[str, Any] | None:
+        """Fetch a single todo by UID.
+
+        The read-back primitive: until now the only way to see one task was to
+        list the whole calendar and filter client-side, which is both wasteful
+        and useless for confirming a write. Addressing a task by UID (never by
+        summary — summaries are neither unique nor stable) is the CalDAV-native
+        way to do it.
+
+        Args:
+            calendar_name: Calendar holding the todo.
+            todo_uid: The VTODO ``UID``.
+
+        Returns:
+            The parsed todo dict, or ``None`` if the resource exists but holds
+            no parseable VTODO.
+
+        Raises:
+            caldav.lib.error.NotFoundError: If no VTODO carries that UID.
+        """
+        await self._ensure_calendar_home()
+        calendar = self._get_calendar(calendar_name)
+
+        todo = await self._async_object_by_uid(
+            calendar, todo_uid, cdav.CompFilter("VTODO")
+        )
+        await _maybe_await(todo.load(only_if_unloaded=True))
+        if not todo.data:
+            return None
+
+        todo_dict = self._parse_ical_todo(todo.data)  # type: ignore[arg-type]
+        if todo_dict is None:
+            return None
+
+        todo_dict["href"] = str(todo.url)
+        todo_dict["etag"] = ""
+        return todo_dict
 
     async def create_todo(
         self, calendar_name: str, todo_data: dict[str, Any]
@@ -2005,11 +2063,36 @@ class CalendarClient:
         except Exception:
             return True
 
+    @staticmethod
+    def _todo_is_completed(todo: dict[str, Any]) -> bool:
+        """Report whether a VTODO is done, per RFC 5545 §3.8.1.11.
+
+        A task counts as completed when ``STATUS:COMPLETED`` is set, or when it
+        carries a ``COMPLETED`` timestamp. Checking both matters because
+        clients are inconsistent: some set the timestamp and leave STATUS at
+        its default, and a task list that shows finished work as outstanding is
+        wrong in the direction that costs the user time.
+        """
+        if str(todo.get("status", "")).upper() == "COMPLETED":
+            return True
+        return bool(todo.get("completed"))
+
     def _todo_matches_filters(
         self, todo: dict[str, Any], filters: dict[str, Any]
     ) -> bool:
-        """Check if a todo matches the provided filters."""
+        """Check if a todo matches the provided filters.
+
+        Recognised keys: ``status``, ``min_priority``, ``categories``,
+        ``summary_contains``, and ``include_completed`` (when explicitly
+        ``False``, finished tasks are dropped).
+        """
         try:
+            # Drop finished tasks when the caller asked for outstanding work.
+            if filters.get("include_completed") is False and self._todo_is_completed(
+                todo
+            ):
+                return False
+
             # Filter by status
             if "status" in filters:
                 if todo.get("status", "").upper() != filters["status"].upper():

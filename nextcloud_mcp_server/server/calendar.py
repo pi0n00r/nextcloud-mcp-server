@@ -1,3 +1,16 @@
+"""MCP tools for Nextcloud calendar and task (VTODO) operations."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import datetime as dt
 import logging
 from typing import Any, Optional
@@ -19,6 +32,55 @@ from nextcloud_mcp_server.models.calendar import (
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
+
+
+async def _verify_todo_completed(
+    client: Any, calendar_name: str, todo_uid: str, result: dict
+) -> dict:
+    """Read a just-completed task back and confirm the server stored it.
+
+    A 2xx on a CalDAV PUT means the request was accepted, not that the
+    resource now says what we sent — scheduling side-effects and sync
+    conflicts can rewrite it. Re-fetching by UID is the cheap way to tell the
+    difference between "reported done" and "is done".
+
+    Never turns a successful write into an exception: a verification that
+    cannot run is annotated on the result, not raised, because the write did
+    happen and hiding that would be worse than an unverified success.
+
+    Args:
+        client: The Nextcloud client.
+        calendar_name: Calendar holding the task.
+        todo_uid: UID of the task just completed.
+        result: The write result to annotate.
+
+    Returns:
+        ``result`` with ``verified`` set, plus ``verification_error`` when the
+        read-back failed or disagreed.
+    """
+    try:
+        stored = await client.calendar.get_todo(calendar_name, todo_uid)
+    except Exception as e:  # noqa: BLE001 - verification must not mask the write
+        logger.warning(
+            "Could not read back todo %s after completing it: %s", todo_uid, e
+        )
+        result["verified"] = False
+        result["verification_error"] = f"read-back failed: {e}"
+        return result
+
+    stored_status = str((stored or {}).get("status", "")).upper()
+    if stored_status == "COMPLETED":
+        result["verified"] = True
+        return result
+
+    logger.warning(
+        "Todo %s still reads STATUS=%r after completion", todo_uid, stored_status
+    )
+    result["verified"] = False
+    result["verification_error"] = (
+        f"server stored STATUS={stored_status or 'missing'!r}, expected 'COMPLETED'"
+    )
+    return result
 
 
 def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
@@ -974,6 +1036,7 @@ def configure_calendar_tools(mcp: FastMCP):
         min_priority: Optional[int] = None,
         categories: Optional[str] = None,
         summary_contains: Optional[str] = None,
+        include_completed: bool = True,
     ) -> ListTodosResponse:
         """List todos/tasks in a calendar with optional filtering.
 
@@ -984,6 +1047,10 @@ def configure_calendar_tools(mcp: FastMCP):
             min_priority: Filter by minimum priority (1=highest, 9=lowest)
             categories: Filter by categories (comma-separated, e.g., "work,urgent")
             summary_contains: Filter todos where summary contains this text
+            include_completed: Keep finished tasks in the result (default True,
+                preserving the historical behaviour). Pass False for "what is
+                still outstanding" — a task is finished when STATUS is
+                COMPLETED or it carries a COMPLETED timestamp.
 
         Returns:
             List of todos matching the filters
@@ -991,7 +1058,7 @@ def configure_calendar_tools(mcp: FastMCP):
         client = await get_client(ctx)
 
         # Build filters dictionary
-        filters = {}
+        filters: dict[str, Any] = {}
         if status is not None:
             filters["status"] = status
         if min_priority is not None:
@@ -1000,6 +1067,8 @@ def configure_calendar_tools(mcp: FastMCP):
             filters["categories"] = [cat.strip() for cat in categories.split(",")]
         if summary_contains is not None:
             filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
 
         todos_data = await client.calendar.list_todos(
             calendar_name, filters if filters else None
@@ -1171,13 +1240,21 @@ def configure_calendar_tools(mcp: FastMCP):
     ):
         """Mark a todo/task as completed.
 
-        Convenience wrapper around nc_calendar_update_todo that sets
-        STATUS=COMPLETED, PERCENT-COMPLETE=100, and the COMPLETED
-        timestamp in one call. Equivalent to invoking update_todo with
-        those three fields populated; useful for AI clients where
-        "complete this task" is a more natural phrasing than "set status
-        to COMPLETED, set percent_complete to 100, set completed
-        timestamp".
+        Completion is an *edit* of the VTODO, never a delete: it sets
+        STATUS=COMPLETED, PERCENT-COMPLETE=100 and the COMPLETED timestamp,
+        leaving the task on the server with its history intact. The task is
+        addressed by UID, which is the only stable identifier — summaries are
+        neither unique nor immutable.
+
+        Convenience wrapper around nc_calendar_update_todo; equivalent to
+        invoking update_todo with those three fields populated, but useful for
+        AI clients where "complete this task" is a more natural phrasing.
+
+        The write is then read back by UID and the stored STATUS checked, so a
+        server that accepted the PUT but did not store the completion (a
+        scheduling side-effect, a sync conflict) is reported rather than
+        confirmed. The read-back costs one extra request and applies only to
+        this confirmatory tool, not to writes generally.
 
         Args:
             calendar_name: Name of the calendar containing the todo
@@ -1187,7 +1264,8 @@ def configure_calendar_tools(mcp: FastMCP):
                 Defaults to the current UTC time if not provided.
 
         Returns:
-            Dict with the update result.
+            Dict with the update result, plus ``verified`` (bool) and, when the
+            read-back could not confirm it, ``verification_error``.
         """
         client = await get_client(ctx)
         if completed_at is None:
@@ -1197,7 +1275,8 @@ def configure_calendar_tools(mcp: FastMCP):
             "percent_complete": 100,
             "completed": completed_at,
         }
-        return await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
+        result = await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
+        return await _verify_todo_completed(client, calendar_name, todo_uid, result)
 
     @mcp.tool(
         title="Search Todo Tasks",
@@ -1211,6 +1290,7 @@ def configure_calendar_tools(mcp: FastMCP):
         min_priority: Optional[int] = None,
         categories: Optional[str] = None,
         summary_contains: Optional[str] = None,
+        include_completed: bool = True,
     ):
         """Search todos across all calendars with optional filtering.
 
@@ -1220,6 +1300,10 @@ def configure_calendar_tools(mcp: FastMCP):
             min_priority: Filter by minimum priority (1=highest, 9=lowest)
             categories: Filter by categories (comma-separated, e.g., "work,urgent")
             summary_contains: Filter todos where summary contains this text
+            include_completed: Keep finished tasks in the result (default True,
+                preserving the historical behaviour). Pass False for "what is
+                still outstanding" — a task is finished when STATUS is
+                COMPLETED or it carries a COMPLETED timestamp.
 
         Returns:
             List of todos matching the filters from all calendars
@@ -1227,7 +1311,7 @@ def configure_calendar_tools(mcp: FastMCP):
         client = await get_client(ctx)
 
         # Build filters dictionary
-        filters = {}
+        filters: dict[str, Any] = {}
         if status is not None:
             filters["status"] = status
         if min_priority is not None:
@@ -1236,6 +1320,8 @@ def configure_calendar_tools(mcp: FastMCP):
             filters["categories"] = [cat.strip() for cat in categories.split(",")]
         if summary_contains is not None:
             filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
 
         todos_data = await client.calendar.search_todos_across_calendars(
             filters if filters else None
