@@ -41,13 +41,27 @@ REQUIRED_FIELDS=(
 # here rather than scanning the whole tree so upstream-inherited files (no
 # fork ownership) aren't penalized.
 FORK_TOUCHED=(
+    "nextcloud_mcp_server/client/base.py"
+    "nextcloud_mcp_server/client/calendar.py"
     "nextcloud_mcp_server/client/contacts.py"
+    "nextcloud_mcp_server/client/dav_errors.py"
+    "nextcloud_mcp_server/client/ocs.py"
+    "nextcloud_mcp_server/client/sharing.py"
     "nextcloud_mcp_server/client/vcard_parser.py"
     "nextcloud_mcp_server/client/webdav.py"
     "nextcloud_mcp_server/models/contacts.py"
+    "nextcloud_mcp_server/models/sharing.py"
+    "nextcloud_mcp_server/server/calendar.py"
     "nextcloud_mcp_server/server/contacts.py"
+    "nextcloud_mcp_server/server/sharing.py"
     "tests/client/contacts/test_byte_preserving.py"
     "tests/client/webdav/test_size_limit.py"
+    "tests/unit/client/test_calendar_todos.py"
+    "tests/unit/client/test_dav_errors.py"
+    "tests/unit/client/test_ocs.py"
+    "tests/unit/client/test_share_types.py"
+    "tests/unit/client/test_webdav_write_conflicts.py"
+    "tests/unit/server/test_todo_completion_verification.py"
 )
 
 failures=0
