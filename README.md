@@ -5,7 +5,7 @@
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 147 MCP tools.
+Deck, Talk, and other Nextcloud application surfaces through 148 MCP tools.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -42,7 +42,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Tool surface** | 147 tools across 12 Nextcloud application surfaces |
+| **Tool surface** | 148 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.0` |
 | **Application version** | `0.150.1` |
@@ -126,7 +126,7 @@ The stable single-user profile exposes the following core tool surface:
 |---|---:|---|
 | **Deck** | 36 | Boards, stacks, cards, comments, labels, assignees, attachments |
 | **Collectives** | 20 | Collectives, pages, tags, hierarchy, trash and restore |
-| **Calendar and Tasks** | 17 | Events, todos, recurrence, availability, bulk operations |
+| **Calendar and Tasks** | 18 | Events, todos, recurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Files (WebDAV)** | 11 | Read/write, search, move/copy, directories, favorites |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
@@ -136,7 +136,7 @@ The stable single-user profile exposes the following core tool surface:
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 6 | Conversations, participants, messages, read state |
-| **Total** | **147** | Core tools in the stable single-user profile |
+| **Total** | **148** | Core tools in the stable single-user profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
