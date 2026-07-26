@@ -39,11 +39,8 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_public_issuer_url": None,
     "nextcloud_public_url": None,
     "cookie_secure": None,
-    # MCP transport security (DNS rebinding protection). Off by default so the
-    # containerized service-DNS deployments this fork targets keep working
-    # unchanged; opt in and enumerate the allowlists when the server is
-    # reachable beyond a trusted network. Comma-separated; entries support the
-    # MCP middleware's ``host:*`` wildcard-port syntax.
+    # Deprecated compatibility aliases for the pre-0.151.0 fork names.
+    # MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS are canonical.
     "mcp_dns_rebinding_protection": False,
     "mcp_dns_rebinding_allowed_hosts": "",
     "mcp_dns_rebinding_allowed_origins": "",
@@ -228,6 +225,17 @@ _DEFAULTS: dict[str, Any] = {
     # timing out or exhausting memory rather than failing predictably. 0
     # disables the guard.
     "webdav_write_max_mb": 50.0,
+    # Transport security (MCP SDK TransportSecuritySettings). Default False
+    # preserves the behaviour hardcoded before these knobs existed: MCP 1.23+
+    # auto-enables localhost-only host checking, which breaks k8s/Docker service
+    # DNS names (docs/MCP-1.23-DNS-REBINDING-FIX.md). Enable it plus
+    # MCP_ALLOWED_HOSTS when the server is reachable from a browser.
+    # Comma-separated Host / Origin allowlists, honoured only when the above is
+    # enabled. Empty means "the SDK's own defaults".
+    "mcp_allowed_hosts": "",
+    "mcp_allowed_origins": "",
+    # Comma-separated CORS origin allowlist. "*" preserves today's behaviour.
+    "cors_allow_origins": "*",
     # Page ceiling for markdown reconstruction (see document_markdown_max_pages).
     "document_markdown_max_pages": 150,
     # Pages per pypdfium2 extraction window (see document_parse_page_window).
@@ -300,8 +308,8 @@ _DEFAULTS: dict[str, Any] = {
     "log_format": "text",
     "log_level": "INFO",
     "log_include_trace_context": True,
-    # Document processing
-    "enable_document_processing": False,
+    # Document processing (no master switch: each optional processor has its own
+    # ENABLE_* flag, and parsing on read is the caller's per-call decision)
     "document_processor": "unstructured",
     "enable_unstructured": False,
     "unstructured_api_url": "http://unstructured:8000",
@@ -312,7 +320,8 @@ _DEFAULTS: dict[str, Any] = {
     "enable_tesseract": False,
     "tesseract_cmd": None,
     "tesseract_lang": "eng",
-    "enable_pymupdf": True,
+    # pymupdf is the built-in "structured" tier and is always available -- there
+    # is no enable flag for it, only these two knobs.
     "pymupdf_extract_images": True,
     "pymupdf_image_dir": None,
     "enable_custom_processor": False,
@@ -796,10 +805,16 @@ def setup_logging():
 def get_document_processor_config() -> dict[str, Any]:
     """Get document processor configuration from dynaconf.
 
+    Each optional processor is gated by its own ``ENABLE_*`` flag. There is no
+    master switch: parsing a document on read is a per-call decision made by the
+    caller (``nc_webdav_read_file``'s ``parse_document`` argument), not an
+    instance-wide setting. The built-in PDF tiers (pypdfium2 / pymupdf / OCR)
+    self-register when ``document_processors`` is first imported and never appear
+    here.
+
     Returns:
         Dict with processor configs:
         {
-            "enabled": bool,
             "default_processor": str,
             "processors": {
                 "unstructured": {...},
@@ -809,7 +824,6 @@ def get_document_processor_config() -> dict[str, Any]:
         }
     """
     config: dict[str, Any] = {
-        "enabled": _dynaconf.get("ENABLE_DOCUMENT_PROCESSING"),
         "default_processor": _dynaconf.get("DOCUMENT_PROCESSOR"),
         "processors": {},
     }
@@ -834,14 +848,12 @@ def get_document_processor_config() -> dict[str, Any]:
             "lang": _dynaconf.get("TESSERACT_LANG"),
         }
 
-    # PyMuPDF configuration (local PDF processing)
-    if _dynaconf.get("ENABLE_PYMUPDF"):  # Enabled by default
-        config["processors"]["pymupdf"] = {
-            "extract_images": _dynaconf.get("PYMUPDF_EXTRACT_IMAGES"),
-            "image_dir": _dynaconf.get(
-                "PYMUPDF_IMAGE_DIR"
-            ),  # None = use temp directory
-        }
+    # NB: pymupdf is deliberately absent. It is the built-in ``structured`` tier,
+    # registered when ``document_processors`` is first imported (lazily, on the
+    # first parse) and tuned from ``Settings.pymupdf_*``. Listing it here would
+    # make ``processors`` non-empty on every deployment, which is what tells app
+    # startup whether it has anything to register -- and so whether it must
+    # import the parse stack at all (#877).
 
     # Custom processor (via HTTP API)
     if _dynaconf.get("ENABLE_CUSTOM_PROCESSOR"):
@@ -863,8 +875,9 @@ def get_document_processor_config() -> dict[str, Any]:
     # Docling configuration (docling-serve HTTP API). Registered only when a URL is
     # set, so a bare ENABLE_DOCLING doesn't shadow other image processors with a
     # dead endpoint (mirrors the custom_url guard above). The standalone processor
-    # auto-serves images; PDFs go through the OCR backend (provider=docling) or an
-    # explicit per-call force_processor override.
+    # auto-serves images; PDFs go through the OCR backend
+    # (DOCUMENT_OCR_PROVIDER=docling) -- docling is an OCR provider, not a tier of
+    # its own.
     if _dynaconf.get("ENABLE_DOCLING"):
         docling_url = _dynaconf.get("DOCLING_API_URL")
         if docling_url:
@@ -971,13 +984,8 @@ class Settings:
     # localhost auto-enablement rejects the service DNS names that Docker/k8s
     # deployments legitimately present in the Host header.
     #
-    # Set MCP_DNS_REBINDING_PROTECTION=true when the server is reachable beyond a
-    # trusted network, and enumerate every Host/Origin your clients present. The
-    # allowlists are comma-separated and support the MCP middleware's ``host:*``
-    # wildcard-port syntax, e.g. "nextcloud-mcp:*,127.0.0.1:*,localhost:*".
-    #
-    # Host validation fails closed: enabling protection with an empty host
-    # allowlist rejects every request. get_app() logs a warning for that case.
+    # Deprecated compatibility aliases for the pre-0.151.0 fork names.
+    # MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS are canonical and take precedence.
     mcp_dns_rebinding_protection: bool = False
     mcp_dns_rebinding_allowed_hosts: str = ""
     mcp_dns_rebinding_allowed_origins: str = ""
@@ -1196,6 +1204,12 @@ class Settings:
     # Pre-flight cap (MB) on nc_webdav_write_file's content (see _DEFAULTS
     # for rationale). 0 disables the guard.
     webdav_write_max_mb: float = 50.0
+    # Transport security. See _DEFAULTS for why the protection defaults off.
+    mcp_dns_rebinding_protection: bool = False
+    mcp_allowed_hosts: str = ""
+    mcp_allowed_origins: str = ""
+    # CORS origin allowlist; "*" is today's behaviour.
+    cors_allow_origins: str = "*"
     # Page ceiling above which the structured tier skips pymupdf4llm.to_markdown
     # and returns the raw text layer instead. 0 disables markdown entirely
     # (every document takes the raw-text path), matching how
@@ -1221,6 +1235,12 @@ class Settings:
     # 2-core pod, and it keeps markdown for the small/prose documents that
     # actually benefit from table reconstruction.
     document_markdown_max_pages: int = 150
+    # Structured-tier (pymupdf) image extraction. Read where that tier registers
+    # itself rather than at app startup: it is a built-in tier, not an optional
+    # processor, so nothing about it may pull the parse stack onto the API
+    # startup path (#877).
+    pymupdf_extract_images: bool = True
+    pymupdf_image_dir: str | None = None
     # RLIMIT_AS in the parse subprocess (below the pod limit). Applied once per
     # worker for its lifetime, so changing it needs a pod restart.
     document_parse_mem_limit_mb: int = 1536
@@ -2067,7 +2087,12 @@ def _build_settings() -> Settings:
         "document_read_timeout_seconds": "DOCUMENT_READ_TIMEOUT_SECONDS",
         "document_max_pdf_size_mb": "DOCUMENT_MAX_PDF_SIZE_MB",
         "webdav_write_max_mb": "WEBDAV_WRITE_MAX_MB",
+        "mcp_allowed_hosts": "MCP_ALLOWED_HOSTS",
+        "mcp_allowed_origins": "MCP_ALLOWED_ORIGINS",
+        "cors_allow_origins": "CORS_ALLOW_ORIGINS",
         "document_markdown_max_pages": "DOCUMENT_MARKDOWN_MAX_PAGES",
+        "pymupdf_extract_images": "PYMUPDF_EXTRACT_IMAGES",
+        "pymupdf_image_dir": "PYMUPDF_IMAGE_DIR",
         "document_parse_mem_limit_mb": "DOCUMENT_PARSE_MEM_LIMIT_MB",
         "document_parse_page_window": "DOCUMENT_PARSE_PAGE_WINDOW",
         "document_parse_process_slots": "DOCUMENT_PARSE_PROCESS_SLOTS",

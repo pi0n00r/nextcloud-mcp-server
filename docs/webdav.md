@@ -5,7 +5,7 @@
 | Tool | Description |
 |------|-------------|
 | `nc_webdav_list_directory` | List files and directories in any NextCloud path |
-| `nc_webdav_read_file` | Read file content (text files decoded, binary as base64) |
+| `nc_webdav_read_file` | Read file content (documents extracted to text/markdown, text decoded, other binary as base64) |
 | `nc_webdav_write_file` | Create or update files in NextCloud |
 | `nc_webdav_create_directory` | Create new directories |
 | `nc_webdav_delete_resource` | Delete files or directories |
@@ -32,6 +32,19 @@ await nc_webdav_list_directory("Documents/Reports")
 
 # Read a text file
 content = await nc_webdav_read_file("Documents/readme.txt")
+
+# Read a document: extracted text by default, no base64
+result = await nc_webdav_read_file("Documents/report.pdf")
+result.content          # the document's text
+result.parse_tier       # "fast" | "structured" | "ocr" -- what produced it
+result.content_format   # "text" | "markdown" | "base64"
+result.parse_notes      # non-empty => say what degraded; this is not the whole document
+
+# Ask for structure (headings, tables) instead of a flat text layer
+await nc_webdav_read_file("Documents/report.pdf", parse_document="markdown")
+
+# Or take the file itself, unparsed
+await nc_webdav_read_file("Documents/report.pdf", parse_document="raw")
 
 # Create a new directory
 await nc_webdav_create_directory("NewProject/docs")
@@ -117,3 +130,45 @@ v2 protocol, but the complete argument is still resident in server memory. A
 pre-flight size gate rejects content over `WEBDAV_WRITE_MAX_MB` (default 50,
 `0` disables) with a clear error rather than risking a timeout or out-of-memory
 failure.
+
+## Conditional move and copy
+
+`nc_webdav_move_resource` and `nc_webdav_copy_resource` accept an optional
+`if_destination_match`. With `overwrite=True` alone the destination is replaced
+unconditionally; supplying the destination's ETag replaces it **only if it is
+still that exact version**, so a file someone else changed in the meantime is not
+clobbered.
+
+```python
+info = await nc_webdav_read_file(path="Docs/report.txt")
+await nc_webdav_move_resource(
+    source_path="Drafts/report.txt",
+    destination_path="Docs/report.txt",
+    overwrite=True,
+    if_destination_match=info["etag"],
+)
+```
+
+### Why not `If-Match`?
+
+`If-Match` applies to the **request-URI**, which for MOVE/COPY is the *source*.
+Conditioning the destination requires RFC 4918 §10.4's tagged-list `If:` form,
+which names the resource explicitly:
+
+```
+If: </remote.php/dav/files/user/Docs/report.txt> (["etag"])
+```
+
+### Limitations
+
+Both come from sabre/dav and are surfaced rather than hidden:
+
+- **Files only.** The etag is checked with `$node instanceof IFile`, so a
+  **directory** destination always fails the condition with 412.
+- **A missing destination yields 404, not 412.** An `If:` condition naming a URI
+  that does not exist raises `NotFound` inside sabre. "The destination must
+  exist" is therefore not expressible this way — `overwrite=False` already covers
+  "must not exist".
+
+`if_destination_match="*"` and combining it with `overwrite=False` both raise
+`ValueError` at the client boundary rather than being silently reinterpreted.

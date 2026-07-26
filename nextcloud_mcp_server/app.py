@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 from __future__ import annotations
 
 import base64
@@ -216,19 +227,22 @@ class GatewaySecretMiddleware:
 def initialize_document_processors():
     """Initialize and register document processors based on configuration.
 
-    This function reads the environment configuration and registers available
-    processors (Unstructured, Tesseract, Custom HTTP, Docling) with the global
-    registry.
+    This function reads the environment configuration and registers the available
+    OPTIONAL processors (Unstructured, Tesseract, Custom HTTP, Docling) with the
+    global registry, each gated by its own ``ENABLE_*`` flag. The built-in PDF
+    tiers (pypdfium2 / pymupdf / OCR) self-register on first import of
+    ``document_processors`` and need nothing here.
     """
     config = get_document_processor_config()
 
-    if not config["enabled"]:
-        logger.info("Document processing disabled")
+    if not config["processors"]:
+        logger.info("No optional document processors configured")
         return
 
     # Imported lazily so the API startup path never loads the ingest document
-    # stack (document_processors -> pymupdf -> _isolation) unless document
-    # processing is actually enabled -- see #877 / the API-vs-ingest split.
+    # stack (document_processors -> pymupdf -> _isolation) unless an optional
+    # processor actually has to be registered -- see #877 / the API-vs-ingest
+    # split. Nothing to register means nothing to import.
     from nextcloud_mcp_server.document_processors import get_registry  # noqa: PLC0415
 
     registry = get_registry()
@@ -273,26 +287,9 @@ def initialize_document_processors():
         except Exception as e:
             logger.warning("Failed to register Tesseract processor: %s", e)
 
-    # Register PyMuPDF processor (high priority, local, no API required)
-    if "pymupdf" in config["processors"]:
-        pymupdf_config = config["processors"]["pymupdf"]
-        try:
-            from nextcloud_mcp_server.document_processors.pymupdf import (  # noqa: PLC0415
-                PyMuPDFProcessor,
-            )
-
-            processor = PyMuPDFProcessor(
-                extract_images=pymupdf_config.get("extract_images", True),
-                image_dir=pymupdf_config.get("image_dir"),
-            )
-            registry.register(processor, priority=15)  # Higher than unstructured
-            logger.info(
-                "Registered PyMuPDF processor: extract_images=%s",
-                pymupdf_config.get("extract_images", True),
-            )
-            registered_count += 1
-        except Exception as e:
-            logger.warning("Failed to register PyMuPDF processor: %s", e)
+    # PyMuPDF is NOT registered here: it is the built-in ``structured`` tier and
+    # registers itself (from Settings.pymupdf_*) when document_processors is
+    # first imported, which is on the first parse rather than at startup (#877).
 
     # Register custom processor
     if "custom" in config["processors"]:
@@ -346,12 +343,16 @@ def initialize_document_processors():
 
     if registered_count > 0:
         logger.info(
-            "Document processing initialized with %s processor(s): %s",
+            "Document processing initialized with %s optional processor(s); "
+            "registry now holds: %s",
             registered_count,
             ", ".join(registry.list_processors()),
         )
     else:
-        logger.warning("Document processing enabled but no processors registered")
+        logger.warning(
+            "Optional document processors were configured but none could be "
+            "registered; only the built-in tiers are available"
+        )
 
 
 def validate_pkce_support(discovery: dict, discovery_url: str) -> None:
@@ -1569,19 +1570,48 @@ def build_transport_security(settings: Settings) -> TransportSecuritySettings:
     beyond a trusted network can now turn it back on and enumerate the
     Host/Origin values their clients present.
     """
+    allowed_hosts = _split_csv(settings.mcp_allowed_hosts)
+    allowed_origins = _split_csv(settings.mcp_allowed_origins)
+    legacy_hosts = _split_csv(settings.mcp_dns_rebinding_allowed_hosts)
+    legacy_origins = _split_csv(settings.mcp_dns_rebinding_allowed_origins)
+
+    if not allowed_hosts and legacy_hosts:
+        allowed_hosts = legacy_hosts
+        logger.warning(
+            "MCP_DNS_REBINDING_ALLOWED_HOSTS is deprecated; use "
+            "MCP_ALLOWED_HOSTS instead."
+        )
+    elif allowed_hosts and legacy_hosts and allowed_hosts != legacy_hosts:
+        logger.warning(
+            "Both MCP_ALLOWED_HOSTS and deprecated "
+            "MCP_DNS_REBINDING_ALLOWED_HOSTS are set; using MCP_ALLOWED_HOSTS."
+        )
+
+    if not allowed_origins and legacy_origins:
+        allowed_origins = legacy_origins
+        logger.warning(
+            "MCP_DNS_REBINDING_ALLOWED_ORIGINS is deprecated; use "
+            "MCP_ALLOWED_ORIGINS instead."
+        )
+    elif allowed_origins and legacy_origins and allowed_origins != legacy_origins:
+        logger.warning(
+            "Both MCP_ALLOWED_ORIGINS and deprecated "
+            "MCP_DNS_REBINDING_ALLOWED_ORIGINS are set; using "
+            "MCP_ALLOWED_ORIGINS."
+        )
+
     if not settings.mcp_dns_rebinding_protection:
+        if allowed_hosts or allowed_origins:
+            logger.warning(
+                "MCP DNS-rebinding allowlists are set but "
+                "MCP_DNS_REBINDING_PROTECTION is false, so they have no effect."
+            )
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
-    allowed_hosts = _split_csv(settings.mcp_dns_rebinding_allowed_hosts)
-    allowed_origins = _split_csv(settings.mcp_dns_rebinding_allowed_origins)
     if not allowed_hosts:
-        # The middleware's Host check fails closed, so an empty allowlist
-        # rejects every request. Surface that as a warning rather than letting
-        # the deployment look mysteriously dead.
-        logger.warning(
-            "MCP_DNS_REBINDING_PROTECTION is enabled but "
-            "MCP_DNS_REBINDING_ALLOWED_HOSTS is empty; every request will be "
-            "rejected. Set the hosts your clients present, e.g. "
+        raise ValueError(
+            "MCP_DNS_REBINDING_PROTECTION is enabled but MCP_ALLOWED_HOSTS is "
+            "empty. Set the hosts your clients present, e.g. "
             "'nextcloud-mcp:*,127.0.0.1:*,localhost:*'."
         )
     logger.info(
@@ -1594,6 +1624,18 @@ def build_transport_security(settings: Settings) -> TransportSecuritySettings:
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
     )
+
+
+def build_cors_origins(settings: Settings) -> list[str]:
+    """Build the configured CORS origin list without changing legacy defaults."""
+    origins = _split_csv(settings.cors_allow_origins) or ["*"]
+    if "*" in origins:
+        logger.warning(
+            "CORS allows any origin with credentials (CORS_ALLOW_ORIGINS='*'). "
+            "Set CORS_ALLOW_ORIGINS to an explicit comma-separated list if this "
+            "server is reachable from a browser."
+        )
+    return origins
 
 
 def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None = None):
@@ -3174,10 +3216,20 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             )
         return await call_next(request)
 
-    # Add CORS middleware to allow browser-based clients like MCP Inspector
+    # Add CORS middleware to allow browser-based clients like MCP Inspector.
+    #
+    # The default is still "*", so behaviour is unchanged — but it is now a
+    # setting rather than a literal, and the wildcard is called out at startup.
+    # "*" together with allow_credentials=True is not the permissive-but-inert
+    # combination it looks like: Starlette echoes the request's Origin back
+    # instead of "*" (a bare "*" is invalid with credentials per the CORS spec),
+    # so *any* origin may send credentialed requests. Fine behind a private
+    # network or for local Inspector use; not something to leave unexamined on a
+    # server reachable from a browser.
+    cors_origins = build_cors_origins(settings)
     app.add_middleware(
         CORSMiddleware,  # type: ignore[invalid-argument-type]
-        allow_origins=["*"],  # Allow all origins for development
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
