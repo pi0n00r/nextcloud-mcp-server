@@ -1,142 +1,270 @@
+<div align="center">
+
 # Nextcloud MCP Server
 
-**A production-ready MCP server that connects AI assistants to your Nextcloud instance.**
+**A production-ready Model Context Protocol server for Nextcloud.**
 
-Enable Large Language Models like Claude, GPT, and Gemini to interact with your Nextcloud data through a secure API. Create notes, manage calendars, organize contacts, work with files, and more - all through natural language conversations.
+Give AI assistants controlled access to files, calendars, contacts, notes,
+Deck, Talk, and the rest of your Nextcloud workspace through 147 MCP tools.
 
-This is a **dedicated standalone MCP server** designed for external MCP clients like Claude Code and IDEs. It runs independently of Nextcloud (Docker, VM, Kubernetes, or local) and provides deep CRUD operations across Nextcloud apps.
+[![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
+[![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
+[![Container](https://img.shields.io/badge/GHCR-v1.5.0-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
+
+[Quick start](#quick-start) | [Capabilities](#nextcloud-capabilities) |
+[Documentation](#documentation) | [Security](#security) |
+[Contributing](#contributing)
+
+</div>
+
+Nextcloud MCP Server is a standalone bridge between MCP clients and an
+existing Nextcloud instance. It runs outside Nextcloud and exposes a broad,
+typed tool surface over the platform's supported APIs, including WebDAV,
+CalDAV, CardDAV, OCS, and application REST endpoints.
+
+This production-focused fork tracks the upstream project while maintaining
+hardened data paths for real-world automation:
+
+- **Byte-preserving CardDAV updates** retain contact photos, folded fields,
+  custom properties, and untouched vCard bytes.
+- **Concurrency-safe writes** use ETags for CardDAV and WebDAV changes instead
+  of silently overwriting newer data.
+- **Atomic large-file uploads** route through Nextcloud's chunked upload path
+  without weakening destination preconditions.
+- **Calendar and Deck fidelity** preserves value types, timezones, alarms,
+  card order, and due dates through updates.
+- **First-class container networking** serves IPv4 and IPv6 from one listener
+  in the stable image.
+
+## At a Glance
+
+| Property | Value |
+|---|---|
+| **Tool surface** | 147 tools across 12 Nextcloud application surfaces |
+| **Transports** | Streamable HTTP and stdio |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.0` |
+| **Application version** | `0.150.1` |
+| **Architectures** | `linux/amd64`, `linux/arm64` |
+| **Authentication** | App passwords, multi-user Basic Auth, Login Flow v2 |
+| **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
 
 > [!NOTE]
-> **Looking for AI features inside Nextcloud?** Nextcloud also provides [Context Agent](https://github.com/nextcloud/context_agent), which powers the Assistant app and runs as an ExApp inside Nextcloud. See [docs/comparison-context-agent.md](docs/comparison-context-agent.md) for a detailed comparison of use cases.
+> This project is a standalone MCP server for external clients. For AI
+> features embedded inside Nextcloud, see
+> [Nextcloud Context Agent](https://github.com/nextcloud/context_agent) and the
+> [comparison guide](docs/comparison-context-agent.md).
 
 ## Quick Start
 
-Run the server locally with [uvx](https://docs.astral.sh/uv/) (no installation required):
+### 1. Create a Nextcloud app password
+
+In Nextcloud, open **Personal settings > Security > Devices & sessions** and
+create an app password for the MCP server. Do not use your primary account
+password.
+
+### 2. Create a private environment file
 
 ```bash
-NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
+mkdir -p ~/.config/nextcloud-mcp
+chmod 700 ~/.config/nextcloud-mcp
+
+printf '%s\n' \
+  'NEXTCLOUD_HOST=https://cloud.example.com' \
+  'NEXTCLOUD_USERNAME=your_username' \
+  'NEXTCLOUD_PASSWORD=your_app_password' \
+  'MCP_DEPLOYMENT_MODE=single_user_basic' \
+  > ~/.config/nextcloud-mcp/env
+
+chmod 600 ~/.config/nextcloud-mcp/env
+```
+
+### 3. Run the stable container
+
+```bash
+docker run --detach \
+  --name nextcloud-mcp \
+  --restart unless-stopped \
+  --publish 127.0.0.1:8000:8000 \
+  --env-file ~/.config/nextcloud-mcp/env \
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.0
+```
+
+Verify the service before connecting a client:
+
+```bash
+curl --fail http://127.0.0.1:8000/health/live
+curl --fail http://127.0.0.1:8000/health/ready
+```
+
+The MCP endpoint is:
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+See the [container package guide](docs/container-package.md) for persistent
+deployment details and health-check configuration.
+
+### Run from source
+
+For a local stdio integration:
+
+```bash
+git clone --branch v1.5.0 --depth 1 \
+  https://github.com/pi0n00r/nextcloud-mcp-server.git
+cd nextcloud-mcp-server
+uv sync --locked
+
+NEXTCLOUD_HOST=https://cloud.example.com \
 NEXTCLOUD_USERNAME=your_username \
 NEXTCLOUD_PASSWORD=your_app_password \
-  uvx nextcloud-mcp-server run --transport stdio
+MCP_DEPLOYMENT_MODE=single_user_basic \
+  uv run nextcloud-mcp-server run --transport stdio
 ```
 
-Or add it directly to your MCP client configuration (e.g. `claude_desktop_config.json` or `.claude/settings.json`):
+## Nextcloud Capabilities
 
-```json
-{
-  "mcpServers": {
-    "nextcloud": {
-      "command": "uvx",
-      "args": ["nextcloud-mcp-server", "run", "--transport", "stdio"],
-      "env": {
-        "NEXTCLOUD_HOST": "https://your.nextcloud.instance.com",
-        "NEXTCLOUD_USERNAME": "your_username",
-        "NEXTCLOUD_PASSWORD": "your_app_password"
-      }
-    }
-  }
-}
-```
+The stable single-user profile exposes the following core tool surface:
 
-> [!TIP]
-> Generate an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) in Nextcloud under **Settings > Security > Devices & sessions** instead of using your login password.
+| Surface | Tools | Coverage |
+|---|---:|---|
+| **Deck** | 36 | Boards, stacks, cards, comments, labels, assignees, attachments |
+| **Collectives** | 20 | Collectives, pages, tags, hierarchy, trash and restore |
+| **Calendar and Tasks** | 17 | Events, todos, recurrence, availability, bulk operations |
+| **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
+| **Files (WebDAV)** | 11 | Read/write, search, move/copy, directories, favorites |
+| **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
+| **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
+| **Notes** | 7 | Create, read, update, append, search, attachments |
+| **Mail** | 6 | Accounts, mailboxes, messages, attachments, sending |
+| **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
+| **Tables** | 6 | Schemas and row-level create/read/update/delete |
+| **Talk** | 6 | Conversations, participants, messages, read state |
+| **Total** | **147** | Core tools in the stable single-user profile |
 
-### Container Package
+MCP resources provide additional structured browsing paths. Optional semantic
+search adds cross-application retrieval for supported content when its
+indexing infrastructure is enabled.
 
-The published stable container image runs with Docker:
+## Production Features
 
-```bash
-docker run --rm -p 127.0.0.1:8000:8000 \
-  -e NEXTCLOUD_HOST=https://your.nextcloud.instance.com \
-  -e NEXTCLOUD_USERNAME=your_username \
-  -e NEXTCLOUD_PASSWORD=your_app_password \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.3.1
-```
+### Data integrity
 
-Then connect your MCP client (Claude Desktop, IDEs, `mcp dev`, etc.) to `http://127.0.0.1:8000/mcp`.
+- Byte-preserving vCard parser with explicit patch and full-replacement tools
+- ETag preconditions and clear conflict reporting
+- Chunked WebDAV uploads with atomic destination checks
+- Stale pooled-read and verified short-read recovery
+- Typed responses for file, contact, calendar, and sharing operations
 
-For a persistent Docker deployment, see
-[docs/container-package.md](docs/container-package.md).
+### Safety and access control
 
-## Key Features
+- App-password isolation for single-user deployments
+- Explicit deployment modes for single-user and multi-user installations
+- Optional pre-shared gateway secret for HTTP transport
+- Configurable DNS-rebinding protection
+- Tag-based file and folder exclusion through `EXCLUDED_TAGS`
+- OAuth scope enforcement for Login Flow deployments
 
-- **110+ MCP Tools** - Comprehensive API coverage across 10 Nextcloud apps
-- **MCP Resources** - Structured data URIs for browsing Nextcloud data
-- **Semantic Search (Experimental)** - Optional vector-powered search for Notes, Files, News items, Deck cards, and Mail messages (requires Qdrant + Ollama)
-- **Document Processing** - OCR and text extraction from PDFs, DOCX, images with progress notifications
-- **Flexible Deployment** - Docker, Kubernetes, VM, or local installation
-- **Production-Ready Auth** - Basic Auth with app passwords; multi-user via Login Flow v2 — MCP clients authenticate via OAuth, the server handles Nextcloud app passwords transparently
-- **Tag-Based File Exclusion** - Hide sensitive files/folders from MCP file tools by tagging them with a configured Nextcloud system tag (`EXCLUDED_TAGS`). See [docs/configuration.md](docs/configuration.md#tag-based-file-exclusion-optional)
-- **Multiple Transports** - streamable-http (default) and stdio
+### Search and document processing
 
-## Supported Apps
+- Keyword and semantic search modes
+- Qdrant-backed indexing with optional dense and sparse embeddings
+- PDF, Office document, image, and OCR extraction
+- Optional Docling backend, including VLM pipelines
+- Verify-on-read safeguards for indexed results
 
-| App | Tools | Capabilities |
-|-----|-------|--------------|
-| **Notes** | 7 | Full CRUD, keyword search, semantic search |
-| **Calendar** | 20+ | Events, todos (tasks), recurring events, attendees, availability |
-| **Contacts** | 8 | Full CardDAV support, address books |
-| **Files (WebDAV)** | 12 | Filesystem access, OCR/document processing |
-| **Deck** | 15 | Boards, stacks, cards, labels, assignments |
-| **Cookbook** | 13 | Recipe management, URL import (schema.org) |
-| **Tables** | 5 | Row operations on Nextcloud Tables |
-| **Sharing** | 10+ | Create and manage shares |
-| **News** | 8 | Feeds, folders, items, feed health monitoring |
-| **Mail** | 5 | Read-only: accounts, mailboxes, messages, attachments (via Mail app's REST API) |
-| **Collectives** | 16 | Full CRUD on collectives, pages, and tags |
-| **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
-| **Semantic Search** | 2+ | Vector search for Notes, Files, News items, Deck cards, and Mail messages (experimental, opt-in, requires infrastructure) |
+### Operations
 
-Want to see another Nextcloud app supported? [Open an issue](https://github.com/pi0n00r/nextcloud-mcp-server/issues) or contribute a pull request!
+- Docker health checks at `/health/live` and `/health/ready`
+- Prometheus metrics and OpenTelemetry tracing
+- SQLite and PostgreSQL storage backends
+- Structured logging and optional continuous profiling
+- CI coverage across multiple Nextcloud and authentication profiles
 
 ## Authentication
 
-The MCP server authenticates to Nextcloud using **app-specific passwords** (Basic Auth). Three deployment modes are supported:
+| Mode | Use case |
+|---|---|
+| `single_user_basic` | Personal and dedicated-agent deployments using one Nextcloud app password |
+| `multi_user_basic` | Multiple callers supplying Nextcloud credentials per request |
+| `login_flow` | Shared deployments using Nextcloud Login Flow v2 and MCP OAuth |
 
-| Mode | Best for |
-|------|----------|
-| Single-User (BasicAuth) | Personal use, development, single-user deployments |
-| Multi-User (BasicAuth pass-through) | Multi-user setups where clients send credentials via Authorization header |
-| Multi-User (Login Flow v2) | Shared deployments — clients authenticate to the MCP server via OAuth, and the server obtains a per-user app password from Nextcloud and uses it transparently |
-
-OAuth-direct-to-Nextcloud is no longer supported (it required upstream patches to `user_oidc` that were never merged). Login Flow v2 replaces it for multi-user deployments and works with stock Nextcloud.
-
-See [docs/authentication.md](docs/authentication.md) for setup instructions.
-
-## Semantic Search
-
-An experimental RAG pipeline that lets MCP clients find Nextcloud content by **meaning** rather than keywords — a query for "car" also surfaces notes about "vehicle" or "transportation". Disabled by default (`ENABLE_SEMANTIC_SEARCH=false`); requires a vector database and embedding service. See [docs/semantic-search-architecture.md](docs/semantic-search-architecture.md) and [docs/configuration.md](docs/configuration.md).
+Start with `single_user_basic` unless the server is intentionally shared.
+Review the [authentication guide](docs/authentication.md) before exposing an
+HTTP deployment beyond a trusted local network.
 
 ## Documentation
 
-- **[Installation](docs/installation.md)** — Docker, Compose profiles, local, VM
-- **[Configuration](docs/configuration.md)** — Environment variables, document processing, semantic search setup
-- **[Authentication](docs/authentication.md)** — Basic Auth, Login Flow v2
-- **[Running the Server](docs/running.md)** — Start, manage, troubleshoot
-- **[App Documentation](docs/)** — Per-app guides (Notes, Calendar, Contacts, WebDAV, Deck, Cookbook, Tables)
-- **[Semantic Search Architecture](docs/semantic-search-architecture.md)** + **[Vector Sync UI](docs/user-guide/vector-sync-ui.md)**
-- **[Login Flow v2](docs/login-flow-v2.md)** — recommended multi-user setup (architecture, env vars, scope reference, troubleshooting)
-- **[Troubleshooting](docs/troubleshooting.md)** · **[Comparison with Context Agent](docs/comparison-context-agent.md)**
+### Start here
 
-## Contributing
+- [Container package](docs/container-package.md)
+- [Installation](docs/installation.md)
+- [Configuration](docs/configuration.md)
+- [Authentication](docs/authentication.md)
+- [Running the server](docs/running.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
-Code contributions and pull requests are welcome under this repository's AGPL
-license.
+### Application guides
 
-- Report bugs or request features: [GitHub Issues](https://github.com/pi0n00r/nextcloud-mcp-server/issues)
-- Submit improvements: [Pull Requests](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
-- Agent and development guidelines: [AGENTS.md](AGENTS.md)
+- [Files and WebDAV](docs/webdav.md)
+- [Calendar and Tasks](docs/calendar.md)
+- [Contacts](docs/contacts.md)
+- [Notes](docs/notes.md)
+- [Deck](docs/deck.md)
+- [Cookbook](docs/cookbook.md)
+- [Tables](docs/table.md)
+
+### Advanced capabilities
+
+- [Semantic search architecture](docs/semantic-search-architecture.md)
+- [Vector sync UI](docs/user-guide/vector-sync-ui.md)
+- [Document processing configuration](docs/configuration.md)
+- [Observability](docs/observability.md)
+- [Database migrations](docs/database-migrations.md)
+- [Architecture decisions](docs/)
+
+## Release Policy
+
+Stable container images use exact release tags and are published for amd64 and
+arm64. A floating `latest` tag is intentionally not published.
+
+- [Latest release](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
+- [Container package](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+- [Changelog](CHANGELOG.md)
 
 ## Security
 
-Found a security issue? **Do not open a public GitHub issue.** Use GitHub's [private vulnerability reporting](https://github.com/pi0n00r/nextcloud-mcp-server/security/advisories/new). See [SECURITY.md](./SECURITY.md) for details.
+Do not report vulnerabilities through a public issue. Use
+[GitHub private vulnerability reporting](https://github.com/pi0n00r/nextcloud-mcp-server/security/advisories/new)
+and review [SECURITY.md](SECURITY.md).
+
+For network deployments, terminate TLS at a trusted reverse proxy, keep the
+MCP service private where possible, and configure the gateway secret and
+allowed-host policy described in the configuration guide.
+
+## Contributing
+
+Bug reports, focused fixes, documentation improvements, and new application
+integrations are welcome.
+
+- [Open an issue](https://github.com/pi0n00r/nextcloud-mcp-server/issues)
+- [Submit a pull request](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md)
+- Target this repository's `master` branch and preserve the documented data
+  integrity contracts
+
+This fork is built on the work of Chris Coutinho and the
+`nextcloud-mcp-server` contributor community. Thank you to everyone whose
+features, fixes, reviews, and testing have strengthened the project.
 
 ## License
 
-This project is licensed under the AGPL-3.0 License. See [LICENSE](./LICENSE) for details.
+Licensed under the [GNU Affero General Public License v3](LICENSE).
 
 ## References
 
-- [Model Context Protocol](https://github.com/modelcontextprotocol)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
 - [Nextcloud](https://nextcloud.com/)
