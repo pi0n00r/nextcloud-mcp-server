@@ -3,9 +3,14 @@ import logging
 from typing import Any, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.calendar import (
+    CalendarEtagConflictError,
+    CalendarEtagUnavailableError,
+)
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.calendar import (
     Calendar,
@@ -71,6 +76,7 @@ def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
         calendar_display_name=event.get("calendar_display_name")
         or event.get("calendar_name"),
         reminders=event.get("reminders", []),
+        etag=event.get("etag"),
     )
 
 
@@ -423,9 +429,25 @@ def configure_calendar_tools(mcp: FastMCP):
         if reminders is not None:
             event_data["reminders"] = reminders
 
-        return await client.calendar.update_event(
-            calendar_name, event_uid, event_data, etag
-        )
+        try:
+            return await client.calendar.update_event(
+                calendar_name, event_uid, event_data, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar event {event_uid} was modified since it was read."
+                f"{current} Read the event again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the event again before retrying."
+            ) from exc
 
     @mcp.tool(
         title="Delete Calendar Event",
@@ -1156,6 +1178,7 @@ def configure_calendar_tools(mcp: FastMCP):
         completed: Optional[str] = None,
         categories: Optional[str] = None,
         reminders: list[dict[str, Any]] | None = None,
+        etag: str = "",
     ):
         """Update an existing todo/task.
 
@@ -1203,7 +1226,25 @@ def configure_calendar_tools(mcp: FastMCP):
         if reminders is not None:
             todo_data["reminders"] = reminders
 
-        return await client.calendar.update_todo(calendar_name, todo_uid, todo_data)
+        try:
+            return await client.calendar.update_todo(
+                calendar_name, todo_uid, todo_data, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar todo {todo_uid} was modified since it was read."
+                f"{current} Read the todo again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the todo again before retrying."
+            ) from exc
 
     @mcp.tool(
         title="Complete Todo Task",

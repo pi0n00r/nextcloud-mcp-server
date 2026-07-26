@@ -10,19 +10,207 @@ upstream's projection-based ``_merge_vcard_properties`` write path.
 """
 
 from datetime import date
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from httpx import HTTPStatusError, Request, Response
 
 from nextcloud_mcp_server.client.contacts import (
     ContactsClient,
+    EtagConflictError,
+    EtagPreconditionError,
     _build_contact_from_data,
     _first_custom,
     _normalize_contact_data,
     _vcard_to_json_projection,
     _wrap_contact_field,
 )
+from nextcloud_mcp_server.server.contacts import _contact_write_tool_error
 
 pytestmark = pytest.mark.unit
+
+MANKIND_VCARD = (
+    "BEGIN:VCARD\r\n"
+    "VERSION:3.0\r\n"
+    "UID:mankind\r\n"
+    "FN:Mankind Grooming\r\n"
+    "PHOTO;ENCODING=b;TYPE=JPEG:abc\r\n"
+    " def\r\n"
+    "X-BARBER-NAME:Kosta\r\n"
+    "NOTE:Original\r\n"
+    "END:VCARD\r\n"
+)
+
+
+@pytest.fixture
+def write_client():
+    client = ContactsClient.__new__(ContactsClient)
+    client._resolved_vcard_url = AsyncMock(return_value="/contacts/mankind.vcf")
+    client._get_raw_vcard = AsyncMock(return_value=(MANKIND_VCARD, '"opaque-v1"'))
+    response = SimpleNamespace(
+        headers={"etag": '"opaque-v2"'}, raise_for_status=lambda: None
+    )
+    client._make_request = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.parametrize("etag", [None, "", " \t"])
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_missing_or_blank_etag_before_network(
+    write_client, method, etag
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="non-blank strong ETag"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_weak_etag_before_network(
+    write_client, method
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": 'W/"opaque-v1"'}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="weak ETags"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "etag",
+    [
+        "*",
+        "opaque-v1",
+        ' "opaque-v1"',
+        '"opaque-v1" ',
+        '"bad"quote"',
+        '"bad\nvalue"',
+        '"bad\x00value"',
+        '"bad\x1fvalue"',
+        '"bad\x7fvalue"',
+        '"bad\u0100value"',
+    ],
+    ids=[
+        "wildcard",
+        "bare-token",
+        "leading-whitespace",
+        "trailing-whitespace",
+        "internal-quote",
+        "newline-control",
+        "nul-control",
+        "unit-separator-control",
+        "del-control",
+        "non-byte-unicode",
+    ],
+)
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_malformed_strong_etag_before_network(
+    write_client, method, etag
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="valid strong HTTP entity-tag"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_preserve_exact_strong_if_match(
+    write_client, method
+):
+    etag = '"opaque!#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~\x80\xff"'
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, etag)
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    await getattr(write_client, method)(**kwargs)
+
+    request = write_client._make_request.await_args
+    assert request.kwargs["headers"]["If-Match"] == etag
+    assert request.args[0] == "PUT"
+    if method == "patch_contact":
+        written = request.kwargs["content"]
+        assert "NOTE:Changed\r\n" in written
+        assert "PHOTO;ENCODING=b;TYPE=JPEG:abc\r\n def\r\n" in written
+        assert "X-BARBER-NAME:Kosta\r\n" in written
+
+
+async def test_patch_rejects_stale_etag_without_put(write_client):
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, '"current"')
+
+    with pytest.raises(EtagConflictError) as caught:
+        await write_client.patch_contact(
+            addressbook="contacts",
+            uid="mankind",
+            etag='"stale"',
+            set_props={"NOTE": "Changed"},
+        )
+
+    assert caught.value.current_etag == '"current"'
+    write_client._make_request.assert_not_awaited()
+
+
+async def test_put_maps_server_412_to_typed_conflict(write_client):
+    request = Request("PUT", "https://cloud.example/contacts/mankind.vcf")
+    response = Response(412, headers={"etag": '"current"'}, request=request)
+    write_client._make_request.side_effect = HTTPStatusError(
+        "precondition failed", request=request, response=response
+    )
+
+    with pytest.raises(EtagConflictError) as caught:
+        await write_client.put_contact(
+            addressbook="contacts",
+            uid="mankind",
+            vcard_text=MANKIND_VCARD,
+            etag='"stale"',
+        )
+
+    assert caught.value.current_etag == '"current"'
+    assert write_client._make_request.await_count == 1
+
+
+def test_contact_precondition_failure_maps_to_actionable_tool_error():
+    error = _contact_write_tool_error(
+        EtagPreconditionError("put_contact requires a strong ETag"), uid="mankind"
+    )
+
+    assert "put_contact requires a strong ETag" in str(error)
+    assert "Read the contact" in str(error)
+
+
+def test_contact_conflict_maps_current_etag_to_tool_error():
+    error = _contact_write_tool_error(
+        EtagConflictError("stale", current_etag='"current"'), uid="mankind"
+    )
+
+    assert '"current"' in str(error)
+    assert "modified since it was read" in str(error)
 
 
 def _vcard(**kwargs) -> str:
@@ -466,7 +654,7 @@ class TestNormalizeContactData:
 
 async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
     client = ContactsClient.__new__(ContactsClient)
-    client.patch_contact = mocker.AsyncMock(return_value={"uid": "alice"})
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
 
     with pytest.warns(DeprecationWarning):
         result = await client.update_contact(
@@ -477,9 +665,30 @@ async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
         )
 
     assert result == {"uid": "alice"}
-    client.patch_contact.assert_awaited_once_with(
+    client._do_patch.assert_awaited_once_with(
         addressbook="contacts",
         uid="alice",
         etag="etag-1",
         set_props={"URL": "https://example.com/profile"},
+        add_props=None,
+        remove_props=None,
+        verify=False,
+        retry_on_conflict=False,
+        attempt=0,
+        legacy_optional_etag=True,
     )
+
+
+async def test_update_contact_keeps_legacy_optional_etag_contract(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={"note": "legacy"},
+        )
+
+    assert client._do_patch.await_args.kwargs["etag"] == ""
+    assert client._do_patch.await_args.kwargs["legacy_optional_etag"] is True

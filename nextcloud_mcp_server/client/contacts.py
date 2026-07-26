@@ -258,6 +258,37 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
+class EtagPreconditionError(ValueError):
+    """Raised when a mandatory CardDAV If-Match value is not a strong ETag."""
+
+
+def _require_strong_etag(etag: str | None, *, operation: str) -> str:
+    """Return the caller ETag verbatim after fail-closed boundary validation."""
+    if etag is None or not etag.strip():
+        raise EtagPreconditionError(
+            f"{operation} requires a non-blank strong ETag for If-Match"
+        )
+    if etag.startswith("W/"):
+        raise EtagPreconditionError(
+            f"{operation} requires a strong ETag; weak ETags cannot be used "
+            "with If-Match"
+        )
+    if (
+        len(etag) < 2
+        or etag[0] != '"'
+        or etag[-1] != '"'
+        or any(
+            char == '"' or ord(char) < 0x21 or ord(char) == 0x7F or ord(char) > 0xFF
+            for char in etag[1:-1]
+        )
+    ):
+        raise EtagPreconditionError(
+            f"{operation} requires exactly one syntactically valid strong "
+            "HTTP entity-tag"
+        )
+    return etag
+
+
 class VerifyMismatchError(Exception):
     """Raised when a write succeeded at the transport layer but the post-write
     GET does not reflect the requested change. Indicates a structural-loss
@@ -565,6 +596,7 @@ class ContactsClient(BaseNextcloudClient):
         retry_on_conflict: bool = False,
     ) -> dict[str, Any]:
         """Surgical edit. GET-with-ETag -> byte-preserve patch -> PUT-with-If-Match."""
+        etag = _require_strong_etag(etag, operation="patch_contact")
         return await self._do_patch(
             addressbook=addressbook,
             uid=uid,
@@ -575,6 +607,7 @@ class ContactsClient(BaseNextcloudClient):
             verify=verify,
             retry_on_conflict=retry_on_conflict,
             attempt=0,
+            legacy_optional_etag=False,
         )
 
     async def _do_patch(
@@ -589,6 +622,7 @@ class ContactsClient(BaseNextcloudClient):
         verify: bool,
         retry_on_conflict: bool,
         attempt: int,
+        legacy_optional_etag: bool,
     ) -> dict[str, Any]:
         url = await self._resolved_vcard_url(addressbook, uid)
         current_vcard, current_etag = await self._get_raw_vcard(addressbook, uid)
@@ -603,9 +637,17 @@ class ContactsClient(BaseNextcloudClient):
             add_props=add_props,
             remove_props=remove_props,
         )
+        if_match = etag
+        if attempt:
+            if legacy_optional_etag:
+                if_match = current_etag
+            else:
+                if_match = _require_strong_etag(
+                    current_etag, operation="patch_contact conflict retry"
+                )
         headers = {"Content-Type": "text/vcard; charset=utf-8"}
-        if current_etag:
-            headers["If-Match"] = current_etag
+        if if_match:
+            headers["If-Match"] = if_match
         try:
             response = await self._make_request(
                 "PUT", url, content=new_vcard, headers=headers
@@ -627,6 +669,7 @@ class ContactsClient(BaseNextcloudClient):
                         verify=verify,
                         retry_on_conflict=False,
                         attempt=1,
+                        legacy_optional_etag=False,
                     )
                 raise EtagConflictError(
                     f"412 PUT {url}; vCard modified by another writer",
@@ -673,10 +716,12 @@ class ContactsClient(BaseNextcloudClient):
         etag: str,
     ) -> dict[str, Any]:
         """Full vCard replace with If-Match."""
+        etag = _require_strong_etag(etag, operation="put_contact")
         url = await self._resolved_vcard_url(addressbook, uid)
-        headers = {"Content-Type": "text/vcard; charset=utf-8"}
-        if etag:
-            headers["If-Match"] = etag
+        headers = {
+            "Content-Type": "text/vcard; charset=utf-8",
+            "If-Match": etag,
+        }
         try:
             response = await self._make_request(
                 "PUT", url, content=vcard_text, headers=headers
@@ -767,8 +812,20 @@ class ContactsClient(BaseNextcloudClient):
                 set_props["CATEGORIES"] = (
                     value if isinstance(value, str) else ",".join(value)
                 )
-        return await self.patch_contact(
-            addressbook=addressbook, uid=uid, etag=etag, set_props=set_props
+        # Keep the deprecated optional-ETag contract isolated from the modern
+        # patch_contact input boundary. Legacy callers still GET first and use
+        # the server ETag when one is available.
+        return await self._do_patch(
+            addressbook=addressbook,
+            uid=uid,
+            etag=etag,
+            set_props=set_props,
+            add_props=None,
+            remove_props=None,
+            verify=False,
+            retry_on_conflict=False,
+            attempt=1 if not etag else 0,
+            legacy_optional_etag=True,
         )
 
 

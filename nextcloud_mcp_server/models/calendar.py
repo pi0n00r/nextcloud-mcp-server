@@ -73,6 +73,7 @@ class CalendarEventSummary(BaseModel):
     reminders: List[dict[str, Any]] = Field(
         default_factory=list, description="Ordered VALARM reminder objects"
     )
+    etag: Optional[str] = Field(None, description="Exact CalDAV ETag for versioning")
 
 
 class CalendarEvent(CalendarEventSummary):

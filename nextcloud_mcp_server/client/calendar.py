@@ -25,6 +25,42 @@ from ..config import get_nextcloud_ssl_verify
 logger = logging.getLogger(__name__)
 
 
+class CalendarEtagConflictError(Exception):
+    """Raised when a CalDAV object changed before a conditional update."""
+
+    status_code = 412
+    error = "etag_conflict"
+
+    def __init__(self, message: str, current_etag: str | None = None):
+        super().__init__(message)
+        self.current_etag = current_etag
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the stable structured error payload exposed to callers."""
+        return {
+            "error": self.error,
+            "status_code": self.status_code,
+            "message": str(self),
+            "current_etag": self.current_etag,
+        }
+
+
+class CalendarEtagUnavailableError(Exception):
+    """Raised when an existing CalDAV object has no usable server ETag."""
+
+    status_code = 409
+    error = "etag_unavailable"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the stable structured error payload exposed to callers."""
+        return {
+            "error": self.error,
+            "status_code": self.status_code,
+            "message": str(self),
+            "current_etag": None,
+        }
+
+
 async def _maybe_await(result: Any) -> Any:
     """Await a result if it's a coroutine, otherwise return it directly.
 
@@ -202,6 +238,110 @@ class CalendarClient:
             name=calendar_name,
         )
 
+    def _validate_calendar_object_url(self, object_url: str) -> str:
+        """Allow conditional writes only to the configured Nextcloud origin."""
+        target = urlsplit(object_url)
+        base = urlsplit(self.base_url)
+
+        def effective_port(parts: Any) -> int | None:
+            if parts.port is not None:
+                return parts.port
+            return {"http": 80, "https": 443}.get(parts.scheme.lower())
+
+        if (
+            target.scheme.lower(),
+            target.hostname,
+            effective_port(target),
+        ) != (
+            base.scheme.lower(),
+            base.hostname,
+            effective_port(base),
+        ):
+            raise ValueError("CalDAV object URL is not on the configured origin")
+        return object_url
+
+    async def _get_object_etag(self, obj: Any, *, fresh: bool = False) -> str | None:
+        """Return an exact server ETag, optionally forcing a PROPFIND."""
+        if not fresh:
+            etag = getattr(obj, "etag", None)
+            if etag:
+                return str(etag)
+            props = getattr(obj, "props", {})
+            etag = props.get(dav.GetEtag.tag)
+            if etag:
+                return str(etag)
+
+        etag = await _maybe_await(obj.get_property(dav.GetEtag()))
+        return str(etag) if etag else None
+
+    async def _require_current_etag(
+        self, obj: Any, caller_etag: str, *, kind: str, uid: str
+    ) -> str:
+        """Validate the ETag coupled to the REPORT calendar data."""
+        current_etag = getattr(obj, "etag", None)
+        if not current_etag:
+            current_etag = getattr(obj, "props", {}).get(dav.GetEtag.tag)
+        current_etag = str(current_etag) if current_etag else None
+        if not current_etag:
+            raise CalendarEtagUnavailableError(
+                f"Cannot update {kind} {uid}: the server supplied no ETag. "
+                "Read the object again and retry only after the server provides "
+                "a strong ETag."
+            )
+        if current_etag.startswith("W/"):
+            raise CalendarEtagUnavailableError(
+                f"Cannot update {kind} {uid}: the server supplied weak ETag "
+                f"{current_etag}, which cannot be used with If-Match. Read the "
+                "object again and retry only after the server provides a strong ETag."
+            )
+        if caller_etag and caller_etag != current_etag:
+            raise CalendarEtagConflictError(
+                f"{kind.capitalize()} {uid} changed since it was read",
+                current_etag=current_etag,
+            )
+        return current_etag
+
+    async def _conditional_update(
+        self,
+        obj: Any,
+        updated_ical: str,
+        current_etag: str,
+        *,
+        kind: str,
+        uid: str,
+    ) -> str | None:
+        """PUT an updated calendar object with its REPORT-coupled If-Match."""
+        object_url = self._validate_calendar_object_url(str(obj.url))
+        response = await self._dav_client.put(
+            object_url,
+            updated_ical,
+            headers={
+                "Content-Type": "text/calendar; charset=utf-8",
+                "If-Match": current_etag,
+            },
+        )
+        if response.status == 412:
+            response_etag = response.headers.get("etag")
+            if not response_etag:
+                try:
+                    response_etag = await self._get_object_etag(obj, fresh=True)
+                except Exception:
+                    response_etag = None
+            raise CalendarEtagConflictError(
+                f"Conditional update of {kind} {uid} was rejected",
+                current_etag=str(response_etag) if response_etag else None,
+            )
+        if response.status not in (200, 201, 204):
+            raise caldav_error.PutError(
+                f"CalDAV PUT for {kind} {uid} returned HTTP {response.status}"
+            )
+
+        new_etag = response.headers.get("etag")
+        if new_etag:
+            obj.props[dav.GetEtag.tag] = new_etag
+            return str(new_etag)
+        return await self._get_object_etag(obj, fresh=True)
+
     async def _async_object_by_uid(
         self, calendar: AsyncCalendar, uid: str, comp_filter: Any = None
     ) -> Any:
@@ -216,7 +356,11 @@ class CalendarClient:
         # retries with per-component-type searches if the initial search returns
         # nothing, handling CalDAV servers with incomplete search support.
         items_found = await calendar.search(  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode: returns coroutine for async clients
-            uid=uid, xml=comp_filter, post_filter=True, _hacks="insist"
+            uid=uid,
+            xml=comp_filter,
+            post_filter=True,
+            _hacks="insist",
+            props=[dav.GetEtag()],  # ty: ignore[invalid-argument-type]  # caldav types props too narrowly
         )
         items_found = [o for o in items_found if o.id == uid]
         if not items_found:
@@ -501,6 +645,7 @@ class CalendarClient:
             await _maybe_await(event.load(only_if_unloaded=True))
             if not event.data:
                 continue
+            event_etag = await self._get_object_etag(event)
 
             try:
                 cal = Calendar.from_ical(event.data)
@@ -514,7 +659,7 @@ class CalendarClient:
             )
             for event_dict in event_dicts:
                 event_dict["href"] = href
-                event_dict["etag"] = ""
+                event_dict["etag"] = event_etag
                 result.append(event_dict)
 
                 if len(result) >= limit:
@@ -592,7 +737,9 @@ class CalendarClient:
         filter_element = cdav.Filter() + outer_comp_filter
 
         data = cdav.CalendarData()
-        query = cdav.CalendarQuery() + [dav.Prop() + data] + filter_element
+        query = (
+            cdav.CalendarQuery() + [dav.Prop() + [dav.GetEtag(), data]] + filter_element
+        )
 
         body = etree.tostring(
             query.xmlelement(), encoding="utf-8", xml_declaration=True
@@ -602,7 +749,9 @@ class CalendarClient:
 
         # Parse response (same pattern as AsyncCalendar.search)
         objects = []
-        response_data = response.expand_simple_props([cdav.CalendarData()])
+        response_data = response.expand_simple_props(
+            [dav.GetEtag(), cdav.CalendarData()]
+        )
         for href, props in response_data.items():
             if href == str(calendar.url):
                 continue
@@ -613,6 +762,7 @@ class CalendarClient:
                     url=calendar.url.join(href),  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]  # url is always set for calendars
                     data=cal_data,
                     parent=calendar,
+                    props={dav.GetEtag.tag: props.get(dav.GetEtag.tag)},
                 )
                 objects.append(obj)
 
@@ -656,18 +806,21 @@ class CalendarClient:
             calendar, event_uid, cdav.CompFilter("VEVENT")
         )
         await _maybe_await(event.load(only_if_unloaded=True))
+        current_etag = await self._require_current_etag(
+            event, etag, kind="event", uid=event_uid
+        )
 
         # Merge updates into existing iCal data
         updated_ical = self._merge_ical_properties(event.data, event_data)  # type: ignore[arg-type]
-        event.data = updated_ical  # type: ignore[misc]
-
-        await _maybe_await(event.save())
+        new_etag = await self._conditional_update(
+            event, updated_ical, current_etag, kind="event", uid=event_uid
+        )
 
         logger.debug("Updated event %s", event_uid)
         return {
             "uid": event_uid,
             "href": str(event.url),
-            "etag": "",
+            "etag": new_etag,
             "status_code": 200,
         }
 
@@ -924,10 +1077,11 @@ class CalendarClient:
             raise ValueError(f"Failed to parse event data for {event_uid}")
 
         event_data["href"] = str(event.url)
-        event_data["etag"] = ""
+        event_etag = await self._get_object_etag(event)
+        event_data["etag"] = event_etag
 
         logger.debug("Retrieved event %s", event_uid)
-        return event_data, ""
+        return event_data, event_etag or ""
 
     async def search_events_across_calendars(
         self,
@@ -994,7 +1148,7 @@ class CalendarClient:
                 continue
             if todo_dict:
                 todo_dict["href"] = str(todo.url)
-                todo_dict["etag"] = ""
+                todo_dict["etag"] = await self._get_object_etag(todo)
 
                 # Apply filters if provided
                 if not filters or self._todo_matches_filters(todo_dict, filters):
@@ -1046,6 +1200,9 @@ class CalendarClient:
             logger.debug(
                 "Loaded todo %s, current data length: %s", todo_uid, len(todo.data)
             )
+            current_etag = await self._require_current_etag(
+                todo, etag, kind="todo", uid=todo_uid
+            )
 
             # Merge updates into existing iCal data
             updated_ical = self._merge_ical_todo_properties(
@@ -1056,15 +1213,15 @@ class CalendarClient:
             logger.debug("Merged iCal data length: %s", len(updated_ical))
             logger.debug("Updated iCal content:\\n%s", updated_ical)
 
-            todo.data = updated_ical
-
-            await _maybe_await(todo.save())
+            new_etag = await self._conditional_update(
+                todo, updated_ical, current_etag, kind="todo", uid=todo_uid
+            )
 
             logger.debug("Updated todo %s", todo_uid)
             return {
                 "uid": todo_uid,
                 "href": str(todo.url),
-                "etag": "",
+                "etag": new_etag,
                 "status_code": 200,
             }
         except Exception as e:

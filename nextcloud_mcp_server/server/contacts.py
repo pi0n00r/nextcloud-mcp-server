@@ -38,9 +38,14 @@ from datetime import date
 from typing import Any, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.contacts import (
+    EtagConflictError,
+    EtagPreconditionError,
+)
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.contacts import (
     AddressBook,
@@ -55,6 +60,23 @@ from nextcloud_mcp_server.models.contacts import (
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
+
+
+def _contact_write_tool_error(
+    exc: EtagConflictError | EtagPreconditionError, *, uid: str
+) -> ToolError:
+    """Map typed CardDAV concurrency failures to actionable MCP tool errors."""
+    if isinstance(exc, EtagConflictError):
+        current = (
+            f" Current ETag: {exc.current_etag}."
+            if exc.current_etag is not None
+            else ""
+        )
+        return ToolError(
+            f"Contact {uid} was modified since it was read.{current} "
+            "Read the contact again and retry with its strong ETag."
+        )
+    return ToolError(f"{exc}. Read the contact and retry with its strong ETag.")
 
 
 def _parse_vcard_fields(
@@ -354,19 +376,22 @@ def configure_contacts_tools(mcp: FastMCP):
             On 412 raises EtagConflictError → MCP error response.
         """
         client = await get_client(ctx)
-        result = await client.contacts.patch_contact(
-            addressbook=addressbook,
-            uid=uid,
-            etag=etag,
-            set_props=set_props,
-            add_props=[
-                (item[0], item[1], item[2] if len(item) > 2 else None)
-                for item in (add_props or [])
-            ],
-            remove_props=remove_props,
-            verify=verify,
-            retry_on_conflict=retry_on_conflict,
-        )
+        try:
+            result = await client.contacts.patch_contact(
+                addressbook=addressbook,
+                uid=uid,
+                etag=etag,
+                set_props=set_props,
+                add_props=[
+                    (item[0], item[1], item[2] if len(item) > 2 else None)
+                    for item in (add_props or [])
+                ],
+                remove_props=remove_props,
+                verify=verify,
+                retry_on_conflict=retry_on_conflict,
+            )
+        except (EtagConflictError, EtagPreconditionError) as exc:
+            raise _contact_write_tool_error(exc, uid=uid) from exc
         return PatchContactResponse(**result)
 
     # ------------------------------------------------------------------
@@ -394,9 +419,12 @@ def configure_contacts_tools(mcp: FastMCP):
             etag: If-Match precondition.
         """
         client = await get_client(ctx)
-        result = await client.contacts.put_contact(
-            addressbook=addressbook, uid=uid, vcard_text=vcard_text, etag=etag
-        )
+        try:
+            result = await client.contacts.put_contact(
+                addressbook=addressbook, uid=uid, vcard_text=vcard_text, etag=etag
+            )
+        except (EtagConflictError, EtagPreconditionError) as exc:
+            raise _contact_write_tool_error(exc, uid=uid) from exc
         return PutContactResponse(**result)
 
     # ------------------------------------------------------------------
