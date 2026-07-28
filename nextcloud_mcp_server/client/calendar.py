@@ -1435,6 +1435,11 @@ class CalendarClient:
                     dt_str,
                     tz_name,
                 )
+            offset = parsed.utcoffset()
+            if isinstance(parsed.tzinfo, dt.timezone) and offset != dt.timedelta(0):
+                toronto_value = parsed.replace(tzinfo=cls._TORONTO_TZ)
+                if toronto_value.utcoffset() == offset:
+                    return toronto_value, cls._TORONTO_TZ
             return parsed, None
 
         if zi is not None:
