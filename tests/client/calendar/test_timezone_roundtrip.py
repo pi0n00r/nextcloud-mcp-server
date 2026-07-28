@@ -207,6 +207,23 @@ def test_create_ical_event_offset_input_ignores_timezone_param(mocker):
     assert "VTIMEZONE" not in ical
 
 
+def test_create_ical_event_promotes_toronto_offset_to_iana_timezone(mocker):
+    """Toronto fixed offsets must not become unresolvable UTC-04:00 TZIDs."""
+    client = _make_client(mocker)
+    event_data = {
+        "title": "Toronto appointment",
+        "start_datetime": "2026-07-28T11:15:00-04:00",
+        "end_datetime": "2026-07-28T11:30:00-04:00",
+    }
+
+    ical = client._create_ical_event(event_data, event_uid="toronto-uid")
+
+    assert "DTSTART;TZID=America/Toronto:20260728T111500" in ical
+    assert "DTEND;TZID=America/Toronto:20260728T113000" in ical
+    assert "TZID:America/Toronto" in ical
+    assert 'TZID="UTC-04:00"' not in ical
+
+
 def test_create_ical_event_unknown_timezone_falls_back_to_floating(mocker, caplog):
     """An unresolvable IANA name must not crash — fall back to floating local time."""
     client = _make_client(mocker)

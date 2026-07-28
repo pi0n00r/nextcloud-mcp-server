@@ -92,6 +92,26 @@ def test_summary_only_update_preserves_dtstart_byte_equal(client):
     assert "SUMMARY:Updated summary" in updated
 
 
+def test_summary_only_update_preserves_legacy_fixed_offset_tzid(client):
+    """Historical fixed-offset records remain byte-preserved unless their time changes."""
+    legacy_ical = EXISTING_ICAL.replace(
+        "DTSTART;TZID=America/Toronto:20260515T100000",
+        'DTSTART;TZID="UTC-04:00":20260515T100000',
+    ).replace(
+        "DTEND;TZID=America/Toronto:20260515T110000",
+        'DTEND;TZID="UTC-04:00":20260515T110000',
+    )
+
+    updated = client._merge_ical_properties(
+        legacy_ical,
+        {"title": "Updated summary"},
+        "test-uid-001",
+    )
+
+    assert 'DTSTART;TZID="UTC-04:00":20260515T100000' in updated
+    assert 'DTEND;TZID="UTC-04:00":20260515T110000' in updated
+
+
 # === T2 — dtstart update with TZID=America/Toronto round-trips correctly ===
 
 
