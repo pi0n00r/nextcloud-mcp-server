@@ -28,13 +28,13 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from nextcloud_mcp_server.config import get_settings
-from nextcloud_mcp_server.embedding import get_embedding_service
 from nextcloud_mcp_server.observability.metrics import (
     CHUNK_DENSITY_BUCKETS,
     density_bucket_index,
     estimate_vector_bytes,
     update_ingest_queue_depth,
     update_qdrant_chunk_density_snapshot,
+    update_vector_sync_dead_lettered_documents,
     update_vector_sync_estimated_vector_bytes,
     update_vector_sync_indexed_chunks,
     update_vector_sync_indexed_documents,
@@ -43,7 +43,9 @@ from nextcloud_mcp_server.observability.metrics import (
     update_vector_sync_qdrant_vectors,
     update_vector_sync_queue_size,
 )
+from nextcloud_mcp_server.providers import get_provider
 from nextcloud_mcp_server.vector import payload_keys
+from nextcloud_mcp_server.vector.dead_letter import DEAD_LETTER_KEY
 from nextcloud_mcp_server.vector.ingest_status import get_ingest_pending
 from nextcloud_mcp_server.vector.placeholder import get_placeholder_filter
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
@@ -108,6 +110,26 @@ async def count_hybrid_chunks(
     return result.count
 
 
+async def count_dead_lettered(
+    qdrant_client: AsyncQdrantClient, collection: str, *, exact: bool = True
+) -> int:
+    """Return the number of documents parked as permanently-failed.
+
+    One tombstone point per ``(doc_type, doc_id)`` (``mark_dead_letter`` upserts
+    a deterministic ID), so this counts documents, not chunks. ``dead_letter`` is
+    payload-indexed -- required, since Qdrant strict mode rejects a filter on an
+    unindexed field.
+    """
+    result = await qdrant_client.count(
+        collection_name=collection,
+        count_filter=Filter(
+            must=[FieldCondition(key=DEAD_LETTER_KEY, match=MatchValue(value=True))]
+        ),
+        exact=exact,
+    )
+    return result.count
+
+
 async def estimate_hybrid_vector_bytes(
     qdrant_client: AsyncQdrantClient,
     collection: str,
@@ -124,7 +146,7 @@ async def estimate_hybrid_vector_bytes(
     #624), rounded to an int for the response payloads.
     """
     hybrid_chunks = await count_hybrid_chunks(qdrant_client, collection, exact=exact)
-    dim = get_embedding_service().get_dimension()
+    dim = get_provider().get_dimension()
     estimated = int(estimate_vector_bytes(hybrid_chunks, dim, overhead))
     return hybrid_chunks, estimated
 
@@ -180,7 +202,7 @@ async def publish_vector_sync_metrics(
     try:
         qdrant_client = await get_qdrant_client()
         collection = settings.get_collection_name()
-        dim = get_embedding_service().get_dimension()
+        dim = get_provider().get_dimension()
         overhead = settings.vector_ram_hnsw_overhead_factor
 
         hybrid_chunks = await count_hybrid_chunks(
@@ -206,6 +228,23 @@ async def publish_vector_sync_metrics(
         )
     except Exception as exc:  # noqa: BLE001 — metrics must not break ingest
         logger.warning("Failed to publish vector-RAM gauges: %s", exc)
+
+    # Permanently-failed documents. Published from here (the scraped, long-lived
+    # backend) because the worker-side counters never reach Prometheus — see the
+    # gauge's definition in observability/metrics.py. Own try/except so a Qdrant
+    # hiccup counting tombstones cannot suppress the gauges above.
+    try:
+        qdrant_client = await get_qdrant_client()
+        # Exact: this is a small, bounded population (one point per failed
+        # document) and an approximate count that drifts to 0 would silence the
+        # alert this gauge exists to raise.
+        update_vector_sync_dead_lettered_documents(
+            await count_dead_lettered(
+                qdrant_client, settings.get_collection_name(), exact=True
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — metrics must not break ingest
+        logger.warning("Failed to publish dead-lettered-documents gauge: %s", exc)
 
 
 async def vector_sync_metrics_task(

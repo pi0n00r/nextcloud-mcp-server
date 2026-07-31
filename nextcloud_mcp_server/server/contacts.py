@@ -591,10 +591,14 @@ def configure_contacts_tools(mcp: FastMCP):
         Callers should migrate to ``patch_contact`` for full fidelity.
 
         Args:
-            addressbook: URI slug.
+            addressbook: URI slug, not the address-book display name.
             uid: Contact UID.
-            contact_data: legacy JSON, e.g. {"fn": "Jane Doe"}.
-            etag: optional If-Match.
+            contact_data: Legacy JSON fields. Plain strings are supported for
+                ``fn``, ``email``, ``tel``/``phone``, ``title`` and ``note``;
+                ``org``/``organization``, ``nickname``, ``categories`` and
+                ``url`` also accept the compatibility shapes handled by the
+                byte-preserving client. Unknown fields are ignored.
+            etag: Optional ETag for optimistic concurrency control.
         """
         logger.warning(
             "nc_contacts_update_contact is DEPRECATED for uid=%s in %s; "

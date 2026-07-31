@@ -5,6 +5,14 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.155.1 (2026-07-30)
+
+### Fix
+
+- **fork**: retain byte-preserving CardDAV updates, atomic chunked WebDAV
+  writes, stale pooled-read recovery, transport compatibility aliases, and
+  dual-stack serving while incorporating upstream v0.155.0
+
 ## v0.151.1 (2026-07-26)
 
 ### Fix
@@ -12,6 +20,88 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 - **storage**: serialize all in-process Alembic commands so concurrent MCP
   sessions cannot corrupt Alembic's process-global context proxy and crash
   with `KeyError: 'config'` or `KeyError: 'script'`
+
+## v0.155.0 (2026-07-30)
+
+### BREAKING CHANGE
+
+- the `nc_semantic_search_answer` MCP tool is removed.
+Clients wanting a generated answer should call `nc_semantic_search` and
+generate from the returned documents themselves. The
+`OLLAMA_GENERATION_MODEL`, `OPENAI_GENERATION_MODEL` and
+`BEDROCK_GENERATION_MODEL` settings are removed and now ignored.
+
+### Feat
+
+- **mcp**: remove MCP sampling, text generation and the RAG eval harness
+
+### Fix
+
+- **retry**: cap the first retry delay at max_delay
+
+### Refactor
+
+- **retry**: reuse the shared backoff helper for the startup probes
+- **config**: derive the field→env map from Settings
+- **providers**: collapse the duplicate embedding package into providers/
+- **viz**: drop dead settings store and stray template blanks
+- **viz**: drop dead Plotly CDN load and stale viz-UI docs
+- **viz**: remove the in-repo vector-visualization UI
+
+## v0.154.2 (2026-07-30)
+
+### Fix
+
+- **ingest**: stop unreadable PDFs from re-queueing forever
+
+### Refactor
+
+- **pymupdf**: hoist the unnamed-document log placeholder to a constant
+
+## v0.154.1 (2026-07-29)
+
+### Fix
+
+- **scanner**: stream Qdrant deletion-tracking scrolls instead of materialising every point
+
+## v0.154.0 (2026-07-28)
+
+### Feat
+
+- **deck**: split over-long card comments instead of just rejecting them
+
+### Fix
+
+- **splitter**: measure length with PHP's trim charlist, not Python's
+- **splitter**: fail loudly if the prefix fixed point never converges
+- **deck**: give each comment operation its own 403 explanation
+
+## v0.153.0 (2026-07-28)
+
+### Feat
+
+- **observability**: publish dead-lettered documents as a scrapeable gauge
+
+### Fix
+
+- **pdf**: restore the parse worker's memory headroom and unmask its failures
+
+## v0.152.0 (2026-07-28)
+
+### BREAKING CHANGE
+
+- the tenant.id span attribute and the TENANT_ID setting are
+removed. Attribute traces by resource.k8s.namespace.name instead. TENANT_ID
+may still be set in the environment; the application now ignores it.
+
+### Fix
+
+- **observability**: guard POD_* env wiring, drop stale TENANT_ID doc
+- **observability**: never let profiling crashloop the ingest worker
+
+### Refactor
+
+- **cli**: extract the ingest worker run loop; use monkeypatch in tests
 
 ## v0.151.0 (2026-07-26)
 
@@ -45,24 +135,6 @@ WebDavClient.stream_to_file now returns (written, content_type, etag).
 - **webdav**: extract the shared MOVE/COPY implementation
 - **webdav**: route stream_to_file's etag through _normalize_etag
 - **webdav**: split the PDF ladder into one method per rung
-
-## v0.150.1 (2026-07-26)
-
-### Fix
-
-- **calendar**: restore strict offset-required CalDAV date parsing after the
-  upstream calendar merge
-- **calendar**: promote Toronto-matching fixed offsets to
-  `America/Toronto`, preserve DST wall-clock semantics, and emit matching
-  `VTIMEZONE` components for events and todos
-- **container**: pin the latest dual-stack-capable `pi0n00r/uvicorn` commit
-  and run its opt-in `--host :: --dual-stack` listener so the image accepts
-  IPv4 and IPv6 without a proxy sidecar
-
-### Documentation
-
-- record which historical fork patches are now upstream-owned and which
-  residual behaviors remain load-bearing
 
 ## v0.150.0 (2026-07-25)
 
@@ -169,10 +241,7 @@ nc_contacts_create_contact instead.
 - nc_webdav_write_file no longer silently overwrites an
 existing file. Omitting if_match now creates a file and fails if it already
 exists; to overwrite, pass the etag from nc_webdav_read_file, or if_match="*"
-to force it. The fork preserves A.2 chunked uploads: create-only uses
-`Overwrite: F`, force uses `Overwrite: T`, and exact destination-ETag updates
-use `Overwrite: T` with an RFC 4918 tagged WebDAV `If` condition on the final
-MOVE.
+to force it.
 
 ### Fix
 
@@ -198,12 +267,6 @@ MOVE.
 - **api**: stop broad handlers masking faults in the webhook/admin surface
 
 ## v0.144.0 (2026-07-21)
-
-### Fork Fix
-
-- **calendar**: recover Nextcloud calendar-trash URI collisions by matching
-  the requested VTODO UID exactly, permanently purging only its stale trash
-  copies, and retrying the operator-requested delete
 
 ### Feat
 
@@ -327,8 +390,6 @@ it must be upgraded before relying on this REST API line.
 
 ### Fix
 
-- **deck**: persist due dates while preserving their UTC instant and
-  card order
 - **client**: skip Content-Length truncation check on compressed responses
 
 ## v0.140.3 (2026-07-16)

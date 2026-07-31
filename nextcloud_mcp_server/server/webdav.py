@@ -416,8 +416,12 @@ def configure_webdav_tools(mcp: FastMCP):
     ) -> WriteFileResponse:
         """Write content to a file in NextCloud.
 
+        Writes are fail-closed: an existing file is never silently overwritten.
+
         Raises ``ToolError`` when ``EXCLUDED_TAGS`` is configured and the
-        target path (or an ancestor folder) carries an excluded system tag.
+        target path (or an ancestor folder) carries an excluded system tag,
+        when decoded content exceeds ``WEBDAV_WRITE_MAX_MB``, or when a write
+        conflicts with a concurrent edit, an existing/missing file, or a lock.
 
         Args:
             path: Full path where to write the file
@@ -426,16 +430,16 @@ def configure_webdav_tools(mcp: FastMCP):
             if_match: Controls overwrite safety. Omit it to create a new file
                 and fail if the path exists. Pass an etag from
                 ``nc_webdav_read_file`` to overwrite only if unchanged. Pass
-                ``"*"`` for explicit force. These semantics remain atomic above
-                the chunking threshold through destination-aware MOVE headers.
+                ``"*"`` to force-overwrite an existing file. These semantics
+                remain atomic above the chunking threshold through
+                destination-aware MOVE headers.
 
         Returns:
             ``WriteFileResponse`` with ``path``, ``status_code``, ``size``,
             ``created`` (True when a new file was created, i.e. HTTP 201; False
             when an existing file was overwritten, i.e. HTTP 204) and ``etag``.
-            Known
-            precondition, lock, and unsupported chunk-condition results surface
-            as ``ToolError`` with an actionable message.
+            Known precondition, lock, and unsupported chunk-condition results
+            surface as ``ToolError`` with an actionable message.
 
             ``etag`` is the file as just written — pass it straight back as
             ``if_match`` on the next write to chain edits without an intervening

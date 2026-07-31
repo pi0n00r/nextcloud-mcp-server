@@ -81,7 +81,26 @@ The Helm chart has moved to a [separate repository](https://github.com/cbcoutinh
 - `mcp_vector_sync_documents_processed_total` - Processing results
 - `mcp_vector_sync_processing_duration_seconds` - Processing latency
 - `mcp_vector_sync_queue_size` - Current queue depth
+- `mcp_vector_sync_dead_lettered_documents` - Documents parked as permanently-failed
 - `mcp_qdrant_operations_total` - Qdrant DB operations
+
+**Alerting on permanently-failed documents.** Prefer the
+`mcp_vector_sync_dead_lettered_documents` **gauge** over the
+`bridgette_document_dead_lettered_total` / `bridgette_document_parse_failed_total`
+counters. Those counters only ever increment in the ingest worker, whose container
+is not a scrape target, and whose tiers are scaled to zero between batches — so a
+counter can fire and terminate without ever being scraped, and resets on scale-up.
+The gauge is published by the long-lived (scraped) backend from the dead-letter
+tombstones in Qdrant, so it survives worker lifecycle:
+
+```promql
+# Any document given up on — parse failures never retried until its etag changes.
+mcp_vector_sync_dead_lettered_documents > 0
+```
+
+A dead-lettered document looks fully indexed to every count-based check (the
+tombstone keeps folder totals reconciling) and its ingest job completes with
+status *success*, so this gauge is the only signal that it is missing from search.
 
 ### Document Ingest Metrics
 
@@ -94,7 +113,7 @@ success, so partial extractions and in-flight batch-OCR polls never inflate them
 - `astrolabe_document_chars_processed_total` - Characters extracted
 - `astrolabe_document_bytes_processed_total` - Source bytes parsed
 - `astrolabe_document_parse_duration_seconds` - Parse latency per document
-- `astrolabe_document_parse_failed_total{reason}` - Hard failures
+- `bridgette_document_parse_failed_total{reason}` - Hard failures
   (`timeout` | `oom` | `error` | `oversize`)
 
 Corpus shape, recorded before the oversize gate so the over-cap tail is visible:

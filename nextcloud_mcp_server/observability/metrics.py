@@ -194,6 +194,26 @@ vector_sync_indexed_chunks = Gauge(
     "Total indexed chunks (non-placeholder points) in the vector store",
 )
 
+# Documents parked as permanently-failed, published as a GAUGE from the
+# long-lived backend rather than left to the worker-side counters.
+#
+# ``bridgette_document_dead_lettered_total`` increments in the ingest worker,
+# which is the wrong place to alert from on two counts: the worker container is
+# not a Prometheus scrape target (only the backend Pod is), and KEDA scales the
+# ingest tiers 0<->1, so a counter that fires and then terminates may never be
+# scraped at all and resets on every scale-up. Four dead-letter events in a day
+# produced no time series whatsoever (Deck #911).
+#
+# Dead-lettering is *durable state* in Qdrant (a tombstone point per document),
+# not just an event, so a gauge read back from the collection is both the honest
+# representation and immune to Pod lifecycle. Alert on ``> 0`` or on an increase
+# over a window; it falls back to 0 when the tombstones are cleared or their
+# etag/tier signature changes and the documents are re-attempted.
+vector_sync_dead_lettered_documents = Gauge(
+    "mcp_vector_sync_dead_lettered_documents",
+    "Documents parked as permanently-failed (dead-letter tombstones in Qdrant)",
+)
+
 # Dense-vector RAM footprint of the collection — the real cost driver for hybrid
 # search (billing is on source bytes, not vector RAM). Two views published by the
 # periodic vector_sync metrics task so operators can watch the "density risk"
@@ -371,7 +391,7 @@ document_escalation_suppressed_total = Counter(
 document_parse_failed_total = Counter(
     "bridgette_document_parse_failed_total",
     "Document parses that failed in the isolated worker (process killed)",
-    ["reason"],  # reason: timeout | oom | error
+    ["reason"],  # reason: timeout | oom | error | unreadable
 )
 
 # Documents dead-lettered after a terminal parse failure: the failing tier had
@@ -385,7 +405,7 @@ document_parse_failed_total = Counter(
 document_dead_lettered_total = Counter(
     "bridgette_document_dead_lettered_total",
     "Documents dead-lettered after a terminal parse failure (no escalation tier)",
-    ["reason"],  # reason: timeout | oom | error | oversize
+    ["reason"],  # reason: timeout | oom | error | oversize | unreadable
 )
 
 # Documents dropped after exhausting in-process indexing retries (the scanner
@@ -1003,6 +1023,11 @@ def update_vector_sync_indexed_chunks(count: int) -> None:
     vector_sync_indexed_chunks.set(count)
 
 
+def update_vector_sync_dead_lettered_documents(count: int) -> None:
+    """Set the dead-lettered-documents gauge."""
+    vector_sync_dead_lettered_documents.set(count)
+
+
 def update_vector_sync_estimated_vector_bytes(byte_estimate: float) -> None:
     """Set the deterministic dense-vector RAM-footprint gauge (from hybrid chunks)."""
     vector_sync_estimated_vector_bytes.set(byte_estimate)
@@ -1136,7 +1161,11 @@ def record_document_parse_failed(reason: str) -> None:
     """Record a hard parse failure from the isolated worker.
 
     Args:
-        reason: ``timeout`` | ``oom`` | ``error``
+        reason: ``timeout`` | ``oom`` | ``error`` (from the isolated worker), or
+            ``unreadable`` -- the engine could not open the bytes as a document
+            at all, i.e. the file's content does not match the mime type its
+            extension claimed. Distinguished from ``error`` on purpose: it means
+            corrupt input, not a failure of ours, so it should not page anyone.
     """
     document_parse_failed_total.labels(reason=reason).inc()
 
@@ -1186,8 +1215,10 @@ def record_document_dead_lettered(reason: str) -> None:
 
     Args:
         reason: ``timeout`` | ``oom`` | ``error`` (the terminal parse failure
-            reason carried from the isolated worker) or ``oversize`` (rejected by
-            the pre-parse size guard, which no tier can ever parse).
+            reason carried from the isolated worker), ``oversize`` (rejected by
+            the pre-parse size guard, which no tier can ever parse), or
+            ``unreadable`` (the bytes are not a document the engine can open --
+            no tier will do better, so it is terminal on the first attempt).
     """
     document_dead_lettered_total.labels(reason=reason).inc()
 
