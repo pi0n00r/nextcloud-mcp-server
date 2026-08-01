@@ -1,9 +1,21 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 
 import httpx
 import pytest
 
 from nextcloud_mcp_server.client.notes import NotesClient
+from nextcloud_mcp_server.client.webdav import WebDAVClient
 from tests.client.conftest import create_mock_error_response, create_mock_note_response
 
 logger = logging.getLogger(__name__)
@@ -150,12 +162,14 @@ async def test_notes_api_delete_note(mocker):
     mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
     mock_make_request.side_effect = [get_response, delete_response]
+    mock_cleanup = mocker.patch.object(WebDAVClient, "cleanup_note_attachments")
 
     client = NotesClient(mock_client, "testuser")
     await client.delete_note(note_id=123)
 
     # Verify DELETE was called
     assert any(call[0][0] == "DELETE" for call in mock_make_request.call_args_list)
+    mock_cleanup.assert_has_awaits([mocker.call(123, "Test"), mocker.call(123, "")])
 
 
 async def test_notes_api_delete_nonexistent(mocker):

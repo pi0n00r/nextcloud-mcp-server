@@ -25,7 +25,7 @@ The fix is in three places:
   bodies above `CHUNK_THRESHOLD` (1MB) through NC's chunked-upload v2
   endpoint, eliminating the silent-truncation failure mode.
 
-## Patch ownership after v0.151.1
+## Patch ownership after v0.159.1
 
 Do not preserve a historical fork commit merely because it was once needed.
 The v0.150.0 and v0.151.0 upstream merges transferred ownership of several
@@ -39,10 +39,11 @@ behaviors. v0.151.1 adds one fork-local concurrency guard:
 | Deck updates | Preserve card order and due date during partial updates | Follow-up update when a Deck version ignores `duedate` during create |
 | WebDAV reads | Bounded streaming, short-read detection, ETag reporting, and document-to-text/Markdown parsing through `parse_document` | Retry one stale pooled GET or verified short read |
 | WebDAV writes | Fail-closed simple PUTs with ETag preconditions and generic MOVE/COPY destination guards | A.2 chunked upload and atomic final-MOVE destination ETag enforcement |
+| Notes attachment cleanup | Refuse to delete a non-empty old attachment directory after a category move | None |
 | Transport policy | Canonical `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, and `CORS_ALLOW_ORIGINS` configuration | Gateway-secret middleware and temporary aliases for the retired `MCP_DNS_REBINDING_ALLOWED_*` names |
 | Webhooks | Server-resolved callback URI, admin gate, and redacted logging | None |
 | Schema migrations | Alembic migration engine and revision scripts | Process-wide serialization of Alembic command entry points, in addition to the existing cross-pod database lock |
-| Container listener | Generic ASGI serving | Pin `pi0n00r/uvicorn` at `c5d334cb3014d72a43a893e848bbfdebb2665738`; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
+| Container runtime | Non-root `appuser` at UID 1000/GID 0 with an immutable `/opt/venv` | Pin `pi0n00r/uvicorn` at `c5d334cb3014d72a43a893e848bbfdebb2665738`; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
 
 The left column is retired as fork patch debt: accept upstream changes there
 unless they regress the stated contract. The right column remains
@@ -106,6 +107,9 @@ uv sync --dev
 
 # Run the byte-preserving test corpus
 uv run pytest tests/client/contacts/test_byte_preserving.py -v
+
+# Run the complete unit suite with warnings treated as errors
+uv run --frozen pytest -q -W error -m unit -n auto -o "addopts=-p no:asyncio"
 
 # Lint the AI-NOTICE block on every Python source file
 bash scripts/lint-ai-notice.sh
