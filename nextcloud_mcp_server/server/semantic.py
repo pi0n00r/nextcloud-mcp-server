@@ -1,7 +1,7 @@
 """Semantic search MCP tools using vector database."""
 
 import logging
-from typing import Annotated
+from typing import Annotated, Literal
 
 import anyio
 from httpx import RequestError
@@ -27,7 +27,7 @@ from nextcloud_mcp_server.observability.metrics import (
 )
 from nextcloud_mcp_server.search.access_filter import (
     MAX_PATH_PREFIXES,
-    list_accessible_owners,
+    list_accessible_scope,
     normalize_path_prefixes,
     resolve_prefix_folder_ids,
 )
@@ -147,6 +147,29 @@ def configure_semantic_tools(mcp: FastMCP):
         doc_types: list[str] | None = None,
         score_threshold: Annotated[float, Field(ge=0.0)] = 0.0,
         fusion: str = "rrf",
+        granularity: Annotated[
+            Literal["chunk", "document"],
+            Field(
+                description=(
+                    "Result granularity. 'chunk' (default) returns the "
+                    "best-matching passages, so a long document can occupy "
+                    "several result slots. 'document' returns one row per "
+                    "document (its best-matching chunk), which is the right "
+                    "shape for 'which files mention X' / 'list documents "
+                    "about Y' — `limit` then counts documents rather than "
+                    "passages. Use 'chunk' when you want the passage text to "
+                    "answer from, 'document' when you want to enumerate "
+                    "sources. Note 'document' improves result diversity, not "
+                    "recall: a document whose best chunk ranks too low to be "
+                    "retrieved is absent under both settings. Caveat when "
+                    "combined with the default doc_types=None (search all "
+                    "types): grouping keys on the numeric document id, which "
+                    "is not unique across types, so a note and a file that "
+                    "happen to share an id can be merged into one result. "
+                    "Pass an explicit doc_types (e.g. ['file']) to avoid this."
+                ),
+            ),
+        ] = "chunk",
         include_context: bool = False,
         context_chars: Annotated[int, Field(ge=0)] = 300,
         modified_after: Annotated[
@@ -213,7 +236,13 @@ def configure_semantic_tools(mcp: FastMCP):
             query: Natural language or keyword search query
             limit: Maximum number of results to return (default: 10)
             doc_types: Document types to search (e.g., ["note", "file", "deck_card", "news_item", "mail_message"]). None = search all indexed types (default)
-            score_threshold: Minimum normalized fusion score (0-1).
+            score_threshold: Minimum fusion score. NOT a relevance percentage —
+                the fused score is a rank artifact, not a calibrated measure.
+                With RRF the top result scores about 2/VECTOR_SEARCH_RRF_K
+                (~0.033 at the default k=60), so a "10% relevant" reading of
+                0.1 returns nothing at all. Leave at 0.0 (the default) and cut
+                by rank via `limit` instead. DBSF scores are distribution-
+                normalized and can exceed 1.0.
             fusion: Fusion algorithm: "rrf" (Reciprocal Rank Fusion, default) or "dbsf" (Distribution-Based Score Fusion)
                    RRF: Good general-purpose fusion using reciprocal ranks
                    DBSF: Uses distribution-based normalization, may better balance different score ranges
@@ -328,8 +357,13 @@ def configure_semantic_tools(mcp: FastMCP):
         # Expand the caller's identity to every owner whose content they
         # have read access to via Nextcloud shares. Lets a user find files
         # owners have shared with them without having to re-index those
-        # files under their own user_id.
-        accessible_owners = await list_accessible_owners(client.sharing, username)
+        # files under their own user_id. ``share_root_ids`` scopes that
+        # expansion to the shared subtrees, so one incoming share does not
+        # admit the whole owner's corpus as candidates for verify-on-read to
+        # reject (which silently shortened result pages).
+        accessible_scope = await list_accessible_scope(client.sharing, username)
+        accessible_owners = accessible_scope.owners
+        shared_root_ids = accessible_scope.share_root_ids
 
         # Admin consent gate: restrict to source types the management client admin has
         # approved (and that are installed for this user). This mirrors
@@ -358,6 +392,7 @@ def configure_semantic_tools(mcp: FastMCP):
                     query=query,
                     total_found=0,
                     search_method=search_method,
+                    granularity=granularity,
                     verified_chunk_count=0,
                     dropped_document_count=0,
                 )
@@ -400,6 +435,8 @@ def configure_semantic_tools(mcp: FastMCP):
                     doc_type=None,  # Signal to search all types
                     score_threshold=score_threshold,
                     accessible_owners=accessible_owners,
+                    shared_root_ids=shared_root_ids,
+                    granularity=granularity,
                     modified_after=modified_after_ts,
                     modified_before=modified_before_ts,
                     path_prefixes=folder_prefixes,
@@ -429,6 +466,8 @@ def configure_semantic_tools(mcp: FastMCP):
                         doc_type=dtype,
                         score_threshold=score_threshold,
                         accessible_owners=accessible_owners,
+                        shared_root_ids=shared_root_ids,
+                        granularity=granularity,
                         modified_after=modified_after_ts,
                         modified_before=modified_before_ts,
                         path_prefixes=folder_prefixes,
@@ -680,6 +719,7 @@ def configure_semantic_tools(mcp: FastMCP):
                 query=query,
                 total_found=len(results),
                 search_method=search_method,
+                granularity=granularity,
                 verified_chunk_count=verified_chunk_count,
                 dropped_document_count=dropped_count,
             )

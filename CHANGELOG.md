@@ -5,21 +5,44 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
-## v0.155.1 (2026-07-30)
+## v0.156.1 (2026-07-31)
 
 ### Fix
 
+- **security**: don't double-escape username in the navbar
+- **security**: autoescape the admin UI templates and escape IdP-derived values
+- **reliability**: drop the unreachable deck-card guard, cover the new guards
+- **reliability**: close the Sonar bug findings in our own code
+- **security**: close the Sonar BLOCKER/MAJOR findings in our own code
+
+## v0.156.0 (2026-07-31)
+
+### Feat
+
+- **api**: expose granularity on POST /api/v1/search; cap grouped prefetch
+- **search**: add granularity="document" to nc_semantic_search
+
+### Fix
+
+- **search**: surface the doc_id caveat to callers; reject granularity on dense
+
+## v0.155.2 (2026-07-31)
+
+### Fix
+
+- **observability**: guard span status read on non-recording spans
+
+## v0.155.1 (2026-07-31)
+
+### Fix
+
+- **search**: scope the ACL owner branch to the subtrees actually shared
+- **search**: pin the RRF constant in tests and correct the threshold docs
+- **search**: set an explicit RRF ranking constant instead of Qdrant's k=2
+- **search**: drop the dense-search score_threshold default to 0.0
 - **fork**: retain byte-preserving CardDAV updates, atomic chunked WebDAV
   writes, stale pooled-read recovery, transport compatibility aliases, and
-  dual-stack serving while incorporating upstream v0.155.0
-
-## v0.151.1 (2026-07-26)
-
-### Fix
-
-- **storage**: serialize all in-process Alembic commands so concurrent MCP
-  sessions cannot corrupt Alembic's process-global context proxy and crash
-  with `KeyError: 'config'` or `KeyError: 'script'`
+  dual-stack serving
 
 ## v0.155.0 (2026-07-30)
 
@@ -102,6 +125,14 @@ may still be set in the environment; the application now ignores it.
 ### Refactor
 
 - **cli**: extract the ingest worker run loop; use monkeypatch in tests
+
+## v0.151.1 (2026-07-26)
+
+### Fix
+
+- **storage**: serialize all in-process Alembic commands so concurrent MCP
+  sessions cannot corrupt Alembic's process-global context proxy and crash
+  with `KeyError: 'config'` or `KeyError: 'script'`
 
 ## v0.151.0 (2026-07-26)
 

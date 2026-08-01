@@ -16,6 +16,7 @@ from nextcloud_mcp_server.search.algorithms import (
     SearchResult,
     build_search_result_from_point,
 )
+from nextcloud_mcp_server.search.bm25_hybrid import GRANULARITY_CHUNK
 from nextcloud_mcp_server.vector.payload_keys import ACL_HASH
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
@@ -29,11 +30,17 @@ class SemanticSearchAlgorithm(SearchAlgorithm):
     768-dimensional embeddings and cosine distance.
     """
 
-    def __init__(self, score_threshold: float = 0.7):
+    def __init__(self, score_threshold: float = 0.0):
         """Initialize semantic search algorithm.
 
         Args:
-            score_threshold: Minimum similarity score (0-1, default: 0.7)
+            score_threshold: Minimum cosine similarity (0-1, default: 0.0 =
+                no cut). Matches ``BM25HybridSearchAlgorithm``'s default and the
+                0.0 the API layer already passes explicitly. The previous 0.7
+                default was inherited from the removed sampling tool, where it
+                silently returned zero results for questions the corpus answered
+                almost verbatim; no caller relied on it, so it survived only as
+                a footgun for the next bare instantiation.
         """
         super().__init__()
         self.score_threshold = score_threshold
@@ -59,6 +66,8 @@ class SemanticSearchAlgorithm(SearchAlgorithm):
         path_prefix: str | None = None,
         path_prefixes: Iterable[str] | None = None,
         path_prefix_folder_ids: list[str] | None = None,
+        shared_root_ids: list[str] | None = None,
+        granularity: str = GRANULARITY_CHUNK,
         **kwargs: Any,
     ) -> list[SearchResult]:
         """Execute semantic search using vector similarity.
@@ -97,6 +106,19 @@ class SemanticSearchAlgorithm(SearchAlgorithm):
         Raises:
             McpError: If vector sync is not enabled or search fails
         """
+        if granularity != GRANULARITY_CHUNK:
+            # Declared explicitly rather than swallowed by **kwargs, matching
+            # the convention on accessible_owners/modified_at: a value this
+            # algorithm cannot honour must fail loudly, not silently return
+            # chunk-granularity rows to a caller that asked for documents.
+            # Grouping is implemented only by BM25HybridSearchAlgorithm; the
+            # /api/v1 layer rejects the combination with a 422 before reaching
+            # here, so this is the defence-in-depth backstop for direct callers.
+            raise ValueError(
+                f"granularity={granularity!r} is not supported by the dense-only "
+                f"{self.name!r} algorithm; use the bm25/hybrid algorithm."
+            )
+
         settings = get_settings()
         score_threshold = kwargs.get("score_threshold", self.score_threshold)
 
@@ -132,6 +154,7 @@ class SemanticSearchAlgorithm(SearchAlgorithm):
             path_prefix=path_prefix,
             path_prefixes=path_prefixes,
             path_prefix_folder_ids=path_prefix_folder_ids,
+            shared_root_ids=shared_root_ids,
         )
 
         # ACL pre-filter (design §11), opt-in via ACL_PREFILTER_ENABLED and OFF

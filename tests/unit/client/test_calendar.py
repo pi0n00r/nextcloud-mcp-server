@@ -595,3 +595,34 @@ def test_todo_reminders_round_trip_and_update_by_ordered_list(mocker):
     assert reparsed is not None
     assert [r["trigger"] for r in reparsed["reminders"]] == ["-PT1H", "-PT5M"]
     assert reparsed["reminders"][0]["description"] == "updated"
+
+
+def test_expand_without_window_returns_master_event(mocker):
+    """A recurring event with no expansion window falls back to the master VEVENT.
+
+    Guards against a revert to the `assert start_datetime is not None` that used
+    to sit inside the try block, where the AssertionError was caught by
+    `except Exception` and logged as a failed recurrence expansion rather than
+    the missing-window caller error it is (python:S5779). The fallback value is
+    identical either way — only the diagnosis differs — so the assertion here is
+    that no expansion is attempted.
+    """
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+    mocker.patch.object(
+        CalendarClient, "_extract_vevent_data", return_value={"uid": "master"}
+    )
+    expand = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.recurring_ical_events.of"
+    )
+
+    cal = mocker.MagicMock()
+    cal.walk.return_value = [{"rrule": "FREQ=DAILY"}]
+
+    result = client._expand_event_occurrences(
+        cal, start_datetime=None, end_datetime=None, do_expand=True
+    )
+
+    assert result == [{"uid": "master"}]
+    expand.assert_not_called()

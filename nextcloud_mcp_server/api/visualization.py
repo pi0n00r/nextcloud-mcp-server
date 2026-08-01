@@ -31,12 +31,17 @@ from nextcloud_mcp_server.api.management import (
 from nextcloud_mcp_server.config import Settings, get_settings
 from nextcloud_mcp_server.providers import get_provider
 from nextcloud_mcp_server.search import (
+    GRANULARITY_CHUNK,
+    GRANULARITY_DOCUMENT,
+    VALID_GRANULARITIES,
     BM25HybridSearchAlgorithm,
     SearchAlgorithm,
     SemanticSearchAlgorithm,
 )
 from nextcloud_mcp_server.search.access_filter import (
+    AccessibleScope,
     list_accessible_owners,
+    list_accessible_scope,
     normalize_path_prefixes,
 )
 from nextcloud_mcp_server.search.context import (
@@ -107,10 +112,10 @@ def _build_search_algorithm(
 async def _search_with_acl(
     request: Request,
     user_id: str,
-    execute: Callable[[list[str] | None], Awaitable[list]],
+    execute: Callable[[AccessibleScope | None], Awaitable[list]],
 ) -> list:
-    """Resolve the caller's Nextcloud client, run ``execute(accessible_owners)``,
-    and verify-on-read — shared by the /api/v1 search endpoints.
+    """Resolve the caller's Nextcloud client, run ``execute(scope)``, and
+    verify-on-read — shared by the /api/v1 search endpoints.
 
     The OAuth bearer only authenticates management UI → MCP Server; MCP Server →
     Nextcloud uses the provisioned app password. When the caller never
@@ -122,7 +127,7 @@ async def _search_with_acl(
     Args:
         request: The Starlette request (carries ``app.state.oauth_context``).
         user_id: The authenticated caller.
-        execute: Coroutine that runs the search for a given owner scope
+        execute: Coroutine that runs the search for a given access scope
             (``None`` ⇒ self-only).
 
     Returns:
@@ -145,8 +150,8 @@ async def _search_with_acl(
         async with nc_client:
             # Expand to owners who shared content with the caller (same as the
             # MCP tool path) so shared documents are searchable.
-            accessible_owners = await list_accessible_owners(nc_client.sharing, user_id)
-            results = await execute(accessible_owners)
+            scope = await list_accessible_scope(nc_client.sharing, user_id)
+            results = await execute(scope)
             # Verify-on-read (ADR-019): drop documents the caller can no longer
             # access (e.g. a revoked share). Eviction runs inline — this
             # Starlette route has no FastMCP lifespan task group.
@@ -180,7 +185,11 @@ async def unified_search(request: Request) -> JSONResponse:
         "limit": 20,  // max: 100
         "offset": 0,  // pagination offset
         "include_pca": false,  // optional PCA coordinates
-        "include_chunks": true  // include text snippets
+        "include_chunks": true,  // include text snippets
+        "granularity": "chunk"  // "chunk" (default) or "document": one row
+                                // per document (its best chunk), so `limit`
+                                // counts documents. "document" requires the
+                                // bm25/hybrid algorithm.
     }
 
     Response:
@@ -277,6 +286,21 @@ async def unified_search(request: Request) -> JSONResponse:
 
         requested_algorithm = body.get("algorithm")  # None ⇒ graceful default
         fusion = body.get("fusion", "rrf")
+        # Unlike ``fusion`` (normalized to "rrf" when unrecognized), an
+        # unrecognized granularity is rejected rather than silently downgraded:
+        # a caller asking for one row per document and receiving several chunks
+        # of the same document would look like a ranking bug, not a bad request.
+        granularity = body.get("granularity", GRANULARITY_CHUNK)
+        if granularity not in VALID_GRANULARITIES:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Invalid granularity {granularity!r}. "
+                        f"Must be one of {list(VALID_GRANULARITIES)}"
+                    )
+                },
+                status_code=400,
+            )
         include_pca = body.get("include_pca", False)
         include_chunks = body.get("include_chunks", True)
         doc_types = body.get("doc_types")  # Optional filter
@@ -310,12 +334,33 @@ async def unified_search(request: Request) -> JSONResponse:
         except UnsupportedSearchType as e:
             return _unsupported_search_type_response(e)
 
+        # Only the hybrid algorithm implements grouping. The dense-only path
+        # would accept the kwarg and silently ignore it, returning several
+        # chunks of one document to a caller that asked for one row per
+        # document — indistinguishable from a ranking bug. Reject instead.
+        # Astrolabe requests "hybrid" (its default), so this combination is
+        # reachable only by an explicit opt-in to the dense algorithm.
+        if granularity == GRANULARITY_DOCUMENT and algorithm == "semantic":
+            return JSONResponse(
+                {
+                    "error": "granularity_unsupported_for_algorithm",
+                    "granularity": granularity,
+                    "algorithm": algorithm,
+                    "supported_algorithms": ["bm25", "hybrid"],
+                },
+                status_code=422,
+            )
+
         # Request extra results to handle offset
         search_limit = limit + offset
 
-        async def _execute(owners: list[str] | None) -> list:
-            """Run the search across requested doc_types with the given owner
+        async def _execute(scope: AccessibleScope | None) -> list:
+            """Run the search across requested doc_types with the given access
             scope (None ⇒ self-only)."""
+            owners = scope.owners if scope else None
+            # Narrow the owner branch to the subtrees actually shared with the
+            # caller; see access_filter.build_ownership_filter.
+            roots = scope.share_root_ids if scope else None
             results: list = []
             if doc_types and isinstance(doc_types, list):
                 for doc_type in doc_types:
@@ -327,6 +372,8 @@ async def unified_search(request: Request) -> JSONResponse:
                                 limit=search_limit,
                                 doc_type=doc_type,
                                 accessible_owners=owners,
+                                shared_root_ids=roots,
+                                granularity=granularity,
                                 modified_after=modified_after,
                                 modified_before=modified_before,
                                 path_prefixes=path_prefixes,
@@ -347,6 +394,8 @@ async def unified_search(request: Request) -> JSONResponse:
                     user_id=user_id,
                     limit=search_limit,
                     accessible_owners=owners,
+                    shared_root_ids=roots,
+                    granularity=granularity,
                     modified_after=modified_after,
                     modified_before=modified_before,
                     path_prefixes=path_prefixes,
@@ -560,9 +609,13 @@ async def vector_search(request: Request) -> JSONResponse:
         except UnsupportedSearchType as e:
             return _unsupported_search_type_response(e)
 
-        async def _execute(owners: list[str] | None) -> list:
-            """Run the search across requested doc_types with the given owner
+        async def _execute(scope: AccessibleScope | None) -> list:
+            """Run the search across requested doc_types with the given access
             scope (None ⇒ self-only)."""
+            owners = scope.owners if scope else None
+            # Narrow the owner branch to the subtrees actually shared with the
+            # caller; see access_filter.build_ownership_filter.
+            roots = scope.share_root_ids if scope else None
             results: list = []
             if doc_types and isinstance(doc_types, list):
                 # Search each doc_type separately and merge results
@@ -575,6 +628,7 @@ async def vector_search(request: Request) -> JSONResponse:
                                 limit=limit,
                                 doc_type=doc_type,
                                 accessible_owners=owners,
+                                shared_root_ids=roots,
                                 modified_after=modified_after,
                                 modified_before=modified_before,
                                 path_prefixes=path_prefixes,
@@ -590,6 +644,7 @@ async def vector_search(request: Request) -> JSONResponse:
                     user_id=user_id,
                     limit=limit,
                     accessible_owners=owners,
+                    shared_root_ids=roots,
                     modified_after=modified_after,
                     modified_before=modified_before,
                     path_prefixes=path_prefixes,
@@ -706,8 +761,12 @@ async def get_chunk_context(request: Request) -> JSONResponse:
         chunk_index_str = request.query_params.get("chunk_index")
         total_chunks_str = request.query_params.get("total_chunks")
 
-        # Validate required parameters
-        if not all([doc_type, doc_id, start_str, end_str]):
+        # Validate required parameters. Written as a chained `and` rather than
+        # `all([...])` + four `assert`s: `all()` does not narrow the types for
+        # the checker, and the asserts that stood in for it sat inside this
+        # try/except Exception, which would have turned a narrowing slip into a
+        # 500 with an AssertionError body (python:S5779).
+        if not (doc_type and doc_id and start_str and end_str):
             return JSONResponse(
                 {
                     "success": False,
@@ -715,12 +774,6 @@ async def get_chunk_context(request: Request) -> JSONResponse:
                 },
                 status_code=400,
             )
-
-        # Type narrowing: we already checked these are not None above
-        assert start_str is not None
-        assert end_str is not None
-        assert doc_id is not None
-        assert doc_type is not None
 
         # Validate doc_id at the handler boundary: a malformed doc_id would
         # otherwise pass through to get_chunk_with_context and bottom out as a

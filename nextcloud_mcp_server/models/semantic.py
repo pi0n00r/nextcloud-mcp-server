@@ -29,8 +29,12 @@ class SemanticSearchResult(BaseModel):
     excerpt: str = Field(description="Excerpt from matching chunk")
     score: float = Field(
         description=(
-            "Relevance score (≥ 0.0, higher is better). A normalized fusion score "
-            "— RRF in [0.0, 1.0], DBSF can exceed 1.0."
+            "Ranking score (≥ 0.0, higher is better). Orders results within "
+            "one response; it is NOT a calibrated relevance measure and is not "
+            "comparable across queries. RRF scores are a rank artifact peaking "
+            "near 2/VECTOR_SEARCH_RRF_K (~0.033 at the default k=60); DBSF sums "
+            "normalized per-retriever scores and is unbounded above 1.0. Filter "
+            "by rank via `limit` rather than by an absolute score."
         )
     )
     chunk_index: int = Field(description="Index of matching chunk in document")
@@ -90,14 +94,25 @@ class SemanticSearchResponse(BaseResponse):
             "same fused query."
         ),
     )
+    granularity: str = Field(
+        default="chunk",
+        description=(
+            "Result granularity actually applied: 'chunk' (each row is a "
+            "passage; one document may occupy several rows) or 'document' "
+            "(each row is a distinct document, represented by its "
+            "best-matching chunk). Echoed so a stored or forwarded response "
+            "is self-describing without its originating request."
+        ),
+    )
     verified_chunk_count: int = Field(
         default=0,
         description=(
-            "Number of search result chunks that passed verify-on-read "
-            "access checks (ADR-019). Equals len(verified_results) before "
-            "trimming to limit. Sized in chunks (result rows), NOT in "
-            "unique documents — see dropped_document_count for the "
-            "per-document counterpart."
+            "Number of result rows that passed verify-on-read access checks "
+            "(ADR-019). Equals len(verified_results) before trimming to "
+            "limit. Counts rows, which are passages at granularity='chunk' "
+            "and distinct documents at granularity='document' — so it equals "
+            "the document count only in the latter. See "
+            "dropped_document_count, which is always sized in documents."
         ),
     )
     dropped_document_count: int = Field(

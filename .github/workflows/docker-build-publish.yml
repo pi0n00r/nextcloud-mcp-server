@@ -22,8 +22,10 @@ jobs:
       packages: write
     steps:
       - name: Validate exact stable tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ inputs.tag }}" != "$PACKAGE_TAG" ]; then
+          if [ "$INPUT_TAG" != "$PACKAGE_TAG" ]; then
             echo "This workflow only publishes $PACKAGE_TAG as the stable package." >&2
             exit 1
           fi
