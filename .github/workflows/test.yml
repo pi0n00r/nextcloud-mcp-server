@@ -69,6 +69,9 @@ jobs:
     needs: [linting]
     strategy:
       fail-fast: false
+      # Each lane pulls several shared container images. Bound the matrix burst
+      # so anonymous registry throttling cannot fail every lane before tests run.
+      max-parallel: 3
       matrix:
         nextcloud_version:
           - "32"
