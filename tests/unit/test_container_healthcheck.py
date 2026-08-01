@@ -50,6 +50,29 @@ def test_dockerfile_runs_dynamic_internal_probe():
     assert "127.0.0.1:8000/health/live" not in dockerfile
 
 
+def test_dockerfile_builds_only_the_pinned_uvicorn_exception_from_source():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    dependency_sync = next(
+        line
+        for line in dockerfile.splitlines()
+        if line.startswith("RUN uv sync") and "--no-install-project" in line
+    )
+    project_sync = next(
+        line
+        for line in dockerfile.splitlines()
+        if line.startswith("RUN uv sync") and "--no-editable" in line
+    )
+
+    assert "--no-build" in dependency_sync
+    assert "--no-install-package uvicorn" in dependency_sync
+    assert "--no-build" not in project_sync
+    assert (
+        "https://github.com/pi0n00r/uvicorn.git@"
+        "c5d334cb3014d72a43a893e848bbfdebb2665738"
+    ) in pyproject
+
+
 def test_shipped_compose_profile_ports_match_health_resolution():
     compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
 

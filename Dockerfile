@@ -21,11 +21,11 @@ WORKDIR /src
 
 COPY pyproject.toml uv.lock README.md .
 
-# --no-build: every third-party dependency must arrive as a wheel, so no
-# dependency's setup.py executes at image-build time (docker:S8541). This is
-# the sync that installs them all; the second one only adds the project itself,
-# which by definition has to be built and cannot carry the flag.
-RUN uv sync --locked --no-dev --no-install-project --no-build --no-cache --extra postgres --extra observability
+# --no-build: ordinary third-party dependencies must arrive as wheels, so their
+# setup.py cannot execute at image-build time (docker:S8541). The pinned Uvicorn
+# fork is the deliberate exception: skip it here, then let the second sync build
+# only that reviewed Git dependency and this project from source.
+RUN uv sync --locked --no-dev --no-install-project --no-install-package uvicorn --no-build --no-cache --extra postgres --extra observability
 
 COPY . .
 
