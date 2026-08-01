@@ -1,5 +1,6 @@
 import atexit
 import copy
+import difflib
 import functools
 import logging
 import logging.config
@@ -31,7 +32,6 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_host": None,
     "nextcloud_username": None,
     "nextcloud_password": None,
-    "nextcloud_app_password": None,
     "nextcloud_verify_ssl": True,
     "nextcloud_ca_bundle": None,
     "nextcloud_mcp_server_url": None,
@@ -145,6 +145,12 @@ _DEFAULTS: dict[str, Any] = {
     # embedding cost) into the SAME collection as hybrid files; ``vector-index``
     # wins if a file carries both. Set empty to disable the second tag entirely.
     "vector_sync_keyword_tag": "keyword-index",
+    # Mail tag (an IMAP keyword) restricting which messages are indexed. Empty
+    # (the default) indexes every message in every mailbox, which is the
+    # behaviour before this setting existed. Set it to a tag display name and
+    # only messages carrying that tag are indexed — the mail analogue of
+    # ``vector_sync_tag`` for files.
+    "mail_index_tag": "",
     # Fail-safe against a flaky/empty tag-discovery read: number of *consecutive*
     # scan cycles for which a given index mode's tag discovery must return zero
     # files (while Qdrant still holds indexed points for that mode) before the
@@ -301,8 +307,6 @@ _DEFAULTS: dict[str, Any] = {
     "otel_exporter_otlp_endpoint": None,
     "otel_exporter_verify_ssl": None,
     "otel_service_name": "nextcloud-mcp-server",
-    "otel_traces_sampler": "always_on",
-    "otel_traces_sampler_arg": 1.0,
     "pyroscope_enabled": False,
     "pyroscope_server_address": None,
     # Pod identity from the Kubernetes downward API (chart-injected). Facts
@@ -478,11 +482,13 @@ def _resolve_settings_files() -> list[str]:
     and env vars still apply.
     """
     files: list[str] = []
-    # The ONLY legitimate os.environ read in the app: this runs BEFORE the
-    # dynaconf instance is built (it computes the settings_files list passed to
-    # Dynaconf), so it cannot go through dynaconf — you can't read the location
-    # of the settings file from the settings file. This + the MCP_DEPLOYMENT_MODE
-    # env_switcher are dynaconf's own bootstrap. All OTHER config is dynaconf-driven.
+    # A legitimate os.environ read: this runs BEFORE the dynaconf instance is
+    # built (it computes the settings_files list passed to Dynaconf), so it
+    # cannot go through dynaconf — you can't read the location of the settings
+    # file from the settings file. This + the MCP_DEPLOYMENT_MODE env_switcher
+    # are dynaconf's own bootstrap. All config *values* are dynaconf-driven; the
+    # only other reads are the legacy-env deprecation check and
+    # _warn_unknown_env_vars, which inspect env var NAMES, not values.
     explicit = os.environ.get("NEXTCLOUD_MCP_SETTINGS_FILE")
     if explicit:
         p = Path(explicit)
@@ -608,6 +614,10 @@ _dynaconf = Dynaconf(
         ),
         # VECTOR_SYNC_KEYWORD_TAG is optional (empty disables keyword-only
         # discovery), so no len_min — but when set it must be a usable tag name.
+        # MAIL_INDEX_TAG is likewise optional (empty indexes all mail), but the
+        # Mail app rejects display names over 128 characters — catch that at
+        # startup instead of failing every mail scan with an HTTP 400.
+        Validator("MAIL_INDEX_TAG", len_max=128),
         # WEBHOOK_SECRET is optional (None disables webhooks — GHSA-8vh3-g2qg-2h2c),
         # but when set it must be long enough to resist guessing. Surfaces a
         # weak/placeholder secret at startup rather than in a later audit.
@@ -625,19 +635,6 @@ _dynaconf = Dynaconf(
             "LOG_LEVEL",
             is_in=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         ),
-        Validator(
-            "OTEL_TRACES_SAMPLER",
-            is_in=[
-                "always_on",
-                "always_off",
-                "traceidratio",
-                "parentbased_always_on",
-                "parentbased_always_off",
-                "parentbased_traceidratio",
-            ],
-        ),
-        # Float ranges
-        Validator("OTEL_TRACES_SAMPLER_ARG", gte=0.0, lte=1.0),
     ],
 )
 
@@ -952,7 +949,6 @@ class Settings:
     nextcloud_host: str | None = None
     nextcloud_username: str | None = None
     nextcloud_password: str | None = None
-    nextcloud_app_password: str | None = None  # Preferred over nextcloud_password
 
     # Browser-reachable public URL for OAuth/Login-Flow-v2 redirects when
     # NEXTCLOUD_HOST is an internal Docker hostname. Falls back to
@@ -1094,6 +1090,15 @@ class Settings:
     # embedding). ``vector-index`` takes precedence when a file carries both tags.
     # Set empty to disable the second tag entirely.
     vector_sync_keyword_tag: str = "keyword-index"
+
+    # Mail tag (an IMAP keyword) restricting which messages are indexed — the
+    # mail analogue of ``vector_sync_tag``. Empty (default) indexes every
+    # message in every mailbox. Set to a tag display name and the scanner
+    # resolves it to that user's tag id and lists only messages carrying it;
+    # verify-on-read applies the same filter, so untagging a message drops it
+    # out of search on the next query. Max 128 characters (the Mail app rejects
+    # longer display names).
+    mail_index_tag: str = ""
 
     # Fail-safe against a flaky/empty tag-discovery read. Number of *consecutive*
     # scan cycles for which an index mode's tag discovery must return zero files
@@ -1332,8 +1337,6 @@ class Settings:
     # endpoint, or plaintext behind a TLS-terminating sidecar).
     otel_exporter_verify_ssl: bool | None = None
     otel_service_name: str = "nextcloud-mcp-server"
-    otel_traces_sampler: str = "always_on"
-    otel_traces_sampler_arg: float = 1.0
     # Continuous profiling (Pyroscope). Push-mode via the Pyroscope SDK to an
     # Alloy pyroscope.receive_http endpoint (e.g. the cloudfleet Alloy at
     # http://alloy.alloy.svc.cluster.local:4041), which forwards to the homelab
@@ -2009,6 +2012,31 @@ def _get_vector_sync_tag() -> str:
 
 
 @functools.cache
+def _warn_unknown_env_vars() -> None:
+    """Warn about env vars that look like a misspelled setting.
+
+    We run dynaconf with ``ignore_unknown_envvars=True`` (see ``_DEFAULTS``), so
+    an env var we don't declare is dropped without a word — ``VECTOR_SYNC_ENABLE``
+    silently does nothing. Only warn when the name closely resembles a declared
+    key, so the environment's own vars (PATH, the ``*_SERVICE_HOST`` pairs
+    Kubernetes injects into every pod, ...) stay quiet. Warn, never fail:
+    ``os.environ`` isn't ours, and a false positive must not stop a deployment.
+    """
+    known = {k.upper() for k in _DEFAULTS}
+    for name in sorted(os.environ):
+        if name in known:
+            continue
+        # cutoff measured: 0.85 catches every planted typo with no false
+        # positive on a realistic container env; 0.80 trips on k8s injections.
+        if match := difflib.get_close_matches(name, known, n=1, cutoff=0.85):
+            logger.warning(
+                "%s is not a recognized setting and was ignored; did you mean %s?",
+                name,
+                match[0],
+            )
+
+
+@functools.cache
 def _build_settings() -> Settings:
     """Get application settings from dynaconf configuration.
 
@@ -2026,6 +2054,8 @@ def _build_settings() -> Settings:
     Returns:
         Settings object with configuration values
     """
+    _warn_unknown_env_vars()
+
     # Get consolidated values with smart dependency resolution
     enable_semantic_search = _get_semantic_search_enabled()
     enable_background_operations = _get_background_operations_enabled()
@@ -2085,6 +2115,9 @@ def _clear_settings_caches() -> None:
     """
     _build_settings.cache_clear()
     get_nextcloud_ssl_verify.cache_clear()
+    # _warn_unknown_env_vars is deliberately NOT cleared: it is a once-per-process
+    # advisory, and re-arming it here would re-log the same warning on every CLI
+    # override and every test reload.
 
 
 def get_procrastinate_conninfo(database_url: str | None = None) -> str:

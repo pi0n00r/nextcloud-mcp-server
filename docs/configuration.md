@@ -397,6 +397,44 @@ OLLAMA_BASE_URL=http://ollama:11434
 
 > **Note:** In multi-user modes (Login Flow v2, Multi-User BasicAuth), enabling `ENABLE_SEMANTIC_SEARCH` automatically enables background operations and refresh token storage. You don't need to set `ENABLE_BACKGROUND_OPERATIONS` separately!
 
+### Indexing a subset of mail — `MAIL_INDEX_TAG`
+
+Mail is indexed for semantic search whenever vector sync is on. By default that
+means **every message in every mailbox** (up to 100 per mailbox — the Mail API's
+per-request maximum). `MAIL_INDEX_TAG` narrows it to the messages a user has
+tagged, the mail analogue of `VECTOR_SYNC_TAG` for files.
+
+| Value | Behaviour |
+|-------|-----------|
+| `""` (default) | Index every message. Unchanged from before this setting existed. |
+| a tag display name | Index only messages carrying that Mail tag. |
+
+```dotenv
+MAIL_INDEX_TAG=vector-index
+```
+
+The tag is created for each user automatically on the first scan, so it shows up
+in their Mail tag picker — applying it there **is** the opt-in. Tag names
+normalise (`"AI Index"`, `"ai index"` and `"ai_index"` are one tag), and tagging
+follows a message's `Message-ID`, so it applies to copies in other mailboxes too.
+
+Notes:
+
+- **Turning it on makes untagged mail unsearchable immediately.** Verify-on-read
+  drops untagged results on the next query; the index storage is reclaimed within
+  a couple of scan cycles by the usual grace-period eviction. No purge needed.
+- **Turning it off is lossy.** Messages indexed *because* they were tagged but
+  older than the unfiltered 100-message window fall out of discovery and are
+  evicted, then re-embedded if they come back. "Just unset it" is not free.
+- **The cap becomes 100 *tagged* messages per mailbox**, which reaches much
+  further back in a mailbox than the unfiltered window does — that coverage is
+  the main win, beyond simply indexing less. Exceeding it logs a warning naming
+  the mailbox.
+- If the tag can't be resolved (Mail app down), the mail scan is skipped for that
+  cycle rather than falling back to indexing everything, and search keeps
+  returning already-indexed mail unverified.
+- Max 128 characters (validated at startup — the Mail app rejects longer names).
+
 ### Per-document keyword vs hybrid indexing — `VECTOR_SYNC_KEYWORD_TAG`
 
 Documents are indexed **hybrid** (dense semantic + BM25 sparse) or
@@ -1512,6 +1550,20 @@ Get-Content .env | ForEach-Object {
 docker run -p 127.0.0.1:8000:8000 --env-file .env --rm \
   ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
 ```
+
+### Misspelled variables
+
+Only the variables documented here are read; anything else in the environment is
+ignored. To keep a typo from failing silently, startup warns when an unknown
+variable closely resembles a real one:
+
+```
+WARNING  VECTOR_SYNC_ENABLE is not a recognized setting and was ignored;
+         did you mean VECTOR_SYNC_ENABLED?
+```
+
+It is only a warning — an unrecognized variable never stops the server — so check
+the logs after changing configuration if a setting does not seem to apply.
 
 ---
 
