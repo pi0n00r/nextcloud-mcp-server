@@ -5,7 +5,7 @@
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 148 MCP tools.
+Deck, Talk, and other Nextcloud application surfaces through 155 MCP tools.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -42,7 +42,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Tool surface** | 148 tools across 12 Nextcloud application surfaces |
+| **Tool surface** | 155 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.1.1` |
 | **Application version** | `0.151.1` |
@@ -132,11 +132,11 @@ The stable single-user profile exposes the following core tool surface:
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 7 | Create, read, update, append, search, attachments |
-| **Mail** | 6 | Accounts, mailboxes, messages, attachments, sending |
+| **Mail** | 13 | Accounts, messages, raw source, flags, tags, move/delete, sending |
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 6 | Conversations, participants, messages, read state |
-| **Total** | **148** | Core tools in the stable single-user profile |
+| **Total** | **155** | Core tools in the stable single-user profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
