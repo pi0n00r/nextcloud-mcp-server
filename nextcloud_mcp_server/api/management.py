@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse
 
 from nextcloud_mcp_server.config import Settings, get_settings
 from nextcloud_mcp_server.config_validators import AuthMode, detect_auth_mode
+from nextcloud_mcp_server.search.rerank import rerank_available
 from nextcloud_mcp_server.vector.metrics_publisher import (
     count_indexed,
     estimate_hybrid_vector_bytes,
@@ -42,8 +43,22 @@ _server_start_time = time.time()
 
 # The search algorithms external management clients understand (the ``algorithm``
 # request param to /api/v1/search and /api/v1/vector-viz/search): ``semantic``
-# (dense only), ``bm25`` (sparse/keyword only), ``hybrid`` (dense+sparse fusion).
+# (dense only), ``bm25``, ``hybrid``.
 # Single source of truth, also consumed by api/visualization.py for validation.
+#
+# CAVEAT — ``bm25`` and ``hybrid`` are currently BEHAVIOURALLY IDENTICAL. Both are
+# routed to ``BM25HybridSearchAlgorithm`` by ``_build_search_algorithm``
+# (api/visualization.py), which always issues dense AND sparse prefetches and
+# returns the fused score. There is no sparse-only path, so ``bm25`` does not mean
+# "keyword only" — it differs from ``hybrid`` only in the string echoed back as
+# ``search_method``. A previous version of this comment claimed "sparse/keyword
+# only", which a caller could reasonably act on.
+#
+# Consequence for callers: raw BM25 scores (unbounded, values above 8 observed)
+# never reach a caller's ``score`` field on either name. What they see is the RRF
+# fused score, bounded by ``2/VECTOR_SEARCH_RRF_K``, or an unbounded DBSF score.
+# Either giving ``bm25`` a genuinely sparse-only path or dropping it from the
+# advertised set is a behaviour change and is tracked on Deck #958, not here.
 SUPPORTED_SEARCH_ALGORITHMS: tuple[str, ...] = ("semantic", "bm25", "hybrid")
 
 
@@ -339,6 +354,13 @@ async def get_server_status(request: Request) -> JSONResponse:
         # vector sync is off; all three (semantic, bm25, hybrid) when it is on.
         # Lets the UI gate its algorithm picker.
         "supported_search_types": supported_search_types(settings),
+        # Whether this server can serve `rerank: true` on /api/v1/search.
+        # Advertised so a client gates its UI on a capability rather than
+        # discovering it by sending the request and handling the 422 — the same
+        # reason supported_search_types exists. Present and false (not absent)
+        # when unconfigured, so a client can distinguish "server says no" from
+        # "server too old to know about reranking".
+        "rerank_available": rerank_available(settings),
         "uptime_seconds": uptime_seconds,
         "management_api_version": "1.0",
     }

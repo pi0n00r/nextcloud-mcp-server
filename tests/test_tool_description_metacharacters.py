@@ -14,10 +14,25 @@ Because docstrings are the descriptions, this is a documentation-style rule and
 a static check over the source is enough: it needs no Nextcloud instance.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import ast
 import pathlib
 
 import pytest
+
+# The CI job runs ``pytest -m unit``, so an unmarked test is collected and then
+# deselected: it never fails, it just silently stops running.
+pytestmark = pytest.mark.unit
 
 METACHARACTERS = ("&&", ";", "||", "$(", "> ", "< ")
 
@@ -26,6 +41,7 @@ METACHARACTERS = ("&&", ";", "||", "$(", "> ", "< ")
 # by strict gateways -- a deliberate trade-off, not an oversight.
 ALLOWED_TOOLS = {
     "nc_calendar_create_event",  # RFC 5545: ``DTSTART;TZID=`` and ``FREQ=...;BYDAY=``
+    "nc_contacts_patch_contact",  # vCard selector syntax: ``TEL;TYPE=CELL``
     "nc_webdav_write_file",  # MIME: ``'type;base64'``
 }
 

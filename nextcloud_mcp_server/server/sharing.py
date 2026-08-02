@@ -119,12 +119,12 @@ def configure_sharing_tools(mcp: FastMCP):
             share_with: Optional recipient identifier, interpreted according to
                 share_type: user id, group id, email address, federated
                 "user@remote", circle id, Talk conversation token, or Deck card
-                id. Required and nonblank for recipient share types; omit for
+                id. Required and nonblank for recipient share types. Omit for
                 share_type 3.
             share_type: OCS share type:
                 - 0 = user (default)
                 - 1 = group
-                - 3 = public link — allowed only when share_with is omitted;
+                - 3 = public link — allowed only when share_with is omitted.
                   permissions remain configurable on this generic tool
                 - 4 = email
                 - 6 = federated (server-to-server)

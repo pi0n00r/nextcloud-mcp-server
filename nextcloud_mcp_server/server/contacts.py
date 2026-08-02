@@ -410,7 +410,7 @@ def configure_contacts_tools(mcp: FastMCP):
 
         Use for recovery import or corrective rewrite — most callers want
         ``patch_contact`` (surgical, byte-preserving) instead. Same If-Match
-        discipline; 412 surfaces to caller.
+        discipline. A 412 response surfaces to the caller.
 
         Args:
             addressbook: URI slug.
@@ -446,7 +446,7 @@ def configure_contacts_tools(mcp: FastMCP):
         Args:
             addressbook: URI slug.
             uid: Contact UID.
-            etag: optional If-Match precondition; without it, the delete is
+            etag: optional If-Match precondition. Without it, the delete is
                 unconditional (allows a concurrent edit to be lost).
         """
         client = await get_client(ctx)
@@ -585,7 +585,7 @@ def configure_contacts_tools(mcp: FastMCP):
         """DEPRECATED. Use ``nc_contacts_patch_contact`` directly.
 
         This shim translates the legacy JSON shape to a ``patch_contact``
-        invocation underneath; it inherits the byte-preserving substrate so
+        invocation underneath. It inherits the byte-preserving substrate so
         PHOTO blobs and X-properties are no longer dropped, but the JSON
         translation is still lossy for fields not in the legacy schema.
         Callers should migrate to ``patch_contact`` for full fidelity.
@@ -594,7 +594,7 @@ def configure_contacts_tools(mcp: FastMCP):
             addressbook: URI slug, not the address-book display name.
             uid: Contact UID.
             contact_data: Legacy JSON fields. Plain strings are supported for
-                ``fn``, ``email``, ``tel``/``phone``, ``title`` and ``note``;
+                ``fn``, ``email``, ``tel``/``phone``, ``title`` and ``note``.
                 ``org``/``organization``, ``nickname``, ``categories`` and
                 ``url`` also accept the compatibility shapes handled by the
                 byte-preserving client. Unknown fields are ignored.

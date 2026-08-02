@@ -41,6 +41,7 @@ REQUIRED_FIELDS=(
 # here rather than scanning the whole tree so upstream-inherited files (no
 # fork ownership) aren't penalized.
 FORK_TOUCHED=(
+    "nextcloud_mcp_server/api/visualization.py"
     "nextcloud_mcp_server/client/base.py"
     "nextcloud_mcp_server/client/calendar.py"
     "nextcloud_mcp_server/client/contacts.py"
@@ -50,22 +51,30 @@ FORK_TOUCHED=(
     "nextcloud_mcp_server/client/sharing.py"
     "nextcloud_mcp_server/client/vcard_parser.py"
     "nextcloud_mcp_server/client/webdav.py"
+    "nextcloud_mcp_server/config.py"
     "nextcloud_mcp_server/migrations.py"
     "nextcloud_mcp_server/models/__init__.py"
     "nextcloud_mcp_server/models/calendar.py"
     "nextcloud_mcp_server/models/contacts.py"
     "nextcloud_mcp_server/models/sharing.py"
+    "nextcloud_mcp_server/observability/metrics.py"
     "nextcloud_mcp_server/server/calendar.py"
     "nextcloud_mcp_server/server/contacts.py"
     "nextcloud_mcp_server/server/deck.py"
     "nextcloud_mcp_server/server/sharing.py"
+    "nextcloud_mcp_server/server/semantic.py"
+    "nextcloud_mcp_server/server/webdav.py"
     "tests/client/calendar/test_calendar_operations.py"
     "tests/client/calendar/test_field_preservation.py"
     "tests/client/calendar/test_task_operations.py"
     "tests/client/contacts/test_byte_preserving.py"
     "tests/client/webdav/test_size_limit.py"
+    "tests/contract/test_gateway_rerank_consumer.py"
     "tests/server/test_calendar_todos_mcp.py"
     "tests/server/test_mcp.py"
+    "tests/test_tool_description_metacharacters.py"
+    "tests/unit/api/test_search_rerank_api.py"
+    "tests/unit/api/test_search_usage_metering.py"
     "tests/unit/client/test_calendar_etag_concurrency.py"
     "tests/unit/client/test_contacts.py"
     "tests/unit/client/test_dav_errors.py"
@@ -74,6 +83,7 @@ FORK_TOUCHED=(
     "tests/unit/client/test_webdav_write_conflicts.py"
     "tests/unit/test_calendar_tools.py"
     "tests/unit/test_migrations_concurrency.py"
+    "tests/unit/test_unified_verifier.py"
 )
 
 failures=0

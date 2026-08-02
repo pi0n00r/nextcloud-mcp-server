@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import base64
 import contextlib
 import logging
@@ -227,7 +238,7 @@ def configure_webdav_tools(mcp: FastMCP):
                   scanned one escalates to OCR when the server has OCR enabled.
                 - ``"markdown"``: additionally reconstruct structure (headings,
                   tables) rather than returning a flat text layer. Costs a
-                  second, slower parse and is bounded by a page ceiling; when it
+                  second, slower parse and is bounded by a page ceiling. When it
                   cannot be honoured the response says so instead of pretending.
                 - ``"raw"``: do not parse. Text files are decoded, anything else
                   comes back base64-encoded.
@@ -581,7 +592,7 @@ def configure_webdav_tools(mcp: FastMCP):
                 nc_webdav_read_file or nc_webdav_write_file). The move then
                 replaces the destination only if it is still that exact version,
                 so ``overwrite=True`` cannot clobber a file someone else changed
-                in the meantime. Requires ``overwrite=True``; ``"*"`` is not
+                in the meantime. Requires ``overwrite=True``. ``"*"`` is not
                 accepted. Files only — a directory destination always fails the
                 check with 412.
 
@@ -652,7 +663,7 @@ def configure_webdav_tools(mcp: FastMCP):
                 nc_webdav_read_file or nc_webdav_write_file). The copy then
                 replaces the destination only if it is still that exact version,
                 so ``overwrite=True`` cannot clobber a file someone else changed
-                in the meantime. Requires ``overwrite=True``; ``"*"`` is not
+                in the meantime. Requires ``overwrite=True``. ``"*"`` is not
                 accepted. Files only — a directory destination always fails the
                 check with 412.
 

@@ -5,6 +5,77 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.162.0 (2026-08-02)
+
+### Feat
+
+- **observability**: record why each OAuth token is rejected, and for whom
+- **observability**: record MCP client fleet and tool-delivery semantics
+
+### Fix
+
+- **observability**: record a management grant only once the allowlist clears
+- **observability**: remove unreachable return left by the chain refactor
+- **observability**: record a fallback chain as one rejection, not one per stage
+- **observability**: drop the duplicate log I added in round 7
+- **observability**: record valid only once an AccessToken exists
+- **observability**: record a token validation once, at acceptance
+- **observability**: classify JWKS fetch failures as network_error
+- **observability**: keep the verified client_id on allowlist rejections
+- **observability**: record the last silent rejection path (opaque, no validator)
+- **observability**: derive rejection result from reason; close remaining gaps
+- **observability**: remove test-order coupling and falsy-value accessor bug
+- **observability**: bound the cardinality of caller-chosen metric labels
+
+## v0.161.0 (2026-08-02)
+
+### Feat
+
+- **search**: expose optional reranking on both search entrypoints
+- **search**: distinguish a routine rerank skip from a real failure
+- **search**: add cross-encoder rerank machinery (unused until wired)
+- **observability**: measure both semantic-search entrypoints equally
+
+### Fix
+
+- **search**: keep unscored rows behind reranked ones in the HTTP re-sort
+- **search**: cut the rerank pool back before verify-on-read on the HTTP path
+- **search**: correct total_found for doc_types, and stop skips reading as outages
+- **search**: carry rerank_score through context expansion
+- **search**: test the granularity echo, use the constant, satisfy Sonar
+- **search**: record failed rerank latency, log truncation, split entry parsing
+- **search**: make the grouped rerank-pool precedence explicit and tested
+- **observability**: bound the algorithm metric label against caller input
+- **observability**: record vector_search errors, and cover the MCP metric paths
+- **observability**: keep the algorithm label stable, and meter the third entrypoint
+- **observability**: label HTTP search usage with the http surface
+- **search**: report the real group limit on the qdrant query span
+- **search**: request exact group count in grouped hybrid search
+
+## v0.160.1 (2026-08-02)
+
+## v0.160.0 (2026-08-02)
+
+### Feat
+
+- **errors**: render tool failures in LLM-friendly form
+
+### Fix
+
+- **errors**: give 429 a back-off hint instead of the generic 4xx one
+
+### Refactor
+
+- **collectives**: raise HTTP errors directly instead of returning them
+
+## v0.159.2 (2026-08-02)
+
+### Fix
+
+- **calendar**: treat a not-yet-started series as having no backlog
+- **calendar**: report the unfinished backlog of recurring todos
+- **calendar**: expand VTODO recurrences client-side
+
 ## v0.159.1 (2026-08-01)
 
 ### Fix

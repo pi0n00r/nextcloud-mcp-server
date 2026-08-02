@@ -1182,8 +1182,8 @@ def configure_calendar_tools(mcp: FastMCP):
             due: Due date/time (ISO format, e.g., "2025-01-15T14:00:00")
             dtstart: Start date/time (ISO format)
             categories: Comma-separated categories (e.g., "work,urgent")
-            reminders: Optional ordered VALARM list. Omit to create no VALARMs;
-                pass [] to explicitly create no VALARMs.
+            reminders: Optional ordered VALARM list. Omit to create no VALARMs.
+                Pass [] to explicitly create no VALARMs.
 
         Returns:
             Dict with todo creation result
@@ -1242,7 +1242,7 @@ def configure_calendar_tools(mcp: FastMCP):
             completed: Completion timestamp (ISO format)
             categories: New categories (comma-separated)
             reminders: Optional ordered VALARM list. Omitted preserves existing
-                VALARMs; [] clears them.
+                VALARMs. Pass [] to clear them.
 
         Returns:
             Dict with todo update result
