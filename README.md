@@ -9,7 +9,7 @@ Deck, Talk, and other Nextcloud application surfaces through 155 MCP tools.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
-[![Container](https://img.shields.io/badge/GHCR-v1.5.1.1-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Container](https://img.shields.io/badge/GHCR-v1.6.2-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
 
@@ -34,7 +34,9 @@ automation:
 - **Atomic large-file uploads** route through Nextcloud's chunked upload path
   without weakening destination preconditions.
 - **Calendar and Deck fidelity** preserves value types, timezones, alarms,
-  card order, and due dates through updates.
+  recurring-task state, card order, and due dates through updates.
+- **Document-aware file reads** select automatic extraction, structured
+  Markdown, or byte-preserving raw content on each request.
 - **First-class container networking** serves IPv4 and IPv6 from one listener
   in the stable image.
 
@@ -44,8 +46,8 @@ automation:
 |---|---|
 | **Tool surface** | 155 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.1.1` |
-| **Application version** | `0.151.1` |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.2` |
+| **Application version** | `0.162.0` |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -82,7 +84,7 @@ docker run --detach \
   --restart unless-stopped \
   --publish 127.0.0.1:8000:8000 \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.1.1
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.2
 ```
 
 Verify the service before connecting a client:
@@ -106,7 +108,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.5.1.1 --depth 1 \
+git clone --branch v1.6.2 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
@@ -126,7 +128,7 @@ The stable single-user profile exposes the following core tool surface:
 |---|---:|---|
 | **Deck** | 36 | Boards, stacks, cards, comments, labels, assignees, attachments |
 | **Collectives** | 20 | Collectives, pages, tags, hierarchy, trash and restore |
-| **Calendar and Tasks** | 18 | Events, todos, recurrence, availability, bulk operations |
+| **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Files (WebDAV)** | 11 | Read/write, search, move/copy, directories, favorites |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
@@ -163,8 +165,10 @@ indexing infrastructure is enabled.
 
 - Keyword and semantic search modes
 - Qdrant-backed indexing with optional dense and sparse embeddings
-- PDF, Office document, image, and OCR extraction
+- Per-read `auto`, structured `markdown`, and byte-preserving `raw` modes
+- PDF, Office document, image, and OCR extraction with reported parse status
 - Optional Docling backend, including VLM pipelines
+- Optional cross-encoder reranking with bounded concurrency and graceful fallback
 - Verify-on-read safeguards for indexed results
 
 ### Operations

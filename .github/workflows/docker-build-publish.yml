@@ -6,13 +6,13 @@ on:
       tag:
         description: Exact stable release tag to publish
         required: true
-        default: v1.5.1.1
+        default: v1.6.2
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  PACKAGE_TAG: v1.5.1.1
-  PACKAGE_VERSION: 0.151.1
+  PACKAGE_TAG: v1.6.2
+  PACKAGE_VERSION: 0.162.0
 
 jobs:
   publish:
@@ -75,4 +75,4 @@ jobs:
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Stable v1.5.1.1 package for nextcloud-mcp-server 0.151.1
+            org.opencontainers.image.description=Stable v1.6.2 package for nextcloud-mcp-server 0.162.0
