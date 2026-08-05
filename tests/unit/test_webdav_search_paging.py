@@ -198,3 +198,19 @@ def test_build_search_xml_emits_offset_only_when_set(mocker):
         offset=None,
     )
     assert "<d:limit>" not in unlimited
+
+
+def test_build_search_xml_uses_match_all_for_empty_where(mocker):
+    client = _make_client(mocker)
+
+    search_xml = client._build_search_xml(
+        scope="Documents",
+        where_conditions=None,
+        properties=["fileid"],
+        order_by=None,
+        limit=50,
+    )
+
+    assert "<d:where>" in search_xml
+    assert "<d:displayname/>" in search_xml
+    assert "<d:literal>%</d:literal>" in search_xml

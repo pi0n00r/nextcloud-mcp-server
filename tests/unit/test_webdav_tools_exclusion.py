@@ -412,6 +412,60 @@ async def test_search_files_filters_excluded(
     assert [r.path for r in result.results] == ["/notes.md"]
 
 
+async def test_search_files_accepts_path_and_query_aliases(
+    webdav_tools, fake_client, patch_get_client, patch_excluded
+):
+    patch_get_client(fake_client)
+    patch_excluded(set())
+    fake_client.webdav.search_files = AsyncMock(return_value=[])
+
+    fn = webdav_tools["nc_webdav_search_files"].fn
+    await fn(
+        ctx=_mock_ctx(fake_client),
+        path="/Documents",
+        query="activity",
+        limit=50,
+    )
+
+    kwargs = fake_client.webdav.search_files.await_args.kwargs
+    assert kwargs["scope"] == "/Documents"
+    assert "<d:literal>%activity%</d:literal>" in kwargs["where_conditions"]
+    assert kwargs["limit"] == 50
+
+
+async def test_search_files_rejects_conflicting_aliases(
+    webdav_tools, fake_client, patch_get_client, patch_excluded
+):
+    patch_get_client(fake_client)
+    patch_excluded(set())
+    fn = webdav_tools["nc_webdav_search_files"].fn
+
+    with pytest.raises(ToolError, match="scope and path"):
+        await fn(ctx=_mock_ctx(fake_client), scope="/A", path="/B")
+
+    with pytest.raises(ToolError, match="name_pattern and query"):
+        await fn(ctx=_mock_ctx(fake_client), name_pattern="%.pdf", query="activity")
+
+
+async def test_search_files_escapes_filter_literals(
+    webdav_tools, fake_client, patch_get_client, patch_excluded
+):
+    patch_get_client(fake_client)
+    patch_excluded(set())
+    fake_client.webdav.search_files = AsyncMock(return_value=[])
+    fn = webdav_tools["nc_webdav_search_files"].fn
+
+    await fn(
+        ctx=_mock_ctx(fake_client),
+        name_pattern="%A&B<notes>%",
+        mime_type="text/<plain>&",
+    )
+
+    where = fake_client.webdav.search_files.await_args.kwargs["where_conditions"]
+    assert "%A&amp;B&lt;notes&gt;%" in where
+    assert "text/&lt;plain&gt;&amp;" in where
+
+
 async def test_find_by_name_filters_excluded(
     webdav_tools, fake_client, patch_get_client, patch_excluded
 ):

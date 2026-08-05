@@ -13,6 +13,7 @@ import base64
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Literal
+from xml.sax.saxutils import escape as xml_escape
 
 import anyio
 from anyio.to_thread import run_sync
@@ -720,6 +721,8 @@ def configure_webdav_tools(mcp: FastMCP):
         mime_type: str | None = None,
         only_favorites: bool = False,
         limit: int | None = None,
+        path: str | None = None,
+        query: str | None = None,
     ) -> SearchFilesResponse:
         """Search for files in NextCloud using WebDAV SEARCH.
 
@@ -732,10 +735,25 @@ def configure_webdav_tools(mcp: FastMCP):
             mime_type: MIME type to filter by (supports % wildcard, e.g., "image/%" for all images)
             only_favorites: If True, only return favorited files
             limit: Maximum number of results to return
+            path: Compatibility alias for scope
+            query: Compatibility alias for a contains-style name_pattern
 
         Returns:
             SearchFilesResponse with list of matching files
         """
+        if path is not None:
+            if scope and scope != path:
+                raise ToolError("Conflicting values supplied for scope and path")
+            scope = path
+
+        if query is not None:
+            query_pattern = query if "%" in query else f"%{query}%"
+            if name_pattern is not None and name_pattern != query_pattern:
+                raise ToolError(
+                    "Conflicting values supplied for name_pattern and query"
+                )
+            name_pattern = query_pattern
+
         client = await get_client(ctx)
 
         # Resolve once and use for both the scope guard and the result filter.
@@ -755,7 +773,7 @@ def configure_webdav_tools(mcp: FastMCP):
                     <d:prop>
                         <d:displayname/>
                     </d:prop>
-                    <d:literal>{name_pattern}</d:literal>
+                    <d:literal>{xml_escape(name_pattern)}</d:literal>
                 </d:like>
             """
             )
@@ -767,7 +785,7 @@ def configure_webdav_tools(mcp: FastMCP):
                     <d:prop>
                         <d:getcontenttype/>
                     </d:prop>
-                    <d:literal>{mime_type}</d:literal>
+                    <d:literal>{xml_escape(mime_type)}</d:literal>
                 </d:like>
             """
             )

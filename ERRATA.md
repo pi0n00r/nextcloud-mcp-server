@@ -15,7 +15,8 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 ## WebDAV SEARCH with an empty predicate
 
-**Status:** Open. A corrected build has not yet been published.
+**Status:** Corrected on `master`. A corrected release and container package
+have not yet been published.
 
 **Affected releases:** `v1.0-release`, `v1.1-release`,
 `v1.1.7-experimental`, `v1.1.8`, `v1.2.6`, `v1.3.0`, `v1.3.1`,
@@ -49,9 +50,11 @@ Supply the canonical arguments and at least one search predicate:
 Do not use `path` or `query` with affected builds. Avoid an unfiltered
 `nc_webdav_search_files` call.
 
-### Planned correction
+### Correction
 
-The correction will accept `path` and `query` as compatibility aliases, reject
-conflicting canonical and alias values, and generate a valid match-all
-predicate when no filter is supplied. Regression coverage will include the
-exact alias call shape and direct unfiltered SEARCH construction.
+The corrected source accepts `path` and `query` as compatibility aliases,
+rejects conflicting canonical and alias values, and generates a valid
+match-all predicate when no filter is supplied. Regression coverage includes
+the exact alias call shape and direct unfiltered SEARCH construction. Continue
+using the workaround above until a release and package explicitly mark this
+erratum resolved.

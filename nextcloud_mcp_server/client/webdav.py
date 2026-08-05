@@ -1581,8 +1581,16 @@ class WebDAVClient(BaseNextcloudClient):
         # Build property list
         prop_xml = "\n".join([self._property_to_xml(prop) for prop in properties])
 
-        # Build where clause
-        where_xml = where_conditions if where_conditions else ""
+        # Nextcloud 34 rejects an empty <d:where> with a server-side type error.
+        # Use an explicit match-all predicate for intentionally unfiltered searches.
+        where_xml = (where_conditions or "").strip()
+        if not where_xml:
+            where_xml = """
+                <d:like>
+                    <d:prop><d:displayname/></d:prop>
+                    <d:literal>%</d:literal>
+                </d:like>
+            """.strip()
 
         # Build order by clause
         orderby_xml = ""
