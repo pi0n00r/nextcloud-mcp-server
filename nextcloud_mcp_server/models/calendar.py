@@ -11,11 +11,104 @@
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .base import BaseResponse, StatusResponse
+
+
+class Reminder(BaseModel):
+    """A single VALARM on an event or todo.
+
+    Exactly one trigger must be given. ``trigger_at`` fires at an absolute
+    instant; ``minutes_before`` and ``trigger`` are relative to the component's
+    start (or its end, via ``related``).
+    """
+
+    action: Literal["DISPLAY", "EMAIL", "AUDIO"] = Field(
+        default="DISPLAY",
+        description=(
+            "Alarm type. Nextcloud silently discards any other value, so the "
+            "set is closed rather than free-form."
+        ),
+    )
+    index: Optional[int] = Field(
+        None, ge=0, description="Zero-based VALARM document order on reads"
+    )
+    minutes_before: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "Fire this many minutes before the trigger point. Negative values "
+            "are rejected rather than quietly flipped into an alarm *after* the "
+            "event — use trigger with a positive duration for that."
+        ),
+    )
+    trigger_at: Optional[str] = Field(
+        None, description="Absolute ISO datetime to fire at"
+    )
+    trigger: Optional[str] = Field(
+        None,
+        description=(
+            "Raw RFC 5545 duration, e.g. ``-PT30M`` or ``-P1D``. Use for offsets "
+            "that minutes_before expresses awkwardly."
+        ),
+    )
+    offset_seconds: Optional[int] = Field(
+        None, description="Raw relative trigger offset in seconds"
+    )
+    description: Optional[str] = Field(
+        None,
+        description=(
+            "Alarm body, and the message text for an EMAIL alarm. Defaults to "
+            "'Event reminder' or 'Todo reminder' depending on what it is "
+            "attached to."
+        ),
+    )
+    summary: Optional[str] = Field(
+        None,
+        description=(
+            "Subject line of an EMAIL alarm. Defaults to the event/todo title. "
+            "Ignored for other actions, which have no SUMMARY in RFC 5545."
+        ),
+    )
+    related: Optional[Literal["START", "END"]] = Field(
+        None,
+        description=(
+            "Whether a relative trigger counts from the start or the end. "
+            "Only meaningful with minutes_before/trigger — RFC 5545 does not "
+            "allow RELATED on an absolute trigger."
+        ),
+    )
+    repeat: Optional[int] = Field(None, ge=0, description="VALARM repeat count")
+    duration: Optional[str] = Field(None, description="Raw RFC 5545 repeat duration")
+    duration_seconds: Optional[int] = Field(
+        None, description="Repeat duration represented in seconds"
+    )
+    attendees: List[str] = Field(
+        default_factory=list, description="VALARM attendee addresses"
+    )
+    attachments: List[str] = Field(
+        default_factory=list, description="VALARM attachment values"
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_trigger(self) -> "Reminder":
+        given = [
+            name
+            for name in ("trigger_at", "trigger", "minutes_before", "offset_seconds")
+            if getattr(self, name) is not None
+        ]
+        if len(given) != 1:
+            raise ValueError(
+                "a reminder needs exactly one of trigger_at, trigger, "
+                "minutes_before or offset_seconds; "
+                f"got {given or 'none'}"
+            )
+        if self.related and self.trigger_at:
+            raise ValueError("related cannot be combined with an absolute trigger_at")
+        return self
 
 
 class Calendar(BaseModel):
@@ -94,7 +187,14 @@ class CalendarEvent(CalendarEventSummary):
     last_modified: Optional[str] = Field(None, description="Last modification datetime")
     recurring: bool = Field(default=False, description="Whether event is recurring")
     recurrence_rule: Optional[str] = Field(None, description="RFC5545 recurrence rule")
-    recurrence_end: Optional[str] = Field(None, description="Recurrence end date")
+    recurrence_end_date: Optional[str] = Field(
+        None,
+        description=(
+            "When the series stops recurring, read back from the rule's UNTIL. "
+            "Named to match the write-side parameter so a value read from an "
+            "event can be passed straight back into an update."
+        ),
+    )
     attendees: List[str] = Field(
         default_factory=list, description="List of attendee email addresses"
     )
@@ -111,7 +211,17 @@ class CalendarEvent(CalendarEventSummary):
     reminder_email: bool = Field(
         default=False, description="Whether to send email reminder"
     )
-    color: Optional[str] = Field(None, description="Event color")
+    reminders: List[Reminder] = Field(
+        default_factory=list,
+        description="The event's VALARMs, in document order",
+    )
+    color: Optional[str] = Field(
+        None,
+        description=(
+            "Event colour as a CSS3 colour name (RFC 7986 COLOR). Nextcloud's "
+            "Calendar UI ignores hex values."
+        ),
+    )
     etag: Optional[str] = Field(None, description="ETag for versioning")
 
 
@@ -262,6 +372,10 @@ class Todo(BaseModel):
     recurrence_rule: str = Field(
         default="", description="RFC 5545 RRULE value, e.g. 'FREQ=YEARLY;INTERVAL=1'"
     )
+    reminders: List[Reminder] = Field(
+        default_factory=list,
+        description="The todo's VALARMs, in document order",
+    )
     pending_count: Optional[int] = Field(
         None,
         description=(
@@ -308,9 +422,6 @@ class Todo(BaseModel):
     )
     calendar_display_name: Optional[str] = Field(
         None, description="Display name of calendar containing this todo"
-    )
-    reminders: List[dict[str, Any]] = Field(
-        default_factory=list, description="Ordered VALARM reminder objects"
     )
 
 

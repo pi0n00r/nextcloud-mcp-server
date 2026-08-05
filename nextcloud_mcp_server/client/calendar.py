@@ -92,6 +92,15 @@ _PENDING_MAX_LOOKBACK = dt.timedelta(days=366 * 3)
 # An occurrence in one of these states is finished and not part of the backlog.
 _TODO_DONE_STATUSES = frozenset({"COMPLETED", "CANCELLED"})
 
+# Fallback VALARM DESCRIPTION per component type. RFC 5545 requires the property
+# on DISPLAY and EMAIL alarms, so a reminder that omits it still needs wording.
+_EVENT_REMINDER_DESCRIPTION = "Event reminder"
+_TODO_REMINDER_DESCRIPTION = "Todo reminder"
+
+# The VALARM actions Nextcloud actually schedules (ReminderService::REMINDER_TYPES).
+# RFC 5545 permits other IANA/X- tokens, which it stores but silently ignores.
+_VALARM_ACTIONS = frozenset({"DISPLAY", "EMAIL", "AUDIO"})
+
 
 def _rrule_to_string(rrule: Any) -> str:
     """Render an icalendar ``vRecur`` as an RFC 5545 RRULE value.
@@ -110,6 +119,149 @@ def _rrule_to_string(rrule: Any) -> str:
         return rrule.to_ical().decode("utf-8")
     except AttributeError:
         return str(rrule)
+
+
+def _shorthand_would_lose(
+    stored: list[dict[str, Any]],
+    default_description: str,
+    default_summary: str,
+) -> bool:
+    """True when the stored alarms carry shape the shorthand cannot express.
+
+    ``reminder_minutes``/``reminder_email`` rebuild to at most one DISPLAY plus
+    one EMAIL, sharing a single whole-minute offset and the default wording. A
+    stored set outside that shape — an absolute or sub-minute trigger, several
+    distinct offsets, two alarms of the same action, a ``RELATED`` qualifier, a
+    custom summary or per-alarm description — cannot survive the rebuild.
+
+    What the caller is *changing* is deliberately not part of this. A new offset,
+    or dropping the EMAIL alarm via ``reminder_email=False``, is the request
+    being honoured, not data being lost. Comparing each stored offset against the
+    new target made this fire on the most ordinary update there is — nudging a
+    reminder's offset — which would have trained the reader to ignore it.
+    """
+    offsets = {reminder.get("minutes_before") for reminder in stored}
+    if len(offsets) > 1:
+        return True
+
+    seen_actions = [reminder.get("action") for reminder in stored]
+    if len(seen_actions) != len(set(seen_actions)):
+        return True
+
+    return any(
+        "minutes_before" not in reminder
+        or reminder.get("action") not in ("DISPLAY", "EMAIL")
+        or reminder.get("related")
+        # An EMAIL alarm the shorthand itself wrote carries the component title
+        # as its subject, so that value is reproducible and not a loss.
+        or (reminder.get("summary") or default_summary) != default_summary
+        or (reminder.get("description") or default_description) != default_description
+        for reminder in stored
+    )
+
+
+def _warn_if_hex_color(color: str) -> None:
+    """Warn when a COLOR value will not survive Nextcloud's Calendar UI.
+
+    RFC 7986 §5.9 defines COLOR as a CSS3 colour *name*, and Nextcloud takes that
+    literally: ``getHexForColorName()`` in the Calendar app is a plain
+    ``css3Colors[name]`` lookup, so ``#FF0000`` resolves to null and the event
+    colour is dropped on display. The property is still written — other CalDAV
+    clients may honour it — but the caller deserves to know it will not show up.
+    """
+    if color.startswith("#"):
+        logger.warning(
+            "Event color %r is a hex value; Nextcloud's Calendar UI only renders "
+            "CSS3 colour names (e.g. 'tomato') and will ignore it",
+            color,
+        )
+
+
+def _rrule_with_until(
+    rrule_str: str, end_date: str, dtstart: Any, *, replace: bool = False
+) -> str:
+    """Return ``rrule_str`` with an ``UNTIL`` derived from ``end_date``.
+
+    RFC 5545 §3.3.10 ties UNTIL's value type to DTSTART's: a DATE-valued DTSTART
+    (an all-day event) takes a DATE, and anything else takes a UTC date-time —
+    including a TZID-bound DTSTART, whose UNTIL must still be expressed in UTC.
+    Getting this wrong is not cosmetic; clients drop a recurrence set whose UNTIL
+    does not match, so the series silently never ends.
+
+    ``end_date`` is inclusive-by-day: a date-only value becomes the last moment of
+    that day (23:59:59 UTC) for a timed event, so "recur until June 30th" keeps the
+    occurrence *on* June 30th rather than dropping it.
+
+    An existing UNTIL or COUNT raises ``ValueError`` — they are mutually exclusive
+    with UNTIL in one rule, and quietly choosing a winner is the silent-ignore
+    behaviour this exists to remove. ``replace=True`` drops them instead, for the
+    update path: applying an end date to the *stored* rule of an already-bounded
+    series means "move the end", not "contradict yourself".
+    """
+    parts = _rrule_parts_without_bounds(rrule_str, replace=replace)
+    all_day = isinstance(dtstart, dt.date) and not isinstance(dtstart, dt.datetime)
+    # DTSTART's zone is what "that day" means to the caller, so an end-of-day
+    # boundary has to be built in it before being converted to UTC.
+    tz = None if all_day else getattr(dtstart, "tzinfo", None)
+    until = _format_until(end_date, all_day=all_day, tz=tz)
+    return ";".join([*parts, f"UNTIL={until}"])
+
+
+def _rrule_parts_without_bounds(rrule_str: str, *, replace: bool) -> list[str]:
+    """Split an RRULE into parts, dropping or rejecting UNTIL/COUNT."""
+    parts = []
+    for part in rrule_str.split(";"):
+        if not part:
+            continue
+        name = part.split("=", 1)[0].strip().upper()
+        if name not in ("UNTIL", "COUNT"):
+            parts.append(part)
+        elif not replace:
+            raise ValueError(
+                f"recurrence_end_date conflicts with {name} already present in "
+                f"recurrence_rule ({rrule_str!r}); pass one or the other"
+            )
+    return parts
+
+
+def _format_until(end_date: str, *, all_day: bool, tz: dt.tzinfo | None = None) -> str:
+    """Render ``end_date`` as an UNTIL value of the type DTSTART requires.
+
+    ``tz`` is DTSTART's own zone. RFC 5545 requires UNTIL to be *formatted* in
+    UTC for a date-time DTSTART, but that is a serialisation rule, not an
+    instruction to anchor the boundary to UTC midnight: "until June 30th" means
+    the end of June 30th where the event happens. Anchoring in UTC drops the
+    last occurrence of any evening event in a zone behind UTC, because its real
+    instant falls on the following UTC date — 21:00 in New York on the 30th is
+    01:00 UTC on the 1st, past a ``T235959Z`` cutoff.
+    """
+    try:
+        parsed = dt.datetime.fromisoformat(end_date)
+    except ValueError:
+        raise ValueError(
+            f"recurrence_end_date {end_date!r} is not an ISO 8601 date or datetime"
+        ) from None
+
+    if all_day:
+        if end_date != end_date.split("T")[0]:
+            # RFC 5545 ties UNTIL's value type to DTSTART's, so an all-day series
+            # can only be bounded by a DATE. Dropping the time is the sole
+            # correct reading rather than a caller error, hence debug not warn —
+            # but it should still be visible to anyone wondering where it went.
+            logger.debug(
+                "recurrence_end_date %r carries a time of day, which an all-day "
+                "series cannot express in UNTIL; using the date alone",
+                end_date,
+            )
+        return parsed.date().strftime("%Y%m%d")
+
+    if end_date == end_date.split("T")[0]:
+        # Date-only input: bound the whole day rather than midnight, which would
+        # exclude an occurrence happening later on that date.
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz or dt.UTC)
+    return parsed.astimezone(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _occurrence_is_done(component: Any) -> bool:
@@ -1546,13 +1698,7 @@ class CalendarClient:
     def _parse_caldav_datetime(
         cls, value: str, *, all_day: bool = False
     ) -> dt.datetime | dt.date:
-        """Parse a CalDAV value without losing wall-clock timezone semantics.
-
-        All-day values become dates. Timed values must include an offset or
-        ``Z``. Fixed offsets matching Toronto on the target date are promoted
-        to ``America/Toronto`` so recurring and subsequently edited values keep
-        their wall-clock meaning across DST. Other offsets remain unchanged.
-        """
+        """Parse CalDAV values while retaining Toronto wall-clock semantics."""
         if all_day:
             return dt.date.fromisoformat(value.split("T", maxsplit=1)[0])
 
@@ -1577,87 +1723,39 @@ class CalendarClient:
         return parsed
 
     @staticmethod
-    def _decode_ical_value(value: Any) -> str:
-        if hasattr(value, "to_ical"):
-            raw = value.to_ical()
-            return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-        return str(value)
+    def _build_valarm(
+        reminder: dict[str, Any],
+        default_summary: str,
+        default_description: str = _EVENT_REMINDER_DESCRIPTION,
+    ) -> Alarm:
+        """Build one VALARM from a ``Reminder``-shaped dict.
 
-    @classmethod
-    def _extract_ical_values(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
-        values = value if isinstance(value, list) else [value]
-        return [cls._decode_ical_value(item) for item in values]
+        Trigger precedence is ``trigger_at`` > ``trigger`` > ``minutes_before``;
+        the model guarantees exactly one is set, so the order only decides which
+        wins if a caller reaches this helper directly.
 
-    @staticmethod
-    def _parse_alarm_datetime(value: str) -> dt.datetime:
-        cleaned = value.strip().replace("Z", "+00:00")
-        try:
-            return dt.datetime.fromisoformat(cleaned)
-        except ValueError:
-            utc = value.strip().endswith("Z")
-            parsed = dt.datetime.strptime(
-                value.strip().removesuffix("Z"), "%Y%m%dT%H%M%S"
-            )
-            return parsed.replace(tzinfo=dt.UTC) if utc else parsed
+        Two RFC 5545 rules are enforced here rather than left to the server:
 
-    def _extract_valarms(self, component: Any) -> list[dict[str, Any]]:
-        reminders: list[dict[str, Any]] = []
-        for index, alarm in enumerate(
-            sub for sub in component.subcomponents if sub.name == "VALARM"
-        ):
-            trigger = alarm.get("trigger")
-            trigger_dt = getattr(trigger, "dt", None)
-            reminder: dict[str, Any] = {
-                "index": index,
-                "action": str(alarm.get("action", "DISPLAY")),
-            }
-            for source, target in (
-                ("description", "description"),
-                ("summary", "summary"),
-            ):
-                value = alarm.get(source)
-                if value is not None:
-                    reminder[target] = str(value)
-            repeat = alarm.get("repeat")
-            if repeat is not None:
-                reminder["repeat"] = int(repeat)
-            duration = alarm.get("duration")
-            if duration is not None:
-                reminder["duration"] = self._decode_ical_value(duration)
-                duration_dt = getattr(duration, "dt", None)
-                if isinstance(duration_dt, dt.timedelta):
-                    reminder["duration_seconds"] = int(duration_dt.total_seconds())
-            attendees = self._extract_ical_values(alarm.get("attendee"))
-            if attendees:
-                reminder["attendees"] = [
-                    value.removeprefix("mailto:") for value in attendees
-                ]
-            attachments = self._extract_ical_values(alarm.get("attach"))
-            if attachments:
-                reminder["attachments"] = attachments
-            if trigger is not None:
-                reminder["trigger"] = self._decode_ical_value(trigger)
-                params = getattr(trigger, "params", {}) or {}
-                if params.get("RELATED"):
-                    reminder["related"] = str(params["RELATED"])
-                if isinstance(trigger_dt, dt.datetime):
-                    reminder["trigger_at"] = trigger_dt.isoformat()
-                elif isinstance(trigger_dt, dt.timedelta):
-                    seconds = int(trigger_dt.total_seconds())
-                    reminder["offset_seconds"] = seconds
-                    if seconds < 0 and seconds % 60 == 0:
-                        reminder["minutes_before"] = abs(seconds) // 60
-            reminders.append(reminder)
-        return reminders
-
-    def _build_valarm(self, reminder: dict[str, Any]) -> Alarm:
+        * ``RELATED`` qualifies a *duration* trigger. Attaching it to an absolute
+          one produces ``TRIGGER;RELATED=START;VALUE=DATE-TIME:...``, which is
+          invalid, so it is only emitted on the relative branches.
+        * An ``EMAIL`` alarm must carry ``SUMMARY`` (the subject) alongside
+          ``DESCRIPTION`` (the body). Nextcloud addresses the message itself,
+          from the component's ATTENDEEs and the calendar's sharees, so no
+          alarm-level ATTENDEE is needed.
+        * ``DESCRIPTION`` belongs to ``DISPLAY`` and ``EMAIL`` alarms only. The
+          ``audioprop`` grammar admits ACTION, TRIGGER, DURATION+REPEAT and
+          ATTACH — writing a description onto an AUDIO alarm produces a
+          spec-invalid component even though lenient parsers accept it.
+        """
         alarm = Alarm()
-        alarm.add("action", reminder.get("action", "DISPLAY"))
-        alarm.add("description", reminder.get("description", "Event reminder"))
-        if reminder.get("summary"):
-            alarm.add("summary", str(reminder["summary"]))
+        action = reminder.get("action", "DISPLAY")
+        alarm.add("action", action)
+        if action in ("DISPLAY", "EMAIL"):
+            alarm.add("description", reminder.get("description") or default_description)
+        if action == "EMAIL":
+            alarm.add("summary", reminder.get("summary") or default_summary)
+
         if "repeat" in reminder:
             alarm.add("repeat", int(reminder["repeat"]))
         if "duration_seconds" in reminder:
@@ -1678,49 +1776,247 @@ class CalendarClient:
             [attachments] if isinstance(attachments, str) else attachments
         ):
             alarm.add("attach", str(attachment))
-        params = (
-            {"RELATED": str(reminder["related"])} if reminder.get("related") else {}
-        )
+
+        params: dict[str, str] = {}
+        related = reminder.get("related")
+        if related:
+            params["RELATED"] = str(related)
+
         if reminder.get("trigger_at"):
-            params["VALUE"] = "DATE-TIME"
-            trigger = self._parse_alarm_datetime(str(reminder["trigger_at"]))
+            trigger_dt = dt.datetime.fromisoformat(str(reminder["trigger_at"]))
+            if trigger_dt.tzinfo is None:
+                trigger_dt = trigger_dt.replace(tzinfo=dt.UTC)
+            # RELATED is deliberately dropped here: it has no meaning on an
+            # absolute trigger and makes the property invalid.
+            alarm.add("trigger", trigger_dt, parameters={"VALUE": "DATE-TIME"})
         elif reminder.get("trigger"):
-            raw_trigger = str(reminder["trigger"])
-            trigger = (
-                vDDDTypes.from_ical(raw_trigger)
-                if raw_trigger.startswith(("P", "-P", "+P"))
-                else self._parse_alarm_datetime(raw_trigger)
+            alarm.add(
+                "trigger",
+                vDDDTypes.from_ical(str(reminder["trigger"])),
+                parameters=params,
             )
         elif "minutes_before" in reminder:
-            trigger = dt.timedelta(minutes=-int(reminder["minutes_before"]))
+            minutes = int(reminder["minutes_before"])
+            alarm.add("trigger", dt.timedelta(minutes=-minutes), parameters=params)
         elif "offset_seconds" in reminder:
-            trigger = dt.timedelta(seconds=int(reminder["offset_seconds"]))
+            alarm.add(
+                "trigger",
+                dt.timedelta(seconds=int(reminder["offset_seconds"])),
+                parameters=params,
+            )
         else:
-            trigger = dt.timedelta(minutes=-15)
-        alarm.add("trigger", trigger, parameters=params)
+            # The Reminder model already enforces this for anything arriving via
+            # an MCP tool, but the client is usable directly and a bare KeyError
+            # would name a dict key rather than the thing the caller got wrong.
+            raise ValueError(
+                "a reminder needs one of trigger_at, trigger or minutes_before; "
+                f"got {sorted(reminder)}"
+            )
+
         return alarm
 
-    def _sync_valarms_by_index(
-        self, component: Any, reminders: list[dict[str, Any]]
+    @staticmethod
+    def _extract_valarms(component: Any) -> list[dict[str, Any]]:
+        """Read a component's VALARMs back into ``Reminder``-shaped dicts.
+
+        An alarm that cannot be represented is skipped rather than surfaced
+        half-built, because the caller's next step is model validation and a
+        malformed alarm must cost at most itself, never the listing it is in.
+        """
+        reminders = []
+        for sub in (
+            child for child in component.subcomponents if child.name == "VALARM"
+        ):
+            reminder = CalendarClient._extract_valarm(sub)
+            if reminder is not None:
+                reminders.append(reminder)
+        return reminders
+
+    @staticmethod
+    def _extract_valarm(alarm: Any) -> dict[str, Any] | None:
+        """Read one VALARM into a ``Reminder``-shaped dict, or ``None``.
+
+        Stored data is normalised to what ``Reminder`` accepts, because this
+        parses whatever any CalDAV client wrote, not only what we write. RFC 5545
+        §3.8.6.1 allows ACTION to carry any IANA or ``X-`` token, so a legacy
+        ``PROCEDURE`` or a custom action is realistic — and left unnormalised it
+        would fail the model's ``Literal`` and take down the whole listing the
+        todo appears in, rather than the one alarm. Nextcloud's own
+        ``ReminderService`` discards an alarm it does not recognise instead of
+        rejecting its component, so unknown actions degrade to DISPLAY here.
+
+        ``None`` means the alarm has no usable TRIGGER. RFC 5545 makes TRIGGER
+        mandatory and Nextcloud cannot schedule an alarm without one, so there is
+        nothing to report — and ``Reminder`` requires exactly one trigger field,
+        so returning a trigger-less dict would fail validation for the whole
+        component just as an unknown ACTION would.
+        """
+        action = str(alarm.get("action", "DISPLAY")).upper()
+        if action not in _VALARM_ACTIONS:
+            logger.warning(
+                "VALARM action %r is not one of %s; reporting it as DISPLAY. "
+                "Nextcloud does not schedule non-standard alarms either",
+                action,
+                ", ".join(sorted(_VALARM_ACTIONS)),
+            )
+            action = "DISPLAY"
+
+        reminder: dict[str, Any] = {
+            "action": action,
+            "description": str(alarm.get("description", "")),
+        }
+        summary = alarm.get("summary")
+        if summary:
+            reminder["summary"] = str(summary)
+        repeat = alarm.get("repeat")
+        if repeat is not None:
+            reminder["repeat"] = int(repeat)
+        duration = alarm.get("duration")
+        if duration is not None:
+            reminder["duration"] = vDDDTypes(duration.dt).to_ical().decode("utf-8")
+            if isinstance(duration.dt, dt.timedelta):
+                reminder["duration_seconds"] = int(duration.dt.total_seconds())
+        attendees = alarm.get("attendee") or []
+        if not isinstance(attendees, list):
+            attendees = [attendees]
+        if attendees:
+            reminder["attendees"] = [
+                str(value).removeprefix("mailto:") for value in attendees
+            ]
+        attachments = alarm.get("attach") or []
+        if not isinstance(attachments, list):
+            attachments = [attachments]
+        if attachments:
+            reminder["attachments"] = [str(value) for value in attachments]
+
+        trigger = alarm.get("trigger")
+        if trigger is None or getattr(trigger, "dt", None) is None:
+            logger.warning(
+                "Skipping a VALARM with no usable TRIGGER; RFC 5545 requires one "
+                "and Nextcloud cannot schedule the alarm without it"
+            )
+            return None
+
+        value = trigger.dt
+        if not isinstance(value, dt.timedelta):
+            reminder["trigger_at"] = value.isoformat()
+            return reminder
+
+        # Emit exactly one trigger field, because that is what ``Reminder``
+        # accepts — a dict carrying both would not validate when a caller feeds
+        # a read reminder back into an update. Whole-minute offsets take the
+        # friendlier ``minutes_before``, anything else keeps its raw duration.
+        total = value.total_seconds()
+        if total <= 0 and total % 60 == 0:
+            reminder["minutes_before"] = int(-total // 60)
+        else:
+            reminder["trigger"] = vDDDTypes(value).to_ical().decode("utf-8")
+
+        related = trigger.params.get("RELATED") if trigger.params else None
+        if related and str(related).upper() in ("START", "END"):
+            # Same reasoning as ACTION: anything else is malformed input that
+            # must not propagate into the model and break the caller's listing.
+            reminder["related"] = str(related).upper()
+        return reminder
+
+    @staticmethod
+    def _sync_valarms(
+        component: Any,
+        reminders: list[dict[str, Any]],
+        default_summary: str,
+        default_description: str = _EVENT_REMINDER_DESCRIPTION,
     ) -> None:
+        """Replace every VALARM on ``component`` with ``reminders``, in order."""
         component.subcomponents = [
             sub for sub in component.subcomponents if sub.name != "VALARM"
         ]
         for reminder in reminders:
-            component.add_component(self._build_valarm(reminder))
+            component.add_component(
+                CalendarClient._build_valarm(
+                    reminder, default_summary, default_description
+                )
+            )
 
-    def _add_reminders_or_legacy_alarm(
-        self, component: Any, data: dict[str, Any], default_description: str
+    def _apply_reminders(
+        self,
+        component: Any,
+        data: dict[str, Any],
+        default_summary: str,
+        default_description: str = _EVENT_REMINDER_DESCRIPTION,
     ) -> None:
+        """Write alarms onto ``component`` from whichever form the caller used.
+
+        An explicit ``reminders`` list is authoritative and replaces everything.
+        Otherwise the older ``reminder_minutes`` / ``reminder_email`` pair is
+        honoured as shorthand: a DISPLAY alarm, plus an EMAIL alarm at the same
+        offset when ``reminder_email`` is set.
+
+        Passing none of the three leaves existing alarms alone, which is what
+        makes an unrelated update non-destructive.
+
+        The two shorthand fields are independently updatable: whichever one the
+        caller omits is read back off the stored alarms rather than assumed. The
+        rebuild would otherwise erase what the caller never mentioned —
+        ``reminder_email=True`` on its own would find no minutes, clear every
+        VALARM and add nothing back, and ``reminder_minutes=45`` on its own would
+        silently drop a stored EMAIL alarm.
+        """
         if "reminders" in data:
-            self._sync_valarms_by_index(component, data.get("reminders") or [])
-        elif data.get("reminder_minutes", 0) > 0:
+            self._sync_valarms(
+                component,
+                data.get("reminders") or [],
+                default_summary,
+                default_description,
+            )
+            return
+
+        if "reminder_minutes" not in data and "reminder_email" not in data:
+            return
+
+        stored = self._extract_valarms(component)
+        if "reminder_minutes" in data:
+            minutes = data["reminder_minutes"] or 0
+        else:
+            minutes = next(
+                (r["minutes_before"] for r in stored if "minutes_before" in r), 0
+            )
+        want_email = (
+            data["reminder_email"]
+            if "reminder_email" in data
+            else any(r["action"] == "EMAIL" for r in stored)
+        )
+
+        actions = ["DISPLAY"] + (["EMAIL"] if want_email else [])
+        if _shorthand_would_lose(stored, default_description, default_summary):
+            logger.warning(
+                "reminder_minutes/reminder_email rebuilds the alarms as one "
+                "%s at %d minutes, which does not reproduce the %d stored "
+                "alarm(s); use the reminders list to edit them without loss",
+                "/".join(actions),
+                minutes,
+                len(stored),
+            )
+
+        if minutes <= 0 and want_email:
+            logger.warning(
+                "reminder_email was requested but no reminder_minutes was given "
+                "and none could be read from the stored alarms, so there is no "
+                "offset to schedule it at"
+            )
+
+        self._sync_valarms(component, [], default_summary, default_description)
+        if minutes <= 0:
+            return
+
+        for action in actions:
             component.add_component(
                 self._build_valarm(
                     {
+                        "action": action,
                         "description": default_description,
-                        "minutes_before": data["reminder_minutes"],
-                    }
+                        "minutes_before": minutes,
+                    },
+                    default_summary,
                 )
             )
 
@@ -1743,9 +2039,13 @@ class CalendarClient:
         tz_name = event_data.get("timezone", "")
         used_timezones: set[ZoneInfo] = set()
 
+        # Kept for the RRULE below, whose UNTIL must match DTSTART's value type.
+        dtstart_value: dt.date | dt.datetime | None = None
+
         if start_str:
             if all_day:
                 start_date = dt.datetime.fromisoformat(start_str.split("T")[0]).date()
+                dtstart_value = start_date
                 event.add("dtstart", start_date)
                 if end_str:
                     end_date = dt.datetime.fromisoformat(end_str.split("T")[0]).date()
@@ -1754,6 +2054,7 @@ class CalendarClient:
                 start_dt, zi = self._parse_event_datetime(start_str, tz_name)
                 if zi is not None:
                     used_timezones.add(zi)
+                dtstart_value = start_dt
                 event.add("dtstart", start_dt)
                 if end_str:
                     end_dt, zi = self._parse_event_datetime(end_str, tz_name)
@@ -1782,14 +2083,28 @@ class CalendarClient:
         if url:
             event.add("url", url)
 
-        # Handle recurrence
-        recurring = event_data.get("recurring", False)
-        if recurring:
-            recurrence_rule = event_data.get("recurrence_rule", "")
-            if recurrence_rule:
-                event.add("rrule", vRecur.from_ical(recurrence_rule))
+        # Add colour (RFC 7986 COLOR)
+        color = event_data.get("color", "")
+        if color:
+            _warn_if_hex_color(color)
+            event.add("color", color)
 
-        self._add_reminders_or_legacy_alarm(event, event_data, "Event reminder")
+        # Handle recurrence. A non-empty rule is itself the intent to recur —
+        # requiring recurring=True as well made recurrence_rule a no-op on this
+        # path while the update path applied it unconditionally, so the same
+        # argument meant different things depending on which tool you called.
+        # ``recurring=False`` remains an explicit opt-out.
+        recurrence_rule = event_data.get("recurrence_rule", "")
+        if recurrence_rule and event_data.get("recurring", True):
+            recurrence_end_date = event_data.get("recurrence_end_date", "")
+            if recurrence_end_date:
+                recurrence_rule = _rrule_with_until(
+                    recurrence_rule, recurrence_end_date, dtstart_value
+                )
+            event.add("rrule", vRecur.from_ical(recurrence_rule))
+
+        # Add alarms/reminders
+        self._apply_reminders(event, event_data, event_data.get("title", ""))
 
         # Add attendees
         attendees = event_data.get("attendees", "")
@@ -1822,6 +2137,10 @@ class CalendarClient:
             "privacy": str(component.get("class", "PUBLIC")),
             "url": str(component.get("url", "")),
         }
+
+        color = component.get("color")
+        if color:
+            event_data["color"] = str(color)
 
         # Handle dates. The ``.isoformat()`` representation already encodes the
         # storage semantics: no suffix for floating local, ``+00:00`` for UTC,
@@ -1856,6 +2175,15 @@ class CalendarClient:
         if rrule:
             event_data["recurring"] = True
             event_data["recurrence_rule"] = _rrule_to_string(rrule)
+            until = (
+                rrule[0].get("UNTIL") if isinstance(rrule, list) else rrule.get("UNTIL")
+            )
+            if until:
+                # vRecur stores UNTIL as a single-element list of date/datetime.
+                value = until[0] if isinstance(until, list) else until
+                # Same key the update tool accepts, so a read value can be fed
+                # straight back in — the write side is recurrence_end_date.
+                event_data["recurrence_end_date"] = value.isoformat()
 
         # Handle attendees
         attendees = []
@@ -2124,13 +2452,14 @@ class CalendarClient:
                     elif "CATEGORIES" in component:
                         del component["CATEGORIES"]
 
-                # Handle recurrence rule
-                if "recurrence_rule" in event_data:
-                    rrule_str = event_data["recurrence_rule"]
-                    if rrule_str:
-                        component["RRULE"] = vRecur.from_ical(rrule_str)
-                    elif "RRULE" in component:
-                        del component["RRULE"]
+                # Handle colour (RFC 7986 COLOR)
+                if "color" in event_data:
+                    color = event_data["color"]
+                    if color:
+                        _warn_if_hex_color(color)
+                        component["COLOR"] = color
+                    elif "COLOR" in component:
+                        del component["COLOR"]
 
                 # Handle attendees
                 if "attendees" in event_data:
@@ -2143,24 +2472,81 @@ class CalendarClient:
                             if email.strip():
                                 component.add("attendee", f"mailto:{email.strip()}")
 
-                if "reminders" in event_data:
-                    self._sync_valarms_by_index(
-                        component, event_data.get("reminders") or []
-                    )
-                elif "reminder_minutes" in event_data:
-                    self._sync_valarms_by_index(component, [])
-                    if event_data["reminder_minutes"] > 0:
-                        component.add_component(
-                            self._build_valarm(
-                                {
-                                    "description": "Event reminder",
-                                    "minutes_before": event_data["reminder_minutes"],
-                                }
-                            )
-                        )
+                # Handle reminders (VALARM). Omitting all reminder arguments
+                # preserves the stored alarms; ``reminders: []`` clears them.
+                self._apply_reminders(
+                    component,
+                    event_data,
+                    event_data.get("title") or str(component.get("summary", "")),
+                )
 
                 # Handle dates
                 used_timezones = self._apply_date_updates(component, event_data)
+
+                # Handle recurrence. ``recurring=False`` clears the series, which
+                # previously required passing recurrence_rule="" instead — the
+                # flag itself did nothing. An end date may be applied to a rule
+                # supplied now or to the one already stored.
+                #
+                # This must run *after* _apply_date_updates: UNTIL's value type
+                # follows DTSTART, so an update that flips all_day and sets
+                # recurrence_end_date in one call has to see the DTSTART being
+                # written, not the one being replaced. Reading the stored value
+                # here would emit exactly the mismatched RRULE that makes clients
+                # discard the recurrence set.
+                if event_data.get("recurring") is False:
+                    if event_data.get("recurrence_end_date"):
+                        logger.warning(
+                            "recurring=False was passed in the same update that "
+                            "set recurrence_end_date, so the series is removed "
+                            "and the end date has nothing to bound"
+                        )
+                    if event_data.get("recurrence_rule"):
+                        logger.warning(
+                            "recurring=False was passed in the same update that "
+                            "set recurrence_rule, so the series is removed and "
+                            "the new rule is discarded"
+                        )
+                    if "RRULE" in component:
+                        del component["RRULE"]
+                elif (
+                    "recurrence_rule" in event_data
+                    or "recurrence_end_date" in event_data
+                ):
+                    caller_supplied_rule = "recurrence_rule" in event_data
+                    rrule_str = (
+                        event_data["recurrence_rule"]
+                        if caller_supplied_rule
+                        else _rrule_to_string(component.get("rrule"))
+                    )
+                    if rrule_str:
+                        end_date = event_data.get("recurrence_end_date", "")
+                        if end_date:
+                            dtstart = component.get("dtstart")
+                            rrule_str = _rrule_with_until(
+                                rrule_str,
+                                end_date,
+                                dtstart.dt if dtstart else None,
+                                replace=not caller_supplied_rule,
+                            )
+                        component["RRULE"] = vRecur.from_ical(rrule_str)
+                    elif "RRULE" in component:
+                        if event_data.get("recurrence_end_date"):
+                            logger.warning(
+                                "recurrence_rule was cleared in the same update "
+                                "that set recurrence_end_date, so the series is "
+                                "removed and the end date has nothing to bound"
+                            )
+                        del component["RRULE"]
+                    elif event_data.get("recurrence_end_date"):
+                        # No stored rule and none supplied: there is nothing for
+                        # the end date to bound, and inventing a series from an
+                        # end date alone would be a guess.
+                        logger.warning(
+                            "recurrence_end_date was given for an event with no "
+                            "recurrence rule, so it has no effect; pass "
+                            "recurrence_rule as well to make the event recur"
+                        )
 
                 # Update timestamps
                 now = dt.datetime.now(dt.UTC)
@@ -2240,7 +2626,10 @@ class CalendarClient:
         if categories:
             todo.add("categories", categories.split(","))
 
-        self._add_reminders_or_legacy_alarm(todo, todo_data, "Todo reminder")
+        # Alarms/reminders
+        self._apply_reminders(
+            todo, todo_data, todo_data.get("summary", ""), _TODO_REMINDER_DESCRIPTION
+        )
 
         # Add timestamps
         now = dt.datetime.now(dt.UTC)
@@ -2397,6 +2786,10 @@ class CalendarClient:
                 todo_data["recurrence_rule"] = _rrule_to_string(rrule)
                 todo_data.update(self._pending_todo_occurrences(cal, component, now))
 
+            reminders = self._extract_valarms(component)
+            if reminders:
+                todo_data["reminders"] = reminders
+
             return todo_data
 
         except Exception as e:
@@ -2477,21 +2870,13 @@ class CalendarClient:
                             ]
                             logger.debug("Set CATEGORIES to %s", categories_str)
 
-                    if "reminders" in todo_data:
-                        self._sync_valarms_by_index(
-                            component, todo_data.get("reminders") or []
-                        )
-                    elif "reminder_minutes" in todo_data:
-                        self._sync_valarms_by_index(component, [])
-                        if todo_data["reminder_minutes"] > 0:
-                            component.add_component(
-                                self._build_valarm(
-                                    {
-                                        "description": "Todo reminder",
-                                        "minutes_before": todo_data["reminder_minutes"],
-                                    }
-                                )
-                            )
+                    # Handle reminders (VALARM)
+                    self._apply_reminders(
+                        component,
+                        todo_data,
+                        todo_data.get("summary") or str(component.get("summary", "")),
+                        _TODO_REMINDER_DESCRIPTION,
+                    )
 
                     # Update timestamps
                     now = dt.datetime.now(dt.UTC)
