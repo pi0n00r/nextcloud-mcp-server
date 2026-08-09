@@ -88,9 +88,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.13@sha256:33d4262d937312d47c91b33a0c945852fb9a8f954da46d710393c86ea2860474"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.13@sha256:73c911f6e674cf16ab9dcafc01984e276fc411eca3c9dd6a4e6b9ab22744c8d8"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.7@sha256:3c3a6ef9fd3c820f294335b0c26dd4b1ec141cf8c68c2a0a7c1dbdb30dbc742b"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.7@sha256:e89c1602bc037672c5978df63e588895c168ee190003aca367380b2eef02b32d"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -102,7 +102,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.2@sha256:eea6e621ded409a0f878db118cd8aec619b555172d30f50d04f9bc2e5e852b4c"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.2@sha256:d7666d54d87c58d52869ddda36d1acbd4a7f53faf8ab6b91293daf204f3434e8"
 
           # Mode-specific properties
           - mode: single-user
@@ -223,7 +223,7 @@ jobs:
 
       # Start services with the appropriate profile
       - name: Run docker compose
-        uses: hoverkraft-tech/compose-action@11beaa1c2dae4e8ed7b1665aa074723b6cecb0e4 # v3.0.0
+        uses: hoverkraft-tech/compose-action@ee6af68587292d72db67743171809c19787df4c9 # v3.1.0
         with:
           compose-file: "./docker-compose.yml"
           compose-flags: "--profile ${{ matrix.profile }} ${{ matrix.extra-compose-profiles }}"
@@ -385,7 +385,7 @@ jobs:
           echo "TOKEN_ENCRYPTION_KEY=${KEY}" >> "$GITHUB_ENV"
 
       - name: Run docker compose (single-user + docling)
-        uses: hoverkraft-tech/compose-action@11beaa1c2dae4e8ed7b1665aa074723b6cecb0e4 # v3.0.0
+        uses: hoverkraft-tech/compose-action@ee6af68587292d72db67743171809c19787df4c9 # v3.1.0
         with:
           compose-file: "./docker-compose.yml"
           compose-flags: "--profile single-user --profile docling"
