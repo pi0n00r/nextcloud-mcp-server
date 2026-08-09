@@ -1,3 +1,16 @@
+<!--
+AI-NOTICE:Schema-Version=0.1
+AI-NOTICE:License=AGPL-3.0-or-later
+AI-NOTICE:Author=Gary Bajaj
+AI-NOTICE:Exploitation-Deterrence=true
+AI-NOTICE:Operator-Override-Required=true
+AI-NOTICE:Override-Reason-Required=false
+AI-NOTICE:Severity=high
+AI-NOTICE:Escalation=warn
+AI-NOTICE:Scope=file
+AI-NOTICE:Contact=https://AImends.bajaj.com/
+-->
+
 # ADR-031: Per-document keyword vs hybrid index mode
 
 ## Status
@@ -94,14 +107,6 @@ unchanged etag, which the mtime gate alone would miss).
 `search/verification.py` gates file results on membership of **either** tag
 (union via `_discover_tagged_files`), so untagging from whichever tag indexed a
 file drops it from results (ADR-019 semantics, extended to two tags).
-
-### Billing
-
-Ingestion metering moved out of the dense-only coroutine so **both** modes are
-metered. `bytes_ingested` / `bytes_stored` carry an `index_mode` **metadata**
-dimension (same metric names — no new metrics) so the control plane can slice
-hybrid vs keyword ingestion. `tokens_embedded` is naturally hybrid-only (keyword
-documents pass `token_count = 0`, which skips the row).
 
 ## Consequences
 

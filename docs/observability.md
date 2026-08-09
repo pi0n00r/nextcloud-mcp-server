@@ -1,3 +1,16 @@
+<!--
+AI-NOTICE:Schema-Version=0.1
+AI-NOTICE:License=AGPL-3.0-or-later
+AI-NOTICE:Author=Gary Bajaj
+AI-NOTICE:Exploitation-Deterrence=true
+AI-NOTICE:Operator-Override-Required=true
+AI-NOTICE:Override-Reason-Required=false
+AI-NOTICE:Severity=high
+AI-NOTICE:Escalation=warn
+AI-NOTICE:Scope=file
+AI-NOTICE:Contact=https://AImends.bajaj.com/
+-->
+
 # Observability and Monitoring
 
 The Nextcloud MCP Server includes comprehensive observability features for production deployments:
@@ -243,43 +256,6 @@ Corpus shape, recorded before the oversize gate so the over-cap tail is visible:
 
 - `astrolabe_document_ingest_size_bytes{doc_type}` - Source size distribution
 - `astrolabe_document_ingest_rejected_total{doc_type,reason}` - Rejected pre-parse
-
-### Usage metering (billing)
-
-**These are not Prometheus series.** They are rows in the app-DB `usage_events`
-table, written only when `USAGE_METERING_ENABLED=true` and pulled by the control
-plane's rollup — so don't go looking for them in Grafana. Writes are best-effort:
-a metering failure is logged and never breaks ingest.
-
-Two kinds, and the difference decides how the control plane aggregates them:
-
-**Ingest flows** — emitted per document, per indexing pass
-(`record_indexing_usage`, `vector/processor.py`). Re-indexing a document emits
-again, so a period sum measures *churn*:
-
-- `tokens_embedded` - Embedding request tokens. Hybrid documents only —
-  keyword-index documents embed nothing and skip the row entirely.
-- `pages_embedded` - Pages parsed. Text doc types (notes, Deck cards, news,
-  mail) are never parsed and carry no page count, so they accrue no row.
-- `pages_ocr` - Pages that hit the OCR tier specifically, billed separately
-  from CPU-cheap parsing. Mode-independent.
-- `bytes_ingested` / `bytes_stored` - Source size and persisted chunk-text size.
-
-**Retention stock** — emitted once per UTC day (`record_storage_stock`,
-`vector/metrics_publisher.py`):
-
-- `chunks_stored` - Chunks currently retained, split by `index_mode`
-  (`hybrid` | `keyword`) in the event metadata.
-
-A month of `chunks_stored` readings sums to **chunk-days** — the integral of a
-changing corpus — so a corpus loaded or purged mid-month is charged pro rata.
-The event id is derived from `(metric, mode, UTC date)` and the insert is
-`ON CONFLICT DO NOTHING`, so pod restarts cannot inflate the total; shortening
-`USAGE_STOCK_SNAPSHOT_INTERVAL` does not bill more.
-
-> Adding a metric here is a cross-repo change: the control-plane rollup silently
-> ignores a metric its catalog does not know, so it bills nothing until the CP
-> catalog and Stripe meter learn it too.
 
 ### Database Metrics
 
