@@ -1,5 +1,16 @@
 """Integration tests for the Nextcloud Talk (spreed) MCP tools."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import json
 import logging
 
@@ -15,20 +26,56 @@ pytestmark = pytest.mark.integration
 EXPECTED_TALK_TOOLS = {
     "talk_list_conversations",
     "talk_get_conversation",
+    "talk_create_conversation",
     "talk_get_messages",
     "talk_list_participants",
+    "talk_add_participant",
     "talk_send_message",
     "talk_mark_as_read",
+    "talk_list_reactions",
+    "talk_react",
+    "talk_delete_reaction",
 }
 
 
 async def test_talk_mcp_connectivity(nc_mcp_client: ClientSession):
-    """All six Talk tools should be registered with the MCP server."""
+    """All supported Talk tools should be registered with the MCP server."""
     tools = await nc_mcp_client.list_tools()
     tool_names = {tool.name for tool in tools.tools}
 
     missing = EXPECTED_TALK_TOOLS - tool_names
     assert not missing, f"Missing Talk tools: {missing}"
+
+
+async def test_talk_create_conversation_via_mcp(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient
+):
+    """A group created through MCP is readable and removable directly."""
+    room_name = "MCP created room"
+    result = await nc_mcp_client.call_tool(
+        "talk_create_conversation",
+        {"room_type": 2, "room_name": room_name},
+    )
+    assert result.isError is False, result.content
+    payload = json.loads(result.content[0].text)
+    token = payload["conversation"]["token"]
+
+    try:
+        conversation = await nc_client.talk.get_conversation(token)
+        assert conversation.name == room_name
+    finally:
+        await nc_client.talk.delete_conversation(token)
+
+
+async def test_talk_create_conversation_rejects_invalid_room_type(
+    nc_mcp_client: ClientSession,
+):
+    result = await nc_mcp_client.call_tool(
+        "talk_create_conversation",
+        {"room_type": 99, "room_name": "Invalid"},
+    )
+
+    assert result.isError is True
 
 
 async def test_talk_send_and_read_workflow(
@@ -84,6 +131,42 @@ async def test_talk_send_and_read_workflow(
     assert mark_payload["success"] is True
     assert mark_payload["conversation_token"] == token
     assert mark_payload["last_read_message"] == posted_id
+
+
+async def test_talk_reaction_workflow(
+    nc_mcp_client: ClientSession,
+    temporary_conversation: dict,
+):
+    """Add, list, and remove a reaction through the public MCP tools."""
+    token = temporary_conversation["token"]
+    emoji = "\N{THUMBS UP SIGN}"
+    send_result = await nc_mcp_client.call_tool(
+        "talk_send_message",
+        {"token": token, "message": "Reaction target"},
+    )
+    assert send_result.isError is False, send_result.content
+    message_id = json.loads(send_result.content[0].text)["message"]["id"]
+
+    react_result = await nc_mcp_client.call_tool(
+        "talk_react",
+        {"token": token, "message_id": message_id, "reaction": emoji},
+    )
+    assert react_result.isError is False, react_result.content
+    assert emoji in json.loads(react_result.content[0].text)["results"]
+
+    list_result = await nc_mcp_client.call_tool(
+        "talk_list_reactions",
+        {"token": token, "message_id": message_id, "reaction": emoji},
+    )
+    assert list_result.isError is False, list_result.content
+    actors = json.loads(list_result.content[0].text)["results"][emoji]
+    assert actors
+
+    delete_result = await nc_mcp_client.call_tool(
+        "talk_delete_reaction",
+        {"token": token, "message_id": message_id, "reaction": emoji},
+    )
+    assert delete_result.isError is False, delete_result.content
 
 
 async def test_talk_list_conversations_includes_temp_room(
