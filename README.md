@@ -69,10 +69,11 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Tool surface** | 160 tools across 12 Nextcloud application surfaces |
+| **Stable tool surface** | 155 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
-| **Application version** | `0.166.1` |
+| **Stable application version** | `0.166.1` |
+| **Development preview** | `v1.7` / `0.169.1`: 160 tools, including 5 Talk tools not yet tested against a live Talk installation |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
