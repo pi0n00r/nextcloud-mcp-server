@@ -69,7 +69,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Tool surface** | 155 tools across 12 Nextcloud application surfaces |
+| **Tool surface** | 160 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
 | **Application version** | `0.166.1` |

@@ -1,5 +1,16 @@
 """MCP tool registration for the Nextcloud Talk (spreed) integration."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 import uuid
 
@@ -180,7 +191,7 @@ def configure_talk_tools(mcp: FastMCP) -> None:
         """Create a new Talk conversation (one-to-one, group, or public).
 
         - room_type=1: private DM — requires ``invite`` (other user id).
-        - room_type=2: private group — requires ``room_name``; optional
+        - room_type=2: private group — requires ``room_name``. An optional
           ``invite`` (one user) is added after create. For more people call
           ``talk_add_participant`` repeatedly.
         - room_type=3: public room — requires ``room_name`` (open link /
@@ -195,7 +206,12 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             invite: User id. Required for one-to-one. Optional single
                 first member for group/public (added after create).
         """
-        if room_type == 1 and not (invite or "").strip():
+        if room_type not in (1, 2, 3):
+            raise McpError(
+                ErrorData(code=-32602, message="room_type must be 1, 2, or 3")
+            )
+        normalized_invite = (invite or "").strip()
+        if room_type == 1 and not normalized_invite:
             raise McpError(
                 ErrorData(
                     code=-32602,
@@ -212,18 +228,26 @@ def configure_talk_tools(mcp: FastMCP) -> None:
                     message="room_name is required for group/public conversations",
                 )
             )
+        normalized_room_name = (room_name or "").strip()
+        if len(normalized_room_name) > 255:
+            raise McpError(
+                ErrorData(
+                    code=-32602,
+                    message="room_name must not exceed 255 characters",
+                )
+            )
         client = await get_client(ctx)
         # Group/public: create without invite (spreed often 404s invite-on-create
         # for type 2), then add the first member explicitly.
-        create_invite = invite if room_type == 1 else None
+        create_invite = normalized_invite if room_type == 1 else None
         conversation = await client.talk.create_conversation(
             room_type=room_type,
-            room_name=room_name or (invite or ""),
+            room_name=normalized_room_name,
             invite=create_invite,
         )
-        if room_type in (2, 3) and (invite or "").strip():
+        if room_type in (2, 3) and normalized_invite:
             await client.talk.add_participant(
-                conversation.token, user_id=invite.strip()
+                conversation.token, user_id=normalized_invite
             )
         return CreateConversationResponse(conversation=conversation)
 
@@ -251,9 +275,7 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             source: Usually ``users``.
         """
         if not (user_id or "").strip():
-            raise McpError(
-                ErrorData(code=-32602, message="user_id must not be empty")
-            )
+            raise McpError(ErrorData(code=-32602, message="user_id must not be empty"))
         client = await get_client(ctx)
         await client.talk.add_participant(
             token, user_id=user_id.strip(), source=source or "users"
@@ -360,6 +382,10 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             message_id: Chat message id.
             reaction: Optional single emoji to filter.
         """
+        if message_id <= 0:
+            raise McpError(
+                ErrorData(code=-32602, message="message_id must be positive")
+            )
         client = await get_client(ctx)
         raw = await client.talk.list_reactions(
             token, int(message_id), reaction=reaction
@@ -389,6 +415,12 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             message_id: Target message id.
             reaction: Single emoji string.
         """
+        if message_id <= 0:
+            raise McpError(
+                ErrorData(code=-32602, message="message_id must be positive")
+            )
+        if not (reaction or "").strip():
+            raise McpError(ErrorData(code=-32602, message="reaction must not be empty"))
         client = await get_client(ctx)
         raw = await client.talk.add_reaction(token, int(message_id), reaction)
         return ReactResponse(
@@ -400,7 +432,11 @@ def configure_talk_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         title="Remove Talk Reaction",
-        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
+        annotations=ToolAnnotations(
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
     )
     @require_scopes("talk.write")
     @instrument_tool
@@ -417,6 +453,12 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             message_id: Target message id.
             reaction: Emoji to remove.
         """
+        if message_id <= 0:
+            raise McpError(
+                ErrorData(code=-32602, message="message_id must be positive")
+            )
+        if not (reaction or "").strip():
+            raise McpError(ErrorData(code=-32602, message="reaction must not be empty"))
         client = await get_client(ctx)
         raw = await client.talk.delete_reaction(token, int(message_id), reaction)
         return ReactResponse(

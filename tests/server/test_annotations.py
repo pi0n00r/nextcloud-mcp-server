@@ -86,7 +86,12 @@ async def test_delete_operations_are_idempotent(nc_mcp_client: ClientSession):
     # under a new one) and a retry is rejected with 403 rather than being a
     # no-op. Verified end-to-end in tests/integration/test_mail_greenmail.py::
     # test_delete_message_removes_it_from_the_inbox.
-    non_idempotent_deletes = {"collectives_delete_collective", "nc_mail_delete_message"}
+    non_idempotent_deletes = {
+        "collectives_delete_collective",
+        "nc_mail_delete_message",
+        # Talk returns 404 after the caller's reaction has already been removed.
+        "talk_delete_reaction",
+    }
 
     for tool in tools.tools:
         if "delete" in tool.name.lower() and tool.name not in non_idempotent_deletes:
