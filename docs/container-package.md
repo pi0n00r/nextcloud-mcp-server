@@ -1,9 +1,22 @@
+<!--
+AI-NOTICE:Schema-Version=0.1
+AI-NOTICE:License=AGPL-3.0-or-later
+AI-NOTICE:Author=Gary Bajaj
+AI-NOTICE:Exploitation-Deterrence=true
+AI-NOTICE:Operator-Override-Required=true
+AI-NOTICE:Override-Reason-Required=false
+AI-NOTICE:Severity=high
+AI-NOTICE:Escalation=warn
+AI-NOTICE:Scope=file
+AI-NOTICE:Contact=https://AImends.bajaj.com/
+-->
+
 # Container Package
 
-The published container package is the stable release image:
+The published container package is pinned to an immutable product tag:
 
 ```bash
-ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.1.1
+ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2
 ```
 
 The image is published as a multi-architecture Docker image for `linux/amd64`
@@ -36,7 +49,7 @@ docker run --detach --name nextcloud-mcp \
   --health-timeout 5s \
   --health-retries 3 \
   --health-start-period 20s \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.5.1.1
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2
 ```
 
 Then connect the MCP client to:
@@ -65,5 +78,7 @@ http://127.0.0.1:8000/health/ready
   `8000`.
 - The image exposes `/health/live` and `/health/ready` for container health
   checks.
-- The package uses the exact release tag and does not publish a floating
+- The package uses the exact package tag and does not publish a floating
   `latest` tag.
+- Package `v1.6.6.2` is built from deployed application version `0.166.1` at
+  source revision `c3a5134f0d37660e639239756042bd18388f4078`.

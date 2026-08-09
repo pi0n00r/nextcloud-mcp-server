@@ -22,7 +22,7 @@ Deck, Talk, and other Nextcloud application surfaces through 155 MCP tools.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
-[![Container](https://img.shields.io/badge/GHCR-v1.6.2-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Container](https://img.shields.io/badge/GHCR-v1.6.6.2-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
 
@@ -33,12 +33,13 @@ Deck, Talk, and other Nextcloud application surfaces through 155 MCP tools.
 </div>
 
 > [!WARNING]
-> **WebDAV filename-search erratum:** all published releases through `v1.6.2`
+> **Historical WebDAV filename-search erratum:** published releases through `v1.6.2`
 > can emit an invalid empty SEARCH predicate when no recognized filter reaches
 > `nc_webdav_search_files`. Clients using the unsupported `path` and `query`
 > argument names may therefore receive HTTP 500, sometimes followed by a proxy
-> HTTP 502, while ordinary WebDAV operations remain available. Until a fixed
-> build is published, use `scope` and `name_pattern` (for example,
+> HTTP 502, while ordinary WebDAV operations remain available. Package
+> `v1.6.6.2` contains the correction. On older builds, use `scope` and
+> `name_pattern` (for example,
 > `{"scope":"/Documents","name_pattern":"%activity%","limit":50}`). See
 > [ERRATA.md](ERRATA.md#webdav-search-with-an-empty-predicate) for affected
 > releases and package guidance.
@@ -70,8 +71,8 @@ automation:
 |---|---|
 | **Tool surface** | 155 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.2` |
-| **Application version** | `0.162.0` |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
+| **Application version** | `0.166.1` |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -108,7 +109,7 @@ docker run --detach \
   --restart unless-stopped \
   --publish 127.0.0.1:8000:8000 \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.2
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2
 ```
 
 Verify the service before connecting a client:
@@ -132,7 +133,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.6.2 --depth 1 \
+git clone --branch v1.6.6.2 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked

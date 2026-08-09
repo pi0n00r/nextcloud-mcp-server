@@ -1,18 +1,30 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 name: Build and Publish Docker Image
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact stable release tag to publish
+        description: Exact immutable package tag to publish
         required: true
-        default: v1.6.2
+        default: v1.6.6.2
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  PACKAGE_TAG: v1.6.2
-  PACKAGE_VERSION: 0.162.0
+  PACKAGE_TAG: v1.6.6.2
+  PACKAGE_VERSION: 0.166.1
+  PACKAGE_REVISION: c3a5134f0d37660e639239756042bd18388f4078
 
 jobs:
   publish:
@@ -21,23 +33,29 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Validate exact stable tag
+      - name: Validate exact immutable tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [ "$INPUT_TAG" != "$PACKAGE_TAG" ]; then
-            echo "This workflow only publishes $PACKAGE_TAG as the stable package." >&2
+            echo "This workflow only publishes immutable package $PACKAGE_TAG." >&2
             exit 1
           fi
 
-      - name: Checkout release tag
+      - name: Checkout package tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.tag }}
 
       - name: Capture checked-out source revision
         id: source
-        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          revision=$(git rev-parse HEAD)
+          if [ "$revision" != "$PACKAGE_REVISION" ]; then
+            echo "Expected source revision $PACKAGE_REVISION, found $revision" >&2
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - name: Validate source version
         run: |
@@ -60,7 +78,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish exact stable image
+      - name: Build and publish exact immutable image
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -71,8 +90,18 @@ jobs:
           sbom: false
           labels: |
             org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
-            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/releases/tag/${{ env.PACKAGE_TAG }}
+            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Stable v1.6.2 package for nextcloud-mcp-server 0.162.0
+            org.opencontainers.image.description=Immutable v1.6.6.2 package for nextcloud-mcp-server 0.166.1
+
+      - name: Record immutable package digest
+        run: |
+          {
+            echo "### Immutable package"
+            echo
+            echo "- Tag: \`${IMAGE_NAME}:${PACKAGE_TAG}\`"
+            echo "- Source: \`${PACKAGE_REVISION}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
