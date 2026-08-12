@@ -1445,6 +1445,73 @@ Notes:
 
 ---
 
+## Capability-Gated Tools
+
+Some tools need an upstream Nextcloud app that may be missing, disabled for the
+account, or too old to serve them — Deck's card dependencies, for instance, only
+exist from Deck 1.18.0. Rather than let the model discover that as a 404, the
+server reads what the instance advertises on
+`GET /ocs/v2.php/cloud/capabilities` and:
+
+- **hides** the tool from `tools/list`, and
+- **refuses** `tools/call` with the reason, for clients holding a stale list.
+
+Nothing to configure — it is on by default and applies per user, so a Talk
+account with Talk disabled sees no Talk tools while their colleague does.
+
+### Behaviour
+
+- The lookup is cached for 30 seconds per user, so enabling or upgrading an app
+  makes its tools appear **without restarting the server**.
+- It **fails open**: if capabilities can't be read (OCS error, unexpected
+  payload, unparseable version), the tool stays listed. Availability beats
+  precision — an instance we can't interrogate behaves exactly as before.
+- Only apps that actually publish a capability block are gated: **Notes, Tables,
+  Deck, Cookbook and Talk** (`spreed`). Calendar and Contacts tools speak
+  CalDAV/CardDAV and keep working with those web apps uninstalled, so they are
+  never gated; Collectives, News and Mail publish nothing to gate on.
+- Version floors follow PEP 440, so a pre-release (`1.18.0-beta.3`) sorts
+  *below* the release it precedes and stays gated out.
+
+### Escape hatch
+
+```bash
+MCP_DISABLE_CAPABILITY_GATING=true    # list and run every registered tool
+```
+
+Set this if tools you expect are missing; it restores the pre-gating behaviour
+so you can confirm gating is the cause (and please open an issue).
+
+### Verifying it
+
+```bash
+docker compose exec app php occ app:disable cookbook
+sleep 31                       # outlive the capability cache
+# re-list tools -> nc_cookbook_* are gone; calling one returns the reason
+docker compose exec app php occ app:enable cookbook
+sleep 31                       # they come back, no restart
+```
+
+(Kept as a manual check rather than an automated one: the integration lane runs
+tests in parallel against a shared Nextcloud, where disabling an app would race
+whatever else is exercising it.)
+
+### Adding a gate to a new tool
+
+```python
+from nextcloud_mcp_server.capabilities import require_capability
+
+@mcp.tool()
+@require_capability("deck", min_version="1.18.0")
+async def deck_assign_dependent_card(ctx: Context, ...): ...
+```
+
+`app` is the OCS capability key (the app id for most apps — Talk's is `spreed`),
+and `min_version` is compared against the `version` the app advertises. Whole-app
+presence gates are applied automatically from `APP_CAPABILITY_KEY` in
+`nextcloud_mcp_server/server/__init__.py`; only add an app there after confirming
+it publishes a capability block, because a missing key is what closes the gate.
+
 ## Tag-Based File Exclusion (Optional)
 
 Some files (contracts, medical records, credentials, private notes) should
@@ -1569,6 +1636,70 @@ WARNING  VECTOR_SYNC_ENABLE is not a recognized setting and was ignored;
 
 It is only a warning — an unrecognized variable never stops the server — so check
 the logs after changing configuration if a setting does not seem to apply.
+
+---
+
+## Running Behind a Reverse Proxy
+
+When a proxy (nginx, Traefik, Caddy, an ingress controller, Envoy) sits in front of
+the server, every log line shows the *proxy's* address instead of the client's:
+
+```
+WARNING  /mcp request WITHOUT Authorization header from Address(host='172.16.0.7', port=44832)
+INFO     172.16.0.7:44832 - "POST /mcp HTTP/1.1" 401
+```
+
+The server reads `X-Forwarded-For` / `X-Forwarded-Proto`, but only from proxies it
+has been told to trust — the default trust list is `127.0.0.1`, so a proxy on
+another host or container is ignored and its headers are discarded. Name the proxy
+with `FORWARDED_ALLOW_IPS` (a comma-separated list of IP addresses and CIDR
+networks, or `*` on its own to trust everything):
+
+```bash
+# Environment variable
+FORWARDED_ALLOW_IPS=172.16.0.7
+```
+
+```toml
+# settings.toml — equivalent, and what the Helm chart mounts as a ConfigMap
+[default]
+forwarded_allow_ips = "172.16.0.7"
+```
+
+The address to trust is the one the server currently logs — the proxy as seen from
+the server, not the proxy's public address. Examples:
+
+| Deployment | Value |
+|------------|-------|
+| docker compose, proxy in the same network | the proxy container's IP, e.g. `172.16.0.7` |
+| Kubernetes, nginx-ingress or Envoy Gateway | the cluster **pod** CIDR, e.g. `10.42.0.0/16` |
+| Proxy on the same host (`--net=host`, local dev) | `127.0.0.1` (already the default) |
+
+This affects more than log readability: rate limiting on OAuth dynamic client
+registration is keyed on the client address, so while the real address is unknown
+every client behind the proxy shares a single bucket.
+
+### Prefer a CIDR over `*`
+
+`*` trusts *any* source and takes the **left-most** `X-Forwarded-For` entry, which
+is attacker-controlled — a client can then claim any address it likes and evade
+per-IP rate limiting. With an explicit list, the header is walked from the right
+past each trusted hop, which cannot be spoofed past a proxy that appends honestly.
+Use `*` only where the server is unreachable except through the proxy, and prefer a
+CIDR even then.
+
+`*` is a wildcard **only as the entire value**. Anywhere else it is inert — it
+matches nothing, so `10.0.0.0/8,*` trusts the `/8` alone, narrowing the list
+rather than widening it. Startup warns when a `*` is used this way.
+
+Entries that are not valid IP addresses or networks (a hostname, or a CIDR with
+host bits set such as `10.0.0.1/8`) are never matched. Startup reports the trust
+list and warns about such entries:
+
+```
+INFO [2026-08-11 18:40:33] nextcloud_mcp_server.cli - Trusting X-Forwarded-* headers from: 10.0.0.1/8
+WARNING [2026-08-11 18:40:33] nextcloud_mcp_server.cli - FORWARDED_ALLOW_IPS entries are not IP addresses or networks and will only ever match a client address literally: 10.0.0.1/8
+```
 
 ---
 
