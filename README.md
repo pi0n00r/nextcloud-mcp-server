@@ -73,7 +73,7 @@ automation:
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
 | **Stable application version** | `0.166.1` |
-| **Development preview** | `v1.7` / `0.170.2`: 160 tools, including 5 Talk tools not yet tested against a live Talk installation |
+| **Current master** | `0.172.0`: 162 tools, including 5 Talk tools not yet tested against a live Talk installation and 2 Deck dependency tools requiring Deck 1.18.0 or newer |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |

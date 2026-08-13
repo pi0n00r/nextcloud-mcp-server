@@ -52,6 +52,7 @@ FORK_TOUCHED=(
     "nextcloud_mcp_server/client/vcard_parser.py"
     "nextcloud_mcp_server/client/webdav.py"
     "nextcloud_mcp_server/config.py"
+    "nextcloud_mcp_server/links.py"
     "nextcloud_mcp_server/migrations.py"
     "nextcloud_mcp_server/models/__init__.py"
     "nextcloud_mcp_server/models/calendar.py"
@@ -82,6 +83,7 @@ FORK_TOUCHED=(
     "tests/unit/client/test_share_types.py"
     "tests/unit/client/test_webdav_write_conflicts.py"
     "tests/unit/test_calendar_tools.py"
+    "tests/unit/test_links.py"
     "tests/unit/test_migrations_concurrency.py"
     "tests/unit/test_unified_verifier.py"
 )

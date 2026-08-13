@@ -21,8 +21,10 @@ from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData, ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.capabilities import require_capability
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.links import with_links
 from nextcloud_mcp_server.models.deck import (
     AttachFileResponse,
     AttachmentOperationResponse,
@@ -797,6 +799,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_boards(ctx: Context) -> ListBoardsResponse:
         """Get all Nextcloud Deck boards"""
@@ -809,6 +812,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_board(
         ctx: Context,
@@ -843,6 +847,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_stacks(
         ctx: Context,
@@ -933,6 +938,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_stack(
         ctx: Context,
@@ -1020,6 +1026,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_archived_stacks(
         ctx: Context,
@@ -1085,6 +1092,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_cards(
         ctx: Context,
@@ -1163,6 +1171,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_board_overview(
         ctx: Context,
@@ -1260,6 +1269,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("deck.read")
+    @with_links
     @instrument_tool
     async def deck_get_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int
@@ -1399,6 +1409,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_create_card(
         ctx: Context,
@@ -1428,7 +1439,6 @@ def configure_deck_tools(mcp: FastMCP):
         return CreateCardResponse(
             id=card.id,
             title=card.title,
-            description=card.description,
             stackId=card.stackId,
         )
 
@@ -1437,6 +1447,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_update_card(
         ctx: Context,
@@ -1496,6 +1507,10 @@ def configure_deck_tools(mcp: FastMCP):
         ),
     )
     @require_scopes("deck.write")
+    # No @with_links here, deliberately: the card is gone by the time this
+    # returns, so a link to it would 404. Every other CardOperationResponse tool
+    # leaves the card in place and does carry one. Asserted by
+    # tests/unit/test_links_tool_coverage.py.
     @instrument_tool
     async def deck_delete_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int
@@ -1522,6 +1537,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_archive_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int
@@ -1548,6 +1564,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_unarchive_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int
@@ -1574,6 +1591,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_reorder_card(
         ctx: Context,
@@ -1614,6 +1632,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_move_card_to_board(
         ctx: Context,
@@ -1753,6 +1772,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_assign_label_to_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int, label_id: int
@@ -1780,6 +1800,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_remove_label_from_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int, label_id: int
@@ -1808,6 +1829,7 @@ def configure_deck_tools(mcp: FastMCP):
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_assign_user_to_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int, user_id: str
@@ -1837,6 +1859,7 @@ def configure_deck_tools(mcp: FastMCP):
         ),
     )
     @require_scopes("deck.write")
+    @with_links
     @instrument_tool
     async def deck_unassign_user_from_card(
         ctx: Context, board_id: int, stack_id: int, card_id: int, user_id: str
@@ -1854,6 +1877,87 @@ def configure_deck_tools(mcp: FastMCP):
         return CardOperationResponse(
             success=True,
             message="User unassigned from card successfully",
+            card_id=card_id,
+            stack_id=stack_id,
+            board_id=board_id,
+        )
+
+    # Card Dependency Tools
+    @mcp.tool(
+        title="Add Dependent Card to Deck Card",
+        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
+    )
+    @require_scopes("deck.write")
+    @require_capability("deck", min_version="1.18.0")
+    @with_links
+    @instrument_tool
+    async def deck_assign_dependent_card(
+        ctx: Context,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        dependent_card_id: int,
+    ) -> CardOperationResponse:
+        """Mark a Nextcloud Deck card as depending on another card.
+
+        Mirrors Deck's "Add dependent card" action. The dependency is
+        directional and stored on ``card_id``: it surfaces in that card's
+        ``dependentCards`` list (visible via deck_get_card). You need read
+        access to the dependent card.
+
+        Args:
+            board_id: The ID of the board containing the depending card
+            stack_id: The ID of the stack containing the depending card
+            card_id: The ID of the card that depends on another card
+            dependent_card_id: The ID of the card that card_id depends on
+        """
+        client = await get_client(ctx)
+        await client.deck.assign_dependent_card(
+            board_id, stack_id, card_id, dependent_card_id
+        )
+        return CardOperationResponse(
+            success=True,
+            message=f"Card {dependent_card_id} added as a dependency of card {card_id}",
+            card_id=card_id,
+            stack_id=stack_id,
+            board_id=board_id,
+        )
+
+    @mcp.tool(
+        title="Remove Dependent Card from Deck Card",
+        annotations=ToolAnnotations(
+            destructiveHint=True, idempotentHint=True, openWorldHint=True
+        ),
+    )
+    @require_scopes("deck.write")
+    @require_capability("deck", min_version="1.18.0")
+    @with_links
+    @instrument_tool
+    async def deck_remove_dependent_card(
+        ctx: Context,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        dependent_card_id: int,
+    ) -> CardOperationResponse:
+        """Remove a dependency between two Nextcloud Deck cards.
+
+        Removes the dependency of ``card_id`` on ``dependent_card_id`` that was
+        created by deck_assign_dependent_card.
+
+        Args:
+            board_id: The ID of the board containing the depending card
+            stack_id: The ID of the stack containing the depending card
+            card_id: The ID of the card that depends on another card
+            dependent_card_id: The ID of the dependency to remove
+        """
+        client = await get_client(ctx)
+        await client.deck.remove_dependent_card(
+            board_id, stack_id, card_id, dependent_card_id
+        )
+        return CardOperationResponse(
+            success=True,
+            message=f"Card {dependent_card_id} removed as a dependency of card {card_id}",
             card_id=card_id,
             stack_id=stack_id,
             board_id=board_id,
