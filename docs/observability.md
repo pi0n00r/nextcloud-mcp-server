@@ -79,9 +79,9 @@ The Helm chart has moved to a [separate repository](https://github.com/cbcoutinh
   `tool_error` | `protocol_error`
 
 > `mcp_tool_outcomes_total` labels `tool_name` with the tool's **registered MCP
-> name**, whereas `mcp_tool_calls_total` uses the Python `func.__name__`. These
-> differ for the OAuth tools (e.g. `tool_provision_access` vs
-> `provision_nextcloud_access`). Don't join the two on `tool_name`.
+> name**; the other three use the Python `func.__name__` of the decorated
+> function. Every tool function is now named after the tool it registers, so the
+> two agree — keep it that way when adding a tool, or the label silently splits.
 
 ### MCP Client Fleet Metrics
 
@@ -320,6 +320,42 @@ When tracing is enabled, all logs include `trace_id` and `span_id`:
   "span_id": "123456789abc...",
   "note_id": 42
 }
+```
+
+### Tool-Call Logs
+
+Every tool call emits one line, from the single `CallToolRequest` handler
+(`instrument_call_tool_outcomes`) rather than per tool, so coverage is automatic
+for every tool and every transport. The unsampled line is metadata-only. Tool
+arguments remain confined to sampled, short-retention traces so file contents,
+search queries, contact data, and message bodies do not become durable log data.
+
+```json
+{
+  "message": "tool call nc_semantic_search success in 3428ms",
+  "logger": "nextcloud_mcp_server.observability.metrics",
+  "mcp_tool": "nc_semantic_search",
+  "duration_ms": 3428,
+  "outcome": "success",
+  "mcp_user": "alice",
+  "mcp_client_id": "claude-ai"
+}
+```
+
+| Field | Notes |
+|-------|-------|
+| `mcp_tool` | Registered tool name, or `unknown` if the caller sent a name that is not registered (bounds cardinality for anything aggregating this field) |
+| `mcp_tool_requested` | The raw requested name — present **only** when it differs from `mcp_tool` |
+| `duration_ms` | Wall-clock, including the SDK's validation and serialization |
+| `outcome` | `success` \| `tool_error` (`isError=True`, the model sees it) \| `protocol_error` (JSON-RPC error, it does not). Same strings as `mcp_tool_outcomes_total` |
+| `mcp_user`, `mcp_client_id` | From the verified access token; absent in BasicAuth / single-user / stdio, where there is no OAuth identity |
+
+Successful calls log at INFO, the two error outcomes at WARNING. Requires
+`LOG_FORMAT=json` for the fields to be queryable:
+
+```logql
+sum by (mcp_tool) (count_over_time(
+  {namespace="tenant-example"} | json | mcp_tool != "" [1h]))
 ```
 
 ## Dashboards

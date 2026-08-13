@@ -84,6 +84,7 @@ FORK_TOUCHED=(
     "tests/unit/client/test_webdav_write_conflicts.py"
     "tests/unit/test_calendar_tools.py"
     "tests/unit/test_links.py"
+    "tests/unit/test_tool_call_logging.py"
     "tests/unit/test_migrations_concurrency.py"
     "tests/unit/test_unified_verifier.py"
 )
