@@ -23,7 +23,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.13@sha256:73c911f6e674cf16ab9dcafc01984e276fc411eca3c9dd6a4e6b9ab22744c8d8}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.14@sha256:a51f43b877edcae3b138856c0010ea752f90de76b36568a0234bd301d39b659a}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -434,7 +434,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    image: docker.io/library/postgres:18-alpine@sha256:a1d02e4bd40c94d3bf2bdd3678c137388e76d9efcd23c285e9429d336a834b44
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp
@@ -483,7 +483,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:5ddafb40cee836126e914274d23944fbdb4f4ccc171f1ec6720578a9cd9981e0
+    image: docker.io/vegardit/openldap:2.6.10@sha256:ee45ee1827d20836dfb7de14d73a3b43fa47c4d6b7bec01548474ac8cdc1f97c
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org

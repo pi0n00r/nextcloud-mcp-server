@@ -86,9 +86,12 @@ from .tables import (
 from .webdav import (
     CopyResourceResponse,
     CreateDirectoryResponse,
+    CreateFileCommentResponse,
     DeleteResourceResponse,
     DirectoryListing,
+    FileComment,
     FileInfo,
+    ListFileCommentsResponse,
     MoveResourceResponse,
     ReadFileResponse,
     SearchFilesResponse,
@@ -163,4 +166,7 @@ __all__ = [
     "MoveResourceResponse",
     "CopyResourceResponse",
     "SearchFilesResponse",
+    "FileComment",
+    "ListFileCommentsResponse",
+    "CreateFileCommentResponse",
 ]
