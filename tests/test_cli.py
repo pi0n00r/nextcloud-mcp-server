@@ -87,7 +87,7 @@ def test_dual_stack_option_is_forwarded_to_uvicorn(
     )
     monkeypatch.setattr(
         "nextcloud_mcp_server.cli.get_uvicorn_logging_config",
-        lambda **kwargs: {},
+        lambda **kwargs: {"version": 1, "disable_existing_loggers": False},
     )
     monkeypatch.setattr(
         "nextcloud_mcp_server.cli.uvicorn.run",

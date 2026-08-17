@@ -42,7 +42,7 @@ behaviors. v0.151.1 adds one fork-local concurrency guard:
 | Notes attachment cleanup | Refuse to delete a non-empty old attachment directory after a category move | None |
 | Transport policy | Canonical `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, and `CORS_ALLOW_ORIGINS` configuration | Gateway-secret middleware and temporary aliases for the retired `MCP_DNS_REBINDING_ALLOWED_*` names |
 | Webhooks | Server-resolved callback URI, admin gate, and redacted logging | None |
-| Schema migrations | Alembic migration engine and revision scripts | Process-wide serialization of Alembic command entry points, in addition to the existing cross-pod database lock |
+| Schema migrations | Alembic migration engine, revision scripts, and process-wide serialization of Alembic command entry points | None |
 | Container runtime | Non-root `appuser` at UID 1000/GID 0 with an immutable `/opt/venv` | Pin `pi0n00r/uvicorn` at `c5d334cb3014d72a43a893e848bbfdebb2665738`; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
 
 The left column is retired as fork patch debt: accept upstream changes there
@@ -50,8 +50,7 @@ unless they regress the stated contract. The right column remains
 load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
 transport gateway-secret middleware and legacy configuration aliases, the
 explicit Mistral embedding timeout, and legacy Arbiter deletion repair remain
-active fork patches. Process-wide Alembic command serialization is
-load-bearing for concurrent MCP sessions. The pinned Uvicorn commit is also
+active fork patches. The pinned Uvicorn commit is also
 load-bearing: upgrading or replacing it requires an IPv4 and IPv6
 container-listener smoke.
 
