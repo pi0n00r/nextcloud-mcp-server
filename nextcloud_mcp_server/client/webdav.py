@@ -1653,16 +1653,16 @@ class WebDAVClient(BaseNextcloudClient):
         # Build property list
         prop_xml = "\n".join([self._property_to_xml(prop) for prop in properties])
 
-        # Nextcloud 34 rejects an empty <d:where> with a server-side type error.
-        # Use an explicit match-all predicate for intentionally unfiltered searches.
-        where_xml = (where_conditions or "").strip()
-        if not where_xml:
-            where_xml = """
-                <d:like>
-                    <d:prop><d:displayname/></d:prop>
-                    <d:literal>%</d:literal>
-                </d:like>
-            """.strip()
+        # Build where clause. An *empty* ``<d:where>`` is not a match-all:
+        # Nextcloud answers it with ``500`` and a Sabre ``TypeError`` document
+        # (verified against 32.0.14). So an unfiltered search -- "everything
+        # under this folder", the most obvious call an MCP client can make --
+        # needs an explicit predicate that holds for every row instead.
+        # ``displayname LIKE '%'`` is that predicate, and reuses the operator
+        # the filtered callers already build.
+        where_xml = (where_conditions or "").strip() or (
+            "<d:like><d:prop><d:displayname/></d:prop><d:literal>%</d:literal></d:like>"
+        )
 
         # Build order by clause
         orderby_xml = ""
