@@ -48,9 +48,10 @@ behaviors. v0.151.1 adds one fork-local concurrency guard:
 The left column is retired as fork patch debt: accept upstream changes there
 unless they regress the stated contract. The right column remains
 load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
-transport gateway-secret middleware and legacy configuration aliases, the
-explicit Mistral embedding timeout, and legacy Arbiter deletion repair remain
-active fork patches. The pinned Uvicorn commit is also
+transport gateway-secret middleware and legacy configuration aliases, and
+legacy Arbiter deletion repair remain active fork patches. The explicit
+Mistral embedding timeout is now upstream-owned but remains load-bearing. The
+pinned Uvicorn commit is also
 load-bearing: upgrading or replacing it requires an IPv4 and IPv6
 container-listener smoke.
 
