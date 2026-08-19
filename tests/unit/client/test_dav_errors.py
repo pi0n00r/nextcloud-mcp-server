@@ -1,10 +1,9 @@
-"""Unit tests for DAV error surfacing.
+"""Unit tests for DAV error surfacing (``client/dav_errors.py``).
 
-Sabre/DAV explains a failure in the response body (``s:exception`` /
-``s:message``); the HTTP status alone under-specifies it. These tests pin the
-parser, the status→type mapping (412/423/507), and the ``_make_request`` hook
-that promotes a plain ``HTTPStatusError`` into the typed error — including the
-guarantee that the replacement is still catchable as ``HTTPStatusError``.
+The point of the module under test is that a failed DAV request should carry
+the explanation the server already sent, and that the three statuses callers
+branch on become distinguishable types -- without breaking any handler that
+catches plain ``HTTPStatusError``.
 """
 
 # AI-NOTICE:Schema-Version=0.1
@@ -18,8 +17,8 @@ guarantee that the replacement is still catchable as ``HTTPStatusError``.
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
+import httpx
 import pytest
-from httpx import AsyncClient, HTTPStatusError, Request, Response
 
 from nextcloud_mcp_server.client.base import BaseNextcloudClient
 from nextcloud_mcp_server.client.dav_errors import (
@@ -28,182 +27,199 @@ from nextcloud_mcp_server.client.dav_errors import (
     DavInsufficientStorage,
     DavLocked,
     DavPreconditionFailed,
-    dav_error_from_status_error,
-    parse_dav_error,
+    enrich_dav_error,
+    parse_dav_error_body,
 )
 
 pytestmark = pytest.mark.unit
 
 
 def _dav_body(exception: str, message: str) -> bytes:
-    """Build a Sabre/DAV error document exactly as Nextcloud emits one."""
-    return (
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">\n'
-        f"  <s:exception>{exception}</s:exception>\n"
-        f"  <s:message>{message}</s:message>\n"
-        "</d:error>\n"
-    ).encode()
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
+  <s:exception>{exception}</s:exception>
+  <s:message>{message}</s:message>
+</d:error>""".encode()
 
 
-def _status_error(status_code: int, body: bytes = b"") -> HTTPStatusError:
-    """Build the HTTPStatusError httpx would raise for a failed DAV request."""
-    request = Request("PUT", "https://cloud.example.org/remote.php/dav/files/a/x.txt")
-    response = Response(status_code, content=body, request=request)
-    return HTTPStatusError(f"{status_code} error", request=request, response=response)
-
-
-class TestParseDavError:
-    def test_extracts_exception_and_message(self):
-        detail = parse_dav_error(
-            _dav_body("Sabre\\DAV\\Exception\\Locked", "File is currently write locked")
-        )
-        assert detail is not None
-        assert detail.exception == "Sabre\\DAV\\Exception\\Locked"
-        assert detail.message == "File is currently write locked"
-        assert detail.describe() == (
-            "Sabre\\DAV\\Exception\\Locked: File is currently write locked"
-        )
-
-    def test_message_only_document(self):
-        body = (
-            '<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
-            "<s:message>Quota exceeded</s:message></d:error>"
-        )
-        detail = parse_dav_error(body)
-        assert detail is not None
-        assert detail.exception is None
-        assert detail.describe() == "Quota exceeded"
-
-    def test_accepts_str_as_well_as_bytes(self):
-        detail = parse_dav_error(_dav_body("Sabre\\DAV\\Exception", "boom").decode())
-        assert detail is not None
-        assert detail.message == "boom"
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            None,
-            b"",
-            b"not xml at all",
-            b'{"ocs": {"meta": {"statuscode": 404}}}',
-            # A multistatus is a valid DAV document but not an error document;
-            # interpreting it here would invent failures out of PROPFIND replies.
-            b'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>',
-            # Well-formed error envelope carrying neither element.
-            b'<d:error xmlns:d="DAV:"></d:error>',
-        ],
+def _error(status: int, content: bytes = b"") -> httpx.HTTPStatusError:
+    """Build the HTTPStatusError raise_for_status() would produce."""
+    request = httpx.Request(
+        "PUT", "https://nc.example.com/remote.php/dav/files/u/a.txt"
     )
-    def test_non_dav_error_bodies_yield_none(self, body):
-        assert parse_dav_error(body) is None
-
-    def test_oversized_body_is_not_parsed(self):
-        """A body too large to be an error document is refused, not parsed —
-        a failed request must not become unbounded work."""
-        padding = b"<!--" + b"x" * (MAX_ERROR_BODY_BYTES + 1) + b"-->"
-        body = _dav_body("Sabre\\DAV\\Exception\\Locked", "locked") + padding
-        assert parse_dav_error(body) is None
-
-    def test_non_bytes_non_str_input_yields_none(self):
-        """Mocked responses hand back sentinels, not bodies; don't parse them."""
-        assert parse_dav_error(object()) is None  # type: ignore[arg-type]
+    response = httpx.Response(status, content=content, request=request)
+    return httpx.HTTPStatusError(f"{status} error", request=request, response=response)
 
 
-class TestStatusMapping:
-    @pytest.mark.parametrize(
-        ("status_code", "expected_type", "hint_fragment"),
-        [
-            (412, DavPreconditionFailed, "If-Match ETag no longer matches"),
-            (423, DavLocked, "locked by another client"),
-            (507, DavInsufficientStorage, "quota is exhausted"),
-        ],
+@pytest.mark.parametrize(
+    ("status", "expected_type"),
+    [
+        (412, DavPreconditionFailed),
+        (423, DavLocked),
+        (507, DavInsufficientStorage),
+    ],
+)
+def test_branchable_statuses_get_their_own_type(status, expected_type):
+    """412/423/507 are the statuses callers branch on, so each gets a type."""
+    enriched = enrich_dav_error(_error(status))
+
+    assert isinstance(enriched, expected_type)
+    # Still catchable by every handler that predates this module.
+    assert isinstance(enriched, httpx.HTTPStatusError)
+    assert enriched.response.status_code == status
+
+
+def test_server_explanation_is_attached_to_the_message():
+    """The s:exception/s:message pair reaches both the message and the attrs."""
+    body = _dav_body("Sabre\\DAV\\Exception\\Locked", "File is currently write locked")
+
+    enriched = enrich_dav_error(_error(423, body))
+
+    assert enriched.dav_exception == "Sabre\\DAV\\Exception\\Locked"
+    assert enriched.dav_message == "File is currently write locked"
+    assert "File is currently write locked" in str(enriched)
+
+
+def test_dav_detail_is_surfaced_for_unmapped_statuses_too():
+    """A 500 has no dedicated type but still carries its explanation.
+
+    This is the empty-<d:where> case: the server said ``TypeError`` in a body
+    that used to be discarded, leaving only "HTTP 500" to debug from.
+    """
+    body = _dav_body("TypeError", "A type error occurred.")
+
+    enriched = enrich_dav_error(_error(500, body))
+
+    assert type(enriched) is DavError
+    assert enriched.dav_exception == "TypeError"
+    assert "A type error occurred." in str(enriched)
+
+
+def test_non_dav_error_is_returned_untouched():
+    """An OCS/JSON failure is not a DAV error and must pass through unchanged."""
+    original = _error(400, b'{"ocs":{"meta":{"statuscode":400}}}')
+
+    assert enrich_dav_error(original) is original
+
+
+def test_malformed_xml_does_not_raise():
+    """A truncated or non-XML body must not turn a failure into a crash."""
+    original = _error(403, b"<d:error><s:exception>unclosed")
+
+    assert enrich_dav_error(original) is original
+
+
+def test_oversized_body_is_not_parsed():
+    """Bodies too large to be a DAV error document are skipped, not parsed."""
+    oversized = b"<d:error>" + b"x" * (MAX_ERROR_BODY_BYTES + 1)
+
+    assert parse_dav_error_body(_error(500, oversized).response) == (None, None)
+
+
+def test_non_bytes_body_yields_no_detail(mocker):
+    """A response whose body is not bytes must degrade, never raise.
+
+    Regression: the first cut called ``len(body)`` unguarded, so a mocked
+    response (``.content`` returning a ``Mock``) raised ``TypeError`` *from
+    inside the error handler*, replacing the caller's real failure with a
+    nonsense one. Anything raised here masks the error being reported.
+    """
+    response = mocker.Mock()
+    response.content = mocker.Mock()
+
+    assert parse_dav_error_body(response) == (None, None)
+
+
+def test_unread_streaming_response_yields_no_detail():
+    """A streaming response raises before the body is read -- degrade quietly.
+
+    ``_stream_request`` calls ``raise_for_status()`` inside the stream context,
+    so the body is not available. Reading it there is not worth a second
+    network-facing read on an already-failing download.
+    """
+    request = httpx.Request(
+        "GET", "https://nc.example.com/remote.php/dav/files/u/a.bin"
     )
-    def test_mapped_dav_statuses_get_their_own_type(
-        self, status_code, expected_type, hint_fragment
-    ):
-        error = dav_error_from_status_error(
-            _status_error(status_code, _dav_body("Sabre\\DAV\\Exception", "failure"))
-        )
-        assert isinstance(error, expected_type)
-        assert hint_fragment in str(error)
-        # Every DAV error stays catchable by pre-existing handlers.
-        assert isinstance(error, HTTPStatusError)
+    response = httpx.Response(
+        507, request=request, stream=httpx.ByteStream(_dav_body("Quota", "full"))
+    )
 
-    @pytest.mark.parametrize("status_code", [412, 423, 507])
-    def test_non_dav_json_status_is_left_as_http_status_error(self, status_code):
-        original = _status_error(status_code, b'{"error":"REST failure"}')
-        assert dav_error_from_status_error(original) is None
-        assert type(original) is HTTPStatusError
+    # Precondition: this is genuinely an unread stream.
+    with pytest.raises(httpx.ResponseNotRead):
+        _ = response.content
 
-    def test_message_carries_method_path_and_server_detail(self):
-        error = dav_error_from_status_error(
-            _status_error(
-                507,
-                _dav_body(
-                    "Sabre\\DAV\\Exception\\InsufficientStorage", "Quota exceeded"
-                ),
-            )
-        )
-        assert error is not None
-        text = str(error)
-        assert "PUT https://cloud.example.org/remote.php/dav/files/a/x.txt" in text
-        assert "Sabre\\DAV\\Exception\\InsufficientStorage: Quota exceeded" in text
-        assert error.detail is not None
-        assert error.detail.message == "Quota exceeded"
-
-    def test_unmapped_status_with_dav_body_is_a_generic_dav_error(self):
-        error = dav_error_from_status_error(
-            _status_error(
-                403, _dav_body("Sabre\\DAV\\Exception\\Forbidden", "Not permitted")
-            )
-        )
-        assert type(error) is DavError
-        assert "Not permitted" in str(error)
-
-    def test_unmapped_status_without_dav_body_is_left_alone(self):
-        """OCS returns JSON and has its own envelope — don't claim its errors."""
-        assert (
-            dav_error_from_status_error(
-                _status_error(404, b'{"ocs": {"meta": {"statuscode": 404}}}')
-            )
-            is None
-        )
+    assert parse_dav_error_body(response) == (None, None)
 
 
-class _ProbeClient(BaseNextcloudClient):
-    """Minimal concrete client so ``_make_request`` can be exercised."""
+class _Client(BaseNextcloudClient):
+    """Minimal concrete client -- BaseNextcloudClient is abstract."""
 
-    app_name = "probe"
+    app_name = "test"
 
 
-class TestMakeRequestPromotion:
-    async def test_make_request_raises_typed_dav_error(self, mocker):
-        request = Request("PUT", "https://cloud.example.org/remote.php/dav/f/x.txt")
-        response = Response(
-            423,
-            content=_dav_body("Sabre\\DAV\\Exception\\Locked", "write locked"),
-            request=request,
-        )
-        http_client = mocker.AsyncMock(spec=AsyncClient)
-        http_client.request = mocker.AsyncMock(return_value=response)
+async def test_make_request_raises_the_enriched_type(mocker):
+    """The wiring, not the building block: a DAV failure through _make_request.
 
-        client = _ProbeClient(http_client, "alice")
+    The unit tests above prove the parser works in isolation. This is the line
+    that decides whether callers ever see it.
+    """
+    request = httpx.Request("PUT", "https://nc.example.com/remote.php/dav/files/u/a")
+    response = httpx.Response(
+        423,
+        content=_dav_body("Sabre\\DAV\\Exception\\Locked", "File is write locked"),
+        request=request,
+    )
+    http_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    http_client.request = mocker.AsyncMock(return_value=response)
 
-        with pytest.raises(DavLocked) as excinfo:
-            await client._make_request("PUT", "/remote.php/dav/f/x.txt")
+    client = _Client(http_client, "alice")
 
-        assert "write locked" in str(excinfo.value)
-        assert excinfo.value.response.status_code == 423
+    with pytest.raises(DavLocked) as exc_info:
+        await client._make_request("PUT", "/remote.php/dav/files/u/a")
 
-    async def test_non_dav_failure_raises_plain_http_status_error(self, mocker):
-        request = Request("GET", "https://cloud.example.org/ocs/v2.php/cloud/user")
-        response = Response(500, content=b"upstream exploded", request=request)
-        http_client = mocker.AsyncMock(spec=AsyncClient)
-        http_client.request = mocker.AsyncMock(return_value=response)
+    assert exc_info.value.dav_message == "File is write locked"
 
-        client = _ProbeClient(http_client, "alice")
 
-        with pytest.raises(HTTPStatusError) as excinfo:
-            await client._make_request("GET", "/ocs/v2.php/cloud/user")
+async def test_make_request_leaves_a_non_dav_failure_unwrapped(mocker):
+    """A non-DAV failure keeps its identity, and does not become its own cause.
 
-        assert not isinstance(excinfo.value, DavError)
+    ``enrich_dav_error`` returns the same object here, so re-raising it with
+    ``from`` would set ``__cause__`` to the exception itself.
+    """
+    request = httpx.Request("GET", "https://nc.example.com/ocs/v2.php/x")
+    response = httpx.Response(
+        400, content=b'{"ocs":{"meta":{"statuscode":400}}}', request=request
+    )
+    http_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    http_client.request = mocker.AsyncMock(return_value=response)
+
+    client = _Client(http_client, "alice")
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client._make_request("GET", "/ocs/v2.php/x")
+
+    assert type(exc_info.value) is httpx.HTTPStatusError
+    assert exc_info.value.__cause__ is not exc_info.value
+
+
+async def test_stream_request_raises_the_enriched_type(mocker):
+    """The streaming path is wired too, not just the buffered one.
+
+    ``_stream_request`` raises inside the stream context, so the body is unread
+    and no detail can be attached -- but the status-based type still applies. A
+    quota failure on a download should arrive as ``DavInsufficientStorage``, not
+    a bare ``HTTPStatusError``.
+    """
+    request = httpx.Request("GET", "https://nc.example.com/remote.php/dav/files/u/a")
+    response = httpx.Response(507, request=request, stream=httpx.ByteStream(b""))
+
+    http_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    http_client.stream = mocker.MagicMock()
+    http_client.stream.return_value.__aenter__ = mocker.AsyncMock(return_value=response)
+    http_client.stream.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
+
+    client = _Client(http_client, "alice")
+
+    with pytest.raises(DavInsufficientStorage):
+        async with client._stream_request("GET", "/remote.php/dav/files/u/a"):
+            pass  # pragma: no cover - the enter itself raises

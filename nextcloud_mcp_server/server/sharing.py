@@ -16,9 +16,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.sharing import PublicLinkRecipientError
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models import PublicDownloadLinkResponse
 from nextcloud_mcp_server.observability.metrics import instrument_tool
@@ -150,12 +152,19 @@ def configure_sharing_tools(mcp: FastMCP):
                 recipient, or a recipient-typed share omits share_with.
         """
         client = await get_client(ctx)
-        share_data = await client.sharing.create_share(
-            path=path,
-            share_with=share_with,
-            share_type=share_type,
-            permissions=permissions,
-        )
+        try:
+            share_data = await client.sharing.create_share(
+                path=path,
+                share_with=share_with,
+                share_type=share_type,
+                permissions=permissions,
+            )
+        except PublicLinkRecipientError as e:
+            raise ToolError(
+                f"{e} For a public download link, use nc_share_create_public_link."
+            ) from e
+        except ValueError as e:
+            raise ToolError(str(e)) from e
         return json.dumps(share_data, indent=2)
 
     @mcp.tool(

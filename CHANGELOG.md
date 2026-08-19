@@ -5,6 +5,79 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.178.1 (2026-08-18)
+
+### Fix
+
+- **ci**: build the image from the checked-out tag, not the event commit
+
+## v0.178.0 (2026-08-18)
+
+### Feat
+
+- **vector**: meter chunks_ingested at indexing
+
+## v0.177.2 (2026-08-18)
+
+### Fix
+
+- **providers**: retry only genuinely-transient Ollama transport errors
+- **providers**: log a failed Ollama batch once, not once per retry attempt
+- **providers**: log the batch shape on every Ollama embed failure
+- **providers**: give Ollama the transient retry every other provider has
+- **providers**: bound Ollama embed requests by characters, not item count
+- **vector**: clear the dead-letter marker only after the upsert succeeds
+- **vector**: dead-letter documents after repeated index failures
+
+## v0.177.1 (2026-08-18)
+
+### Fix
+
+- **collectives**: stop OCSError double-prefixing the status code
+- **client**: preserve mail's falsy-statuscode default, finish the extraction
+- **webdav**: escape caller values in SEARCH predicates
+- **providers**: bound Mistral embedding requests at 120s
+
+### Refactor
+
+- **client**: centralise OCS envelope parsing and name 997
+
+## v0.177.0 (2026-08-18)
+
+### BREAKING CHANGE
+
+- `create_share` / `nc_share_create` now reject a `shareType=3`
+(public link) call that also carries `shareWith`, and a recipient-typed call
+that omits it. Both combinations previously reached the server: the first
+silently produced an anonymous public link while reporting success, which is
+the defect being fixed. A caller relying on either now gets a `ValueError` /
+`ToolError` instead of a share. Recorded as breaking so it is discoverable by
+version rather than by surprise, even though the prior behaviour was wrong.
+
+### Feat
+
+- **client**: wire the streaming path into DAV error typing too
+- **client**: surface the DAV layer's own explanation on failure
+
+### Fix
+
+- **calendar**: give CalDAV writes ETag concurrency control
+- **client**: unblock the Sonar gate, keep the error message on one line
+- **client**: avoid a self-referential __cause__, and test the wiring
+- **sharing**: attach the public-link redirect only where it applies
+- **sharing**: stop the rejection pointing agents at a nonexistent tool
+- **sharing**: reject shareType/shareWith pairings that silently misfire
+
+### Refactor
+
+- **client**: drop the dead logger, type request, sharpen the docstring
+
+### Perf
+
+- **calendar**: close the last per-event ETag round trip
+- **calendar**: batch the todo-listing ETag fetch
+- **calendar**: ask the date-range REPORT for getetag
+
 ## v0.176.5 (2026-08-17)
 
 ### Fix

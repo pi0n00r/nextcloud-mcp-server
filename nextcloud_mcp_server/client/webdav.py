@@ -314,6 +314,16 @@ def _validate_destination_precondition(
         )
 
 
+def like_predicate(prop_element: str, value: str) -> str:
+    """Build a WebDAV SEARCH ``like`` predicate with an escaped literal."""
+    return (
+        "<d:like>"
+        f"<d:prop><{prop_element}/></d:prop>"
+        f"<d:literal>{xml_escape(value)}</d:literal>"
+        "</d:like>"
+    )
+
+
 def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
     """Return the atomic precondition for a simple destination PUT."""
     if if_match is None:
@@ -325,9 +335,17 @@ def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
 
 def _dav_detail_text(error: BaseException) -> Optional[str]:
     """Return the parsed DAV explanation carried by ``error``, if it has one."""
-    if not isinstance(error, DavError) or error.detail is None:
+    if not isinstance(error, DavError):
         return None
-    return error.detail.describe() or None
+    detail = ": ".join(
+        part
+        for part in (
+            getattr(error, "dav_exception", None),
+            getattr(error, "dav_message", None),
+        )
+        if part
+    )
+    return detail or None
 
 
 def _with_server_detail(
@@ -1875,14 +1893,7 @@ class WebDAVClient(BaseNextcloudClient):
             # Find files starting with "report"
             results = await find_by_name("report%")
         """
-        where_conditions = f"""
-            <d:like>
-                <d:prop>
-                    <d:displayname/>
-                </d:prop>
-                <d:literal>{xml_escape(pattern)}</d:literal>
-            </d:like>
-        """
+        where_conditions = like_predicate("d:displayname", pattern)
 
         return await self.search_files(
             scope=scope, where_conditions=where_conditions, limit=limit
@@ -1931,15 +1942,7 @@ class WebDAVClient(BaseNextcloudClient):
     @staticmethod
     def _type_search_args(mime_type: str) -> Tuple[str, List[str]]:
         """Build the where clause and properties for a MIME-type SEARCH."""
-        escaped_mime_type = xml_escape(mime_type)
-        where_conditions = f"""
-            <d:like>
-                <d:prop>
-                    <d:getcontenttype/>
-                </d:prop>
-                <d:literal>{escaped_mime_type}</d:literal>
-            </d:like>
-        """
+        where_conditions = like_predicate("d:getcontenttype", mime_type)
         properties = [
             "displayname",
             "getcontentlength",
@@ -2024,14 +2027,7 @@ class WebDAVClient(BaseNextcloudClient):
             results = await find_by_tag("vector-index", scope="Documents")
         """
         # Use LIKE for tag matching since tags can be comma-separated
-        where_conditions = f"""
-            <d:like>
-                <d:prop>
-                    <oc:tags/>
-                </d:prop>
-                <d:literal>%{xml_escape(tag_name)}%</d:literal>
-            </d:like>
-        """
+        where_conditions = like_predicate("oc:tags", f"%{tag_name}%")
 
         # Request tag property along with standard properties
         properties = [

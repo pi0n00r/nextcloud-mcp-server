@@ -10,6 +10,7 @@ from httpx import HTTPStatusError, Request, Response
 from nextcloud_mcp_server.client.webdav import (
     WebDAVClient,
     _normalize_etag,
+    like_predicate,
 )
 
 
@@ -1103,8 +1104,25 @@ async def test_get_note_attachment_raises_on_truncated_body(mocker):
 
 
 @pytest.mark.unit
-async def test_move_resource_encodes_destination_header(mocker):
-    """The MOVE Destination header must be percent-encoded too (card 309)."""
+@pytest.mark.parametrize("method", ["move_resource", "copy_resource"])
+@pytest.mark.parametrize(
+    ("destination", "expected_suffix"),
+    [
+        # '#' would otherwise be read as a URL fragment and truncate (card 309).
+        ("b/new #1.pdf", "/b/new%20%231.pdf"),
+        # Non-ASCII would otherwise blow up on the ASCII-only header with
+        # "'ascii' codec can't encode characters" (discussion #1337).
+        (
+            "b/30-39 \ud55c\uad6d\ub300\ud559\uad50/x.txt",
+            "/b/30-39%20%ED%95%9C%EA%B5%AD%EB%8C%80%ED%95%99%EA%B5%90/x.txt",
+        ),
+    ],
+)
+async def test_move_copy_encode_destination_header(
+    mocker, method, destination, expected_suffix
+):
+    """MOVE/COPY carry the target in a header, so it needs the same encoding
+    the request URL gets for free from httpx."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
     client._principal_discovered = True
@@ -1115,36 +1133,14 @@ async def test_move_resource_encodes_destination_header(mocker):
     mock_response.raise_for_status = mocker.Mock()
     mock_http_client.request = AsyncMock(return_value=mock_response)
 
-    await client.move_resource("a/old.pdf", "b/new #1.pdf")
+    await getattr(client, method)("a/old.pdf", destination)
 
     call = mock_http_client.request.call_args
     # Source is the request path; destination is the header.
     assert call[0][1] == "/remote.php/dav/files/testuser/a/old.pdf"
-    destination = call.kwargs["headers"]["Destination"]
-    assert "%23" in destination
-    assert "#" not in destination
-
-
-@pytest.mark.unit
-async def test_copy_resource_encodes_destination_header(mocker):
-    """The COPY Destination header must be percent-encoded too (card 309)."""
-    mock_http_client = AsyncMock()
-    client = WebDAVClient(mock_http_client, "testuser")
-    client._principal_discovered = True
-
-    mock_response = AsyncMock()
-    mock_response.status_code = 201
-    mock_response.headers = {"etag": '"new-etag"'}
-    mock_response.raise_for_status = mocker.Mock()
-    mock_http_client.request = AsyncMock(return_value=mock_response)
-
-    await client.copy_resource("a/old.pdf", "b/new #1.pdf")
-
-    call = mock_http_client.request.call_args
-    assert call[0][1] == "/remote.php/dav/files/testuser/a/old.pdf"
-    destination = call.kwargs["headers"]["Destination"]
-    assert "%23" in destination
-    assert "#" not in destination
+    header = call.kwargs["headers"]["Destination"]
+    header.encode("ascii")  # headers are ASCII-only; unencoded paths raise here
+    assert header.endswith(expected_suffix)
 
 
 @pytest.mark.unit
@@ -1735,3 +1731,35 @@ async def test_list_directory_survives_a_non_numeric_fileid(mocker):
 
     by_name = {item["name"]: item for item in items}
     assert by_name["notes.txt"]["file_id"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "escaped"),
+    [
+        ("Costs & Revenue%", "Costs &amp; Revenue%"),
+        ("<draft>%", "&lt;draft&gt;%"),
+        ("a > b", "a &gt; b"),
+    ],
+)
+def test_like_predicate_escapes_the_literal(value, escaped):
+    """Every caller-supplied literal is escaped by construction."""
+    predicate = like_predicate("d:displayname", value)
+
+    # Well-formed once namespaced (raised ParseError when unescaped).
+    ET.fromstring(f"<root xmlns:d='DAV:'>{predicate}</root>")
+    assert escaped in predicate
+    assert value not in predicate
+
+
+@pytest.mark.unit
+def test_like_predicate_keeps_wildcards_intact():
+    """``%`` is SEARCH syntax, not XML -- escaping must leave it alone."""
+    predicate = like_predicate("oc:tags", "%vector-index%")
+
+    root = ET.fromstring(
+        f"<root xmlns:d='DAV:' xmlns:oc='http://owncloud.org/ns'>{predicate}</root>"
+    )
+    literal = root.find(".//{DAV:}literal")
+    assert literal is not None
+    assert literal.text == "%vector-index%"

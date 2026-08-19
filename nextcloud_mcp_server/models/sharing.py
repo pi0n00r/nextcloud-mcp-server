@@ -46,9 +46,11 @@ class ShareType(IntEnum):
     CIRCLE = 7
     #: Talk conversation; ``shareWith`` is the conversation token.
     TALK = 10
+    TALK_CONVERSATION = 10
     #: Deck card attachment; ``shareWith`` is the card id. Fired by the Deck
     #: UI when a file is attached to a card.
     DECK = 12
+    DECK_CARD = 12
 
 
 #: Share types whose ``shareWith`` names a recipient and is therefore required.

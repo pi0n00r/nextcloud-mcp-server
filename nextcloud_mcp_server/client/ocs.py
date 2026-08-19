@@ -1,28 +1,29 @@
-"""OCS envelope handling for Nextcloud's ``/ocs/v2.php`` API.
+"""Shared handling for Nextcloud's OCS response envelope.
 
-Every OCS response wraps its payload in a status envelope::
+Every OCS endpoint wraps its payload the same way::
 
     {"ocs": {"meta": {"status": "ok", "statuscode": 200, "message": "OK"},
              "data": {...}}}
 
 Two properties of that envelope bite callers who only check the HTTP status:
 
-* **The v1 trap.** ``/ocs/v1.php`` answers *every* request with HTTP 200 — the
-  real outcome lives in ``meta.statuscode``, where success is ``100``.
-  ``/ocs/v2.php`` mirrors the OCS code onto the HTTP status and uses ``200``
-  for success. This module accepts both success codes so a helper written
-  against v2 still behaves correctly if it is ever pointed at a v1 route, and
-  so the envelope is checked either way. New call sites should use v2 paths.
+* **The v1 trap.** ``/ocs/v1.php`` answers *every* request with HTTP 200 and
+  puts the real outcome in ``meta.statuscode``, where success is ``100``.
+  ``/ocs/v2.php`` mirrors the OCS code onto the HTTP status and uses ``200``.
+  Both codes therefore mean success, depending only on which route was called.
 
-* **997 is not a server error.** Nextcloud returns ``997`` when the request was
-  not authenticated *or* when it omitted the mandatory
-  ``OCS-APIRequest: true`` header, which its CSRF check requires on every OCS
-  call. Reporting that as a generic failure sends the reader hunting for a
-  server-side fault that is not there, so it gets its own exception type and a
-  message that names both causes.
+* **997 is not a server error.** Nextcloud returns it when the request was
+  unauthenticated *or* when it omitted the mandatory ``OCS-APIRequest: true``
+  header that its CSRF check requires on every OCS call. Reported as a generic
+  failure it sends the reader hunting for a server fault that is not there, so
+  it gets named explicitly here.
 
-:class:`OCSError` derives from ``RuntimeError``, matching what the OCS clients
-raised before this module existed.
+This module deliberately does **not** raise. Three clients parse this envelope
+and each raises a different type that its callers already catch --
+``OCSError`` (collectives, caught in a dozen places in ``server/collectives``),
+``HTTPStatusError`` (mail), and ``RuntimeError`` (sharing). Centralising the
+*parsing* and the *wording* is safe; centralising the raising would change
+three caller contracts at once.
 """
 
 # AI-NOTICE:Schema-Version=0.1
@@ -36,124 +37,145 @@ raised before this module existed.
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-from typing import Any, Optional
+from typing import Any, NamedTuple
 
-#: Header Nextcloud's CSRF check requires on every OCS request. Omitting it
-#: yields ``meta.statuscode: 997``, not a 4xx, which is why it is easy to
-#: misdiagnose.
+#: Headers Nextcloud's CSRF check requires on every OCS request. Omitting
+#: ``OCS-APIRequest`` yields ``meta.statuscode: 997``, not a 4xx, which is why
+#: it is easy to misdiagnose.
+#:
+#: Used by the three clients this module serves (sharing, collectives, mail).
+#: The same literal still appears inline elsewhere -- deck, groups, tables,
+#: users, and the DAV calls in webdav that send it for unrelated reasons --
+#: which is a wider sweep than this module's scope.
+OCS_REQUEST_HEADERS: dict[str, str] = {
+    "OCS-APIRequest": "true",
+    "Accept": "application/json",
+}
 OCS_API_REQUEST_HEADER = {"OCS-APIRequest": "true"}
 
 #: Success codes: ``100`` from OCS v1, ``200`` from v2.
 OCS_SUCCESS_STATUS_CODES = frozenset({100, 200})
 
-#: "Unauthorised" in OCS's vocabulary — bad credentials *or* a missing
+#: "Unauthorised" in OCS's vocabulary -- bad credentials *or* a missing
 #: ``OCS-APIRequest`` header.
 OCS_STATUS_UNAUTHENTICATED = 997
 
 _UNAUTHENTICATED_HINT = (
-    "unauthenticated — the credentials were rejected, or the request omitted "
-    "the required 'OCS-APIRequest: true' header that Nextcloud's CSRF check "
-    "enforces on OCS routes"
+    "unauthenticated — either the credentials were rejected, or the request "
+    "omitted the 'OCS-APIRequest: true' header that Nextcloud's CSRF check "
+    "requires on OCS routes"
 )
 
 
+class OCSEnvelope(NamedTuple):
+    """The parts of an OCS envelope callers act on."""
+
+    status_code: int
+    message: str
+    data: Any
+    has_data: bool
+
+    @property
+    def is_success(self) -> bool:
+        """True when the OCS code is a documented success (100 or 200).
+
+        This is stricter than the ``< 400`` test the collectives and mail
+        clients apply. They keep their own comparison for now rather than being
+        silently retightened by a refactor -- converging on one rule needs
+        evidence about which sub-400 codes real endpoints return.
+        """
+        return self.status_code in OCS_SUCCESS_STATUS_CODES
+
+
 class OCSError(RuntimeError):
-    """An OCS response whose envelope reported a failure.
+    """OCS envelope failure retained for existing fork callers."""
 
-    Attributes:
-        status_code: The ``ocs.meta.statuscode`` value, when present.
-        ocs_message: The server's ``ocs.meta.message``, when present.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: Optional[int] = None,
-        ocs_message: Optional[str] = None,
-    ):
+    def __init__(self, message: str, *, status_code: int = 500) -> None:
         super().__init__(message)
         self.status_code = status_code
-        self.ocs_message = ocs_message
 
 
 class OCSAuthenticationError(OCSError):
-    """``statuscode: 997`` — rejected credentials or a missing OCS header."""
+    """OCS status 997: bad credentials or missing CSRF header."""
 
 
-def _meta(payload: Any) -> dict:
-    """Return ``payload["ocs"]["meta"]`` defensively.
+def parse_ocs_envelope(payload: Any) -> OCSEnvelope:
+    """Pull ``(statuscode, message, data)`` out of an OCS response body.
 
-    ``x or {}`` rather than ``.get(k, {})`` so a present-but-null ``ocs`` or
-    ``meta`` (which Nextcloud does emit) coerces to an empty dict instead of
-    raising ``AttributeError`` on ``None.get``.
+    Tolerates every malformed shape seen in practice -- a non-dict body, a
+    missing or non-dict ``ocs`` / ``meta``, a non-numeric statuscode -- by
+    reporting ``500`` with a description, rather than raising a ``KeyError`` or
+    ``TypeError`` that tells the caller nothing about what the server said.
     """
     if not isinstance(payload, dict):
-        return {}
-    ocs = payload.get("ocs") or {}
+        return OCSEnvelope(
+            500, f"Response is not a JSON object: {type(payload).__name__}", None, False
+        )
+
+    ocs = payload.get("ocs")
     if not isinstance(ocs, dict):
-        return {}
-    meta = ocs.get("meta") or {}
-    return meta if isinstance(meta, dict) else {}
+        return OCSEnvelope(500, "Response is not an OCS envelope", None, False)
+
+    meta = ocs.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+
+    # ``or 200`` covers falsy-but-present values (``0``, ``""``, ``None``) the
+    # same way the mail client did before this module existed. Without it an
+    # empty statuscode parses to 500, which crosses mail's ``>= 400`` gate and
+    # turns a response that used to succeed into a raised error. A genuinely
+    # non-numeric value still falls through to 500 -- an unreadable status is
+    # not something to report as success.
+    raw_status = meta.get("statuscode") or 200
+    try:
+        status_code = int(raw_status)
+    except (TypeError, ValueError):
+        status_code = 500
+
+    # One fallback string for all three clients. They previously differed --
+    # sharing "Unknown error", collectives "OCS error", mail "Unknown OCS
+    # error" -- and consolidating is deliberate rather than incidental: this is
+    # the text shown only when the server sent no message at all, so a
+    # per-client variant conveys nothing a caller can act on. Called out
+    # explicitly because the statuscode default next to it was preserved
+    # exactly, and the difference in treatment should not look accidental.
+    message = meta.get("message") or "Unknown error"
+    return OCSEnvelope(status_code, str(message), ocs.get("data"), "data" in ocs)
+
+
+def describe_ocs_failure(status_code: int, message: str) -> str:
+    """Render an OCS failure, naming 997's two causes rather than guessing."""
+    if status_code == OCS_STATUS_UNAUTHENTICATED:
+        return f"OCS API error (code {status_code}): {_UNAUTHENTICATED_HINT}"
+    return f"OCS API error (code {status_code}): {message}"
 
 
 def raise_for_ocs_status(payload: Any, *, context: str = "OCS API") -> None:
-    """Raise if the OCS envelope in ``payload`` reports a failure.
+    """Raise the fork's typed error while using the shared upstream parser."""
+    ocs = payload.get("ocs") if isinstance(payload, dict) else None
+    meta = ocs.get("meta") if isinstance(ocs, dict) else None
+    status_code = meta.get("statuscode") if isinstance(meta, dict) else None
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        raise OCSError(f"{context}: malformed OCS envelope")
 
-    The envelope fails closed: missing, malformed, and non-integer
-    ``meta.statuscode`` values are protocol errors, never evidence of success.
-
-    Args:
-        payload: Decoded JSON body of an OCS response.
-        context: Operation name used in the raised message.
-
-    Raises:
-        OCSAuthenticationError: On ``statuscode: 997``.
-        OCSError: On any other non-success ``statuscode``.
-    """
-    meta = _meta(payload)
-    status_code = meta.get("statuscode")
-    if type(status_code) is not int:
-        raise OCSError(
-            f"{context} error: malformed OCS envelope "
-            "(ocs.meta.statuscode must be an integer)",
-        )
-    if status_code in OCS_SUCCESS_STATUS_CODES:
+    envelope = parse_ocs_envelope(payload)
+    if envelope.is_success:
         return
-
-    ocs_message = meta.get("message")
-    detail = ocs_message if isinstance(ocs_message, str) else "Unknown error"
-
-    if status_code == OCS_STATUS_UNAUTHENTICATED:
-        raise OCSAuthenticationError(
-            f"{context} error (code {status_code}): {_UNAUTHENTICATED_HINT} "
-            f"[server said: {detail}]",
-            status_code=status_code,
-            ocs_message=ocs_message if isinstance(ocs_message, str) else None,
-        )
-
-    raise OCSError(
-        f"{context} error (code {status_code}): {detail}",
-        status_code=status_code,
-        ocs_message=ocs_message if isinstance(ocs_message, str) else None,
+    message = (
+        f"{context}: {describe_ocs_failure(envelope.status_code, envelope.message)}"
     )
+    error_type = (
+        OCSAuthenticationError
+        if envelope.status_code == OCS_STATUS_UNAUTHENTICATED
+        else OCSError
+    )
+    raise error_type(message, status_code=envelope.status_code)
 
 
 def ocs_data(payload: Any, *, context: str = "OCS API") -> Any:
-    """Validate the envelope and return ``payload["ocs"]["data"]``.
-
-    Args:
-        payload: Decoded JSON body of an OCS response.
-        context: Operation name used in any raised message.
-
-    Raises:
-        OCSAuthenticationError: On ``statuscode: 997``.
-        OCSError: On any other non-success ``statuscode``, or when the response
-            carries no ``ocs.data`` key at all.
-    """
+    """Validate an OCS response and return its data payload."""
     raise_for_ocs_status(payload, context=context)
-
-    ocs = payload.get("ocs") if isinstance(payload, dict) else None
-    if not isinstance(ocs, dict) or "data" not in ocs:
+    envelope = parse_ocs_envelope(payload)
+    if not envelope.has_data:
         raise OCSError(f"{context}: response carried no ocs.data payload")
-    return ocs["data"]
+    return envelope.data

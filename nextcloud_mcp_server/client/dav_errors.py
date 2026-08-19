@@ -1,7 +1,6 @@
-"""Typed WebDAV/CalDAV/CardDAV error surfacing.
+"""Surface the explanation Nextcloud's DAV layer already sends on a failure.
 
-Nextcloud's DAV layer (Sabre/DAV) answers a failed request with an XML body
-naming the concrete failure::
+Sabre/DAV answers a failed request with a document naming the concrete cause::
 
     <?xml version="1.0" encoding="utf-8"?>
     <d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
@@ -9,12 +8,14 @@ naming the concrete failure::
       <s:message>File is currently write locked</s:message>
     </d:error>
 
-The HTTP status alone under-specifies the cause: a bare "412 Precondition
-Failed" says nothing about *which* precondition failed, and a 403 can mean
-anything from a share permission to a blocked filename. Discarding that body
-is the difference between an actionable error and a shrug, so this module
-lifts the ``s:exception``/``s:message`` pair into the raised exception and
-maps the three statuses that need distinct handling onto their own types:
+The status alone under-specifies the cause: a bare ``412`` says nothing about
+*which* precondition failed, and a ``403`` can be a share permission, a blocked
+filename, or a quota rule. Discarding that body is the difference between an
+actionable error and a shrug -- an unfiltered WebDAV SEARCH returning ``500``
+took far longer to diagnose than it should have, because the server was saying
+``TypeError`` in a body nobody read.
+
+Three statuses get their own type because callers branch on them:
 
 ===  ==============================  =======================================
 412  :class:`DavPreconditionFailed`  ``If-Match`` ETag no longer current
@@ -22,9 +23,14 @@ maps the three statuses that need distinct handling onto their own types:
 507  :class:`DavInsufficientStorage` quota exhausted
 ===  ==============================  =======================================
 
-Every type derives from :class:`httpx.HTTPStatusError`, so existing
-``except HTTPStatusError`` handlers keep working untouched; callers that want
-to branch on the failure mode catch the specific subclass instead.
+Everything here derives from :class:`httpx.HTTPStatusError`, so handlers that
+predate this module keep catching these unchanged.
+
+Both of ``BaseNextcloudClient``'s request paths are wired to this: the buffered
+``_make_request`` and the streaming ``_stream_request``. The streaming one
+raises before its body is read, so it gets the status-based type without the
+server's wording -- a 507 download is still a
+:class:`DavInsufficientStorage`.
 """
 
 # AI-NOTICE:Schema-Version=0.1
@@ -39,208 +45,158 @@ to branch on the failure mode catch the specific subclass instead.
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from typing import Optional, Type, Union
 
-from httpx import HTTPStatusError, Response, ResponseNotRead
+from httpx import HTTPStatusError, Request, Response, ResponseNotRead
 
-#: Namespaces carried by a Sabre/DAV error document.
-DAV_NAMESPACE = "DAV:"
-SABREDAV_NAMESPACE = "http://sabredav.org/ns"
+# An XML namespace URI, not an address anything is fetched from. Namespaces are
+# matched as exact strings, so "upgrading" this to https would stop every Sabre
+# error document from being recognised. The same literal appears inline in
+# webdav.py's PROPFIND bodies.
+SABREDAV_NAMESPACE = "http://sabredav.org/ns"  # NOSONAR(S5332)
 
-#: Upper bound on the body we will hand to the XML parser. DAV error documents
-#: are a few hundred bytes; anything larger is not one, and parsing it would
-#: turn a failed request into an unbounded amount of work.
+# DAV error documents run to a few hundred bytes. Anything larger is not one,
+# and handing it to the XML parser would turn a failed request into an
+# unbounded amount of work on a path that is already failing.
 MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
-@dataclass(frozen=True)
-class DavErrorDetail:
-    """The ``s:exception``/``s:message`` pair from a DAV error document."""
-
-    exception: Optional[str] = None
-    message: Optional[str] = None
-
-    def describe(self) -> str:
-        """Render as ``"<exception>: <message>"``, omitting missing halves."""
-        if self.exception and self.message:
-            return f"{self.exception}: {self.message}"
-        return self.exception or self.message or ""
-
-
 class DavError(HTTPStatusError):
-    """A DAV request that failed, with the server's own explanation attached.
-
-    Subclasses :class:`httpx.HTTPStatusError` so it stays catchable by the
-    handlers that predate this module.
-    """
+    """A failed DAV request, carrying the server's own explanation."""
 
     def __init__(
         self,
         message: str,
         *,
-        request,
-        response,
-        detail: Optional[DavErrorDetail] = None,
-    ):
+        request: Request,
+        response: Response,
+        dav_exception: str | None = None,
+        dav_message: str | None = None,
+    ) -> None:
         super().__init__(message, request=request, response=response)
-        self.detail = detail
+        self.dav_exception = dav_exception
+        self.dav_message = dav_message
 
 
 class DavPreconditionFailed(DavError):
-    """412 — an ``If-Match``/``If-None-Match`` precondition did not hold."""
+    """412 -- a precondition failed, typically a stale ``If-Match`` ETag."""
 
 
 class DavLocked(DavError):
-    """423 — the resource is write-locked by another client."""
+    """423 -- the resource is write-locked by another client."""
 
 
 class DavInsufficientStorage(DavError):
-    """507 — the write would exceed the account or folder quota."""
+    """507 -- the write would exceed the available quota."""
 
 
-#: Statuses that get their own type and a remediation hint. Kept as a literal
-#: table rather than a chain of ``if``s so adding a status is a one-line edit.
-_STATUS_MAP: dict[int, tuple[Type[DavError], str]] = {
-    412: (
-        DavPreconditionFailed,
-        "the If-Match ETag no longer matches the server copy (the resource "
-        "was modified by another writer) — re-read it and re-apply the change",
-    ),
-    423: (
-        DavLocked,
-        "the resource is locked by another client — retry once the lock is "
-        "released, or clear it from the Files app",
-    ),
-    507: (
-        DavInsufficientStorage,
-        "insufficient storage — the account or folder quota is exhausted",
-    ),
+_STATUS_TYPES: dict[int, type[DavError]] = {
+    412: DavPreconditionFailed,
+    423: DavLocked,
+    507: DavInsufficientStorage,
 }
 
 
-def _decode_body(body: Union[bytes, str, None]) -> Optional[str]:
-    """Return ``body`` as text if it is small enough to be an error document."""
-    if body is None:
-        return None
-    if isinstance(body, bytes):
-        if len(body) > MAX_ERROR_BODY_BYTES:
-            return None
-        return body.decode("utf-8", errors="replace")
-    if isinstance(body, str):
-        if len(body.encode("utf-8", errors="replace")) > MAX_ERROR_BODY_BYTES:
-            return None
-        return body
-    # Anything else (a mock, a stream) is not something we can parse.
-    return None
+def parse_dav_error_body(response: Response) -> tuple[str | None, str | None]:
+    """Extract ``(s:exception, s:message)`` from a DAV error response.
 
-
-def _local_name(tag: object) -> str:
-    """Strip the ``{namespace}`` prefix from an ElementTree tag."""
-    if not isinstance(tag, str):
-        return ""
-    return tag.rsplit("}", 1)[-1]
-
-
-def parse_dav_error(body: Union[bytes, str, None]) -> Optional[DavErrorDetail]:
-    """Extract the exception/message pair from a Sabre/DAV error document.
-
-    Args:
-        body: Raw response body. Non-XML, oversized, or non-DAV bodies are not
-            an error condition here — they simply yield ``None``.
-
-    Returns:
-        The parsed detail, or ``None`` if ``body`` is not a DAV error document
-        or carries neither element.
+    Returns ``(None, None)`` for anything that is not a readable Sabre error
+    document -- an unread streaming response, a JSON body, an oversized body,
+    or malformed XML. This runs while another error is already being raised, so
+    it must never raise one of its own.
     """
-    text = _decode_body(body)
-    if not text:
-        return None
-
     try:
-        root = ET.fromstring(text)
-    except ET.ParseError:
-        return None
-
-    # Sabre wraps every failure in <d:error>; a multistatus or an unrelated
-    # XML document is not ours to interpret.
-    if _local_name(root.tag) != "error":
-        return None
-
-    exception: Optional[str] = None
-    message: Optional[str] = None
-    for element in root.iter():
-        name = _local_name(element.tag)
-        text_value = (element.text or "").strip()
-        if not text_value:
-            continue
-        if name == "exception" and exception is None:
-            exception = text_value
-        elif name == "message" and message is None:
-            message = text_value
-
-    if exception is None and message is None:
-        return None
-    return DavErrorDetail(exception=exception, message=message)
-
-
-def _response_body(response: Response) -> Union[bytes, None]:
-    """Read an already-buffered response body, tolerating a streamed one."""
-    try:
-        return response.content
+        body = response.content
     except ResponseNotRead:
-        # A streaming response has not been read; there is nothing to parse and
-        # consuming it here would steal the caller's body.
-        return None
+        # Streaming responses raise before the body is read. Nothing to add.
+        return None, None
+
+    # Anything that is not a real byte body -- a test double, a stub response
+    # from a caller that fakes the httpx surface -- is not a DAV error document.
+    # This runs while another exception is already propagating, so degrading to
+    # "no detail" is the only acceptable outcome. Raising here would replace the
+    # caller's real failure with a TypeError from the error handler itself.
+    if not isinstance(body, (bytes, bytearray)):
+        return None, None
+
+    if not body or len(body) > MAX_ERROR_BODY_BYTES:
+        return None, None
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        # Not XML (an OCS JSON body, an HTML error page from a proxy) or
+        # truncated. Both are ordinary here, not worth a log line.
+        return None, None
+
+    exception = root.find(f".//{{{SABREDAV_NAMESPACE}}}exception")
+    message = root.find(f".//{{{SABREDAV_NAMESPACE}}}message")
+    return (
+        exception.text if exception is not None else None,
+        message.text if message is not None else None,
+    )
 
 
-def _request_summary(response: Response) -> str:
-    """Describe the failed request as ``"<METHOD> <path>"`` where possible."""
-    request = getattr(response, "request", None)
-    method = getattr(request, "method", None)
-    url = getattr(request, "url", None)
-    if not isinstance(method, str) or url is None:
-        return "DAV request"
-    return f"{method} {url}"
+def dav_error_from_response(
+    status: int, *, method: str, url: str, body: bytes | str = b""
+) -> HTTPStatusError:
+    """Build the typed error for a DAV failure observed outside httpx.
 
-
-def dav_error_from_status_error(exc: HTTPStatusError) -> Optional[DavError]:
-    """Build the typed DAV error for ``exc``, or ``None`` if it is not one.
-
-    A response qualifies only when its body is a valid Sabre/DAV error
-    document. Status alone is insufficient because JSON/REST endpoints also
-    use 412/423/507 for non-DAV failures. WebDAV callers that own the protocol
-    boundary may still classify a bare status there.
-
-    Args:
-        exc: The ``HTTPStatusError`` raised by ``raise_for_status``.
-
-    Returns:
-        A :class:`DavError` (or subclass) carrying the parsed detail, or
-        ``None`` when the response is not DAV-shaped.
+    The CalDAV client talks through the ``caldav`` library rather than
+    ``BaseNextcloudClient._make_request`` (an intentional exception -- it has
+    its own DAV session), and ``caldav``'s ``put`` *returns* a 412 rather than
+    raising. So that path has a status, a URL and a body but no
+    ``HTTPStatusError`` to enrich. This wraps them into the same vocabulary, so
+    a stale-ETag CalDAV write raises the same
+    :class:`DavPreconditionFailed` a WebDAV one would.
     """
-    response = exc.response
-    status_code = getattr(response, "status_code", None)
-    detail = parse_dav_error(_response_body(response))
-    if detail is None:
-        return None
+    if isinstance(body, str):
+        body = body.encode("utf-8", errors="replace")
 
-    error_type: Type[DavError] = DavError
-    hint = ""
-    if isinstance(status_code, int) and status_code in _STATUS_MAP:
-        error_type, hint = _STATUS_MAP[status_code]
+    request = Request(method, url)
+    response = Response(status, content=body, request=request)
+    return enrich_dav_error(
+        HTTPStatusError(
+            f"{status} error for {method} {url}", request=request, response=response
+        )
+    )
 
-    described = detail.describe()
-    parts = [f"{status_code} on {_request_summary(response)}"]
-    if hint:
-        parts.append(hint)
-    if described:
-        parts.append(described)
-    message = ": ".join(parts)
 
-    return error_type(
+def enrich_dav_error(exc: HTTPStatusError) -> HTTPStatusError:
+    """Return *exc* re-expressed with the server's explanation attached.
+
+    Returns the original exception untouched when there is nothing to add, so
+    non-DAV callers (OCS, the app APIs) are unaffected on every status *except*
+    412/423/507. Those three are typed off the status code alone, whatever the
+    body: the type says "the server answered 412", not "a Sabre document was
+    found". A 412 with no parseable body still becomes a
+    :class:`DavPreconditionFailed`, just without the ``Server said:`` suffix.
+    That is deliberate -- callers branch on those statuses, and a type that
+    appeared only when the body happened to parse would be useless to branch on.
+    Nothing downstream is affected either way, since every catch site tests
+    ``isinstance`` or ``.response.status_code`` rather than an exact type.
+    """
+    dav_exception, dav_message = parse_dav_error_body(exc.response)
+    status = exc.response.status_code
+    error_type = _STATUS_TYPES.get(status)
+
+    if dav_exception is None and dav_message is None and error_type is None:
+        return exc
+
+    detail = ": ".join(part for part in (dav_exception, dav_message) if part)
+    # Single line on purpose: callers log this with "%s" (webdav.py does), and a
+    # newline here would split one failure across two log records -- which line-
+    # oriented log shipping then indexes as two unrelated events.
+    message = f"{exc} -- Server said: {detail}" if detail else str(exc)
+
+    return (error_type or DavError)(
         message,
         request=exc.request,
-        response=response,
-        detail=detail,
+        response=exc.response,
+        dav_exception=dav_exception,
+        dav_message=dav_message,
     )
+
+
+def dav_error_from_status_error(exc: HTTPStatusError) -> HTTPStatusError:
+    """Backward-compatible name for the upstream-owned enrichment helper."""
+    return enrich_dav_error(exc)

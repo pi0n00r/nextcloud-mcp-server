@@ -25,6 +25,10 @@ from .ocs import ocs_data, raise_for_ocs_status
 logger = logging.getLogger(__name__)
 
 
+class PublicLinkRecipientError(ValueError):
+    """A public-link share was given a recipient it cannot address."""
+
+
 def validate_share_with(share_type: int, share_with: str | None) -> None:
     """Check the ``shareType``/``shareWith`` pairing before it reaches the wire.
 
@@ -46,12 +50,12 @@ def validate_share_with(share_type: int, share_with: str | None) -> None:
     has_recipient = bool(share_with and share_with.strip())
 
     if share_type == ShareType.PUBLIC_LINK and has_recipient:
-        raise ValueError(
+        raise PublicLinkRecipientError(
             "shareType 3 (public link) must not carry shareWith: a public link "
             "addresses nobody, and Nextcloud silently ignores the recipient — "
-            f"the file would be published to anyone with the URL, not shared "
+            f"the file would be published to anyone holding the URL, not shared "
             f"with {share_with!r}. Use shareType 0 (user) or 1 (group) to share "
-            "with a recipient, or create_public_link() for an anonymous link."
+            "with a recipient, or omit shareWith for an anonymous public link."
         )
 
     if share_type in SHARE_TYPES_REQUIRING_RECIPIENT and not has_recipient:

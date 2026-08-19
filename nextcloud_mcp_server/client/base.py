@@ -28,7 +28,7 @@ from nextcloud_mcp_server.observability.metrics import (
 )
 from nextcloud_mcp_server.observability.tracing import trace_nextcloud_api_call
 
-from .dav_errors import dav_error_from_status_error
+from .dav_errors import enrich_dav_error
 
 #: Marks a request whose body the caller intends to consume incrementally.
 #:
@@ -262,6 +262,9 @@ class BaseNextcloudClient(ABC):
                     record_nextcloud_api_retry(app=self.app_name, reason="429")
                     await anyio.sleep(5)
                     continue
+                enriched = enrich_dav_error(e)
+                if enriched is not e:
+                    raise enriched from e
                 raise
             finally:
                 # A retried 429 is metered as its own attempt, matching how
@@ -345,9 +348,10 @@ class BaseNextcloudClient(ABC):
             # replacement subclasses HTTPStatusError, so callers matching on
             # the old type (and retry_on_429 above) are unaffected.
             if isinstance(e, HTTPStatusError):
-                dav_error = dav_error_from_status_error(e)
-                if dav_error is not None:
+                dav_error = enrich_dav_error(e)
+                if dav_error is not e:
                     raise dav_error from e
+                raise
 
             # Re-raise the exception
             raise
