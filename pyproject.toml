@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.178.1"
+version = "0.179.0"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -168,7 +168,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.72,<0.0.73",
+    "ty>=0.0.73,<0.0.74",
     "pytest-otel>=2.0.1",
     "procrastinate>=3.8",
     "psycopg[binary,pool]>=3.2",

@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.2-noble@sha256:759869cb6f003234a95c6384cdee245b4bce7de26913fe607a8110362c0c007d
+    image: docker.io/library/mariadb:12.3.2-noble@sha256:c237fd50cc48d6f2b87c4ca66d52f3b5eef7271b3bea7aee586c0be19d5b460d
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -100,6 +100,45 @@ services:
       start_period: 30s
     profiles:
       - docling
+
+  # infinity: self-hosted embeddings + CROSS-ENCODER RERANKING. Opt-in via the
+  # "infinity" profile. Infinity provides both OpenAI-compatible /embeddings
+  # and Cohere-protocol /rerank from one self-hosted process.
+  #
+  # CPU image: no CUDA runtime, so it runs on a plain runner or laptop. CPU
+  # cross-encoding is slow — a 200-candidate pool takes tens of seconds — so
+  # raise SEARCH_RERANK_TIMEOUT_SECONDS or lower SEARCH_RERANK_POOL_SIZE, or
+  # use the GPU image (drop the "-cpu" suffix) for real workloads.
+  infinity:
+    image: docker.io/michaelf34/infinity:0.0.77-cpu@sha256:94db836145f609c508f3f296f3b9bd0e78ae088025e879664d073dfd9f929e96
+    restart: always
+    command:
+      - v2
+      - --model-id
+      - BAAI/bge-m3
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --port
+      - "7997"
+    ports:
+      - 127.0.0.1:7997:7997
+    volumes:
+      # Model weights are ~2.5 GB and are downloaded on first boot; cache them
+      # so a `docker compose down` isn't a re-download.
+      - infinity-cache:/app/.cache
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:7997/health").read()
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      # Two models to fetch and load before the first probe can pass.
+      start_period: 300s
+    profiles:
+      - infinity
 
   mcp:
     build: .
@@ -528,3 +567,4 @@ volumes:
   qdrant-data:
   mcp-data:
   multi-user-basic-data:
+  infinity-cache:

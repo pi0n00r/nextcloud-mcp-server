@@ -235,6 +235,7 @@ TLS-terminating reverse proxy.
 ### Advanced capabilities
 
 - [Semantic search architecture](docs/semantic-search-architecture.md)
+- [Reranking](docs/reranking.md)
 - [Vector sync UI](docs/user-guide/vector-sync-ui.md)
 - [Document processing configuration](docs/configuration.md)
 - [Observability](docs/observability.md)
