@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp.server.fastmcp import FastMCP
-from mcp.shared.exceptions import McpError
+from mcp.server.fastmcp.exceptions import ToolError
 
 from nextcloud_mcp_server.models.talk import TalkConversation
 from nextcloud_mcp_server.server.talk import configure_talk_tools
@@ -47,7 +47,7 @@ def talk_client(mocker):
         add_participant=AsyncMock(),
         list_reactions=AsyncMock(),
         add_reaction=AsyncMock(),
-        delete_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
     )
     client = SimpleNamespace(talk=talk)
     mocker.patch(
@@ -86,7 +86,7 @@ def test_talk_write_and_reaction_tools_are_registered_with_scopes(tools):
         "talk_add_participant": ["talk.write"],
         "talk_list_reactions": ["talk.read"],
         "talk_react": ["talk.write"],
-        "talk_delete_reaction": ["talk.write"],
+        "talk_remove_reaction": ["talk.write"],
     }
 
     for name, scopes in expected_scopes.items():
@@ -94,23 +94,23 @@ def test_talk_write_and_reaction_tools_are_registered_with_scopes(tools):
         assert getattr(tools[name].fn, "_required_scopes") == scopes
 
 
-async def test_create_group_then_adds_requested_participant(tools, talk_client):
+async def test_create_group_passes_requested_invite(tools, talk_client):
     talk_client.create_conversation.return_value = _conversation()
 
     result = await tools["talk_create_conversation"].fn(
         ctx=_context(),
         room_type=2,
         room_name="Operations",
-        invite="  alice  ",
+        invite="alice",
     )
 
     assert result.conversation.token == "room123"
     talk_client.create_conversation.assert_awaited_once_with(
         room_type=2,
         room_name="Operations",
-        invite=None,
+        invite="alice",
     )
-    talk_client.add_participant.assert_awaited_once_with("room123", user_id="alice")
+    talk_client.add_participant.assert_not_awaited()
 
 
 async def test_create_direct_conversation_passes_invite_at_creation(tools, talk_client):
@@ -121,13 +121,13 @@ async def test_create_direct_conversation_passes_invite_at_creation(tools, talk_
     await tools["talk_create_conversation"].fn(
         ctx=_context(),
         room_type=1,
-        room_name="Ignored for direct conversations",
+        room_name=None,
         invite="alice",
     )
 
     talk_client.create_conversation.assert_awaited_once_with(
         room_type=1,
-        room_name="Ignored for direct conversations",
+        room_name=None,
         invite="alice",
     )
     talk_client.add_participant.assert_not_awaited()
@@ -136,16 +136,14 @@ async def test_create_direct_conversation_passes_invite_at_creation(tools, talk_
 @pytest.mark.parametrize(
     ("room_type", "room_name", "invite", "message"),
     [
-        (99, "Room", None, "room_type must be 1, 2, or 3"),
-        (1, "", None, "invite .* is required"),
+        (1, "", None, "invite is required"),
         (2, "  ", None, "room_name is required"),
-        (2, "x" * 256, None, "must not exceed 255 characters"),
     ],
 )
 async def test_create_conversation_rejects_invalid_contract(
     tools, talk_client, room_type, room_name, invite, message
 ):
-    with pytest.raises(McpError, match=message):
+    with pytest.raises(ToolError, match=message):
         await tools["talk_create_conversation"].fn(
             ctx=_context(),
             room_type=room_type,
@@ -156,19 +154,31 @@ async def test_create_conversation_rejects_invalid_contract(
     talk_client.create_conversation.assert_not_awaited()
 
 
-async def test_add_participant_normalizes_source_and_user(tools, talk_client):
+async def test_add_participant_dispatches_source_and_participant(tools, talk_client):
     result = await tools["talk_add_participant"].fn(
         ctx=_context(),
         token="room123",
-        user_id="  alice  ",
-        source="",
+        participant="alice",
+        source="users",
     )
 
-    assert result.user_id == "alice"
+    assert result.participant == "alice"
     assert result.source == "users"
     talk_client.add_participant.assert_awaited_once_with(
-        "room123", user_id="alice", source="users"
+        "room123", "alice", source="users"
     )
+
+
+async def test_add_participant_rejects_blank_participant(tools, talk_client):
+    with pytest.raises(ToolError, match="participant must not be empty"):
+        await tools["talk_add_participant"].fn(
+            ctx=_context(),
+            token="room123",
+            participant="  ",
+            source="users",
+        )
+
+    talk_client.add_participant.assert_not_awaited()
 
 
 async def test_reaction_tools_preserve_actor_projection(tools, talk_client):
@@ -176,7 +186,7 @@ async def test_reaction_tools_preserve_actor_projection(tools, talk_client):
     projection = {emoji: [_actor()]}
     talk_client.list_reactions.return_value = projection
     talk_client.add_reaction.return_value = projection
-    talk_client.delete_reaction.return_value = projection
+    talk_client.remove_reaction.return_value = projection
 
     listed = await tools["talk_list_reactions"].fn(
         ctx=_context(), token="room123", message_id=42, reaction=emoji
@@ -184,44 +194,14 @@ async def test_reaction_tools_preserve_actor_projection(tools, talk_client):
     added = await tools["talk_react"].fn(
         ctx=_context(), token="room123", message_id=42, reaction=emoji
     )
-    removed = await tools["talk_delete_reaction"].fn(
+    removed = await tools["talk_remove_reaction"].fn(
         ctx=_context(), token="room123", message_id=42, reaction=emoji
     )
 
-    assert listed.results[emoji][0].actorId == "alice"
-    assert added.results[emoji][0].actorId == "alice"
-    assert removed.results[emoji][0].actorId == "alice"
+    assert listed.reactions[emoji][0].actorId == "alice"
+    assert added.reactions[emoji][0].actorId == "alice"
+    assert removed.reactions[emoji][0].actorId == "alice"
+    assert listed.distinct_emoji == 1
     talk_client.list_reactions.assert_awaited_once_with("room123", 42, reaction=emoji)
     talk_client.add_reaction.assert_awaited_once_with("room123", 42, emoji)
-    talk_client.delete_reaction.assert_awaited_once_with("room123", 42, emoji)
-
-
-@pytest.mark.parametrize(
-    ("tool_name", "arguments", "message"),
-    [
-        (
-            "talk_list_reactions",
-            {"message_id": 0, "reaction": None},
-            "message_id must be positive",
-        ),
-        (
-            "talk_react",
-            {"message_id": 42, "reaction": "  "},
-            "reaction must not be empty",
-        ),
-        (
-            "talk_delete_reaction",
-            {"message_id": -1, "reaction": "x"},
-            "message_id must be positive",
-        ),
-    ],
-)
-async def test_reaction_tools_reject_invalid_arguments(
-    tools, talk_client, tool_name, arguments, message
-):
-    with pytest.raises(McpError, match=message):
-        await tools[tool_name].fn(ctx=_context(), token="room123", **arguments)
-
-    talk_client.list_reactions.assert_not_awaited()
-    talk_client.add_reaction.assert_not_awaited()
-    talk_client.delete_reaction.assert_not_awaited()
+    talk_client.remove_reaction.assert_awaited_once_with("room123", 42, emoji)

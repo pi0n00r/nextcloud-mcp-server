@@ -16,11 +16,7 @@ import logging
 import httpx
 import pytest
 
-from nextcloud_mcp_server.client.talk import (
-    TalkClient,
-    _validate_message_id,
-    _validate_token,
-)
+from nextcloud_mcp_server.client.talk import TalkClient, _validate_token
 from nextcloud_mcp_server.models.talk import (
     TalkConversation,
     TalkMessage,
@@ -198,56 +194,6 @@ async def test_talk_create_conversation(mocker):
     call_args = mock_make_request.call_args
     assert call_args[0][0] == "POST"
     assert call_args[1]["json"] == {"roomType": 2, "roomName": "New Room"}
-
-
-@pytest.mark.parametrize("room_type", [0, 4, 99])
-async def test_talk_create_conversation_rejects_unsupported_room_type(
-    mocker, room_type
-):
-    mock_make_request = mocker.patch.object(TalkClient, "_make_request")
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    with pytest.raises(ValueError, match="room_type must be 1, 2, or 3"):
-        await client.create_conversation(room_type=room_type, room_name="Room")
-
-    mock_make_request.assert_not_called()
-
-
-async def test_talk_create_direct_conversation_requires_and_strips_invite(mocker):
-    mock_response = create_mock_talk_room_response(
-        conversation_id=11, token="direct", name="Alice"
-    )
-    mock_make_request = mocker.patch.object(
-        TalkClient, "_make_request", return_value=mock_response
-    )
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    await client.create_conversation(room_type=1, room_name="Alice", invite="  alice  ")
-
-    assert mock_make_request.call_args.kwargs["json"] == {
-        "roomType": 1,
-        "invite": "alice",
-    }
-
-
-async def test_talk_create_direct_conversation_rejects_missing_invite(mocker):
-    mock_make_request = mocker.patch.object(TalkClient, "_make_request")
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    with pytest.raises(ValueError, match="invite is required"):
-        await client.create_conversation(room_type=1, room_name="")
-
-    mock_make_request.assert_not_called()
-
-
-async def test_talk_create_conversation_rejects_long_room_name(mocker):
-    mock_make_request = mocker.patch.object(TalkClient, "_make_request")
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    with pytest.raises(ValueError, match="must not exceed 255 characters"):
-        await client.create_conversation(room_name="x" * 256)
-
-    mock_make_request.assert_not_called()
 
 
 async def test_talk_delete_conversation(mocker):
@@ -530,121 +476,189 @@ async def test_talk_list_participants_with_include_status(mocker):
     assert params["includeStatus"] == 1
 
 
-async def test_talk_add_participant_normalizes_payload(mocker):
-    mock_response = create_mock_response(
-        status_code=200,
-        json_data={"ocs": {"meta": {"status": "ok"}, "data": []}},
-    )
-    mock_make_request = mocker.patch.object(
-        TalkClient, "_make_request", return_value=mock_response
-    )
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+# Participants (write) and reactions
 
-    await client.add_participant("abc", user_id="  alice  ", source="")
 
-    assert mock_make_request.call_args.args == (
-        "POST",
-        "/ocs/v2.php/apps/spreed/api/v4/room/abc/participants",
-    )
-    assert mock_make_request.call_args.kwargs["json"] == {
-        "newParticipant": "alice",
-        "source": "users",
+@pytest.mark.parametrize("bad_id", [0, -1, "3", 3.5, True, None])
+async def test_reaction_rejects_invalid_message_id(mocker, bad_id):
+    """A message id that cannot address a message is refused before the wire.
+
+    ``True`` is in the list on purpose: ``bool`` is an ``int`` subclass, so
+    without an explicit check it would be accepted as message id 1.
+    """
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+    mock_request = mocker.patch.object(TalkClient, "_make_request")
+
+    with pytest.raises(ValueError, match="Message ID"):
+        await client.list_reactions("abc123", bad_id)
+
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_reaction", ["", "   "])
+async def test_reaction_rejects_blank_emoji(mocker, bad_reaction):
+    """spreed rejects these too, but with a 400 that names no field."""
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+    mock_request = mocker.patch.object(TalkClient, "_make_request")
+
+    with pytest.raises(ValueError, match="Reaction must not be empty"):
+        await client.add_reaction("abc123", 1, bad_reaction)
+
+    mock_request.assert_not_called()
+
+
+async def test_add_reaction_posts_the_emoji(mocker):
+    """POST to the reaction endpoint with the emoji in the body."""
+    response = mocker.Mock()
+    response.json.return_value = {
+        "ocs": {
+            "meta": {"statuscode": 201},
+            "data": {"🎉": [{"actorType": "users", "actorId": "alice"}]},
+        }
     }
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
+    )
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+
+    reactions = await client.add_reaction("abc123", 42, "🎉")
+
+    assert reactions == {"🎉": [{"actorType": "users", "actorId": "alice"}]}
+    args, kwargs = mock_request.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/ocs/v2.php/apps/spreed/api/v1/reaction/abc123/42"
+    assert kwargs["json"] == {"reaction": "🎉"}
 
 
-async def test_talk_add_participant_rejects_blank_user_before_request(mocker):
-    mock_make_request = mocker.patch.object(TalkClient, "_make_request")
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+async def test_remove_reaction_sends_delete_with_body(mocker):
+    """spreed takes the emoji in the body of a DELETE, not the query string."""
+    response = mocker.Mock()
+    response.json.return_value = {"ocs": {"meta": {"statuscode": 200}, "data": {}}}
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
+    )
+    client = TalkClient(mocker.AsyncMock(), "testuser")
 
-    with pytest.raises(ValueError, match="user_id must not be empty"):
-        await client.add_participant("abc", user_id="  ")
+    assert await client.remove_reaction("abc123", 42, "🎉") == {}
 
-    mock_make_request.assert_not_called()
-
-
-# Reaction tests
+    args, kwargs = mock_request.call_args
+    assert args[0] == "DELETE"
+    assert kwargs["json"] == {"reaction": "🎉"}
 
 
-def _reaction_actor(actor_id="alice"):
-    return {
-        "actorType": "users",
-        "actorId": actor_id,
-        "actorDisplayName": actor_id.title(),
-        "timestamp": 1700000000,
+@pytest.mark.parametrize("empty", [{}, [], None])
+async def test_reaction_map_normalises_empty_payloads(mocker, empty):
+    """ "No reactions" arrives in three shapes across spreed's responses.
+
+    Talk 22 returns ``{}`` for an unreacted message, but PHP serialises empty
+    maps as ``[]`` elsewhere in this API and ``null`` shows up on error paths.
+    All three have to mean the same thing to the caller.
+    """
+    response = mocker.Mock()
+    response.json.return_value = {"ocs": {"meta": {"statuscode": 200}, "data": empty}}
+    mocker.patch.object(TalkClient, "_make_request", return_value=response)
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+
+    assert await client.list_reactions("abc123", 1) == {}
+
+
+async def test_list_reactions_filters_by_emoji(mocker):
+    """The optional filter is passed as a query parameter, not a body field."""
+    response = mocker.Mock()
+    response.json.return_value = {"ocs": {"meta": {"statuscode": 200}, "data": {}}}
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
+    )
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+
+    await client.list_reactions("abc123", 7, reaction="👍")
+
+    assert mock_request.call_args.kwargs["params"] == {"reaction": "👍"}
+
+
+async def test_add_participant_posts_participant_and_source(mocker):
+    """The participant id and its source both reach the wire."""
+    response = mocker.Mock()
+    response.json.return_value = {"ocs": {"meta": {"statuscode": 200}, "data": []}}
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
+    )
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+
+    await client.add_participant("abc123", "bob", source="groups")
+
+    args, kwargs = mock_request.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/ocs/v2.php/apps/spreed/api/v4/room/abc123/participants"
+    assert kwargs["json"] == {"newParticipant": "bob", "source": "groups"}
+
+
+async def test_add_participant_rejects_path_traversal_token(mocker):
+    """Token validation guards the participants path too."""
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+    mock_request = mocker.patch.object(TalkClient, "_make_request")
+
+    with pytest.raises(ValueError, match="Invalid Talk conversation token"):
+        await client.add_participant("../../admin", "bob")
+
+    mock_request.assert_not_called()
+
+
+async def test_create_one_to_one_conversation_omits_room_name(mocker):
+    """A one-to-one room is created with no roomName at all.
+
+    spreed names those after the other participant (verified against Talk
+    22.0.17), so sending a blank name is a different request from sending
+    none -- the key is omitted rather than emptied.
+    """
+    response = mocker.Mock()
+    response.json.return_value = {
+        "ocs": {
+            "meta": {"statuscode": 200},
+            "data": {
+                "id": 7,
+                "token": "abc123",
+                "type": 1,
+                "name": "bob",
+                "displayName": "Bob",
+            },
+        }
     }
-
-
-@pytest.mark.parametrize("message_id", [0, -1])
-def test_validate_message_id_rejects_nonpositive(message_id):
-    with pytest.raises(ValueError, match="positive integer"):
-        _validate_message_id(message_id)
-
-
-async def test_talk_list_reactions_preserves_filtered_emoji_key(mocker):
-    emoji = "\N{THUMBS UP SIGN}"
-    mock_response = create_mock_response(
-        status_code=200,
-        json_data={"ocs": {"meta": {"status": "ok"}, "data": [_reaction_actor()]}},
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
     )
-    mock_make_request = mocker.patch.object(
-        TalkClient, "_make_request", return_value=mock_response
+    client = TalkClient(mocker.AsyncMock(), "testuser")
+
+    await client.create_conversation(room_type=1, invite="bob")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body == {"roomType": 1, "invite": "bob"}
+    assert "roomName" not in body
+
+
+async def test_create_group_conversation_sends_room_name(mocker):
+    """The group path is unchanged: the name is still sent."""
+    response = mocker.Mock()
+    response.json.return_value = {
+        "ocs": {
+            "meta": {"statuscode": 200},
+            "data": {
+                "id": 8,
+                "token": "def456",
+                "type": 2,
+                "name": "Team",
+                "displayName": "Team",
+            },
+        }
+    }
+    mock_request = mocker.patch.object(
+        TalkClient, "_make_request", return_value=response
     )
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = TalkClient(mocker.AsyncMock(), "testuser")
 
-    result = await client.list_reactions("abc", 42, reaction=emoji)
+    await client.create_conversation(room_type=2, room_name="Team")
 
-    assert result == {emoji: [_reaction_actor()]}
-    assert mock_make_request.call_args.args == (
-        "GET",
-        "/ocs/v2.php/apps/spreed/api/v1/reaction/abc/42",
-    )
-    assert mock_make_request.call_args.kwargs["params"] == {"reaction": emoji}
-
-
-async def test_talk_list_reactions_accepts_grouped_payload(mocker):
-    emoji = "\N{THUMBS UP SIGN}"
-    mock_response = create_mock_response(
-        status_code=200,
-        json_data={
-            "ocs": {"meta": {"status": "ok"}, "data": {emoji: [_reaction_actor()]}}
-        },
-    )
-    mocker.patch.object(TalkClient, "_make_request", return_value=mock_response)
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    assert await client.list_reactions("abc", 42) == {emoji: [_reaction_actor()]}
-
-
-@pytest.mark.parametrize(
-    ("method_name", "http_method"),
-    [("add_reaction", "POST"), ("delete_reaction", "DELETE")],
-)
-async def test_talk_reaction_mutations_preserve_emoji_key(
-    mocker, method_name, http_method
-):
-    emoji = "\N{THUMBS UP SIGN}"
-    mock_response = create_mock_response(
-        status_code=200,
-        json_data={"ocs": {"meta": {"status": "ok"}, "data": [_reaction_actor()]}},
-    )
-    mock_make_request = mocker.patch.object(
-        TalkClient, "_make_request", return_value=mock_response
-    )
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    result = await getattr(client, method_name)("abc", 42, emoji)
-
-    assert result == {emoji: [_reaction_actor()]}
-    assert mock_make_request.call_args.args[0] == http_method
-    assert mock_make_request.call_args.kwargs["json"] == {"reaction": emoji}
-
-
-@pytest.mark.parametrize("method_name", ["add_reaction", "delete_reaction"])
-async def test_talk_reaction_mutations_reject_blank_emoji(mocker, method_name):
-    mock_make_request = mocker.patch.object(TalkClient, "_make_request")
-    client = TalkClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-
-    with pytest.raises(ValueError, match="reaction emoji must not be empty"):
-        await getattr(client, method_name)("abc", 42, "  ")
-
-    mock_make_request.assert_not_called()
+    assert mock_request.call_args.kwargs["json"] == {
+        "roomType": 2,
+        "roomName": "Team",
+    }

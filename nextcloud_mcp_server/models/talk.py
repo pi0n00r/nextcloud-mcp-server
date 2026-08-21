@@ -11,11 +11,23 @@
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .base import BaseResponse, StatusResponse
+
+#: The actor sources spreed accepts when adding a participant. A ``Literal``
+#: rather than a bare ``str`` so an unsupported source is rejected by the schema
+#: -- and appears as an enum in the MCP tool definition -- instead of reaching
+#: the server as a bare 400 that names no field.
+TalkParticipantSource = Literal[
+    "users", "groups", "emails", "circles", "federated_users"
+]
+
+#: The room types spreed accepts: 1=one-to-one, 2=group, 3=public. A ``Literal``
+#: for the same reason as the source above.
+TalkRoomType = Literal[1, 2, 3]
 
 # Domain models
 
@@ -40,10 +52,6 @@ class TalkMessage(BaseModel):
     expirationTimestamp: int | None = None
     referenceId: str | None = None
     markdown: bool | None = None
-    # Optional chat.md fields — useful for agents (threading + emoji votes).
-    parent: dict[str, Any] | None = None
-    reactions: dict[str, int] | None = None
-    reactionsSelf: list[str] | None = None
 
     @field_validator("messageParameters", mode="before")
     @classmethod
@@ -53,29 +61,6 @@ class TalkMessage(BaseModel):
         if isinstance(v, list) and not v:
             return {}
         return v
-
-    @field_validator("parent", mode="before")
-    @classmethod
-    def _coerce_empty_parent(cls, v: Any) -> Any:
-        if isinstance(v, list) and not v:
-            return None
-        return v
-
-    @field_validator("reactions", mode="before")
-    @classmethod
-    def _coerce_empty_reactions(cls, v: Any) -> Any:
-        if isinstance(v, list) and not v:
-            return None
-        return v
-
-
-class TalkReactionActor(BaseModel):
-    """One participant who left a given emoji reaction."""
-
-    actorType: str
-    actorId: str
-    actorDisplayName: str
-    timestamp: int
 
 
 class TalkConversation(BaseModel):
@@ -149,6 +134,15 @@ class TalkParticipant(BaseModel):
     statusMessage: str | None = None
 
 
+class TalkReactionActor(BaseModel):
+    """One actor's reaction to a chat message."""
+
+    actorType: str
+    actorId: str
+    actorDisplayName: str = ""
+    timestamp: int = 0
+
+
 # Response wrappers for MCP tools
 
 
@@ -165,22 +159,6 @@ class GetConversationResponse(BaseResponse):
     """Response model for fetching a single Talk conversation."""
 
     conversation: TalkConversation = Field(description="The Talk conversation")
-
-
-class CreateConversationResponse(BaseResponse):
-    """Response model returned after creating a Talk conversation."""
-
-    conversation: TalkConversation = Field(
-        description="The newly created Talk conversation (includes token)"
-    )
-
-
-class AddParticipantResponse(StatusResponse):
-    """Response model after inviting someone into a Talk conversation."""
-
-    conversation_token: str = Field(description="Token of the conversation")
-    user_id: str = Field(description="Invited user (or group) id")
-    source: str = Field(description="Participant source (usually users)")
 
 
 class ListMessagesResponse(BaseResponse):
@@ -225,23 +203,54 @@ class MarkAsReadResponse(StatusResponse):
     )
 
 
-class ListReactionsResponse(BaseResponse):
-    """Reactions on a chat message, keyed by emoji."""
+class CreateConversationResponse(BaseResponse):
+    """Response model returned after creating a Talk conversation."""
 
-    conversation_token: str
-    message_id: int
-    results: dict[str, list[TalkReactionActor]] = Field(
-        description="Map emoji → actors who reacted with it"
+    conversation: TalkConversation = Field(description="The created conversation")
+
+
+class AddParticipantResponse(StatusResponse):
+    """Response model returned after adding a participant.
+
+    spreed answers a successful add with an empty ``data`` payload, so there is
+    no participant object to return -- the echo of what was added is all the
+    caller gets, and is what makes the result readable.
+    """
+
+    conversation_token: str = Field(description="Token of the conversation")
+    participant: str = Field(description="Identifier of the added participant")
+    source: TalkParticipantSource = Field(
+        description="Actor source the participant was added from"
     )
 
 
-class ReactResponse(BaseResponse):
-    """After adding or removing a reaction."""
+class ReactionsResponse(BaseResponse):
+    """Reactions on a chat message, keyed by emoji.
 
-    conversation_token: str
-    message_id: int
-    reaction: str
-    results: dict[str, list[TalkReactionActor]] = Field(
+    spreed returns a map of emoji -> list of actors. An *empty* map arrives as
+    a JSON object (``{}``) on Talk 22, but PHP serialises empty maps as ``[]``
+    elsewhere in this API, so the validator below accepts either -- see the
+    PHP empty-array quirk in CLAUDE.md.
+    """
+
+    conversation_token: str = Field(description="Token of the conversation")
+    message_id: int = Field(description="ID of the message the reactions are on")
+    reactions: dict[str, list[TalkReactionActor]] = Field(
         default_factory=dict,
-        description="Updated reactions map after the change",
+        description="Emoji -> the actors who reacted with it",
     )
+    distinct_emoji: int = Field(
+        default=0,
+        description=(
+            "Number of distinct emoji on this message -- not the total number "
+            "of reactions, which is the sum of the actor lists."
+        ),
+    )
+
+    @field_validator("reactions", mode="before")
+    @classmethod
+    def _coerce_empty_list(cls, value: Any) -> Any:
+        """Treat PHP's empty-list-for-empty-map as an empty map."""
+        if isinstance(value, list) and not value:
+            return {}
+        return value

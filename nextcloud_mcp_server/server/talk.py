@@ -15,10 +15,11 @@ import logging
 import uuid
 
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.shared.exceptions import McpError
-from mcp.types import ErrorData, ToolAnnotations
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.capabilities import require_capability
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.talk import (
     AddParticipantResponse,
@@ -27,11 +28,11 @@ from nextcloud_mcp_server.models.talk import (
     ListConversationsResponse,
     ListMessagesResponse,
     ListParticipantsResponse,
-    ListReactionsResponse,
     MarkAsReadResponse,
-    ReactResponse,
+    ReactionsResponse,
     SendMessageResponse,
-    TalkReactionActor,
+    TalkParticipantSource,
+    TalkRoomType,
 )
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
@@ -177,118 +178,6 @@ def configure_talk_tools(mcp: FastMCP) -> None:
     # Write tools
 
     @mcp.tool(
-        title="Create Talk Conversation",
-        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
-    )
-    @require_scopes("talk.write")
-    @instrument_tool
-    async def talk_create_conversation(
-        ctx: Context,
-        room_type: int = 2,
-        room_name: str = "",
-        invite: str | None = None,
-    ) -> CreateConversationResponse:
-        """Create a new Talk conversation (one-to-one, group, or public).
-
-        - room_type=1: private DM — requires ``invite`` (other user id).
-        - room_type=2: private group — requires ``room_name``. An optional
-          ``invite`` (one user) is added after create. For more people call
-          ``talk_add_participant`` repeatedly.
-        - room_type=3: public room — requires ``room_name`` (open link /
-          reports channel). Add members with ``talk_add_participant`` if needed.
-
-        Returns ``token`` for ``talk_send_message``. Never reuse a type=1
-        DM token as a “shared” room — others will get 404.
-
-        Args:
-            room_type: 1=one-to-one, 2=group, 3=public. Defaults to 2.
-            room_name: Display name (required for group/public).
-            invite: User id. Required for one-to-one. Optional single
-                first member for group/public (added after create).
-        """
-        if room_type not in (1, 2, 3):
-            raise McpError(
-                ErrorData(code=-32602, message="room_type must be 1, 2, or 3")
-            )
-        normalized_invite = (invite or "").strip()
-        if room_type == 1 and not normalized_invite:
-            raise McpError(
-                ErrorData(
-                    code=-32602,
-                    message=(
-                        "invite (other user id) is required for "
-                        "one-to-one conversations"
-                    ),
-                )
-            )
-        if room_type in (2, 3) and not (room_name or "").strip():
-            raise McpError(
-                ErrorData(
-                    code=-32602,
-                    message="room_name is required for group/public conversations",
-                )
-            )
-        normalized_room_name = (room_name or "").strip()
-        if len(normalized_room_name) > 255:
-            raise McpError(
-                ErrorData(
-                    code=-32602,
-                    message="room_name must not exceed 255 characters",
-                )
-            )
-        client = await get_client(ctx)
-        # Group/public: create without invite (spreed often 404s invite-on-create
-        # for type 2), then add the first member explicitly.
-        create_invite = normalized_invite if room_type == 1 else None
-        conversation = await client.talk.create_conversation(
-            room_type=room_type,
-            room_name=normalized_room_name,
-            invite=create_invite,
-        )
-        if room_type in (2, 3) and normalized_invite:
-            await client.talk.add_participant(
-                conversation.token, user_id=normalized_invite
-            )
-        return CreateConversationResponse(conversation=conversation)
-
-    @mcp.tool(
-        title="Add Talk Participant",
-        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
-    )
-    @require_scopes("talk.write")
-    @instrument_tool
-    async def talk_add_participant(
-        ctx: Context,
-        token: str,
-        user_id: str,
-        source: str = "users",
-    ) -> AddParticipantResponse:
-        """Invite a user into an existing Talk group/public conversation.
-
-        Use after ``talk_create_conversation`` (room_type 2 or 3) to bring
-        in a second, third, … colleague. Does not work meaningfully on
-        one-to-one rooms (type 1) — create a group instead.
-
-        Args:
-            token: Conversation token from create/list.
-            user_id: Nextcloud login to invite (e.g. alice).
-            source: Usually ``users``.
-        """
-        if not (user_id or "").strip():
-            raise McpError(ErrorData(code=-32602, message="user_id must not be empty"))
-        client = await get_client(ctx)
-        await client.talk.add_participant(
-            token, user_id=user_id.strip(), source=source or "users"
-        )
-        return AddParticipantResponse(
-            success=True,
-            message="Participant invited",
-            conversation_token=token,
-            user_id=user_id.strip(),
-            source=source or "users",
-        )
-
-    @mcp.tool(
         title="Send Talk Message",
         annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
     )
@@ -353,117 +242,195 @@ def configure_talk_tools(mcp: FastMCP) -> None:
             last_read_message=last_read_message,
         )
 
-    def _reactions_map(
-        raw: dict,
-    ) -> dict[str, list[TalkReactionActor]]:
-        out: dict[str, list[TalkReactionActor]] = {}
-        for emoji, actors in (raw or {}).items():
-            out[str(emoji)] = [
-                TalkReactionActor(**a) for a in actors if isinstance(a, dict)
-            ]
-        return out
+    @mcp.tool(
+        title="Create Talk Conversation",
+        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_create_conversation(
+        ctx: Context,
+        room_name: str | None = None,
+        room_type: TalkRoomType = 2,
+        invite: str | None = None,
+    ) -> CreateConversationResponse:
+        """Create a new Talk conversation (room).
+
+        Args:
+            room_name: Display name for the room. Required for a group (2) or
+                public (3) room. Omit it for a one-to-one room, which spreed
+                names after the other participant.
+            room_type: 2 for a group room (default), 3 for a public room, 1 for
+                a one-to-one room.
+            invite: User or group ID to add at creation time. Required for a
+                one-to-one room, where it is the other participant and is what
+                defines the room. Optional otherwise.
+        """
+        if room_type == 1:
+            # A one-to-one room is defined by who is in it, not by a name --
+            # spreed accepts the create with no roomName at all. Without an
+            # invite there is no second participant, so there is no room.
+            if not invite or not invite.strip():
+                raise ToolError(
+                    "invite is required for a one-to-one room (room_type=1): "
+                    "the other participant is what identifies the room"
+                )
+        elif not room_name or not room_name.strip():
+            raise ToolError(
+                f"room_name is required for room_type={room_type} and must not "
+                "be empty or whitespace-only"
+            )
+
+        client = await get_client(ctx)
+        conversation = await client.talk.create_conversation(
+            room_type=room_type,
+            room_name=room_name,
+            invite=invite,
+        )
+        return CreateConversationResponse(conversation=conversation)
 
     @mcp.tool(
-        title="List Talk Reactions",
+        title="Add Talk Participant",
+        annotations=ToolAnnotations(
+            # Adding someone already in the room succeeds as a no-op (verified
+            # against Talk 22.0.17), so repeating the call leaves the same state.
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_add_participant(
+        ctx: Context,
+        token: str,
+        participant: str,
+        source: TalkParticipantSource = "users",
+    ) -> AddParticipantResponse:
+        """Add a participant to a group or public Talk conversation.
+
+        A one-to-one conversation cannot take additional participants -- the
+        server rejects that with a room-type error.
+
+        Args:
+            token: Conversation token.
+            participant: Identifier to add, interpreted according to `source`.
+            source: Where the identifier comes from - "users" (default),
+                "groups", "emails", "circles", or "federated_users".
+        """
+        if not participant or not participant.strip():
+            raise ToolError("participant must not be empty or whitespace-only")
+
+        client = await get_client(ctx)
+        await client.talk.add_participant(token, participant, source=source)
+        return AddParticipantResponse(
+            conversation_token=token,
+            participant=participant,
+            source=source,
+            message=f"Added {participant} ({source}) to the conversation",
+        )
+
+    @mcp.tool(
+        title="List Talk Message Reactions",
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     )
     @require_scopes("talk.read")
+    @require_capability("spreed", feature="reactions")
     @instrument_tool
     async def talk_list_reactions(
         ctx: Context,
         token: str,
         message_id: int,
         reaction: str | None = None,
-    ) -> ListReactionsResponse:
-        """Who reacted to a Talk message (emoji → actors).
+    ) -> ReactionsResponse:
+        """List the reactions on a Talk chat message, grouped by emoji.
 
         Args:
             token: Conversation token.
-            message_id: Chat message id.
-            reaction: Optional single emoji to filter.
+            message_id: ID of the message to read reactions from.
+            reaction: Optional single emoji to filter to.
         """
-        if message_id <= 0:
-            raise McpError(
-                ErrorData(code=-32602, message="message_id must be positive")
-            )
         client = await get_client(ctx)
-        raw = await client.talk.list_reactions(
-            token, int(message_id), reaction=reaction
+        reactions = await client.talk.list_reactions(
+            token, message_id, reaction=reaction
         )
-        return ListReactionsResponse(
+        return ReactionsResponse(
             conversation_token=token,
-            message_id=int(message_id),
-            results=_reactions_map(raw),
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
         )
 
     @mcp.tool(
         title="React to Talk Message",
-        annotations=ToolAnnotations(idempotentHint=False, openWorldHint=True),
+        annotations=ToolAnnotations(
+            # Reactions are a set: reacting twice with the same emoji leaves the
+            # same state (spreed answers 201 then 200).
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
     )
     @require_scopes("talk.write")
+    @require_capability("spreed", feature="reactions")
     @instrument_tool
     async def talk_react(
         ctx: Context,
         token: str,
         message_id: int,
         reaction: str,
-    ) -> ReactResponse:
-        """Add an emoji reaction to a Talk message (👍, ❤️, …).
+    ) -> ReactionsResponse:
+        """React to a Talk chat message with an emoji.
+
+        Returns the message's reactions after the change, so the caller does
+        not need a follow-up read.
 
         Args:
             token: Conversation token.
-            message_id: Target message id.
-            reaction: Single emoji string.
+            message_id: ID of the message to react to.
+            reaction: The emoji to react with.
         """
-        if message_id <= 0:
-            raise McpError(
-                ErrorData(code=-32602, message="message_id must be positive")
-            )
-        if not (reaction or "").strip():
-            raise McpError(ErrorData(code=-32602, message="reaction must not be empty"))
         client = await get_client(ctx)
-        raw = await client.talk.add_reaction(token, int(message_id), reaction)
-        return ReactResponse(
+        reactions = await client.talk.add_reaction(token, message_id, reaction)
+        return ReactionsResponse(
             conversation_token=token,
-            message_id=int(message_id),
-            reaction=(reaction or "").strip(),
-            results=_reactions_map(raw),
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
         )
 
     @mcp.tool(
-        title="Remove Talk Reaction",
+        title="Remove Talk Message Reaction",
         annotations=ToolAnnotations(
             destructiveHint=True,
-            idempotentHint=False,
+            # Same end state when repeated, though the server reports the second
+            # removal as a 404 rather than a no-op.
+            idempotentHint=True,
             openWorldHint=True,
         ),
     )
     @require_scopes("talk.write")
+    @require_capability("spreed", feature="reactions")
     @instrument_tool
-    async def talk_delete_reaction(
+    async def talk_remove_reaction(
         ctx: Context,
         token: str,
         message_id: int,
         reaction: str,
-    ) -> ReactResponse:
-        """Remove your emoji reaction from a Talk message.
+    ) -> ReactionsResponse:
+        """Remove the user's own reaction from a Talk chat message.
+
+        Removing a reaction the user has not made is reported by the server as
+        a not-found error rather than succeeding silently.
 
         Args:
             token: Conversation token.
-            message_id: Target message id.
-            reaction: Emoji to remove.
+            message_id: ID of the message to remove the reaction from.
+            reaction: The emoji to remove.
         """
-        if message_id <= 0:
-            raise McpError(
-                ErrorData(code=-32602, message="message_id must be positive")
-            )
-        if not (reaction or "").strip():
-            raise McpError(ErrorData(code=-32602, message="reaction must not be empty"))
         client = await get_client(ctx)
-        raw = await client.talk.delete_reaction(token, int(message_id), reaction)
-        return ReactResponse(
+        reactions = await client.talk.remove_reaction(token, message_id, reaction)
+        return ReactionsResponse(
             conversation_token=token,
-            message_id=int(message_id),
-            reaction=(reaction or "").strip(),
-            results=_reactions_map(raw),
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
         )
