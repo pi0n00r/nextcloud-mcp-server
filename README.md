@@ -18,7 +18,8 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 155 MCP tools.
+Deck, Talk, and other Nextcloud application surfaces through 155 tools in the
+stable package and 164 tools in the current source release.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -73,7 +74,7 @@ automation:
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
 | **Stable application version** | `0.166.1` |
-| **Current master** | `0.180.0`: 164 tools, including 2 file-comment tools, 11 Talk tools covering conversations, participants, messages, read state, and reactions, and 2 Deck dependency tools requiring Deck 1.18.0 or newer |
+| **Current source release** | `v1.8.0` / `0.180.0`: 164 tools, including 2 file-comment tools, 11 Talk tools covering conversations, participants, messages, read state, and reactions, and 2 Deck dependency tools requiring Deck 1.18.0 or newer |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
