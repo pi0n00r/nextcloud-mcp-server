@@ -27,6 +27,7 @@ import re
 from typing import Any
 
 from nextcloud_mcp_server.client.base import BaseNextcloudClient
+from nextcloud_mcp_server.client.ocs import OCS_REQUEST_HEADERS
 from nextcloud_mcp_server.models.talk import (
     TalkConversation,
     TalkMessage,
@@ -104,10 +105,7 @@ class TalkClient(BaseNextcloudClient):
         so setting it here would also leak it onto bodyless GETs and
         DELETEs.
         """
-        return {
-            "OCS-APIRequest": "true",
-            "Accept": "application/json",
-        }
+        return dict(OCS_REQUEST_HEADERS)
 
     # Conversations (rooms)
 

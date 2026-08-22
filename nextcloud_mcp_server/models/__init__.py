@@ -32,6 +32,7 @@ from .calendar import (
     ManageCalendarResponse,
     UpcomingEventsResponse,
     UpdateEventResponse,
+    UpdateTodoResponse,
 )
 
 # Contacts models
@@ -119,6 +120,7 @@ __all__ = [
     "CompleteTodoResponse",
     "CreateEventResponse",
     "UpdateEventResponse",
+    "UpdateTodoResponse",
     "DeleteEventResponse",
     "ListEventsResponse",
     "ListCalendarsResponse",

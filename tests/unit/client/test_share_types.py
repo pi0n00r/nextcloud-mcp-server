@@ -112,7 +112,7 @@ class TestCreateShareValidation:
     async def test_public_link_without_recipient_reaches_wire_without_share_with(
         self, sharing_client, mocker
     ):
-        sharing_client._client.post.return_value = _ok_response(mocker, {"id": 10})
+        sharing_client._client.request.return_value = _ok_response(mocker, {"id": 10})
 
         share = await sharing_client.create_share(
             path="/report.pdf",
@@ -121,7 +121,7 @@ class TestCreateShareValidation:
         )
 
         assert share["id"] == 10
-        data = sharing_client._client.post.call_args.kwargs["data"]
+        data = sharing_client._client.request.call_args.kwargs["data"]
         assert data == {"path": "/report.pdf", "shareType": 3, "permissions": 3}
 
     async def test_public_link_with_recipient_never_reaches_the_wire(
@@ -131,24 +131,24 @@ class TestCreateShareValidation:
             await sharing_client.create_share(
                 path="/report.pdf", share_with="alice", share_type=3
             )
-        sharing_client._client.post.assert_not_called()
+        sharing_client._client.request.assert_not_called()
 
     async def test_missing_recipient_never_reaches_the_wire(self, sharing_client):
         with pytest.raises(ValueError, match="requires a non-empty shareWith"):
             await sharing_client.create_share(
                 path="/report.pdf", share_with="", share_type=ShareType.USER
             )
-        sharing_client._client.post.assert_not_called()
+        sharing_client._client.request.assert_not_called()
 
     async def test_valid_user_share_is_sent(self, sharing_client, mocker):
-        sharing_client._client.post.return_value = _ok_response(mocker, {"id": 11})
+        sharing_client._client.request.return_value = _ok_response(mocker, {"id": 11})
 
         share = await sharing_client.create_share(
             path="/report.pdf", share_with="alice", share_type=ShareType.USER
         )
 
         assert share["id"] == 11
-        data = sharing_client._client.post.call_args.kwargs["data"]
+        data = sharing_client._client.request.call_args.kwargs["data"]
         assert data["shareType"] == 0
         assert data["shareWith"] == "alice"
 
@@ -157,26 +157,26 @@ class TestCreateShareValidation:
     ):
         """Type 12 binds a file to a Deck card via shareWith=<cardId>; the new
         validation must not break the Deck attachment path."""
-        sharing_client._client.post.return_value = _ok_response(mocker, {"id": 12})
+        sharing_client._client.request.return_value = _ok_response(mocker, {"id": 12})
 
         await sharing_client.create_share(
             path="/Notes/n.md", share_with="123", share_type=ShareType.DECK
         )
 
-        data = sharing_client._client.post.call_args.kwargs["data"]
+        data = sharing_client._client.request.call_args.kwargs["data"]
         assert data["shareType"] == 12
         assert data["shareWith"] == "123"
 
 
 class TestPublicLinkPayload:
     async def test_public_link_sends_no_recipient(self, sharing_client, mocker):
-        sharing_client._client.post.return_value = _ok_response(
+        sharing_client._client.request.return_value = _ok_response(
             mocker, {"id": 5, "url": "https://cloud.example.org/s/tok"}
         )
 
         await sharing_client.create_public_link(path="/receipt.jpg")
 
-        data = sharing_client._client.post.call_args.kwargs["data"]
+        data = sharing_client._client.request.call_args.kwargs["data"]
         assert data["shareType"] == 3
         assert "shareWith" not in data
 
@@ -202,7 +202,7 @@ class TestSharingOcsHeaders:
                 "data": [],
             }
         }
-        sharing_client._client.get.return_value = response
+        sharing_client._client.request.return_value = response
 
         with pytest.raises(OCSAuthenticationError, match="OCS-APIRequest"):
             await sharing_client.list_shares()
@@ -224,8 +224,7 @@ class TestSharingOcsHeaders:
         response = mocker.Mock()
         response.raise_for_status = mocker.Mock()
         response.json.return_value = {"ocs": {"meta": {}, "data": {"id": 7}}}
-        for method in ("post", "delete", "get", "put"):
-            getattr(sharing_client._client, method).return_value = response
+        sharing_client._client.request.return_value = response
 
         with pytest.raises(OCSError, match="malformed OCS envelope"):
             await call(sharing_client)
