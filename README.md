@@ -73,7 +73,6 @@ automation:
 | **Current tool surface** | 164 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
-| **Stable application version** | `0.166.1` |
 | **Current source release** | `v1.8.0` / `0.180.0`: 164 tools, including 2 file-comment tools, 11 Talk tools covering conversations, participants, messages, read state, and reactions, and 2 Deck dependency tools requiring Deck 1.18.0 or newer |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
