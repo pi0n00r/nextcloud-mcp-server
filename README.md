@@ -18,8 +18,8 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 155 tools in the
-stable package and 164 tools in the current source release.
+Deck, Talk, and other Nextcloud application surfaces through 164 tools in the
+current source release.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -70,7 +70,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Stable tool surface** | 155 tools across 12 Nextcloud application surfaces |
+| **Current tool surface** | 164 tools across 12 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.6.6.2` |
 | **Stable application version** | `0.166.1` |
@@ -149,23 +149,23 @@ MCP_DEPLOYMENT_MODE=single_user_basic \
 
 ## Nextcloud Capabilities
 
-The stable single-user profile exposes the following core tool surface:
+The current full single-user source profile exposes the following tool surface:
 
 | Surface | Tools | Coverage |
 |---|---:|---|
-| **Deck** | 36 | Boards, stacks, cards, comments, labels, assignees, attachments |
+| **Deck** | 38 | Boards, stacks, cards, comments, labels, assignees, attachments and dependencies |
 | **Collectives** | 20 | Collectives, pages, tags, hierarchy, trash and restore |
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
-| **Files (WebDAV)** | 11 | Read/write, search, move/copy, directories, favorites |
+| **Files (WebDAV)** | 13 | Read/write, search, move/copy, directories, favorites and comments |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 7 | Create, read, update, append, search, attachments |
 | **Mail** | 13 | Accounts, messages, raw source, flags, tags, move/delete, sending |
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
-| **Talk** | 6 | Conversations, participants, messages, read state |
-| **Total** | **155** | Core tools in the stable single-user profile |
+| **Talk** | 11 | Conversations, participants, messages, read state and reactions |
+| **Total** | **164** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
