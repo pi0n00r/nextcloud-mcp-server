@@ -1792,7 +1792,6 @@ class CalendarClient:
             updated_ical = self._merge_ical_todo_properties(
                 todo.data,  # type: ignore[arg-type]
                 todo_data,
-                todo_uid,
             )
             logger.debug("Merged iCal data length: %s", len(updated_ical))
             logger.debug("Updated iCal content:\\n%s", updated_ical)
@@ -3182,13 +3181,15 @@ class CalendarClient:
             return None
 
     def _merge_ical_todo_properties(
-        self, raw_ical: str, todo_data: dict[str, Any], todo_uid: str
+        self, raw_ical: str, todo_data: dict[str, Any]
     ) -> str:
-        """Merge new todo data into existing raw iCal while preserving all properties."""
+        """Merge new todo data while preserving every stored iCalendar property.
+
+        Any merge failure propagates. Rebuilding from the partial update dictionary
+        would silently discard properties that the caller did not send.
+        """
         try:
-            logger.debug(
-                "Merging todo properties for %s: %s", todo_uid, list(todo_data.keys())
-            )
+            logger.debug("Merging todo properties: %s", list(todo_data.keys()))
             cal = Calendar.from_ical(raw_ical)
 
             for component in cal.walk():
@@ -3323,7 +3324,7 @@ class CalendarClient:
             raise
         except Exception as e:
             logger.error("Error merging iCal todo properties: %s", e)
-            return self._create_ical_todo(todo_data, todo_uid)
+            raise
 
     # ============= Helper Methods - Filtering =============
 
