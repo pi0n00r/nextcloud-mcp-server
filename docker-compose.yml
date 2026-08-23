@@ -19,11 +19,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.0-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
+    image: docker.io/library/redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.14@sha256:a51f43b877edcae3b138856c0010ea752f90de76b36568a0234bd301d39b659a}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.14@sha256:915ee67db2cdd703f22e718aa5ad13114db8a9ce8f8262c5c993894c8751f97a}
     restart: always
     ports:
       - 127.0.0.1:8080:80
@@ -57,7 +57,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.3-alpine@sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752
+    image: docker.io/library/nginx:1.31.4-alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -81,7 +81,7 @@ services:
   # runs on plain GitHub-hosted runners. CPU OCR is slow; give it a generous
   # DOCLING_TIMEOUT.
   docling:
-    image: ghcr.io/docling-project/docling-serve-cpu:v1.30.0@sha256:061d35c03611bc15b73d024c8e8387bcf0624279f8b57c16c1567326f214ba56
+    image: ghcr.io/docling-project/docling-serve-cpu:v1.31.0@sha256:32ba1a1dded8d8fd21f9d8da1b9837e04cfee164ef891d9513174c3d989dcee9
     restart: always
     ports:
       - 127.0.0.1:5001:5001
@@ -522,7 +522,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:ee45ee1827d20836dfb7de14d73a3b43fa47c4d6b7bec01548474ac8cdc1f97c
+    image: docker.io/vegardit/openldap:2.6.10@sha256:8161e8fa74c518697776fff27b403cc4c273aede07b6d87f473a45201050d0de
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org
