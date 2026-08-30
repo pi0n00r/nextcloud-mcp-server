@@ -1438,6 +1438,18 @@ async def test_chunked_write_returns_final_move_etag(
         ('""', ""),
         (None, None),
         ('W/"abc"', "W/abc"),
+        # Apache's mod_deflate appends -gzip to the ETag of every compressed
+        # response (DeflateAlterETag AddSuffix, the default). Left in place it
+        # breaks every conditional overwrite behind such a proxy.
+        ('"abc-gzip"', "abc"),
+        ("abc-br", "abc"),
+        ("abc-deflate", "abc"),
+        # Weakness is part of validator semantics and must not be erased.
+        ('W/"abc-gzip"', "W/abc"),
+        # Only a trailing suffix counts: a name that merely contains one
+        # survives untouched.
+        ("gzip-abc", "gzip-abc"),
+        ("   abc   ", "abc"),
     ],
 )
 def test_normalize_etag(raw, expected):

@@ -59,7 +59,13 @@ class EtagConflictError(Exception):
 
 
 def _normalize_etag(raw: Optional[str]) -> Optional[str]:
-    """Return an ETag without transport quotes, preserving a weak prefix."""
+    """Return a reusable ETag, repairing known content-coding suffixes.
+
+    Apache and other compression proxies can append ``-gzip``, ``-br`` or
+    ``-deflate`` to the origin ETag. Preserve a weak validator's ``W/`` prefix,
+    but remove a recognized transport suffix from the opaque value so a later
+    conditional write addresses the origin validator.
+    """
     if raw is None:
         return None
 
@@ -70,6 +76,10 @@ def _normalize_etag(raw: Optional[str]) -> Optional[str]:
         value = value[2:]
     if value.startswith('"') and value.endswith('"'):
         value = value[1:-1]
+    for suffix in ("-gzip", "-br", "-deflate"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
     return f"{prefix}{value}"
 
 
@@ -341,7 +351,10 @@ def _write_precondition_header(if_match: Optional[str]) -> dict[str, str]:
         return {"If-None-Match": "*"}
     if if_match == "*":
         return {"If-Match": "*"}
-    return {"If-Match": _quote_etag(if_match)}
+    normalized = _normalize_etag(if_match)
+    if normalized is None:
+        raise ValueError("Invalid ETag value")
+    return {"If-Match": _quote_etag(normalized)}
 
 
 def _dav_detail_text(error: BaseException) -> Optional[str]:
