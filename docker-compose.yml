@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.2-noble@sha256:a02fe89cb597d4375812b2eac90cf9d0775d4686daa7f7cc750ebbcad7525bbc
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:dd9b303aed4f4890ed09f766d8ca9ddfd176c0c6f6267feff53b3192ec65a979
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -522,7 +522,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:6c5595fa4d1c5dbe0b607458d8fe1ec1fa102653cac37ed9f1ce3e76a65593b8
+    image: docker.io/vegardit/openldap:2.6.10@sha256:4378fb00077a0dd4a969f35694d7a3660c171ccb2bd62e9260647490882f17c5
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org
