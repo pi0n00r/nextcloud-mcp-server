@@ -2090,7 +2090,7 @@ requires-dist = [
     { name = "recurring-ical-events", specifier = ">=3.8.0,<4.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "starlette", specifier = "<1.0" },
-    { name = "uvicorn", git = "https://github.com/pi0n00r/uvicorn.git?rev=c5d334cb3014d72a43a893e848bbfdebb2665738" },
+    { name = "uvicorn", git = "https://github.com/pi0n00r/uvicorn.git" },
 ]
 provides-extras = ["postgres", "observability"]
 
@@ -4468,8 +4468,8 @@ wheels = [
 
 [[package]]
 name = "uvicorn"
-version = "0.51.0"
-source = { git = "https://github.com/pi0n00r/uvicorn.git?rev=c5d334cb3014d72a43a893e848bbfdebb2665738#c5d334cb3014d72a43a893e848bbfdebb2665738" }
+version = "0.52.4"
+source = { git = "https://github.com/pi0n00r/uvicorn.git#7b36fd98bca23a22ff80ae74761f54733584a691" }
 dependencies = [
     { name = "click" },
     { name = "h11" },

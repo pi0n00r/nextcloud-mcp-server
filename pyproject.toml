@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude", "webdav", "caldav", "carddav"]
 dependencies = [
     "mcp[cli] (>=1.29,<1.30)",
-    "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git@c5d334cb3014d72a43a893e848bbfdebb2665738",
+    "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git",
     "httpx (>=0.28.1,<0.29.0)",
     # Imported directly at runtime. Each was previously reachable only because
     # some other dependency happened to pull it in — the accident that broke

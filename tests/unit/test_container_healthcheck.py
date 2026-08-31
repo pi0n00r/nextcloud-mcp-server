@@ -50,7 +50,7 @@ def test_dockerfile_runs_dynamic_internal_probe():
     assert "127.0.0.1:8000/health/live" not in dockerfile
 
 
-def test_dockerfile_builds_only_the_pinned_uvicorn_exception_from_source():
+def test_dockerfile_builds_only_the_uvicorn_fork_exception_from_source():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text()
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     dependency_sync = next(
@@ -67,10 +67,8 @@ def test_dockerfile_builds_only_the_pinned_uvicorn_exception_from_source():
     assert "--no-build" in dependency_sync
     assert "--no-install-package uvicorn" in dependency_sync
     assert "--no-build" not in project_sync
-    assert (
-        "https://github.com/pi0n00r/uvicorn.git@"
-        "c5d334cb3014d72a43a893e848bbfdebb2665738"
-    ) in pyproject
+    assert "https://github.com/pi0n00r/uvicorn.git" in pyproject
+    assert "https://github.com/pi0n00r/uvicorn.git@" not in pyproject
 
 
 def test_shipped_compose_profile_ports_match_health_resolution():
