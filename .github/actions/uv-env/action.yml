@@ -1,8 +1,8 @@
 name: uv environment
 description: >
-  Install uv and the locked dependencies without ever executing a third-party
-  build script, then install this project from a wheel built from its own
-  source. Every job that runs `uv run` uses this.
+  Install uv and locked wheel dependencies without arbitrary third-party
+  source builds, install the trusted Uvicorn fork from its latest branch, then
+  install this project from a wheel. Every job that runs `uv run` uses this.
 
 runs:
   using: composite
@@ -22,13 +22,16 @@ runs:
         # a plain `uv sync --no-build` fails with "Distribution
         # nextcloud-mcp-server @ editable+. can't be installed because it is
         # marked as --no-build but has no binary distribution". Hence the split:
-        # dependencies come from wheels only, and the one build we do run is of
-        # our own source -- with build-backend = "uv_build", which ships inside
-        # the uv binary, so no third-party code is fetched or executed for it.
+        # dependencies come from wheels only, except for the repository's
+        # intentional Uvicorn fork. Exclude that source dependency from the
+        # locked wheel-only sync, then install its latest branch explicitly.
+        # The remaining build is our own source, with build-backend =
+        # "uv_build", which ships inside the uv binary.
         #
         # NOTE: `uv sync` installs the dev group, which carries pyroscope-io --
         # no Windows wheel. Any job on a Windows runner must skip this action
         # and build the wheel directly (see package-smoke).
-        uv sync --frozen --no-build --no-install-project
+        uv sync --frozen --no-build --no-install-project --no-install-package uvicorn
+        uv pip install --no-deps "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git"
         uv build --wheel --out-dir dist
         uv pip install --no-deps --no-build dist/*.whl
