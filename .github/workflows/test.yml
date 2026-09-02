@@ -43,7 +43,7 @@ jobs:
       # -q instead of -v: with xdist, per-test progress lines are interleaved
       # noise, and failures still print in full.
       - name: Run unit tests
-        run: uv run --frozen pytest -q -W error -m unit -n auto -o "addopts=-p no:asyncio"
+        run: uv run --no-build --no-sync pytest -q -W error -m unit -n auto -o "addopts=-p no:asyncio"
 
   # Cross-platform install smoke test. Installs the package (and its full
   # dependency closure) into an isolated environment and runs the CLI
