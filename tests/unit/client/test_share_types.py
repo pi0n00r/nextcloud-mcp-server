@@ -21,7 +21,7 @@ client-side here.
 
 import pytest
 from httpx import AsyncClient
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from nextcloud_mcp_server.client.ocs import OCSAuthenticationError, OCSError
 from nextcloud_mcp_server.client.sharing import SharingClient, validate_share_with
@@ -231,7 +231,7 @@ class TestSharingOcsHeaders:
 
 
 def test_registry_keeps_dedicated_public_link_capability_exposed():
-    mcp = FastMCP("sharing-registry")
+    mcp = MCPServer("sharing-registry")
     configure_sharing_tools(mcp)
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
 

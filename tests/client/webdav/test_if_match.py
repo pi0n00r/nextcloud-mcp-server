@@ -109,23 +109,19 @@ async def test_T3_write_file_412_returns_etag_conflict():
     assert result["server_etag"] == "server-current-etag"
 
 
-async def test_T3b_gzip_etag_variant_retries_once_with_authoritative_etag():
-    """An exact -gzip transport variant retries without weakening If-Match."""
+async def test_T3b_gzip_etag_variant_uses_authoritative_etag_immediately():
+    """A transport-added suffix is removed before the conditional write."""
     c = _make_client()
     seen_if_match = []
 
     async def fake_request(method, url, content=None, headers=None):
         seen_if_match.append(headers["If-Match"])
-        if len(seen_if_match) == 1:
-            req = Request(method, url)
-            resp = Response(412, headers={"etag": '"abc123"'}, request=req)
-            raise HTTPStatusError("412", request=req, response=resp)
         return _mock_response(204, headers={"etag": '"new-etag"'})
 
     c._make_request = fake_request
     result = await c.write_file("/file.txt", b"data", if_match="abc123-gzip")
 
-    assert seen_if_match == ['"abc123-gzip"', '"abc123"']
+    assert seen_if_match == ['"abc123"']
     assert result == {
         "status_code": 204,
         "bytes_written": 4,
@@ -133,14 +129,13 @@ async def test_T3b_gzip_etag_variant_retries_once_with_authoritative_etag():
     }
 
 
-async def test_T3c_gzip_retry_preserves_second_conflict():
-    """A changed authoritative ETag after the retry still fails closed."""
+async def test_T3c_gzip_normalization_preserves_conflict():
+    """A real conflict after suffix repair still fails closed."""
     c = _make_client()
-    server_etags = iter(("abc123", "changed-after-read"))
 
     async def fake_request(method, url, content=None, headers=None):
         req = Request(method, url)
-        resp = Response(412, headers={"etag": f'"{next(server_etags)}"'}, request=req)
+        resp = Response(412, headers={"etag": '"changed-after-read"'}, request=req)
         raise HTTPStatusError("412", request=req, response=resp)
 
     c._make_request = fake_request

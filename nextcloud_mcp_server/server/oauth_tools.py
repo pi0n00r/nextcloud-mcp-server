@@ -9,9 +9,10 @@ import logging
 import os
 import secrets
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import urlencode
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
@@ -426,7 +427,7 @@ async def _check_logged_in(ctx: Context, user_id: str) -> str:
         server_client_id = os.getenv("MCP_SERVER_CLIENT_ID")
         if not server_client_id:
             # Try to get from lifespan context (DCR)
-            lifespan_ctx = ctx.request_context.lifespan_context
+            lifespan_ctx: Any = ctx.request_context.lifespan_context
             if hasattr(lifespan_ctx, "server_client_id"):
                 server_client_id = lifespan_ctx.server_client_id
 
@@ -575,8 +576,8 @@ def register_oauth_tools(mcp):
             "You'll need to complete an OAuth authorization in your browser."
         ),
         annotations=ToolAnnotations(
-            idempotentHint=False,  # Creates new OAuth session each time
-            openWorldHint=True,
+            idempotent_hint=False,  # Creates new OAuth session each time
+            open_world_hint=True,
         ),
     )
     @require_scopes("openid")
@@ -590,9 +591,9 @@ def register_oauth_tools(mcp):
         title="Revoke Server Access to Nextcloud",
         description="Revoke offline access to Nextcloud resources.",
         annotations=ToolAnnotations(
-            destructiveHint=True,  # Removes stored access tokens
-            idempotentHint=True,  # Revoking revoked access = same end state
-            openWorldHint=True,
+            destructive_hint=True,  # Removes stored access tokens
+            idempotent_hint=True,  # Revoking revoked access = same end state
+            open_world_hint=True,
         ),
     )
     @require_scopes("openid")
@@ -606,8 +607,8 @@ def register_oauth_tools(mcp):
         title="Check Provisioning Status",
         description="Check whether Nextcloud access is provisioned.",
         annotations=ToolAnnotations(
-            readOnlyHint=True,  # Only checks status, doesn't modify
-            openWorldHint=True,
+            read_only_hint=True,  # Only checks status, doesn't modify
+            open_world_hint=True,
         ),
     )
     @require_scopes("openid")
@@ -624,8 +625,8 @@ def register_oauth_tools(mcp):
             "If not logged in, this tool will prompt you to complete the login flow."
         ),
         annotations=ToolAnnotations(
-            readOnlyHint=True,  # Checking status doesn't modify state
-            openWorldHint=True,
+            read_only_hint=True,  # Checking status doesn't modify state
+            open_world_hint=True,
         ),
     )
     @require_scopes("openid")

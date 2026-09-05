@@ -32,10 +32,9 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from mcp import types
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.fastmcp import FastMCP
-from mcp.server.lowlevel.server import request_ctx
+from mcp.server.context import CallNext, ServerRequestContext
+from mcp.server.mcpserver import MCPServer
 from prometheus_client import (
     REGISTRY,
     Counter,
@@ -1111,19 +1110,16 @@ def _minor_version(version: object) -> str:
     return ".".join(_client_label(version, 32).split(".")[:2])
 
 
-def record_client_session() -> None:
+def record_client_session(ctx: ServerRequestContext | None) -> None:
     """Record the calling MCP client's identity and capabilities, once per session.
 
-    Reads the SDK's per-request contextvar rather than taking a ``Context``, so
-    it works in every deployment mode (single-user, multi-user BasicAuth, Login
-    Flow v2, OAuth) and for every tool, including the auth/oauth tools that
-    carry no ``@instrument_tool``.
+    Takes the SDK's request context directly, so it works in every deployment
+    mode and for every tool, including auth/oauth tools that carry no
+    ``@instrument_tool``.
 
     Never raises: instrumentation must not be able to fail a tool call.
     """
-    try:
-        ctx = request_ctx.get()
-    except LookupError:
+    if ctx is None:
         # Legitimate outside a request (startup, direct calls in tests), but this
         # function is only wired into the CallToolRequest handler, where a missing
         # request context means the wiring is wrong.
@@ -1272,7 +1268,7 @@ def _sanitize_tool_args(arguments: Mapping[str, Any] | None) -> str | None:
 
 
 def _log_tool_call(
-    req: types.CallToolRequest, tool_name: str, outcome: str, started: float
+    requested_name: str, tool_name: str, outcome: str, started: float
 ) -> None:
     """Emit the one structured line per tool call that Loki queries.
 
@@ -1289,10 +1285,10 @@ def _log_tool_call(
         "duration_ms": int((time.perf_counter() - started) * 1000),
     }
 
-    if req.params.name != tool_name:
+    if requested_name != tool_name:
         # Kept out of the metric label to bound cardinality, kept here because a
         # client sending an unregistered name is exactly what you want to see.
-        fields["mcp_tool_requested"] = req.params.name[:100]
+        fields["mcp_tool_requested"] = requested_name[:100]
 
     # None in BasicAuth / single-user / stdio, where there is no OAuth identity.
     # Deliberately not extract_user_id_from_token(): that raises McpError on a
@@ -1313,22 +1309,20 @@ def _log_tool_call(
     )
 
 
-def instrument_call_tool_outcomes(mcp: FastMCP) -> None:
-    """Wrap the low-level CallToolRequest handler to record how the SDK replied.
+def instrument_call_tool_outcomes(mcp: MCPServer) -> None:
+    """Append middleware that records how the SDK replied to ``tools/call``.
 
     The tool_error/protocol_error distinction is made *inside* the SDK, one
-    frame above ``FastMCP.call_tool``: the handler either returns
-    ``CallToolResult(isError=True)`` or lets an exception escape into
-    ``_handle_request``, which turns it into a JSON-RPC error. This is the only
-    place that can observe which happened.
+    frame above ``MCPServer.call_tool``: the handler either returns
+    ``CallToolResult(is_error=True)`` or lets an exception escape into the
+    dispatcher, which turns it into a JSON-RPC error. Middleware is the only
+    place that can observe which happened in MCP SDK v2.
 
     Doing the same classification inside ``instrument_tool`` by inspecting the
     exception type would merely re-encode our current belief about the SDK, so
     the metric would read identically before and after the 2.x upgrade and
     detect nothing — which is the one thing this metric exists to do.
     """
-    server = mcp._mcp_server
-    original = server.request_handlers[types.CallToolRequest]
 
     def _tool_label(name: str) -> str:
         """Reduce a requested tool name to a registered one, or "unknown".
@@ -1350,29 +1344,32 @@ def instrument_call_tool_outcomes(mcp: FastMCP) -> None:
             logger.debug("Could not consult the tool registry", exc_info=True)
         return "unknown"
 
-    async def handler(req: types.CallToolRequest) -> types.ServerResult:
-        record_client_session()
-        tool_name = _tool_label(req.params.name)
+    async def middleware(ctx: ServerRequestContext, call_next: CallNext) -> Any:
+        if ctx.method != "tools/call":
+            return await call_next(ctx)
+
+        record_client_session(ctx)
+        params: Mapping[str, Any] = ctx.params or {}
+        requested = params.get("name")
+        requested = requested if isinstance(requested, str) else ""
+        tool_name = _tool_label(requested)
         started = time.perf_counter()
         try:
-            result = await original(req)
+            result = await call_next(ctx)
         except Exception:
             # Deliberately Exception, not BaseException: anyio cancellation is
             # not a protocol error and must not poison this signal.
             mcp_tool_outcomes_total.labels(
                 tool_name=tool_name, outcome="protocol_error"
             ).inc()
-            _log_tool_call(req, tool_name, "protocol_error", started)
+            _log_tool_call(requested, tool_name, "protocol_error", started)
             raise
-        # v1 wraps the result in the ServerResult RootModel; v2 returns the
-        # CallToolResult directly.
-        is_error = bool(getattr(getattr(result, "root", result), "isError", False))
-        outcome = "tool_error" if is_error else "success"
+        outcome = "tool_error" if getattr(result, "is_error", False) else "success"
         mcp_tool_outcomes_total.labels(tool_name=tool_name, outcome=outcome).inc()
-        _log_tool_call(req, tool_name, outcome, started)
+        _log_tool_call(requested, tool_name, outcome, started)
         return result
 
-    server.request_handlers[types.CallToolRequest] = handler
+    mcp.middleware.append(middleware)
 
 
 def record_nextcloud_api_call(

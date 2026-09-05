@@ -112,7 +112,13 @@ def _is_compressed_etag_variant(
     if_match: Optional[str], server_etag: Optional[str]
 ) -> bool:
     """Return true only for the exact transport-added ``-gzip`` variant."""
-    client_etag = _normalize_etag(if_match)
+    if if_match is None:
+        return False
+    client_etag = if_match.strip()
+    if client_etag.startswith("W/"):
+        client_etag = client_etag[2:]
+    if client_etag.startswith('"') and client_etag.endswith('"'):
+        client_etag = client_etag[1:-1]
     authoritative_etag = _normalize_etag(server_etag)
     return bool(
         client_etag
@@ -1025,8 +1031,10 @@ class WebDAVClient(BaseNextcloudClient):
         except HTTPStatusError as error:
             status_code = error.response.status_code
             server_etag = _normalize_etag(error.response.headers.get("etag"))
-            if status_code == 412 and _is_compressed_etag_variant(
-                if_match, server_etag
+            if (
+                status_code == 412
+                and _is_compressed_etag_variant(if_match, server_etag)
+                and headers.get("If-Match") != _quote_etag(server_etag or "")
             ):
                 assert server_etag is not None
                 retry_headers = {**headers, "If-Match": _quote_etag(server_etag)}

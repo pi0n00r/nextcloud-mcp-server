@@ -15,8 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from nextcloud_mcp_server.client.calendar import (
     CalendarEtagConflictError,
@@ -39,7 +39,7 @@ def basicauth_mode():
 
 @pytest.fixture
 def list_events_tool():
-    mcp = FastMCP("test-calendar-tools")
+    mcp = MCPServer("test-calendar-tools")
     configure_calendar_tools(mcp)
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
     return tools["nc_calendar_list_events"]
@@ -72,7 +72,7 @@ def test_list_events_schema_allows_omitted_calendar_name(list_events_tool):
 
 
 def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
-    mcp = FastMCP("test-calendar-compatibility")
+    mcp = MCPServer("test-calendar-compatibility")
     configure_calendar_tools(mcp)
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
 
@@ -112,7 +112,7 @@ def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
 
 
 async def test_complete_todo_accepts_completed_at_alias():
-    mcp = FastMCP("test-calendar-completion-alias")
+    mcp = MCPServer("test-calendar-completion-alias")
     configure_calendar_tools(mcp)
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
     update_todo = AsyncMock(return_value={"href": "/calendars/tasks/todo.ics"})
@@ -157,7 +157,7 @@ async def test_complete_todo_accepts_completed_at_alias():
     ],
 )
 async def test_complete_todo_maps_etag_errors(error, message_pattern):
-    mcp = FastMCP("test-calendar-completion-errors")
+    mcp = MCPServer("test-calendar-completion-errors")
     configure_calendar_tools(mcp)
     tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
         "nc_calendar_complete_todo"
@@ -183,7 +183,7 @@ async def test_complete_todo_maps_etag_errors(error, message_pattern):
 
 
 async def test_completion_verifies_after_forwarding_exact_etag():
-    mcp = FastMCP("test-calendar-completion-verification")
+    mcp = MCPServer("test-calendar-completion-verification")
     configure_calendar_tools(mcp)
     tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
         "nc_calendar_complete_todo"
@@ -214,7 +214,7 @@ async def test_completion_verifies_after_forwarding_exact_etag():
 
 
 async def test_readback_failure_does_not_weaken_or_mask_successful_write():
-    mcp = FastMCP("test-calendar-completion-readback-failure")
+    mcp = MCPServer("test-calendar-completion-readback-failure")
     configure_calendar_tools(mcp)
     tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
         "nc_calendar_complete_todo"
@@ -296,7 +296,7 @@ def test_event_summary_preserves_exact_etag():
 async def test_update_tools_translate_etag_errors_to_actionable_toolerror(
     tool_name, method_name, uid_name, uid, error, message_pattern
 ):
-    mcp = FastMCP("test-calendar-etag-errors")
+    mcp = MCPServer("test-calendar-etag-errors")
     configure_calendar_tools(mcp)
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
     update = AsyncMock(side_effect=error)

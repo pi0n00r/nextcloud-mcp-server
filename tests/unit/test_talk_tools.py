@@ -15,8 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from nextcloud_mcp_server.models.talk import TalkConversation
 from nextcloud_mcp_server.server.talk import configure_talk_tools
@@ -35,7 +35,7 @@ def basicauth_mode():
 
 @pytest.fixture
 def tools():
-    mcp = FastMCP("test-talk-tools")
+    mcp = MCPServer("test-talk-tools")
     configure_talk_tools(mcp)
     return {tool.name: tool for tool in mcp._tool_manager.list_tools()}
 

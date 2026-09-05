@@ -42,7 +42,7 @@ async def test_mcp_contacts_workflow(
             "nc_contacts_create_addressbook",
             {"name": addressbook_name, "display_name": f"MCP Test {addressbook_name}"},
         )
-        assert create_ab_result.isError is False
+        assert create_ab_result.is_error is False
 
         # 2. Verify address book creation
         addressbooks = await nc_client.contacts.list_addressbooks()
@@ -58,7 +58,7 @@ async def test_mcp_contacts_workflow(
                 "contact_data": contact_data,
             },
         )
-        assert create_c_result.isError is False
+        assert create_c_result.is_error is False
 
         # 4. Verify contact creation (and that all fields — #716 — actually persisted)
         contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
@@ -76,7 +76,7 @@ async def test_mcp_contacts_workflow(
             "nc_contacts_search_contacts",
             {"query": unique_suffix, "addressbook": addressbook_name},
         )
-        assert search_result.isError is False
+        assert search_result.is_error is False
         search_payload = _extract_payload(search_result)
         assert search_payload["total_count"] == 1
         searched = search_payload["contacts"][0]
@@ -94,7 +94,7 @@ async def test_mcp_contacts_workflow(
                 "contact_data": {"url": "https://mcp-test.example.com"},
             },
         )
-        assert update_result.isError is False
+        assert update_result.is_error is False
         contacts = await nc_client.contacts.list_contacts(
             addressbook=addressbook_name, include_vcard=True
         )
@@ -110,7 +110,7 @@ async def test_mcp_contacts_workflow(
             "nc_contacts_delete_contact",
             {"addressbook": addressbook_name, "uid": contact_uid},
         )
-        assert delete_c_result.isError is False
+        assert delete_c_result.is_error is False
 
         # 6. Verify contact deletion
         contacts = await nc_client.contacts.list_contacts(addressbook=addressbook_name)
@@ -121,7 +121,7 @@ async def test_mcp_contacts_workflow(
         delete_ab_result = await nc_mcp_client.call_tool(
             "nc_contacts_delete_addressbook", {"name": addressbook_name}
         )
-        assert delete_ab_result.isError is False
+        assert delete_ab_result.is_error is False
 
         # 8. Verify address book deletion
         addressbooks = await nc_client.contacts.list_addressbooks()
