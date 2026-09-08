@@ -1,0 +1,10 @@
+--- docling_serve/__main__.py
++++ docling_serve/__main__.py
+@@ -155,6 +155,7 @@
+         app="docling_serve.app:create_app",
+         factory=True,
+         host=uvicorn_settings.host,
++        dual_stack=True,
+         port=uvicorn_settings.port,
+         reload=uvicorn_settings.reload,
+         workers=uvicorn_settings.workers,

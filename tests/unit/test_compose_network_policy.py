@@ -74,3 +74,17 @@ def test_every_compose_port_is_explicitly_dual_stack() -> None:
                 f"{service_name} port {socket} mixes loopback and non-loopback bindings: "
                 f"{hosts}"
             )
+
+
+def test_docling_serve_uses_an_ipv6_dual_stack_listener() -> None:
+    """Docling's upstream default is IPv4-only, so override it explicitly."""
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+
+    docling = compose["services"]["docling"]
+    assert docling["build"]["dockerfile"] == "docker/docling/Dockerfile"
+    assert docling["command"] == [
+        "docling-serve",
+        "run",
+        "--host",
+        "::",
+    ]

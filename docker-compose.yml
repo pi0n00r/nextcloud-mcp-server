@@ -84,8 +84,12 @@ services:
   # runs on plain GitHub-hosted runners. CPU OCR is slow; give it a generous
   # DOCLING_TIMEOUT.
   docling:
-    image: ghcr.io/docling-project/docling-serve-cpu:v1.32.0@sha256:576fc2074ac77bcfbf3fe27633aa0dd89b452a170b2cd31689c8751e94d60f7a
+    build:
+      context: .
+      dockerfile: docker/docling/Dockerfile
+    image: nextcloud-mcp-docling:local
     restart: always
+    command: ["docling-serve", "run", "--host", "::"]
     ports:
       - "127.0.0.1:5001:5001"
       - "[::1]:5001:5001"

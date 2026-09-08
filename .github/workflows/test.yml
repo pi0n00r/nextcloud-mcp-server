@@ -434,7 +434,7 @@ jobs:
           echo "Waiting for docling-serve /health on http://localhost:5001..."
           max_attempts=60
           attempt=0
-          until curl -sf http://localhost:5001/health > /dev/null 2>&1; do
+          until curl -4 -sf http://127.0.0.1:5001/health > /dev/null 2>&1; do
             attempt=$((attempt + 1))
             if [ $attempt -ge $max_attempts ]; then
               echo "docling-serve did not become ready in time."
@@ -444,7 +444,9 @@ jobs:
             echo "Attempt $attempt/$max_attempts: Not ready, sleeping 5s..."
             sleep 5
           done
-          echo "docling-serve is ready."
+          curl -4 -fsS http://127.0.0.1:5001/health > /dev/null
+          curl -6 -g -fsS http://[::1]:5001/health > /dev/null
+          echo "docling-serve is ready over IPv4 and IPv6."
 
       - name: Wait for MCP service (single-user)
         run: |
