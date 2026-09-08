@@ -9,7 +9,8 @@ services:
     volumes:
       - db:/var/lib/mysql
     ports:
-      - 127.0.0.1:3306:3306
+      - "127.0.0.1:3306:3306"
+      - "[::1]:3306:3306"
     environment:
       - MYSQL_ROOT_PASSWORD=password
       - MYSQL_PASSWORD=password
@@ -26,7 +27,8 @@ services:
     image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.14@sha256:29d45e778fe42c07cd3b06ddbf5fe4bf383f3f663c69dee8f0def1e7441f48b8}
     restart: always
     ports:
-      - 127.0.0.1:8080:80
+      - "127.0.0.1:8080:80"
+      - "[::1]:8080:80"
     depends_on:
       - redis
       - db
@@ -67,7 +69,8 @@ services:
     image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.10@sha256:0df934a22e4e893cf15e7aeaf35c463ecc75937758a83099aefdc13041619a1d
     restart: always
     ports:
-      - 127.0.0.1:8005:8000
+      - "127.0.0.1:8005:8000"
+      - "[::1]:8005:8000"
     # Unstructured API runs on port 8000 internally
     # We expose it on 8005 externally to avoid conflict
     profiles:
@@ -84,7 +87,8 @@ services:
     image: ghcr.io/docling-project/docling-serve-cpu:v1.32.0@sha256:576fc2074ac77bcfbf3fe27633aa0dd89b452a170b2cd31689c8751e94d60f7a
     restart: always
     ports:
-      - 127.0.0.1:5001:5001
+      - "127.0.0.1:5001:5001"
+      - "[::1]:5001:5001"
     # docling-serve is a Python app (no curl in the image), so probe /health via
     # the stdlib. Gives local `--profile docling` users a readiness signal and
     # lets a future `depends_on: condition: service_healthy` gate on it.
@@ -121,7 +125,8 @@ services:
       - --port
       - "7997"
     ports:
-      - 127.0.0.1:7997:7997
+      - "127.0.0.1:7997:7997"
+      - "[::1]:7997:7997"
     volumes:
       # Model weights are ~2.5 GB and are downloaded on first boot; cache them
       # so a `docker compose down` isn't a re-download.
@@ -148,8 +153,10 @@ services:
       app:
         condition: service_healthy
     ports:
-      - 127.0.0.1:8000:8000
-      - 127.0.0.1:9090:9090
+      - "127.0.0.1:8000:8000"
+      - "[::1]:8000:8000"
+      - "127.0.0.1:9090:9090"
+      - "[::1]:9090:9090"
     volumes:
       - mcp-data:/app/data
       - ./settings.toml.example:/app/settings.toml:ro
@@ -258,7 +265,8 @@ services:
       app:
         condition: service_healthy
     ports:
-      - 127.0.0.1:8003:8000
+      - "127.0.0.1:8003:8000"
+      - "[::1]:8003:8000"
     environment:
       # Multi-user BasicAuth pass-through mode (ADR-020, ADR-022)
       - NEXTCLOUD_HOST=http://app:80
@@ -323,7 +331,8 @@ services:
       - "--hostname-backchannel-dynamic=true"
       - "--features=preview"  # Enable Legacy V1 token exchange (supports both Standard V2 and Legacy V1)
     ports:
-      - 127.0.0.1:8888:8080
+      - "127.0.0.1:8888:8080"
+      - "[::1]:8888:8080"
     environment:
       - KC_BOOTSTRAP_ADMIN_USERNAME=admin
       - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
@@ -347,7 +356,8 @@ services:
       app:
         condition: service_started
     ports:
-      - 127.0.0.1:8002:8002
+      - "127.0.0.1:8002:8002"
+      - "[::1]:8002:8002"
     environment:
       - PORT=8002
       # Generic OIDC configuration (external IdP mode - Keycloak)
@@ -399,7 +409,8 @@ services:
       app:
         condition: service_healthy
     ports:
-      - 127.0.0.1:8004:8004
+      - "127.0.0.1:8004:8004"
+      - "[::1]:8004:8004"
     environment:
       - PORT=8004
       - NEXTCLOUD_HOST=http://app:80
@@ -452,8 +463,10 @@ services:
     image: docker.io/qdrant/qdrant:v1.19.1@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10
     restart: always
     ports:
-      - 127.0.0.1:6333:6333  # REST API
-      - 127.0.0.1:6334:6334  # gRPC (optional)
+      - "127.0.0.1:6333:6333"  # REST API
+      - "[::1]:6333:6333"
+      - "127.0.0.1:6334:6334"  # gRPC (optional)
+      - "[::1]:6334:6334"
     volumes:
       - qdrant-data:/qdrant/storage
     environment:
@@ -480,7 +493,8 @@ services:
       POSTGRES_PASSWORD: mcp
       POSTGRES_DB: mcp
     ports:
-      - 127.0.0.1:5433:5432
+      - "127.0.0.1:5433:5432"
+      - "[::1]:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mcp -d mcp"]
       interval: 5s
@@ -502,9 +516,12 @@ services:
     ports:
       # Plaintext SMTP/IMAP + the management REST API (8080 → 8085 to avoid the
       # host 8080 already taken by the `app` service).
-      - 127.0.0.1:3025:3025
-      - 127.0.0.1:3143:3143
-      - 127.0.0.1:8085:8080
+      - "127.0.0.1:3025:3025"
+      - "[::1]:3025:3025"
+      - "127.0.0.1:3143:3143"
+      - "[::1]:3143:3143"
+      - "127.0.0.1:8085:8080"
+      - "[::1]:8085:8080"
     healthcheck:
       # The slim JRE base has no curl/wget, but the Ubuntu base ships bash, so
       # probe the IMAP port directly (open once `setup.test.all` has bound it).
@@ -535,7 +552,8 @@ services:
       # no data volume, so it re-seeds fresh on every `up`).
       - ./ldap/bootstrap.ldif:/opt/ldifs/init_org_entries.ldif:ro
     ports:
-      - 127.0.0.1:1389:389
+      - "127.0.0.1:1389:389"
+      - "[::1]:1389:389"
     # Searching for the seeded `alice` entry (not just a port probe) means
     # "healthy" == "bootstrap LDIF applied" — the app-hook can rely on that.
     healthcheck:
