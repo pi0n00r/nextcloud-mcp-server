@@ -45,6 +45,14 @@ current source release.
 > [ERRATA.md](ERRATA.md#webdav-search-with-an-empty-predicate) for affected
 > releases and package guidance.
 
+> [!CAUTION]
+> **BasicAuth is *not* affected.** Packages containing application version
+> `0.185.0` or earlier must not be used with OAuth/Login Flow v2. The correction
+> is present on `master` in `0.185.1`; no corrected
+> container package has been published yet. Operators of affected Login Flow v2
+> deployments must revoke and re-provision pre-fix grants after upgrading. See
+> [ERRATA.md](ERRATA.md#login-flow-v2-grant-ownership).
+
 Nextcloud MCP Server is a standalone bridge between MCP clients and an
 existing Nextcloud instance. It runs outside Nextcloud and exposes a broad,
 typed tool surface over WebDAV, CalDAV, CardDAV, OCS, and application REST
