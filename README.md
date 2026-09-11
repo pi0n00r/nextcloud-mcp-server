@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 164 tools in the
+Deck, Talk, and other Nextcloud application surfaces through 176 tools in the
 current source release.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -78,7 +78,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 164 tools across 12 Nextcloud application surfaces |
+| **Current tool surface** | 176 tools across 13 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5` (application `0.185.0`) |
 | **Current source release** | `v1.8.5` / `0.185.0`: MCP Python SDK v2 and protocol 2026-07-28, direct file links, calendar transparency and concurrent cross-calendar reads, resilient OCR batch polling, and convergent vector re-indexing |
@@ -164,6 +164,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Collectives** | 20 | Collectives, pages, tags, hierarchy, trash and restore |
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
+| **Shopping List** | 12 | Lists, items, bulk ingredient entry, completion and checked-item cleanup |
 | **Files (WebDAV)** | 13 | Read/write, search, move/copy, directories, favorites and comments |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
@@ -172,7 +173,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
-| **Total** | **164** | Tools in the current full single-user source profile |
+| **Total** | **176** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
