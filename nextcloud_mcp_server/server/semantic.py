@@ -12,9 +12,10 @@
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import logging
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, cast
 
 import anyio
+from anyio.abc import TaskGroup
 from httpx import RequestError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import MCPError
@@ -71,6 +72,14 @@ from nextcloud_mcp_server.vector.metrics_publisher import (
 from nextcloud_mcp_server.vector.qdrant_client import get_qdrant_client
 
 logger = logging.getLogger(__name__)
+
+
+class _VectorLifespanContext(Protocol):
+    """Lifespan fields shared by the HTTP vector-search contexts."""
+
+    eviction_task_group: TaskGroup | None
+    task_producer: object | None
+    document_receive_stream: object | None
 
 
 def _consent_narrowed_doc_types(
@@ -616,9 +625,10 @@ def configure_semantic_tools(mcp: MCPServer):
             # AttributeError surfaces during the first search rather than
             # silently degrading to inline eviction for the life of the
             # process.
-            eviction_task_group = (
-                ctx.request_context.lifespan_context.eviction_task_group
+            lifespan_ctx = cast(
+                _VectorLifespanContext, ctx.request_context.lifespan_context
             )
+            eviction_task_group = lifespan_ctx.eviction_task_group
             verification_start = anyio.current_time()
             verified_results, dropped_count = await verify_search_results(
                 client,
@@ -1005,7 +1015,9 @@ def configure_semantic_tools(mcp: MCPServer):
                 get_ingest_pending,
             )
 
-            lifespan_ctx = ctx.request_context.lifespan_context
+            lifespan_ctx = cast(
+                _VectorLifespanContext, ctx.request_context.lifespan_context
+            )
             pending = await get_ingest_pending(
                 task_producer=lifespan_ctx.task_producer,
                 document_receive_stream=lifespan_ctx.document_receive_stream,
