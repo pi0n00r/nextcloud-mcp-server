@@ -5,6 +5,27 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.188.1 (2026-09-15)
+
+### Fix
+
+- **contacts**: keep the mapper's photo default, opt out only in list/search
+- **contacts**: make photo payloads opt-in and add paging
+
+## v0.188.0 (2026-09-15)
+
+### Feat
+
+- **webdav**: expose file tags
+
+### Fix
+
+- **webdav**: apply @with_links to nc_webdav_find_by_tag_name
+
+### Refactor
+
+- **webdav**: typed responses and exclusion guards for the tag tools
+
 ## v0.187.1 (2026-09-12)
 
 ### Fix

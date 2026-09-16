@@ -24,7 +24,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.14@sha256:29d45e778fe42c07cd3b06ddbf5fe4bf383f3f663c69dee8f0def1e7441f48b8}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:ea7bd4d0dc80337b4298c71ae7ab8ce7d42e5237c3b9abbe60602d2451e33c44}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -66,7 +66,7 @@ services:
       - ./tests/fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
 
   unstructured:
-    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.11@sha256:dd3176b0f7f86734707664f0d3996764fcac0bffe1e03dec6a0194438285f1d5
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.11@sha256:023f27de17bd3a809390acfa147cb6373104eadca4120b36eb154fc1de8a61ca
     restart: always
     ports:
       - "127.0.0.1:8005:8000"
@@ -326,7 +326,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.7.2@sha256:9d1f1b2b7261ff53c66cb1092dfcdc34a5fb77e81f9e6a6e75b8b6a795de8067
+    image: quay.io/keycloak/keycloak:26.7.3@sha256:29be7252db0a106f1cd2ac17b9a56ff2668073da645638a38b9fc67deeb2d6c4
     command:
       - "start-dev"
       - "--import-realm"

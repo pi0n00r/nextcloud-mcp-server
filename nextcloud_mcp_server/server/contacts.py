@@ -141,60 +141,103 @@ def _parse_address_fields(raw_values: dict | list | None) -> list[ContactField]:
     return fields
 
 
-def _raw_contact_to_model(raw: dict) -> Contact:
-    contact_info = raw.get("contact")
-    if contact_info is None:
-        contact_info = raw.get("json", {})
-    emails = _parse_vcard_fields(contact_info.get("email"), "email")
-    phones = _parse_vcard_fields(contact_info.get("tel"), "phone")
-
-    raw_urls = contact_info.get("url")
+def _parse_url_fields(raw_urls: str | list | None) -> list[ContactField]:
     if isinstance(raw_urls, str):
         raw_urls = [raw_urls] if raw_urls else []
-    urls = [
+    return [
         ContactField(type="url", value=url)
         for url in (raw_urls or [])
         if isinstance(url, str) and url
     ]
 
-    raw_categories = contact_info.get("categories") or []
-    if isinstance(raw_categories, str):
-        categories = [
-            category.strip()
-            for category in raw_categories.split(",")
-            if category.strip()
-        ]
-    else:
-        categories = [
-            category
-            for category in raw_categories
-            if isinstance(category, str) and category
-        ]
 
+def _parse_categories(raw_categories: str | list | None) -> list[str]:
+    raw_categories = raw_categories or []
+    if isinstance(raw_categories, str):
+        return [item.strip() for item in raw_categories.split(",") if item.strip()]
+    return [item for item in raw_categories if isinstance(item, str) and item]
+
+
+def _build_custom_fields(contact_info: dict) -> dict[str, Any]:
     custom_fields: dict[str, Any] = dict(contact_info.get("custom_fields") or {})
     nickname = contact_info.get("nickname")
     if nickname:
         custom_fields["nickname"] = nickname
     custom_fields.update(contact_info.get("custom") or {})
-    name_parts = contact_info.get("n") or []
+    return custom_fields
+
+
+def _split_name_parts(raw_n: list | None) -> tuple[str | None, str | None]:
+    """Return ``(family_name, given_name)`` from the N component list.
+
+    N is ``[family, given, additional, prefix, suffix]``; index-guarded since a
+    malformed card can carry fewer components. Empty strings become ``None``.
+    """
+    name_parts = raw_n or []
+    family = name_parts[0] if len(name_parts) > 0 else None
+    given = name_parts[1] if len(name_parts) > 1 else None
+    return (family or None), (given or None)
+
+
+def _page(items: list, limit: int | None, offset: int) -> list:
+    """Slice one page out of a contact list.
+
+    Both bounds are defensive: a negative offset starts at the beginning, a
+    negative limit yields nothing rather than slicing from the end.
+    """
+    start = max(0, offset)
+    if limit is None:
+        return items[start:]
+    return items[start : start + max(0, limit)]
+
+
+def _raw_contact_to_model(raw: dict, *, include_photo: bool = True) -> Contact:
+    """Convert a raw contact dict from the contacts client to a Contact model.
+
+    Maps fullname, name parts, nickname, birthday, email, tel, address, org,
+    title, note, url, categories, photo and X-* extension fields. Email/tel
+    values may be plain strings, dicts with ``value``/``type`` keys, or lists of
+    either – see :func:`_parse_vcard_fields`.
+
+    ``include_photo`` controls whether the inline PHOTO payload is carried
+    over. It defaults to True so single-contact mappings keep their previous
+    shape; only the list and search tools opt out, because vCards embed photos
+    as base64 and that dwarfs every other field when many contacts are
+    returned at once. ``has_photo`` is reported either way.
+    """
+    contact_info = raw.get("contact")
+    if contact_info is None:
+        contact_info = raw.get("json", {})
+
+    emails = _parse_vcard_fields(contact_info.get("email"), "email")
+    phones = _parse_vcard_fields(contact_info.get("tel"), "phone")
+    urls = _parse_url_fields(contact_info.get("url"))
+    categories = _parse_categories(contact_info.get("categories"))
+    custom_fields = _build_custom_fields(contact_info)
+    family_name, given_name = _split_name_parts(contact_info.get("n"))
+    # An empty PHOTO is no photo: normalising here keeps photo and has_photo
+    # consistent instead of reporting "" alongside has_photo=False.
+    raw_photo = contact_info.get("photo") or None
+
     return Contact(
         uid=raw.get("vcard_id") or raw.get("uid"),
         resource_path=raw.get("object_path"),
         fn=contact_info.get("fullname", ""),
         etag=raw.get("getetag") if "getetag" in raw else raw.get("etag"),
         vcard_text=raw.get("vcard_text"),
-        given_name=name_parts[1] or None if len(name_parts) > 1 else None,
-        family_name=name_parts[0] or None if name_parts else None,
+        given_name=given_name,
+        family_name=family_name,
+        organization=contact_info.get("org"),
+        title=contact_info.get("title"),
+        note=contact_info.get("note"),
+        photo=raw_photo if include_photo else None,
+        has_photo=bool(raw_photo),
         birthday=contact_info["birthday"].isoformat()
         if isinstance(contact_info.get("birthday"), date)
         else contact_info.get("birthday"),
         emails=emails,
         phones=phones,
         addresses=_parse_address_fields(contact_info.get("adr")),
-        organization=contact_info.get("org"),
-        title=contact_info.get("title"),
-        note=contact_info.get("note"),
-        photo=contact_info.get("photo"),
         urls=urls,
         categories=categories,
         custom_fields=custom_fields,
@@ -242,15 +285,26 @@ def configure_contacts_tools(mcp: MCPServer):
         addressbook: str,
         include_vcard: bool = False,
         include_etag: bool = True,
+        include_photos: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> ListContactsResponse:
         """List all contacts in the specified addressbook.
 
         Args:
-            addressbook: URI slug of the addressbook (e.g. "contacts").
+            addressbook: URI slug of the addressbook (e.g. "contacts"), not
+                the display name.
             include_vcard: include the raw vcard_text per contact (byte-truth,
                 useful for byte-preserving subsequent writes).
             include_etag: include the per-contact ETag (default True so
                 callers can chain into patch_contact without an extra GET).
+            include_photos: Include the inline base64 PHOTO payload. Off by
+                default: embedded photos dominate vCard size and can push the
+                response past what the transport delivers. ``has_photo`` still
+                says which contacts have one.
+            limit: Maximum number of contacts to return. None returns all.
+            offset: Number of contacts to skip, for paging through a large
+                addressbook together with ``limit``.
         """
         client = await get_client(ctx)
         contacts_data = await client.contacts.list_contacts(
@@ -258,9 +312,16 @@ def configure_contacts_tools(mcp: MCPServer):
             include_vcard=include_vcard,
             include_etag=include_etag,
         )
-        contacts = [_raw_contact_to_model(c) for c in contacts_data]
+        total = len(contacts_data)
+
+        page = _page(contacts_data, limit, offset)
+        contacts = [
+            _raw_contact_to_model(c, include_photo=include_photos) for c in page
+        ]
+        # total_count reports the addressbook size, not the page size, so a
+        # caller can tell whether more contacts remain.
         return ListContactsResponse(
-            contacts=contacts, addressbook=addressbook, total_count=len(contacts)
+            contacts=contacts, addressbook=addressbook, total_count=total
         )
 
     # ------------------------------------------------------------------
@@ -464,7 +525,11 @@ def configure_contacts_tools(mcp: MCPServer):
     @require_scopes("contacts.read")
     @instrument_tool
     async def nc_contacts_search_contacts(
-        ctx: Context, *, query: str, addressbook: str | None = None
+        ctx: Context,
+        *,
+        query: str,
+        addressbook: str | None = None,
+        include_photos: bool = False,
     ) -> ListContactsResponse:
         """Search contacts by free-text query across name, nickname, email, and phone.
 
@@ -480,6 +545,8 @@ def configure_contacts_tools(mcp: MCPServer):
                 An empty query returns no results — use list_contacts for that.
             addressbook: Optional URI slug of a specific addressbook to search.
                 When omitted, every addressbook for the user is searched.
+            include_photos: Include the inline base64 PHOTO payload. Off by
+                default -- see nc_contacts_list_contacts.
 
         Returns:
             ListContactsResponse with matching contacts. The ``addressbook``
@@ -508,7 +575,7 @@ def configure_contacts_tools(mcp: MCPServer):
         for ab_slug in address_books:
             raw_contacts = await client.contacts.list_contacts(addressbook=ab_slug)
             for raw in raw_contacts:
-                contact = _raw_contact_to_model(raw)
+                contact = _raw_contact_to_model(raw, include_photo=include_photos)
                 hay_parts: list[str] = []
                 if contact.fn:
                     hay_parts.append(contact.fn.lower())

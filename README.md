@@ -18,8 +18,8 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 176 tools in the
-current source release.
+Deck, Talk, and other Nextcloud application surfaces through 181 tools in the
+current source branch.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -78,10 +78,10 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 176 tools across 13 Nextcloud application surfaces |
+| **Current tool surface** | 181 tools across 13 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5` (application `0.185.0`) |
-| **Current source release** | `v1.8.5` / `0.185.0`: MCP Python SDK v2 and protocol 2026-07-28, direct file links, calendar transparency and concurrent cross-calendar reads, resilient OCR batch polling, and convergent vector re-indexing |
+| **Current source** | `0.188.1`: stable-package capabilities plus WebDAV file tags and paged, opt-in contact-photo payloads |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -165,7 +165,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Shopping List** | 12 | Lists, items, bulk ingredient entry, completion and checked-item cleanup |
-| **Files (WebDAV)** | 13 | Read/write, search, move/copy, directories, favorites and comments |
+| **Files (WebDAV)** | 18 | Read/write, search, move/copy, directories, favorites, comments and file tags |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 7 | Create, read, update, append, search, attachments |
@@ -173,7 +173,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
-| **Total** | **176** | Tools in the current full single-user source profile |
+| **Total** | **181** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
