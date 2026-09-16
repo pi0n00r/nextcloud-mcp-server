@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 181 tools in the
+Deck, Talk, and other Nextcloud application surfaces through 185 tools in the
 current source branch.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -78,7 +78,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 181 tools across 13 Nextcloud application surfaces |
+| **Current tool surface** | 185 tools across 13 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5` (application `0.185.0`) |
 | **Current source** | `0.188.1`: stable-package capabilities plus WebDAV file tags and paged, opt-in contact-photo payloads |
@@ -165,7 +165,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Shopping List** | 12 | Lists, items, bulk ingredient entry, completion and checked-item cleanup |
-| **Files (WebDAV)** | 18 | Read/write, search, move/copy, directories, favorites, comments and file tags |
+| **Files (WebDAV)** | 22 | Read/write, search, move/copy, directories, favorites, comments, file tags, trash restore and version rollback |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 7 | Create, read, update, append, search, attachments |
