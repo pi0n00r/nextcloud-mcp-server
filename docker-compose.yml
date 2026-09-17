@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.3-noble@sha256:ab1c3dd381940233af12512b97d47b508fd3a0f17fbe3ba388739b7bc17cbc0b
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:adbf5727f3d6ffa0ea11109f948247d88d110edd3f43f8d4c134c0a09060c5f3
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -24,7 +24,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:ea7bd4d0dc80337b4298c71ae7ab8ce7d42e5237c3b9abbe60602d2451e33c44}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:db4f7083210711ebe0c448341a92b0f1b839429507725f4df77c52fc03573336}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -59,7 +59,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.5-alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3
+    image: docker.io/library/nginx:1.31.6-alpine@sha256:d0a6faaed2491faecdb9021f449e8edd7b1bbba246fe2ddf7eba63cccd5b9803
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -326,7 +326,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.7.3@sha256:29be7252db0a106f1cd2ac17b9a56ff2668073da645638a38b9fc67deeb2d6c4
+    image: quay.io/keycloak/keycloak:26.7.4@sha256:82a77884f3af238beab1e7afd63b5f530e1b5c0590bd7aa60b40a40463e29b2c
     command:
       - "start-dev"
       - "--import-realm"
@@ -390,6 +390,8 @@ services:
       # Login Flow v2 (ADR-022) with external IdP — derived from the
       # auto-detected LOGIN_FLOW deployment mode; no separate flag needed.
       - ENABLE_DCR=true
+      # CIMD (GH #1470): trust claude.ai's Client ID Metadata Document
+      - CIMD_ALLOWED_HOSTS=claude.ai
 
       # OAuth scopes (optional - uses defaults if not specified)
       - NEXTCLOUD_OIDC_SCOPES=openid profile email offline_access notes.read notes.write calendar.read calendar.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write sharing.read sharing.write todo.read todo.write
@@ -543,7 +545,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:0d9b7cf8874b5fc4fda4507a1b884325f04a1fe3589c0bfb17ce50c367619dae
+    image: docker.io/vegardit/openldap:2.6.10@sha256:b81f6c360830b21b9e6d8878563e3e11bd81e243693c83fa371efeee34556ce9
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org
