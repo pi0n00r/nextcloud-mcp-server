@@ -15,6 +15,7 @@ import datetime as dt
 import logging
 from typing import Any, Optional
 
+import httpx
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -594,6 +595,7 @@ def configure_calendar_tools(mcp: MCPServer):
         location: str = "",
         description: str = "",
         reminder_minutes: int = 15,
+        timezone: str = "",
     ):
         """Quick meeting creation with smart defaults
 
@@ -617,11 +619,22 @@ def configure_calendar_tools(mcp: MCPServer):
             location: Meeting location
             description: Meeting description/agenda
             reminder_minutes: Minutes before meeting to send reminder (default: 15)
+            timezone: IANA timezone ``date``/``time`` are expressed in (e.g.
+                ``"Europe/Amsterdam"``). Defaults to the user's Nextcloud
+                timezone setting. Only if that is unset or unreadable is the
+                meeting stored as floating local time.
 
         Returns:
             Dict with meeting creation result
         """
         client = await get_client(ctx)
+
+        if not timezone:
+            try:
+                timezone = await client.users.get_current_user_timezone()
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                # Fail open: a floating meeting beats no meeting.
+                logger.warning("Could not read the user's timezone: %s", e)
 
         # Combine date and time for start_datetime
         start_datetime = f"{date}T{time}:00"
@@ -643,6 +656,7 @@ def configure_calendar_tools(mcp: MCPServer):
             "status": "CONFIRMED",
             "priority": 5,
             "privacy": "PUBLIC",
+            "timezone": timezone,
         }
 
         return await client.calendar.create_event(calendar_name, event_data)
@@ -849,6 +863,7 @@ def configure_calendar_tools(mcp: MCPServer):
         new_reminder_minutes: Optional[int] = None,
         # Move operation parameters
         target_calendar: Optional[str] = None,
+        apply_to_series: bool = False,
     ):
         """Perform bulk operations (update/delete) on events matching filter criteria.
 
@@ -875,6 +890,12 @@ def configure_calendar_tools(mcp: MCPServer):
 
             # For move operations:
             target_calendar: Calendar to move events to (requires operation="move")
+
+            apply_to_series: A matched occurrence of a recurring event stands for
+                the whole stored series: update/delete act on every occurrence,
+                not only those inside the date filter. Such matches are skipped
+                (status "skipped") unless this is true. Move never takes a
+                recurring series.
 
         Returns:
             Summary of operation results including counts and details
@@ -939,11 +960,14 @@ def configure_calendar_tools(mcp: MCPServer):
                     filters=filter_criteria,
                 )
 
+            targets, skipped = client.calendar._bulk_targets(
+                events, apply_to_series, "delete"
+            )
             deleted_count = 0
             failed_count = 0
-            results = []
+            results = list(skipped)
 
-            for event in events:
+            for event in targets:
                 try:
                     outcome = await client.calendar.delete_event(
                         event.get("calendar_name", calendar_name), event["uid"]
@@ -983,9 +1007,10 @@ def configure_calendar_tools(mcp: MCPServer):
 
             return {
                 "operation": "delete",
-                "total_found": len(events),
+                "total_found": len(targets) + len(skipped),
                 "deleted_count": deleted_count,
                 "failed_count": failed_count,
+                "skipped_count": len(skipped),
                 "results": results,
             }
 
@@ -1009,7 +1034,7 @@ def configure_calendar_tools(mcp: MCPServer):
                 raise ValueError("No update data provided for update operation")
 
             return await client.calendar.bulk_update_events(
-                filter_criteria, update_data
+                filter_criteria, update_data, apply_to_series=apply_to_series
             )
 
         elif operation == "move":
@@ -1034,11 +1059,14 @@ def configure_calendar_tools(mcp: MCPServer):
                     filters=filter_criteria,
                 )
 
+            targets, skipped = client.calendar._bulk_targets(
+                events, apply_to_series, "move"
+            )
             moved_count = 0
             failed_count = 0
-            results = []
+            results = list(skipped)
 
-            for event in events:
+            for event in targets:
                 try:
                     # Create event in target calendar
                     event_data = {
@@ -1105,9 +1133,10 @@ def configure_calendar_tools(mcp: MCPServer):
 
             return {
                 "operation": "move",
-                "total_found": len(events),
+                "total_found": len(targets) + len(skipped),
                 "moved_count": moved_count,
                 "failed_count": failed_count,
+                "skipped_count": len(skipped),
                 "target_calendar": target_calendar,
                 "results": results,
             }

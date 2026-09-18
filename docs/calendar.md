@@ -58,7 +58,8 @@ await nc_calendar_create_event(
     recurrence_rule="FREQ=WEEKLY;BYDAY=MO"
 )
 
-# Quick meeting creation
+# Quick meeting creation. `timezone` defaults to the user's Nextcloud
+# timezone setting; pass an IANA name to override it.
 await nc_calendar_create_meeting(
     title="Client Call",
     date="2025-07-28",
@@ -102,6 +103,9 @@ bulk_result = await nc_calendar_bulk_operations(
     new_location="Conference Room B",
     new_reminder_minutes=15
 )
+# Each stored event is acted on once. A matched occurrence of a recurring
+# event stands for its whole series, so update/delete skip it (status
+# "skipped") unless apply_to_series=True. Move never takes a recurring series.
 
 # Create a new project calendar
 new_calendar = await nc_calendar_manage_calendar(
