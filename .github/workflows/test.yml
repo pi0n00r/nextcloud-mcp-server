@@ -92,9 +92,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:db4f7083210711ebe0c448341a92b0f1b839429507725f4df77c52fc03573336"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:d327f7cbd131726f11058e6021f393867dd5c8c17d097af719c773c771f6c26c"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.9@sha256:10d0073499dc583ea9810da16512818d43c16d60501a6bb777742ee5d9eea238"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.9@sha256:29eed78ab5152c9fef2e89cf742f8b10f1fb20d4acdd5e4224fdd93625e6f114"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -106,7 +106,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.4@sha256:fca405153f43542409c7351636752e388329c07418557f04e6fcbdeeaf64585d"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.4@sha256:b13a87affb7e11e4c99ad56f885bc44f9c7564af089f55aea9e0d7cf789fa84d"
 
           # Mode-specific properties
           - mode: single-user
@@ -227,7 +227,7 @@ jobs:
 
       # Start services with the appropriate profile
       - name: Run docker compose
-        uses: hoverkraft-tech/compose-action@ee6af68587292d72db67743171809c19787df4c9 # v3.1.0
+        uses: hoverkraft-tech/compose-action@b659c744ee9bed25aea2307c017ad849bd104433 # v3.2.0
         with:
           compose-file: "./docker-compose.yml"
           compose-flags: "--profile ${{ matrix.profile }} ${{ matrix.extra-compose-profiles }}"
@@ -389,7 +389,7 @@ jobs:
           echo "TOKEN_ENCRYPTION_KEY=${KEY}" >> "$GITHUB_ENV"
 
       - name: Run docker compose (single-user + docling)
-        uses: hoverkraft-tech/compose-action@ee6af68587292d72db67743171809c19787df4c9 # v3.1.0
+        uses: hoverkraft-tech/compose-action@b659c744ee9bed25aea2307c017ad849bd104433 # v3.2.0
         with:
           compose-file: "./docker-compose.yml"
           compose-flags: "--profile single-user --profile docling"
@@ -495,6 +495,122 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: debug-docling
+          path: |
+            /tmp/docker-compose-logs.txt
+            /tmp/nextcloud-app.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Collabora Online conversion lane (ADR-039). Starts the single-user MCP service
+  # plus the docker-compose `collabora` profile (CODE container) and runs the
+  # gated `-m collabora` suite: legacy .doc/.xls/.ppt and ODF .odt files are
+  # converted by coolwsd's convert-to API and read by the native OOXML readers.
+  # Its own job for the same reason as docling: an extra large image, and no
+  # need for the Nextcloud version matrix.
+  collabora-integration:
+    name: integration (collabora)
+    runs-on: ubuntu-latest
+    needs: [linting]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate ephemeral TOKEN_ENCRYPTION_KEY
+        run: |
+          KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+          echo "TOKEN_ENCRYPTION_KEY=${KEY}" >> "$GITHUB_ENV"
+
+      - name: Run docker compose (single-user + collabora)
+        uses: hoverkraft-tech/compose-action@b659c744ee9bed25aea2307c017ad849bd104433 # v3.2.0
+        with:
+          compose-file: "./docker-compose.yml"
+          compose-flags: "--profile single-user --profile collabora"
+          up-flags: "--build"
+        env:
+          TOKEN_ENCRYPTION_KEY: ${{ env.TOKEN_ENCRYPTION_KEY }}
+          COLLABORA_URL: "http://collabora:9980"
+
+      - name: Set up the uv environment
+        uses: ./.github/actions/uv-env
+
+      - name: Wait for Nextcloud
+        run: |
+          echo "Waiting for Nextcloud at http://localhost:8080..."
+          max_attempts=60
+          attempt=0
+          until curl -sSf http://localhost:8080/status.php 2>/dev/null | grep -q '"installed":true'; do
+            attempt=$((attempt + 1))
+            if [ $attempt -ge $max_attempts ]; then
+              echo "Nextcloud did not become ready in time."
+              docker compose logs app
+              exit 1
+            fi
+            echo "Attempt $attempt/$max_attempts: Not ready, sleeping 5s..."
+            sleep 5
+          done
+          echo "Nextcloud is ready."
+
+      - name: Wait for Collabora
+        run: |
+          # The CODE image has no shell for a container healthcheck; its
+          # capabilities endpoint also says whether convert-to is allowed.
+          echo "Waiting for coolwsd /hosting/capabilities on http://localhost:9980..."
+          max_attempts=60
+          attempt=0
+          until curl -sf http://localhost:9980/hosting/capabilities | grep -q '"convert-to":{"available":true'; do
+            attempt=$((attempt + 1))
+            if [ $attempt -ge $max_attempts ]; then
+              echo "Collabora did not become ready in time."
+              docker compose --profile collabora logs collabora
+              exit 1
+            fi
+            echo "Attempt $attempt/$max_attempts: Not ready, sleeping 5s..."
+            sleep 5
+          done
+          echo "Collabora is ready."
+
+      - name: Wait for MCP service (single-user)
+        run: |
+          echo "Waiting for MCP service on port 8000..."
+          max_attempts=30
+          attempt=0
+          until curl -o /dev/null -s -w "%{http_code}\n" http://localhost:8000/health 2>/dev/null | grep -qE "200|404|405"; do
+            attempt=$((attempt + 1))
+            if [ $attempt -ge $max_attempts ]; then
+              echo "MCP service did not become ready in time."
+              docker compose --profile single-user logs mcp
+              exit 1
+            fi
+            echo "Attempt $attempt/$max_attempts: Not ready, sleeping 5s..."
+            sleep 5
+          done
+          echo "MCP service is ready on port 8000."
+
+      - name: Run collabora tests
+        env:
+          NEXTCLOUD_HOST: "http://localhost:8080"
+          NEXTCLOUD_USERNAME: "admin"
+          NEXTCLOUD_PASSWORD: "admin"
+          # Lifts the skipif in tests/integration/test_collabora_convert.py; it
+          # reads this process's environment, not the container's.
+          COLLABORA_URL: "http://collabora:9980"
+        run: |
+          uv run --no-build --no-sync pytest -v \
+            --log-cli-level=WARN \
+            -m collabora \
+            -o "addopts=-p no:asyncio" \
+            --timeout=600
+
+      - name: Collect service logs on failure
+        if: failure()
+        run: |
+          docker compose --profile single-user --profile collabora logs --tail=500 > /tmp/docker-compose-logs.txt 2>&1
+          docker compose exec -T app cat /var/www/html/data/nextcloud.log 2>/dev/null | tail -100 > /tmp/nextcloud-app.log 2>&1 || true
+
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-collabora
           path: |
             /tmp/docker-compose-logs.txt
             /tmp/nextcloud-app.log

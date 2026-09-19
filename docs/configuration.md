@@ -435,6 +435,33 @@ Notes:
   returning already-indexed mail unverified.
 - Max 128 characters (validated at startup — the Mail app rejects longer names).
 
+### Which file types get indexed — `VECTOR_SYNC_INDEXABLE_MIME_TYPES`
+
+Tagged-file discovery enqueues **PDF plus the OOXML office formats that have a
+native reader** (`.pdf`, `.docx`, `.xlsx`, `.pptx`; ADR-036/038). A tagged file of
+any other type is ignored. The list is an explicit allowlist rather than "whatever the
+processor registry can parse", so enabling an optional processor cannot widen
+the corpus — and its embedding bill — without someone choosing to.
+
+> **Upgrading from a PDF-only release changes what you pay to embed.** Before
+> this setting existed, discovery was hard-filtered to `application/pdf`. On
+> upgrade, any `.docx`/`.xlsx`/`.pptx` file already sitting under a `vector-index`
+> (or `keyword-index`) tag — including everything beneath a tagged folder —
+> becomes eligible and will be indexed on the next scan. Nothing is removed and
+> no API changes, so this is not a breaking change; but if you tagged folders
+> broadly and only meant PDFs, narrow it back before upgrading:
+>
+> ```dotenv
+> VECTOR_SYNC_INDEXABLE_MIME_TYPES=application/pdf
+> ```
+>
+> Setting it **empty** does not mean "no filter" — it means *index nothing*, and
+> discovery logs a warning saying so.
+
+Reading `.doc`/`.docx` and legacy `.xls` needs LibreOffice in the image. Where
+it is absent those types are simply not claimed, and each discovered file logs
+one "no processor for type" failure rather than failing mid-parse.
+
 ### Per-document keyword vs hybrid indexing — `VECTOR_SYNC_KEYWORD_TAG`
 
 Documents are indexed **hybrid** (dense semantic + BM25 sparse) or
@@ -776,7 +803,7 @@ shorter OCR ceiling:
 ```dotenv
 DOCUMENT_PARSE_TIMEOUT_SECONDS=120    # Wall-clock cap per isolated parse (default: 120)
 DOCUMENT_OCR_TIMEOUT_SECONDS=180      # OCR backend request timeout (default: 180)
-DOCUMENT_MAX_PDF_SIZE_MB=50           # Pre-parse size cap; 0 disables (default: 50)
+DOCUMENT_MAX_PDF_SIZE_MB=50           # Pre-parse size cap for EVERY indexed document, not only PDFs; 0 disables (default: 50)
 DOCUMENT_PARSE_PAGE_WINDOW=100        # Pages per extraction window; 0 disables (default: 100)
 DOCUMENT_PARSE_PROCESS_SLOTS=2        # Concurrent isolated parse subprocesses (default: 2)
 DOCUMENT_MARKDOWN_MAX_PAGES=150       # Structured-tier markdown page ceiling; 0 disables markdown (default: 150)
@@ -798,7 +825,13 @@ well beyond what the pod can survive. Keep
 `DOCUMENT_PARSE_PROCESS_SLOTS × DOCUMENT_PARSE_MEM_LIMIT_MB` within the pod's
 memory limit. The limiter is created once per worker, so a change needs a restart.
 
-A PDF larger than `DOCUMENT_MAX_PDF_SIZE_MB` fails fast with reason `oversize`
+**The name says PDF; the cap does not.** `DOCUMENT_MAX_PDF_SIZE_MB` guards every
+indexed document — `.docx`, `.doc`, `.xlsx`, `.xls` and `.msg` included — since
+discovery stopped being PDF-only. The setting keeps its original name so
+existing deployments are not silently re-tuned by a rename. If a large `.docx`
+is being rejected as `oversize`, this is the knob, despite the name.
+
+A document larger than `DOCUMENT_MAX_PDF_SIZE_MB` fails fast with reason `oversize`
 (exported on `bridgette_document_parse_failed_total{reason="oversize"}`) instead
 of being handed to the tiers, where a 40+ MB scan would otherwise burn the full
 OCR timeout for zero recovered text.
@@ -977,11 +1010,12 @@ own, so a PDF reaches it through the OCR tier and nowhere else:
   `force_processor="docling"`, which asked the caller to name an extraction
   engine it had no basis to choose.)
 
-Office formats (DOCX/XLSX) deliberately stay with `unstructured` — docling is
-scoped to the image/scan/handwriting use case here. `.pptx` has its own native
-`python-pptx` reader (ADR-036) and does not route through docling for its text;
-it can optionally send the *pictures* it finds to docling for captioning — see
-"PPTX picture captioning" below. OCR language codes are
+Office formats never route through docling for their text — docling is scoped
+to the image/scan/handwriting use case here. `.pptx` has a native `python-pptx`
+reader (ADR-036), and `.docx`/`.xlsx` native `python-docx`/`openpyxl` readers
+(ADR-038); all three can optionally send the *pictures* they find to docling
+for captioning — see
+"Office picture captioning" below. OCR language codes are
 engine-dependent: the docling-serve default engine (EasyOCR) uses two-letter
 codes (`en,de`); a Tesseract-backed instance wants `eng,deu`. The synchronous
 convert endpoint has an observed ~2 min practical ceiling (from our testing, not a
@@ -1028,37 +1062,64 @@ base64 **fast** instead of hanging until the client times out. Default is empty
 if you deliberately want interactive VLM with a tolerant client. It never affects
 the async ingest/worker path. See `docs/ADR-032-docling-vlm-pipeline.md`.
 
-#### PPTX picture captioning (opt-in)
+#### Legacy and ODF office formats via Collabora Online (opt-in)
 
-`PptxProcessor` (ADR-036) reads `.pptx` text/tables natively and never touches
-docling for that. It can *additionally* send each raster picture it finds on a
-slide to the same docling-serve instance for a short caption, appended under
-the slide as `*Image: <caption>*`:
+`.doc`/`.xls`/`.ppt` and `.odt`/`.ods`/`.odp` have no pure-Python reader. Point
+the server at a Collabora Online (coolwsd) instance, for example the one serving
+Nextcloud Office, and these files are converted to OOXML by its stateless
+`convert-to` API and read by the native `.docx`/`.xlsx`/`.pptx` readers (ADR-039):
 
 ```dotenv
-PPTX_CAPTION_IMAGES=false          # explicit opt-in, on top of DOCLING_API_URL
-PPTX_CAPTION_MAX_IMAGES=8          # cap on docling round trips per file
-PPTX_CAPTION_TIMEOUT_SECONDS=15    # per-picture request timeout (independent of DOCLING_TIMEOUT)
+COLLABORA_URL=http://collabora:9980   # coolwsd base URL; unset = these types are not claimed
+COLLABORA_TIMEOUT_SECONDS=60          # per-file convert-to request timeout
 ```
+
+coolwsd answers `convert-to` only for clients in its `net.post_allow` list. The
+default list covers loopback and the private ranges (compose networks, cluster
+pod CIDRs); a denied client gets HTTP 403. Check with
+`curl $COLLABORA_URL/hosting/capabilities`, which reports
+`"convert-to":{"available":true}` for an allowed client. For local development:
+`docker compose --profile collabora up -d collabora` and
+`COLLABORA_URL=http://collabora:9980`.
+
+Outlook `.msg` needs none of this: it is read in-process.
+
+#### Office picture captioning (opt-in)
+
+The native OOXML readers (`.pptx`, ADR-036; `.docx`/`.xlsx`, ADR-038) extract
+text/tables without docling. They can *additionally* send each raster picture
+they find to the same docling-serve instance for a short caption, added as
+`*Image: <caption>*` — under the slide for `.pptx`, right after the paragraph
+holding the picture for `.docx`, and in a trailing `## Images` section for
+`.xlsx`:
+
+```dotenv
+OFFICE_CAPTION_IMAGES=false          # explicit opt-in, on top of DOCLING_API_URL
+OFFICE_CAPTION_MAX_IMAGES=8          # cap on docling round trips per file
+OFFICE_CAPTION_TIMEOUT_SECONDS=15    # per-picture request timeout (independent of DOCLING_TIMEOUT)
+```
+
+These were `PPTX_CAPTION_*` in 0.193.0. The old names still apply, with a
+deprecation warning, wherever the new name is left at its default.
 
 Requires `DOCLING_API_URL` (does **not** require `ENABLE_DOCLING` — that flag
 only gates the images-auto-select processor on the `find_processor` path,
-a different touchpoint). `PPTX_CAPTION_IMAGES` is its own explicit toggle
+a different touchpoint). `OFFICE_CAPTION_IMAGES` is its own explicit toggle
 rather than riding the bare URL, for the same reason `DOCUMENT_OCR_PROVIDER`
 needs its own selection: a deployment that only wants docling for scanned-PDF
-OCR shouldn't start captioning every picture in every presentation for free.
+OCR shouldn't start captioning every picture in every document for free.
 
 Only *raster* picture shapes are captioned, and only above
 `MIN_CAPTION_PICTURE_PX` (80px on either native axis) — small pictures are
 treated as decorative (a logo, a bullet icon) and skipped. **Native vector
 diagrams (SmartArt, freeform/connector shapes) are not pictures in the OOXML
-sense and are not affected by this setting at all** — python-pptx has no
+sense and are not affected by this setting at all** — the readers have no
 rendering engine to turn them into pixels, so they still produce no text. The
-result's `parsing_metadata.pptx_pictures_found` / `.pptx_pictures_captioned`
+result's `parsing_metadata.pictures_found` / `.pictures_captioned`
 report what was found/described, surfaced as a `parse_notes` entry on
-`nc_webdav_read_file` whenever a deck has pictures that were not (fully)
+`nc_webdav_read_file` whenever a document has pictures that were not (fully)
 captioned. `DOCLING_PIPELINE=vlm` also affects captions (better descriptions,
-much slower per picture — raise `PPTX_CAPTION_TIMEOUT_SECONDS` accordingly).
+much slower per picture — raise `OFFICE_CAPTION_TIMEOUT_SECONDS` accordingly).
 See `docs/ADR-037-pptx-picture-captioning.md`.
 
 #### OCR execution mode: synchronous vs batch (Deck #332)
@@ -1391,6 +1452,7 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `ENABLE_SEMANTIC_SEARCH` | ⚠️ Optional | `false` | Enable semantic search with background indexing (replaces `VECTOR_SYNC_ENABLED`) |
 | `VECTOR_SYNC_TAG` | ⚠️ Optional | `vector-index` | Nextcloud tag marking files for **hybrid** (dense + BM25 sparse) indexing (ADR-031) |
 | `VECTOR_SYNC_KEYWORD_TAG` | ⚠️ Optional | `keyword-index` | Nextcloud tag marking files for **keyword-only** (BM25 sparse) indexing into the same collection; on by default, set empty to disable. Hybrid wins if a file carries both tags (ADR-031) |
+| `VECTOR_SYNC_INDEXABLE_MIME_TYPES` | ⚠️ Optional | `application/pdf`, `…wordprocessingml.document`, `…spreadsheetml.sheet`, `…presentationml.presentation` | Comma-separated MIME types that tagged-file discovery will enqueue — PDF plus `.docx`/`.xlsx`/`.pptx`. A tagged file of any other type is ignored. Deliberately an explicit allowlist rather than "whatever the processor registry can parse", so enabling an optional processor cannot silently widen the corpus (and its embedding bill). Set to `application/pdf` alone to restore PDF-only indexing. Adding a type with no processor (e.g. legacy `.doc`/`.xls`) makes each discovered file of that type fail once as "no processor for type" |
 | `QDRANT_URL` | ⚠️ Optional | - | Qdrant service URL (network mode) - mutually exclusive with `QDRANT_LOCATION` |
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
 | `QDRANT_API_KEY` | ⚠️ Optional | - | Qdrant API key (network mode only) |

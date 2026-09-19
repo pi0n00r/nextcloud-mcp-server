@@ -180,6 +180,18 @@ _DEFAULTS: dict[str, Any] = {
     # embedding cost) into the SAME collection as hybrid files; ``vector-index``
     # wins if a file carries both. Set empty to disable the second tag entirely.
     "vector_sync_keyword_tag": "keyword-index",
+    # Which MIME types tagged-file discovery will enqueue. Comma-separated, and
+    # deliberately an explicit list rather than "whatever the registry can
+    # parse": enabling an optional processor (unstructured claims pptx, epub,
+    # images) would otherwise silently widen what gets indexed and billed.
+    # Adding a type here without a processor for it is harmless -- the file is
+    # discovered, fails to parse once, and is reported.
+    "vector_sync_indexable_mime_types": (
+        "application/pdf,"
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document,"
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
     # Mail tag (an IMAP keyword) restricting which messages are indexed. Empty
     # (the default) indexes every message in every mailbox, which is the
     # behaviour before this setting existed. Set it to a tag display name and
@@ -476,24 +488,39 @@ _DEFAULTS: dict[str, Any] = {
     # VLM preset name sent when docling_pipeline == "vlm". None -> docling-serve
     # picks its own DOCLING_SERVE_DEFAULT_VLM_PRESET. Preset names are server-defined.
     "docling_vlm_preset": None,
-    # Caption raster pictures embedded in a .pptx via the same docling-serve
-    # instance (ADR-037). Explicit opt-in beyond a bare DOCLING_API_URL, like
-    # DOCUMENT_OCR_PROVIDER=docling needs its own selection: a deployment that
-    # only wants docling for scanned-PDF OCR shouldn't start captioning every
-    # picture in every presentation for free. python-pptx has no rendering
-    # engine, so this only reaches actual picture shapes -- native vector
-    # diagrams (SmartArt, freeform/connector shapes) are unaffected.
-    "pptx_caption_images": False,
-    # Cap on pictures captioned per .pptx (one docling-serve round trip each).
+    # Caption raster pictures embedded in .pptx/.docx/.xlsx via the same
+    # docling-serve instance (ADR-037). Explicit opt-in beyond a bare
+    # DOCLING_API_URL, like DOCUMENT_OCR_PROVIDER=docling needs its own
+    # selection: a deployment that only wants docling for scanned-PDF OCR
+    # shouldn't start captioning every picture in every document for free. The
+    # native readers have no rendering engine, so this only reaches actual
+    # pictures -- native vector drawings (SmartArt, shapes) are unaffected.
+    "office_caption_images": False,
+    # Cap on pictures captioned per file (one docling-serve round trip each).
     # nc_webdav_read_file blocks synchronously for the whole parse, so this
-    # bounds the worst case rather than leaving it to the deck's picture count.
-    "pptx_caption_max_images": 8,
+    # bounds the worst case rather than leaving it to the file's picture count.
+    "office_caption_max_images": 8,
     # Per-picture docling-serve request timeout (seconds). Deliberately short
     # and independent of DOCLING_TIMEOUT/DOCUMENT_OCR_TIMEOUT_SECONDS (other
     # touchpoints, other latency profiles): a caption is meant to be a quick
-    # per-picture round trip repeated up to PPTX_CAPTION_MAX_IMAGES times, not
+    # per-picture round trip repeated up to OFFICE_CAPTION_MAX_IMAGES times, not
     # a single long convert. Raise it if DOCLING_PIPELINE=vlm makes captions
     # time out (VLM is far slower than the standard pipeline -- see ADR-032).
+    "office_caption_timeout_seconds": 15.0,
+    # Collabora Online (coolwsd) base URL for converting legacy .doc/.xls/.ppt
+    # and ODF .odt/.ods/.odp to OOXML, which the native readers then parse
+    # (ADR-039). Unset = those types are not claimed. coolwsd only answers
+    # convert-to for clients in its net.post_allow list (private ranges by
+    # default).
+    "collabora_url": None,
+    # Per-file convert-to request timeout (seconds). A typical document
+    # converts in well under a second; the headroom is for large workbooks.
+    "collabora_timeout_seconds": 60.0,
+    # Deprecated PPTX_CAPTION_* spellings (0.193.0, pptx-only) of the three keys
+    # above; see _apply_legacy_caption_settings. Declared so dynaconf reads
+    # them at all, with the same defaults so their validators still apply.
+    "pptx_caption_images": False,
+    "pptx_caption_max_images": 8,
     "pptx_caption_timeout_seconds": 15.0,
     # Tag-based file exclusion (issue #710): comma-separated list of
     # Nextcloud system tag names. Files/folders carrying any of these tags
@@ -663,6 +690,9 @@ _dynaconf = Dynaconf(
         Validator("OIDC_DISCOVERY_MAX_ATTEMPTS", gte=1),
         Validator("OIDC_DISCOVERY_BACKOFF_BASE", gte=0),
         Validator("OIDC_DISCOVERY_BACKOFF_MAX", gte=0),
+        Validator("OFFICE_CAPTION_MAX_IMAGES", gte=0),
+        Validator("OFFICE_CAPTION_TIMEOUT_SECONDS", gt=0),
+        Validator("COLLABORA_TIMEOUT_SECONDS", gt=0),
         Validator("PPTX_CAPTION_MAX_IMAGES", gte=0),
         Validator("PPTX_CAPTION_TIMEOUT_SECONDS", gt=0),
         Validator("QDRANT_INIT_MAX_ATTEMPTS", gte=1),
@@ -1257,6 +1287,27 @@ class Settings:
     # Set empty to disable the second tag entirely.
     vector_sync_keyword_tag: str = "keyword-index"
 
+    # Comma-separated MIME types that tagged-file discovery enqueues. Explicit
+    # rather than derived from the processor registry: turning on an optional
+    # processor would otherwise silently widen the corpus (and its embedding
+    # bill). Defaults to PDF plus the OOXML formats with a native reader
+    # (.docx/.xlsx/.pptx, ADR-036/038).
+    vector_sync_indexable_mime_types: str = (
+        "application/pdf,"
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document,"
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+
+    @property
+    def indexable_mime_types(self) -> tuple[str, ...]:
+        """``vector_sync_indexable_mime_types`` as a tuple, blanks dropped."""
+        return tuple(
+            t.strip()
+            for t in self.vector_sync_indexable_mime_types.split(",")
+            if t.strip()
+        )
+
     # Mail tag (an IMAP keyword) restricting which messages are indexed — the
     # mail analogue of ``vector_sync_tag``. Empty (default) indexes every
     # message in every mailbox. Set to a tag display name and the scanner
@@ -1520,11 +1571,16 @@ class Settings:
     docling_pipeline: str = "standard"
     docling_vlm_preset: str | None = None
 
-    # PPTX picture captioning, a second touchpoint on the same docling-serve
+    # OOXML picture captioning, a second touchpoint on the same docling-serve
     # instance (ADR-037). See _DEFAULTS above for the reasoning.
-    pptx_caption_images: bool = False
-    pptx_caption_max_images: int = 8
-    pptx_caption_timeout_seconds: float = 15.0
+    office_caption_images: bool = False
+    office_caption_max_images: int = 8
+    office_caption_timeout_seconds: float = 15.0
+
+    # Collabora Online conversion service for legacy/ODF office formats
+    # (ADR-039). See _DEFAULTS above.
+    collabora_url: str | None = None
+    collabora_timeout_seconds: float = 60.0
 
     # Observability settings
     metrics_enabled: bool = True
@@ -2123,6 +2179,39 @@ def _get_semantic_search_enabled() -> bool:
     return new_value or old_value
 
 
+def _apply_legacy_caption_settings(kwargs: dict) -> None:
+    """Honor the deprecated ``PPTX_CAPTION_*`` names for ``OFFICE_CAPTION_*``.
+
+    Both are declared with the same default, so "set" means "differs from the
+    default": a legacy value wins only where the new key was left at its
+    default. Deprecated in the release that generalized captioning beyond
+    .pptx; removal will be a ``BREAKING CHANGE``.
+    """
+    for suffix in ("images", "max_images", "timeout_seconds"):
+        new_field = f"office_caption_{suffix}"
+        legacy = _dynaconf.get(f"PPTX_CAPTION_{suffix.upper()}")
+        default = _DEFAULTS[new_field]
+        if legacy == default:
+            continue
+        name = suffix.upper()
+        if kwargs.get(new_field, default) != default:
+            logger.warning(
+                "Both OFFICE_CAPTION_%s and PPTX_CAPTION_%s are set. Using "
+                "OFFICE_CAPTION_%s; PPTX_CAPTION_%s is deprecated.",
+                name,
+                name,
+                name,
+                name,
+            )
+            continue
+        logger.warning(
+            "PPTX_CAPTION_%s is deprecated; use OFFICE_CAPTION_%s instead.",
+            name,
+            name,
+        )
+        kwargs[new_field] = legacy
+
+
 def _is_multi_user_mode() -> bool:
     """Detect if this is a multi-user deployment mode.
 
@@ -2354,6 +2443,7 @@ def _build_settings() -> Settings:
     kwargs["vector_sync_enabled"] = enable_semantic_search
     kwargs["enable_offline_access"] = enable_background_operations
     kwargs["vector_sync_tag"] = _get_vector_sync_tag()
+    _apply_legacy_caption_settings(kwargs)
 
     return Settings(**kwargs)
 

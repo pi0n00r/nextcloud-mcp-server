@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.193.1"
+version = "0.195.0"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -66,6 +66,9 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "pypdfium2>=5.9.0",
     "python-pptx>=1.0.2",
+    "python-docx>=1.2.0",
+    "openpyxl>=3.1.5",
+    "olefile>=0.47",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -104,6 +107,7 @@ markers = [
     "postgres: Tests requiring the docker-compose postgres-test service (ADR-026)",
     "contract: Pact consumer/provider contract tests (ADR-029)",
     "docling: Tests requiring the docker-compose docling-serve backend (ADR-031)",
+    "collabora: Tests requiring the docker-compose Collabora Online converter (ADR-039)",
 ]
 testpaths = [
     "tests",
@@ -173,7 +177,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.81,<0.0.82",
+    "ty>=0.0.82,<0.0.83",
     "pytest-otel>=2.0.1",
     "procrastinate>=3.8",
     "psycopg[binary,pool]>=3.2",
