@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.3-noble@sha256:adbf5727f3d6ffa0ea11109f948247d88d110edd3f43f8d4c134c0a09060c5f3
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:805c8e104bd563d5bfa24fadd3f31cd419ea859cb5277f32b5dbf2db714f9ed1
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -20,11 +20,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
+    image: docker.io/library/redis:8.10.1-alpine@sha256:bd999b5cfee25fb24b8320a31fddbd69f462df44c8138c66e369582937beebc0
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:db4f7083210711ebe0c448341a92b0f1b839429507725f4df77c52fc03573336}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:64f3fe9cf4185bdaa44595d67f8e4aad1e31c52d9f36c3b39318f3d364a19619}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -59,7 +59,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.6-alpine@sha256:d0a6faaed2491faecdb9021f449e8edd7b1bbba246fe2ddf7eba63cccd5b9803
+    image: docker.io/library/nginx:1.31.6-alpine@sha256:adad2ae9204d0fd7a34f40299bc838c3782be1293b10005eac4315ff5a1abf4e
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -87,6 +87,8 @@ services:
     build:
       context: .
       dockerfile: docker/docling/Dockerfile
+      args:
+        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.34.0@sha256:0525640504db7ed8a53e0e443882727888f6a3746948b1b7a8820efe95567bd3
     image: nextcloud-mcp-docling:local
     restart: always
     command: ["docling-serve", "run", "--host", "::"]

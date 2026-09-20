@@ -9,7 +9,7 @@
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-ARG DOCLING_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.32.0@sha256:576fc2074ac77bcfbf3fe27633aa0dd89b452a170b2cd31689c8751e94d60f7a
+ARG DOCLING_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.34.0@sha256:0525640504db7ed8a53e0e443882727888f6a3746948b1b7a8820efe95567bd3
 FROM ${DOCLING_IMAGE}
 
 USER 0
