@@ -84,6 +84,22 @@ def _normalize_etag(raw: Optional[str]) -> Optional[str]:
     return f"{prefix}{value}"
 
 
+_GENERIC_CONTENT_TYPES = frozenset({"application/octet-stream", "text/plain"})
+
+
+def _resolve_content_type(reported: str, path: str) -> str:
+    """Prefer an extension-specific type over a generic server response."""
+    guessed, _ = mimetypes.guess_type(path)
+    if not guessed:
+        return reported
+
+    base, _, parameters = reported.partition(";")
+    normalized = base.strip().lower()
+    if normalized not in _GENERIC_CONTENT_TYPES or normalized == guessed.lower():
+        return reported
+    return f"{guessed};{parameters}" if parameters else guessed
+
+
 def _quote_etag(etag: str) -> str:
     """Return one syntactically valid entity-tag without double quoting."""
     value = etag.strip()
@@ -919,8 +935,11 @@ class WebDAVClient(BaseNextcloudClient):
             written = 0
             try:
                 async with self._stream_request("GET", webdav_path) as response:
-                    content_type = response.headers.get(
-                        "content-type", "application/octet-stream"
+                    content_type = _resolve_content_type(
+                        response.headers.get(
+                            "content-type", "application/octet-stream"
+                        ),
+                        path,
                     )
                     etag = _normalize_etag(response.headers.get("etag"))
                     # "wb" truncates on every attempt. A stale first stream can
@@ -974,8 +993,9 @@ class WebDAVClient(BaseNextcloudClient):
 
         try:
             response, content = await self._get_complete_response(webdav_path, path)
-            content_type = response.headers.get(
-                "content-type", "application/octet-stream"
+            content_type = _resolve_content_type(
+                response.headers.get("content-type", "application/octet-stream"),
+                path,
             )
             etag = _normalize_etag(response.headers.get("etag"))
 
