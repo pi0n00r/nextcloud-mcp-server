@@ -298,6 +298,34 @@ def test_vcard_projection_surfaces_complete_read_metadata():
     assert projected["custom_fields"] == {"X-TEST": ["preserve-me"]}
 
 
+@pytest.mark.parametrize("bad_line", ["BDAY;VALUE=DATE:--1226", "GEO:37.38,-122.08"])
+def test_vcard_projection_drops_only_unparseable_property(bad_line: str):
+    """One unsupported property must not blank the otherwise valid contact."""
+    vcard = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\n"
+        f"TEL;TYPE=CELL:+1 555 010 1234\r\n{bad_line}\r\nUID:u1\r\nEND:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="u1")
+
+    assert projected["fullname"] == "Jane Doe"
+    assert projected["tel"][0]["value"] == "+1 555 010 1234"
+    assert projected["birthday"] is None
+
+
+def test_vcard_projection_drops_multiple_unparseable_properties():
+    """Isolation handles several bad properties in the same stored card."""
+    vcard = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nBDAY:--1226\r\n"
+        "GEO:37.38,-122.08\r\nEMAIL:jane@example.com\r\nEND:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="u1")
+
+    assert projected["fullname"] == "Jane Doe"
+    assert projected["email"][0]["value"] == "jane@example.com"
+
+
 def test_invalid_bday_is_dropped_not_raised(caplog):
     """An unparseable BDAY must warn and be omitted, not crash the call."""
     import logging

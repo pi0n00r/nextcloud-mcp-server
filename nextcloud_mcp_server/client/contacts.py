@@ -42,7 +42,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import unquote
 
 from httpx import HTTPStatusError
-from pythonvCard4.vcard import Contact
+from pythonvCard4.vcard import Contact, unfold_lines
 
 from .base import BaseNextcloudClient
 from .entity_tag import (
@@ -817,10 +817,43 @@ class ContactsClient(BaseNextcloudClient):
 # ---- shared helpers ----------------------------------------------------
 
 
+def _parses_vcard_property(line: str) -> bool:
+    """Return whether pythonvCard4 accepts one logical property in isolation."""
+    try:
+        Contact.from_vcard(f"FN:x\n{line}")
+    except Exception:
+        return False
+    return True
+
+
+def _parse_vcard_for_projection(vcard_text: str) -> Contact:
+    """Parse a vCard while isolating malformed properties from its projection.
+
+    Some real CardDAV clients emit shapes that the pinned pythonvCard4 parser
+    rejects, including reduced birthdays and vCard 3.0 GEO coordinates. A
+    single such property must not blank the contact's otherwise valid name,
+    phone, and email. The original vCard remains untouched for raw reads and
+    byte-preserving writes; this retry affects only the JSON projection.
+    """
+    try:
+        return Contact.from_vcard(vcard_text)
+    except Exception:
+        lines = unfold_lines(vcard_text.splitlines())
+        dropped = [line for line in lines if not _parses_vcard_property(line)]
+        if not dropped:
+            raise
+        logger.warning(
+            "Dropped unparseable vCard properties from projection (properties=%s)",
+            [line.split(":", 1)[0] for line in dropped],
+        )
+        kept = [line for line in lines if line not in dropped]
+        return Contact.from_vcard("\n".join(kept))
+
+
 def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str, Any]:
     """Build the complete JSON projection used by contact read tools."""
     try:
-        contact = Contact.from_vcard(vcard_text)
+        contact = _parse_vcard_for_projection(vcard_text)
     except Exception as e:
         logger.warning(
             "vCard parse failed for projection (UID=%s): %s", fallback_uid, e
