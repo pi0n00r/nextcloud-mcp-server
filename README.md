@@ -80,8 +80,8 @@ automation:
 |---|---|
 | **Current tool surface** | 185 tools across 13 Nextcloud application surfaces |
 | **Transports** | Streamable HTTP and stdio |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5` (application `0.185.0`) |
-| **Current source** | `0.195.0`: Shopping List, file tags, paged contact photos, Calendar availability, native OOXML readers, and optional Collabora conversion |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3` (application `0.195.3`) |
+| **Current source** | `0.195.3`: Shopping List, file tags, paged contact photos, Calendar availability, native OOXML readers, optional Collabora conversion, resilient page-range reads, and tolerant vCard projections |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -116,9 +116,10 @@ chmod 600 ~/.config/nextcloud-mcp/env
 docker run --detach \
   --name nextcloud-mcp \
   --restart unless-stopped \
-  --publish 127.0.0.1:8000:8000 \
+  --publish 0.0.0.0:8000:8000 \
+  --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3
 ```
 
 Verify the service before connecting a client:
