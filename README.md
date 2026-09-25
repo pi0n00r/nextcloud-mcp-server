@@ -23,35 +23,16 @@ current source branch.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
-[![Container](https://img.shields.io/badge/GHCR-v1.8.5-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Container](https://img.shields.io/badge/GHCR-v1.9.5.3-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
 
 [Quick start](#quick-start) | [Capabilities](#nextcloud-capabilities) |
+[Packages](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server) |
 [Documentation](#documentation) | [Security](#security) |
 [Contributing](#contributing)
 
 </div>
-
-> [!WARNING]
-> **Historical WebDAV filename-search erratum:** published releases through `v1.6.2`
-> can emit an invalid empty SEARCH predicate when no recognized filter reaches
-> `nc_webdav_search_files`. Clients using the unsupported `path` and `query`
-> argument names may therefore receive HTTP 500, sometimes followed by a proxy
-> HTTP 502, while ordinary WebDAV operations remain available. Package
-> `v1.6.6.2` contains the correction. On older builds, use `scope` and
-> `name_pattern` (for example,
-> `{"scope":"/Documents","name_pattern":"%activity%","limit":50}`). See
-> [ERRATA.md](ERRATA.md#webdav-search-with-an-empty-predicate) for affected
-> releases and package guidance.
-
-> [!CAUTION]
-> **BasicAuth is *not* affected.** Packages containing application version
-> `0.185.0` or earlier must not be used with OAuth/Login Flow v2. The correction
-> is present on `master` in `0.185.1`; no corrected
-> container package has been published yet. Operators of affected Login Flow v2
-> deployments must revoke and re-provision pre-fix grants after upgrading. See
-> [ERRATA.md](ERRATA.md#login-flow-v2-grant-ownership).
 
 Nextcloud MCP Server is a standalone bridge between MCP clients and an
 existing Nextcloud instance. It runs outside Nextcloud and exposes a broad,
@@ -125,14 +106,14 @@ docker run --detach \
 Verify the service before connecting a client:
 
 ```bash
-curl --fail http://127.0.0.1:8000/health/live
-curl --fail http://127.0.0.1:8000/health/ready
+curl --globoff --fail 'http://[::1]:8000/health/live'
+curl --globoff --fail 'http://[::1]:8000/health/ready'
 ```
 
 The MCP endpoint is:
 
 ```text
-http://127.0.0.1:8000/mcp
+http://[::1]:8000/mcp
 ```
 
 See the [container package guide](docs/container-package.md) for persistent
@@ -143,7 +124,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.8.5 --depth 1 \
+git clone --branch v1.9.5.3 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked

@@ -16,8 +16,10 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 The published container package is pinned to an immutable product tag:
 
 ```bash
-ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5
+ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3
 ```
+
+[Browse published package versions](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server).
 
 The image is published as a multi-architecture Docker image for `linux/amd64`
 and `linux/arm64`.
@@ -42,20 +44,21 @@ Run the MCP server:
 ```bash
 docker run --detach --name nextcloud-mcp \
   --restart unless-stopped \
-  --publish 127.0.0.1:8000:8000 \
+  --publish 0.0.0.0:8000:8000 \
+  --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  --health-cmd 'curl -fsS http://127.0.0.1:8000/health/live || exit 1' \
+  --health-cmd "curl --globoff -fsS 'http://[::1]:8000/health/live' || exit 1" \
   --health-interval 30s \
   --health-timeout 5s \
   --health-retries 3 \
   --health-start-period 20s \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.8.5
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3
 ```
 
 Then connect the MCP client to:
 
 ```text
-http://127.0.0.1:8000/mcp
+http://[::1]:8000/mcp
 ```
 
 Check status and logs:
@@ -68,8 +71,8 @@ docker logs --follow nextcloud-mcp
 Check both health endpoints before routing client traffic:
 
 ```text
-http://127.0.0.1:8000/health/live
-http://127.0.0.1:8000/health/ready
+http://[::1]:8000/health/live
+http://[::1]:8000/health/ready
 ```
 
 ## Notes
@@ -80,5 +83,5 @@ http://127.0.0.1:8000/health/ready
   checks.
 - The package uses the exact package tag and does not publish a floating
   `latest` tag.
-- Package `v1.8.5` is built from application version `0.185.0` at source
-  revision `73316d8cdcfe0efe8b6a2abb5f64d9103ef81693`.
+- Package `v1.9.5.3` is built from application version `0.195.3` at source
+  revision `12b76059f735f76c609876f06d5930f9a5122f57`.
