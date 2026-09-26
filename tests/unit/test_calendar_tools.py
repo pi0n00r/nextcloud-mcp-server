@@ -111,6 +111,34 @@ def test_calendar_tool_schemas_keep_valarm_and_completion_aliases():
     )
 
 
+async def test_update_todo_empty_due_is_documented_and_forwarded():
+    mcp = MCPServer("test-calendar-clear-todo-due")
+    configure_calendar_tools(mcp)
+    tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
+        "nc_calendar_update_todo"
+    ]
+    update_todo = AsyncMock(
+        return_value={"uid": "todo-1", "href": "/calendars/tasks/todo-1.ics"}
+    )
+    client = SimpleNamespace(calendar=SimpleNamespace(update_todo=update_todo))
+
+    assert "empty string to remove DUE" in tool.description
+
+    with patch(
+        "nextcloud_mcp_server.server.calendar.get_client",
+        new=AsyncMock(return_value=client),
+    ):
+        await tool.fn(
+            calendar_name="tasks",
+            todo_uid="todo-1",
+            ctx=_context(),
+            etag='"todo-v1"',
+            due="",
+        )
+
+    update_todo.assert_awaited_once_with("tasks", "todo-1", {"due": ""}, '"todo-v1"')
+
+
 async def test_complete_todo_accepts_completed_at_alias():
     mcp = MCPServer("test-calendar-completion-alias")
     configure_calendar_tools(mcp)

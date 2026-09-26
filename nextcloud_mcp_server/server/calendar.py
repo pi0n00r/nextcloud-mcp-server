@@ -1386,6 +1386,8 @@ def configure_calendar_tools(mcp: MCPServer):
             priority: New priority (0-9)
             percent_complete: New completion percentage (0-100)
             due: New due date/time (ISO format). Date-only means whole-day.
+                Omit it or pass null to preserve the stored DUE property; pass
+                an empty string to remove DUE.
             dtstart: New start date/time (ISO format). Date-only means whole-day.
                 A side left unchanged keeps the stored kind, so a bare date
                 still becomes a date-time on an existing timed todo.

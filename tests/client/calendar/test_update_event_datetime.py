@@ -234,6 +234,46 @@ def test_todo_due_update_preserves_tzid(client):
     assert "DUE:2026-06-15 14:30:00-04:00" not in updated
 
 
+def test_todo_empty_due_removes_property(client):
+    """An explicit empty string clears DUE instead of being filtered out."""
+    updated = client._merge_ical_todo_properties(
+        EXISTING_TODO_ICAL,
+        {"due": ""},
+        "test-todo-001",
+    )
+
+    assert "DUE" not in updated
+    assert "SUMMARY:Original todo" in updated
+
+
+def test_todo_omitted_due_preserves_property(client):
+    """An unrelated partial update retains the existing DUE value."""
+    updated = client._merge_ical_todo_properties(
+        EXISTING_TODO_ICAL,
+        {"summary": "Updated todo"},
+        "test-todo-001",
+    )
+
+    assert "DUE;TZID=America/Toronto:20260515T120000" in updated
+
+
+def test_todo_clear_due_does_not_block_timed_dtstart_update(client):
+    """Clearing a DATE-like DUE cannot strand a newly timed DTSTART."""
+    all_day_pair = EXISTING_TODO_ICAL.replace(
+        "DUE;TZID=America/Toronto:20260515T120000",
+        "DTSTART;VALUE=DATE:20260515\r\nDUE;VALUE=DATE:20260516",
+    )
+
+    updated = client._merge_ical_todo_properties(
+        all_day_pair,
+        {"due": "", "dtstart": "2026-05-15T10:00:00-04:00"},
+        "test-todo-001",
+    )
+
+    assert "DUE" not in updated
+    assert "DTSTART;TZID=America/Toronto:20260515T100000" in updated
+
+
 # === T8 — non-Toronto offset is preserved as fixed offset (don't impose Toronto) ===
 
 

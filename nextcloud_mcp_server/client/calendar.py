@@ -3189,6 +3189,14 @@ class CalendarClient:
                         component["PERCENT-COMPLETE"] = percent_value
                         logger.debug("Set PERCENT-COMPLETE to %s", percent_value)
 
+                    # Match the Deck update sentinel: an omitted/None due date
+                    # preserves DUE, while an explicitly supplied empty string
+                    # removes it.  Do this before pairing DUE with DTSTART so a
+                    # cleared DATE value cannot strand a newly timed DTSTART.
+                    if todo_data.get("due") == "" and "DUE" in component:
+                        del component["DUE"]
+                        logger.debug("Removed DUE")
+
                     # Due / start dates, paired the same way as
                     # _create_ical_todo — except a side that isn't being
                     # updated votes with the value type already stored.
