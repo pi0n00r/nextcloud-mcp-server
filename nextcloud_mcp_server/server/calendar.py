@@ -31,6 +31,7 @@ from nextcloud_mcp_server.models.calendar import (
     AvailabilitySlot,
     Calendar,
     CalendarEventSummary,
+    CalendarReadError,
     CompleteTodoResponse,
     DeleteEventResponse,
     DeleteTodoResponse,
@@ -376,12 +377,14 @@ def configure_calendar_tools(mcp: MCPServer):
         if location_contains is not None:
             filters["location_contains"] = location_contains
 
+        failures: list[dict[str, str]] = []
         if search_all_calendars:
             # Search across all calendars with filters
             events = await client.calendar.search_events_across_calendars(
                 start_datetime=start_datetime,
                 end_datetime=end_datetime,
                 filters=filters if filters else None,
+                failures=failures,
             )
             events = events[:limit]
         else:
@@ -411,6 +414,7 @@ def configure_calendar_tools(mcp: MCPServer):
             start_date=start_date or None,
             end_date=end_date or None,
             total_found=len(summaries),
+            errors=[CalendarReadError(**f) for f in failures],
         )
 
     @mcp.tool(
@@ -679,6 +683,7 @@ def configure_calendar_tools(mcp: MCPServer):
         now = dt.datetime.now()
         end_datetime = now + dt.timedelta(days=days_ahead)
 
+        failures: list[dict[str, str]] = []
         if calendar_name:
             # Get events from specific calendar
             events = await client.calendar.get_calendar_events(
@@ -691,28 +696,12 @@ def configure_calendar_tools(mcp: MCPServer):
             for event in events:
                 event["calendar_name"] = calendar_name
         else:
-            # Get events from all calendars
-            all_calendars = await client.calendar.list_calendars()
-            all_events = []
-
-            for calendar in all_calendars:
-                try:
-                    cal_events = await client.calendar.get_calendar_events(
-                        calendar_name=calendar["name"],
-                        start_datetime=now,
-                        end_datetime=end_datetime,
-                        limit=limit,
-                    )
-                    for event in cal_events:
-                        event["calendar_name"] = calendar["name"]
-                        event["calendar_display_name"] = calendar["display_name"]
-                    all_events.extend(cal_events)
-                except Exception as e:
-                    logger.warning(
-                        "Error getting events from calendar %s: %s", calendar["name"], e
-                    )
-                    continue
-
+            all_events = await client.calendar.search_events_across_calendars(
+                start_datetime=now,
+                end_datetime=end_datetime,
+                limit=limit,
+                failures=failures,
+            )
             # Sort by start time and limit
             all_events.sort(key=lambda x: x.get("start_datetime", ""))
             events = all_events[:limit]
@@ -722,6 +711,7 @@ def configure_calendar_tools(mcp: MCPServer):
             events=summaries,
             days_ahead=days_ahead,
             calendar_name=calendar_name or None,
+            errors=[CalendarReadError(**f) for f in failures],
         )
 
     @mcp.tool(
@@ -1628,9 +1618,14 @@ def configure_calendar_tools(mcp: MCPServer):
         if not include_completed:
             filters["include_completed"] = False
 
+        failures: list[dict[str, str]] = []
         todos_data = await client.calendar.search_todos_across_calendars(
-            filters if filters else None
+            filters if filters else None, failures=failures
         )
 
         todos = [Todo(**todo_data) for todo_data in todos_data]
-        return ListTodosResponse(todos=todos, total_count=len(todos))
+        return ListTodosResponse(
+            todos=todos,
+            total_count=len(todos),
+            errors=[CalendarReadError(**f) for f in failures],
+        )

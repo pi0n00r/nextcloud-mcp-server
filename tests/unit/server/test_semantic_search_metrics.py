@@ -10,6 +10,17 @@ Mirrors the spy pattern in tests/unit/api/test_search_usage_metering.py so the
 two entrypoints are held to the same standard.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,7 +43,8 @@ def _build_tool():
 
             return deco
 
-    configure_semantic_tools(_Mcp())
+    reusable_search = configure_semantic_tools(_Mcp())
+    assert reusable_search is captured["nc_semantic_search"]
     return captured["nc_semantic_search"]
 
 

@@ -12,6 +12,7 @@
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal, Protocol, cast
 
 import anyio
@@ -101,7 +102,9 @@ def _consent_narrowed_doc_types(
     return [dt for dt in doc_types if dt in allowed]
 
 
-def configure_semantic_tools(mcp: MCPServer):
+def configure_semantic_tools(
+    mcp: MCPServer,
+) -> Callable[..., Awaitable[SemanticSearchResponse]]:
     """Configure semantic search tools for MCP server."""
 
     @mcp.tool(
@@ -1074,3 +1077,5 @@ def configure_semantic_tools(mcp: MCPServer):
                 code=-1,
                 message=f"Failed to retrieve vector sync status: {str(e)}",
             )
+
+    return nc_semantic_search

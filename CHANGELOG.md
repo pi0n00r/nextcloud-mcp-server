@@ -5,6 +5,100 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.198.0 (2026-09-28)
+
+### BREAKING CHANGE
+
+- SAR cases and redacted export are no longer served
+implicitly when vector sync and EMBEDDING_GATEWAY_URL are configured.
+Set SAR_ENABLED=true to keep them.
+
+### Feat
+
+- **sar**: SAR is opt-in per deployment via SAR_ENABLED
+
+## v0.197.1 (2026-09-27)
+
+### Fix
+
+- **redaction**: a detected job title is redacted whole, never split
+- **redaction**: role and relationship words are never names
+- **redaction**: a window never starts inside a word longer than the overlap
+- **redaction**: cut NER windows on whitespace, never mid-word
+
+## v0.197.0 (2026-09-27)
+
+### BREAKING CHANGE
+
+- /api/v1/status reports sar_available instead of
+sar_export_available, and the SAR tools and routes now require the
+sar.read or sar.write scope. Clients need to request them.
+- NerClient.detect() now takes the labels to request and
+returns (label, surface) pairs; detect_names() is replaced by
+detect_entities(), which returns (names, addresses). The gateway NER
+consumer pact now sends labels ["person", "address"] under the provider
+state "the gateway detects person names and addresses".
+
+### Feat
+
+- **sar**: sar.read and sar.write scopes; advertise sar_available
+- **sar**: case searches with the search page's filters, logged in the case
+- **redaction**: redact addresses and UK postcodes in SAR archives
+- **sar**: persisted SAR cases shared by Astrolabe and MCP agents (ADR-040)
+- **sar**: /api/v1/sar/exports for the Astrolabe app (ADR-040)
+- **sar**: redacted SAR export archives via sar_export_submit (ADR-040)
+- **redaction**: gateway NER client and person-name redaction core
+
+### Fix
+
+- **redaction**: keep only the subject's address or its leading part
+- **sar**: a case search's log entry is built before the search runs
+- **sar**: cap and dedupe the search log; case search needs semantic.read
+- **sar**: export what was locked, render off the event loop
+- **sar**: no lost updates when a case is edited concurrently
+- **sar**: no semicolons in SAR tool descriptions
+- **redaction**: number a bare token as the one person it belongs to
+- **sar**: refuse '.'/'..' segments in output_folder
+- **redaction**: an NER error never repeats the response's entity text
+- **redaction**: title-free name phrase is one form; validate NER_TIMEOUT_SECONDS
+- **redaction**: bool-first index guard in NerClient._parse; test bool index
+- **redaction**: order bool guard first for Sonar S2583; document sort key
+- **redaction**: address review round 1
+
+### Refactor
+
+- **sar**: split complex functions; 5xx on case creation is retryable
+- **redaction**: re-scope the core to SAR export archives (ADR-040)
+
+### Perf
+
+- **sar**: load case files concurrently when listing cases
+
+## v0.196.0 (2026-09-27)
+
+### BREAKING CHANGE
+
+- with VECTOR_SYNC_INDEXABLE_MIME_TYPES unset, tagged
+.msg, .txt, .md and .csv files are now indexed, as are ODF and legacy
+Office files when COLLABORA_URL is set, and whatever types an optional
+processor claims when one is configured (Unstructured, Tesseract,
+Docling, custom HTTP: images, EPUB, RTF, ...). Set the variable to keep
+the previous scope.
+
+### Feat
+
+- **vector-sync**: index every file type an enabled processor reads
+
+### Fix
+
+- **webdav**: reading a text file stays raw now that text has a processor
+
+## v0.195.5 (2026-09-27)
+
+### Fix
+
+- **calendar**: accept percent-encoded calendar names, report skipped calendars
+
 ## v0.195.4 (2026-09-25)
 
 ### Fix

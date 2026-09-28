@@ -18,8 +18,8 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 185 tools in the
-current source branch.
+Deck, Talk, and other Nextcloud application surfaces through 185 application
+tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
@@ -59,10 +59,10 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 185 tools across 13 Nextcloud application surfaces |
+| **Current tool surface** | 185 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3` (application `0.195.3`) |
-| **Current source** | `0.195.3`: Shopping List, file tags, paged contact photos, Calendar availability, native OOXML readers, optional Collabora conversion, resilient page-range reads, and tolerant vCard projections |
+| **Current source** | `0.198.0`: opt-in SAR case and redacted-export tools, cross-calendar error reporting, corrected Calendar name encoding, and reliable plain-text WebDAV extraction |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -159,7 +159,9 @@ The current full single-user source profile exposes the following tool surface:
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
-indexing infrastructure is enabled.
+indexing infrastructure is enabled. When SAR and its required indexing and NER
+services are configured, seven additional case, search, and export tools are
+registered.
 
 ## Production Features
 

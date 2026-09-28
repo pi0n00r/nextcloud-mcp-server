@@ -20,7 +20,7 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.2-alpine@sha256:72cedd9603038893af961e90ac5e1a1a0d8377d5e338dbdad8fe284ea25de18f
+    image: docker.io/library/redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
     restart: always
 
   app:
@@ -59,7 +59,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.6-alpine@sha256:d10753d9289b8e3f884386351f73554ce72b631378949deddd75e83ee296c427
+    image: docker.io/library/nginx:1.31.6-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -88,7 +88,7 @@ services:
       context: .
       dockerfile: docker/docling/Dockerfile
       args:
-        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.34.0@sha256:0525640504db7ed8a53e0e443882727888f6a3746948b1b7a8820efe95567bd3
+        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.35.0@sha256:79e5fcd19ab227ed36323fa5fa31820d14d53efc4f073417ba37be7931c7af0a
     image: nextcloud-mcp-docling:local
     restart: always
     command: ["docling-serve", "run", "--host", "::"]
@@ -120,7 +120,7 @@ services:
   # the MCP server reaches it on the compose network. The image ships no shell,
   # so there is no container healthcheck; poll /hosting/capabilities instead.
   collabora:
-    image: docker.io/collabora/code:26.04.4.1.1@sha256:1efda3043e8b9cb437d1b6c6efe20cc3753760e634de012b8dac391da488bf97
+    image: docker.io/collabora/code:26.04.4.2.1@sha256:4e983196eb9878f339cc506c38c21f1cc3473bca3d6de883c5de08f9c0cc3a6c
     restart: always
     ports:
       - "127.0.0.1:9980:9980"
@@ -169,6 +169,18 @@ services:
       start_period: 300s
     profiles:
       - infinity
+
+  # Canned stand-in for the embedding gateway's POST /v1/ner, so the login-flow
+  # tests exercise SAR export redaction (ADR-040) without a model. It detects
+  # only the synthetic names hard-coded in tests/fixtures/ner_stub.py.
+  ner-stub:
+    image: docker.io/library/python:3.14-alpine@sha256:9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01
+    restart: always
+    command: ["python", "/stub/ner_stub.py"]
+    volumes:
+      - ./tests/fixtures/ner_stub.py:/stub/ner_stub.py:ro
+    profiles:
+      - login-flow
 
   mcp:
     build: .
@@ -439,6 +451,8 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      ner-stub:
+        condition: service_started
     ports:
       - "127.0.0.1:8004:8004"
       - "[::1]:8004:8004"
@@ -479,6 +493,13 @@ services:
       # `nextcloudMcpServerUIPublicClient` used by login-flow integration tests.
       - ALLOWED_MGMT_CLIENT=astrolabeMcpClientOAuth00000000000,nextcloudMcpServerUIPublicClient
 
+      # SAR export (ADR-040): opt-in, enabled here for the SAR tests. Names are
+      # detected via the gateway's /v1/ner, stubbed here like the `mcp`
+      # service. OCR and reranking are off by default, so nothing else routes
+      # through the gateway.
+      - SAR_ENABLED=${SAR_ENABLED:-true}
+      - EMBEDDING_GATEWAY_URL=${EMBEDDING_GATEWAY_URL:-http://ner-stub:8080}
+
       # Observability -- same host passthrough as the `mcp` service. This is the
       # profile Astrolabe drives, so it is the one to point at a collector when
       # tracing the search/chunk-context path end to end.
@@ -517,7 +538,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:18-alpine@sha256:6c538e7206ea40ff740ef27883529390a690b6ead6ba96b44c67a9f7c638e8fd
+    image: docker.io/library/postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp
@@ -570,7 +591,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:b81f6c360830b21b9e6d8878563e3e11bd81e243693c83fa371efeee34556ce9
+    image: docker.io/vegardit/openldap:2.6.10@sha256:ebdec39ff8a923189b62bfa7db0f9235befc27136c013876bb017285ec335a11
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org

@@ -282,6 +282,7 @@ async def test_list_events_all_calendars_without_calendar_name(
         start_datetime=None,
         end_datetime=None,
         filters=None,
+        failures=[],
     )
     calendar_client.calendar.get_calendar_events.assert_not_awaited()
 
