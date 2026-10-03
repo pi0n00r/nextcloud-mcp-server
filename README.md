@@ -61,8 +61,8 @@ automation:
 |---|---|
 | **Current tool surface** | 185 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
+| **Latest source release** | `v1.9.8.3` (application `0.198.3`): opt-in SAR workflows, safe partial vector discovery, explicit Calendar todo due-date clearing, encoded calendar names, and PgBouncer-compatible PostgreSQL sessions |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3` (application `0.195.3`) |
-| **Current source** | `0.198.0`: opt-in SAR case and redacted-export tools, cross-calendar error reporting, corrected Calendar name encoding, and reliable plain-text WebDAV extraction |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -124,7 +124,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.9.5.3 --depth 1 \
+git clone --branch v1.9.8.3 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
@@ -238,8 +238,10 @@ TLS-terminating reverse proxy.
 
 ## Release Policy
 
-Stable container images use exact release tags and are published for amd64 and
-arm64. A floating `latest` tag is intentionally not published.
+Source releases and immutable container packages have independent publication
+gates. When published, container images use exact package tags and support
+amd64 and arm64. A source release does not imply a matching container package,
+and a floating `latest` container tag is intentionally not published.
 
 - [Latest release](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
 - [Container package](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
