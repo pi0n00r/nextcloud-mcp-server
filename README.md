@@ -62,7 +62,7 @@ automation:
 | **Current tool surface** | 185 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v1.9.8.3` (application `0.198.3`): opt-in SAR workflows, safe partial vector discovery, explicit Calendar todo due-date clearing, encoded calendar names, and PgBouncer-compatible PostgreSQL sessions |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3` (application `0.195.3`) |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.8.3` (application `0.198.3`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -100,7 +100,7 @@ docker run --detach \
   --publish 0.0.0.0:8000:8000 \
   --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.5.3
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.9.8.3
 ```
 
 Verify the service before connecting a client:
