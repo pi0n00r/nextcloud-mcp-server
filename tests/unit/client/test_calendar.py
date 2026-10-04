@@ -793,7 +793,6 @@ def test_todo_reminders_round_trip_and_update_by_ordered_list(mocker):
                 {"offset_seconds": -300},
             ]
         },
-        "todo-uid",
     )
     reparsed = client._parse_ical_todo(updated)
     assert reparsed is not None

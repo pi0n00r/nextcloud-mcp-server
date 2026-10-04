@@ -13,6 +13,7 @@ guards ``_read_complete_body`` already had: the #965 short-read check and the
 from __future__ import annotations
 
 import gzip
+import mimetypes
 
 import httpx
 import pytest
@@ -162,7 +163,7 @@ async def test_streamed_etag_is_none_when_absent(tmp_path):
         # .yaml/.js/.svg, all reproduced here via the two catch-alls involved.
         ("/report.json", "text/plain;charset=UTF-8", "application/json;charset=UTF-8"),
         ("/page.html", "text/plain", "text/html"),
-        ("/data.xml", "application/octet-stream", "text/xml"),
+        ("/data.xml", "application/octet-stream", mimetypes.guess_type("/data.xml")[0]),
         # A specific server answer is trusted even when it disagrees with the
         # extension -- this only intervenes on the two generic catch-alls.
         ("/report.json", "application/pdf", "application/pdf"),

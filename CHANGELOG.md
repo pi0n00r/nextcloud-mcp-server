@@ -5,6 +5,16 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.198.4 (2026-10-04)
+
+### Fix
+
+- **mcp**: advertise the package version in every server handshake
+- **mcp**: return Calendar and Tables lists as one complete content block
+- **calendar**: fail closed rather than rebuilding VTODOs from partial updates
+- **calendar**: emit one VTIMEZONE RDATE per line for client interoperability
+- **webdav**: prefer extension-specific MIME types over generic server answers
+
 ## v0.198.3 (2026-10-01)
 
 ### Fix
