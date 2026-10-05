@@ -22,6 +22,7 @@ from scripts import check_publication_identity as gate
 
 pytestmark = pytest.mark.unit
 SYNTHETIC_PRIVATE_IDENTITY = "Example Operator Private Name"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _set_private(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,3 +159,18 @@ def test_private_identity_in_archive_member_name_is_rejected(
     assert result == 1
     assert "private operator identity in path" in captured.err
     assert SYNTHETIC_PRIVATE_IDENTITY not in captured.err
+
+
+def test_container_publication_enables_the_in_image_private_gate() -> None:
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (
+        REPOSITORY_ROOT / ".github/workflows/docker-build-publish.yml"
+    ).read_text(encoding="utf-8")
+    dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
+
+    assert "ARG AI_NOTICE_PUBLICATION_GATE=0" in dockerfile
+    assert "--mount=type=secret,id=AI_NOTICE_OPERATOR_L1" in dockerfile
+    assert "--require-private-comparison" in dockerfile
+    assert "AI_NOTICE_PUBLICATION_GATE=1" in workflow
+    assert "AI_NOTICE_OPERATOR_L1=${{ secrets.AI_NOTICE_OPERATOR_L1 }}" in workflow
+    assert "!scripts/check_publication_identity.py" in dockerignore

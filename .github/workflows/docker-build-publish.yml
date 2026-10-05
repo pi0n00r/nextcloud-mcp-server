@@ -106,6 +106,10 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            AI_NOTICE_PUBLICATION_GATE=1
+          secrets: |
+            AI_NOTICE_OPERATOR_L1=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
           tags: ${{ env.IMAGE_NAME }}:${{ env.PACKAGE_TAG }}
           provenance: false
           sbom: false
