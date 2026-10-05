@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 name: Tests
 
 on:
@@ -29,6 +40,8 @@ jobs:
       # [project.dependencies] (#1285). Config in pyproject.toml [tool.deptry].
       - name: Check for undeclared dependencies
         run: uv run --frozen deptry .
+      - name: Check AI-NOTICE and public identities
+        run: ./scripts/lint-ai-notice.sh
 
   unit-test:
     runs-on: ubuntu-latest
