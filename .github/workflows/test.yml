@@ -52,6 +52,8 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
+      - name: Synchronize locked test environment
+        run: uv sync --frozen
       # -n auto fans the (fully mocked) unit tests across the runner's cores.
       # -q instead of -v: with xdist, per-test progress lines are interleaved
       # noise, and failures still print in full.
