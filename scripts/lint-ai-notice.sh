@@ -24,18 +24,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-REQUIRED_FIELDS=(
-    "Schema-Version=0.1"
-    "License=AGPL-3.0-or-later"
-    "Author=Gary Bajaj"
-    "Exploitation-Deterrence=true"
-    "Operator-Override-Required=true"
-    "Override-Reason-Required=false"
-    "Severity=high"
-    "Escalation=warn"
-    "Scope=file"
-    "Contact=https://AImends.bajaj.com/"
-)
+mapfile -t REQUIRED_FIELDS < <(grep '^AI-NOTICE:' AI-NOTICE.txt)
+if (( ${#REQUIRED_FIELDS[@]} != 10 )); then
+    echo "AI-NOTICE.txt must contain exactly 10 template fields" >&2
+    exit 1
+fi
 
 # Files this fork added or substantially modified. The list is maintained
 # here rather than scanning the whole tree so upstream-inherited files (no
@@ -67,6 +60,7 @@ FORK_TOUCHED=(
     "nextcloud_mcp_server/server/sharing.py"
     "nextcloud_mcp_server/server/semantic.py"
     "nextcloud_mcp_server/server/webdav.py"
+    "scripts/check_publication_identity.py"
     "tests/client/calendar/test_calendar_operations.py"
     "tests/client/calendar/test_field_preservation.py"
     "tests/client/calendar/test_task_operations.py"
@@ -89,6 +83,7 @@ FORK_TOUCHED=(
     "tests/unit/test_compact_tool_results.py"
     "tests/unit/test_compose_network_policy.py"
     "tests/unit/test_links.py"
+    "tests/unit/test_publication_identity.py"
     "tests/unit/test_tool_call_logging.py"
     "tests/unit/test_unified_verifier.py"
 )
@@ -102,14 +97,14 @@ for f in "${FORK_TOUCHED[@]}"; do
     fi
     missing_fields=()
     for field in "${REQUIRED_FIELDS[@]}"; do
-        if ! grep -q "AI-NOTICE:$field" "$f"; then
+        if ! grep -Fq "$field" "$f"; then
             missing_fields+=("$field")
         fi
     done
     if (( ${#missing_fields[@]} > 0 )); then
         echo "FAIL $f" >&2
         for mf in "${missing_fields[@]}"; do
-            echo "  missing: AI-NOTICE:$mf" >&2
+            echo "  missing: $mf" >&2
         done
         ((failures++)) || true
     else
@@ -123,3 +118,8 @@ if (( failures > 0 )); then
     exit 1
 fi
 echo "AI-NOTICE lint: all ${#FORK_TOUCHED[@]} fork-touched files pass"
+
+# Public source lint checks every tracked AI-NOTICE author. The private operator
+# identity is deliberately absent here; publication workflows add that
+# comparison and fail closed if their repository secret is unavailable.
+python3 scripts/check_publication_identity.py --git-tree "$ROOT"

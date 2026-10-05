@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 name: Tests
 
 on:
@@ -29,6 +40,8 @@ jobs:
       # [project.dependencies] (#1285). Config in pyproject.toml [tool.deptry].
       - name: Check for undeclared dependencies
         run: uv run --frozen deptry .
+      - name: Check AI-NOTICE and public identities
+        run: ./scripts/lint-ai-notice.sh
 
   unit-test:
     runs-on: ubuntu-latest
@@ -39,6 +52,8 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
+      - name: Synchronize locked test environment
+        run: uv sync --frozen
       # -n auto fans the (fully mocked) unit tests across the runner's cores.
       # -q instead of -v: with xdist, per-test progress lines are interleaved
       # noise, and failures still print in full.
@@ -67,6 +82,25 @@ jobs:
           enable-cache: true
       - name: Smoke test CLI (isolated install)
         run: uv run --isolated --no-project --with . nextcloud-mcp-server --help
+
+  container-publication-gate:
+    needs: [linting]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Exercise in-image publication preflight without pushing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          build-args: |
+            AI_NOTICE_PUBLICATION_GATE=1
+          secrets: |
+            AI_NOTICE_OPERATOR_L1=Example Operator Private Name
 
   integration-test:
     runs-on: ubuntu-latest

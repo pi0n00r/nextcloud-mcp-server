@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 FROM docker.io/library/python:3.14-slim-trixie@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc /uv /uvx /bin/
@@ -30,6 +41,23 @@ RUN uv sync --locked --no-dev --no-install-project --no-install-package uvicorn 
 COPY . .
 
 RUN uv sync --locked --no-dev --no-editable --no-cache --extra postgres --extra observability
+
+# Ordinary development and CI builds remain unchanged. The immutable package
+# workflow opts in and supplies the protected comparison through a BuildKit
+# secret, which is mounted only for this RUN and never enters an image layer.
+ARG AI_NOTICE_PUBLICATION_GATE=0
+RUN --mount=type=secret,id=AI_NOTICE_OPERATOR_L1 \
+    if [ "$AI_NOTICE_PUBLICATION_GATE" = "1" ]; then \
+        test -s /run/secrets/AI_NOTICE_OPERATOR_L1; \
+        package_dir="$(/opt/venv/bin/python -c 'import pathlib, nextcloud_mcp_server; print(pathlib.Path(nextcloud_mcp_server.__file__).parent)')"; \
+        metadata_dir="$(/opt/venv/bin/python -c 'from importlib.metadata import distribution; print(distribution("nextcloud-mcp-server")._path)')"; \
+        AI_NOTICE_OPERATOR_L1="$(cat /run/secrets/AI_NOTICE_OPERATOR_L1)" \
+            /opt/venv/bin/python scripts/check_publication_identity.py \
+                --candidate /src \
+                --candidate "$package_dir" \
+                --candidate "$metadata_dir" \
+                --require-private-comparison; \
+    fi
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
