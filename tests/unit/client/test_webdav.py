@@ -1468,8 +1468,11 @@ async def test_chunked_write_returns_final_move_etag(
         ('"abc-gzip"', "abc"),
         ("abc-br", "abc"),
         ("abc-deflate", "abc"),
+        ("abc-zstd", "abc"),
+        ('"abc-zstd"', "abc"),
         # Weakness is part of validator semantics and must not be erased.
         ('W/"abc-gzip"', "W/abc"),
+        ('W/"abc-zstd"', "W/abc"),
         # Only a trailing suffix counts: a name that merely contains one
         # survives untouched.
         ("gzip-abc", "gzip-abc"),
