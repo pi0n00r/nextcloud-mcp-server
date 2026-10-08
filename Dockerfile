@@ -36,11 +36,11 @@ COPY pyproject.toml uv.lock README.md .
 # setup.py cannot execute at image-build time (docker:S8541). The Uvicorn
 # fork is the deliberate exception: skip it here, then let the second sync build
 # only that reviewed Git dependency and this project from source.
-RUN uv sync --locked --no-dev --no-install-project --no-install-package uvicorn --no-build --no-cache --extra postgres --extra observability
+RUN uv sync --locked --no-dev --no-install-project --no-install-package uvicorn --no-build --no-cache --extra semantic --extra postgres --extra observability
 
 COPY . .
 
-RUN uv sync --locked --no-dev --no-editable --no-cache --extra postgres --extra observability
+RUN uv sync --locked --no-dev --no-editable --no-cache --extra semantic --extra postgres --extra observability
 
 # Ordinary development and CI builds remain unchanged. The immutable package
 # workflow opts in and supplies the protected comparison through a BuildKit

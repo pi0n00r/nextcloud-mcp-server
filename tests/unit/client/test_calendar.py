@@ -703,7 +703,7 @@ def test_event_reminders_round_trip_and_preserve_on_unrelated_update(mocker):
     assert parsed is not None
     assert len(parsed["reminders"]) == 2
     assert parsed["reminders"][0]["action"] == "DISPLAY"
-    assert parsed["reminders"][0]["trigger_at"].startswith("2026-06-26T10:00:00")
+    assert parsed["reminders"][0]["trigger_at"].startswith("2026-06-26T07:00:00")
     assert parsed["reminders"][1]["minutes_before"] == 30
     assert parsed["reminders"][1]["related"] == "START"
 

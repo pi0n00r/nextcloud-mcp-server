@@ -53,6 +53,7 @@ FORK_TOUCHED=(
     "nextcloud_mcp_server/models/sharing.py"
     "nextcloud_mcp_server/observability/metrics.py"
     "nextcloud_mcp_server/providers/rerank.py"
+    "nextcloud_mcp_server/sar_plugin.py"
     "nextcloud_mcp_server/serialization.py"
     "nextcloud_mcp_server/server/calendar.py"
     "nextcloud_mcp_server/server/contacts.py"
@@ -84,6 +85,7 @@ FORK_TOUCHED=(
     "tests/unit/test_compose_network_policy.py"
     "tests/unit/test_links.py"
     "tests/unit/test_publication_identity.py"
+    "tests/unit/test_plugins.py"
     "tests/unit/test_tool_call_logging.py"
     "tests/unit/test_unified_verifier.py"
 )
