@@ -67,10 +67,24 @@ jobs:
       id-token: write
       contents: read
     steps:
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh .
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -114,10 +128,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh .
 
       # The bump commit that the tag points at is the one commitizen wrote the
       # CHANGELOG entry in, so the section is always present at this ref.

@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -238,6 +241,110 @@ def test_private_identity_file_rejects_relative_path(
             candidates=[candidate],
             require_private_comparison=True,
         )
+
+
+def test_many_identity_findings_have_bounded_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_private(tmp_path, monkeypatch)
+    candidates = tmp_path / "candidates"
+    candidates.mkdir()
+    for index in range(15):
+        (candidates / f"item-{index:02d}.txt").write_text(
+            SYNTHETIC_PRIVATE_IDENTITY, encoding="utf-8"
+        )
+
+    result = gate.main(["--candidate", str(candidates), "--require-private-comparison"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err.count("FAIL ") == gate.MAX_REPORTED_FINDINGS
+    assert "5 additional finding(s) omitted" in captured.err
+    assert "15 finding(s)" in captured.err
+    assert SYNTHETIC_PRIVATE_IDENTITY not in captured.err
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("git") is None,
+    reason="publication preflight requires Bash and Git",
+)
+def test_early_preflight_checks_secret_and_exact_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    candidate = source / "safe.txt"
+    candidate.write_text("safe", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "safe.txt"], check=True)
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    script = REPOSITORY_ROOT / "scripts/preflight-publication-identity.sh"
+    environment = os.environ.copy()
+    environment["RUNNER_TEMP"] = str(private_dir)
+
+    def invoke(value: str | None) -> subprocess.CompletedProcess[str]:
+        current = environment.copy()
+        if value is None:
+            current.pop("AI_NOTICE_PRIVATE_L1_TEXT", None)
+        else:
+            current["AI_NOTICE_PRIVATE_L1_TEXT"] = value
+        return subprocess.run(
+            ["bash", str(script), str(source)],
+            cwd=REPOSITORY_ROOT,
+            env=current,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    missing = invoke(None)
+    assert missing.returncode == 2
+    assert "secret is missing" in missing.stderr
+    assert list(private_dir.iterdir()) == []
+
+    invalid = invoke("Gary Bajaj")
+    assert invalid.returncode == 2
+    assert "not distinct" in invalid.stderr
+    assert list(private_dir.iterdir()) == []
+
+    good = invoke(SYNTHETIC_PRIVATE_IDENTITY)
+    assert good.returncode == 0
+    assert "1 file(s) pass" in good.stdout
+    assert list(private_dir.iterdir()) == []
+
+    candidate.write_text(SYNTHETIC_PRIVATE_IDENTITY, encoding="utf-8")
+    matched = invoke(SYNTHETIC_PRIVATE_IDENTITY)
+    assert matched.returncode == 1
+    assert "private operator identity in content" in matched.stderr
+    assert SYNTHETIC_PRIVATE_IDENTITY not in matched.stderr
+    assert list(private_dir.iterdir()) == []
+
+
+def test_publication_workflows_fail_fast_before_build_and_container_setup() -> None:
+    docker = (REPOSITORY_ROOT / ".github/workflows/docker-build-publish.yml").read_text(
+        encoding="utf-8"
+    )
+    release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    pypi, github_release = release.split("  github-release:", 1)
+
+    assert docker.index(
+        "Require private publication secret before checkout"
+    ) < docker.index("Checkout maintained packaging tooling")
+    assert docker.index(
+        "Validate private publication identity before build"
+    ) < docker.index("Install uv")
+    assert docker.index(
+        "Validate private publication identity before build"
+    ) < docker.index("Set up QEMU")
+    for job in (pypi, github_release):
+        assert job.index(
+            "Require private publication secret before checkout"
+        ) < job.index("name: Checkout")
+        assert job.index(
+            "Validate private publication identity before build"
+        ) < job.index("Set up Docker Buildx")
+        assert "bash scripts/preflight-publication-identity.sh ." in job
 
 
 def test_private_identity_file_rejects_symlink(

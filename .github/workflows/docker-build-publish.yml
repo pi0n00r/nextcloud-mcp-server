@@ -42,6 +42,15 @@ jobs:
             exit 1
           fi
 
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
       - name: Checkout maintained packaging tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,6 +71,11 @@ jobs:
           install -m 0644 scripts/check_publication_identity.py \
             package-context/scripts/check_publication_identity.py
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh package-source
 
       - name: Validate source version
         run: |

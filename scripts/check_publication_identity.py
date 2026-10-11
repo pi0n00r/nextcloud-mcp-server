@@ -33,6 +33,7 @@ PRIVATE_IDENTITY_FILE_ENV = "AI_NOTICE_PRIVATE_L1_FILE"
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_DEPTH = 3
+MAX_REPORTED_FINDINGS = 10
 IGNORED_TREE_PARTS = frozenset({".git", ".venv", "__pycache__"})
 AUTHOR_PATTERN = re.compile(r"AI-NOTICE:" r"Author=([^\r\n<]+)")
 
@@ -342,12 +343,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if findings:
-        for finding in sorted(
+        unique_findings = sorted(
             set(findings), key=lambda item: (item.location, item.reason)
-        ):
+        )
+        for finding in unique_findings[:MAX_REPORTED_FINDINGS]:
             print(f"FAIL {finding.location}: {finding.reason}", file=sys.stderr)
+        omitted = len(unique_findings) - MAX_REPORTED_FINDINGS
+        if omitted > 0:
+            print(f"... {omitted} additional finding(s) omitted", file=sys.stderr)
         print(
-            f"publication identity gate: {len(findings)} finding(s)",
+            f"publication identity gate: {len(unique_findings)} finding(s)",
             file=sys.stderr,
         )
         return 1
