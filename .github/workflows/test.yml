@@ -137,7 +137,7 @@ jobs:
           build-args: |
             AI_NOTICE_PUBLICATION_GATE=1
           secrets: |
-            AI_NOTICE_OPERATOR_L1=Example Operator Private Name
+            AI_NOTICE_PRIVATE_L1_FILE=Example Operator Private Name
 
   integration-test:
     runs-on: ubuntu-latest

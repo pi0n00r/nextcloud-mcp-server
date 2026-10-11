@@ -78,14 +78,29 @@ jobs:
         run: uv python install 3.11
       - name: Build
         run: uv build
+      - name: Prepare protected private comparison file
+        id: private-comparison
+        env:
+          AI_NOTICE_PRIVATE_L1_VALUE: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+        run: |
+          target="$RUNNER_TEMP/ai-notice-private-l1"
+          umask 077
+          printf '%s' "$AI_NOTICE_PRIVATE_L1_VALUE" > "$target"
+          chmod 0600 "$target"
+          echo "path=$target" >> "$GITHUB_OUTPUT"
       - name: Preflight source and generated distributions
         env:
-          AI_NOTICE_OPERATOR_L1: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+          AI_NOTICE_PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
         run: |
           python scripts/check_publication_identity.py \
             --git-tree . \
             --candidate dist \
             --require-private-comparison
+      - name: Remove protected private comparison file
+        if: always()
+        env:
+          PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
+        run: rm -f -- "$PRIVATE_L1_FILE"
       - name: Smoke test (wheel)
         run: uv run --isolated --no-project --with dist/*.whl nextcloud-mcp-server --help
       - name: Smoke test (source distribution)
@@ -117,14 +132,31 @@ jobs:
           ./scripts/extract-changelog.sh "$TAG" > notes.md
           echo "Prepared release notes for $TAG; publication preflight follows."
 
+      - name: Prepare protected private comparison file
+        id: private-comparison
+        env:
+          AI_NOTICE_PRIVATE_L1_VALUE: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+        run: |
+          target="$RUNNER_TEMP/ai-notice-private-l1"
+          umask 077
+          printf '%s' "$AI_NOTICE_PRIVATE_L1_VALUE" > "$target"
+          chmod 0600 "$target"
+          echo "path=$target" >> "$GITHUB_OUTPUT"
+
       - name: Preflight source and release notes
         env:
-          AI_NOTICE_OPERATOR_L1: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+          AI_NOTICE_PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
         run: |
           python scripts/check_publication_identity.py \
             --git-tree . \
             --candidate notes.md \
             --require-private-comparison
+
+      - name: Remove protected private comparison file
+        if: always()
+        env:
+          PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
+        run: rm -f -- "$PRIVATE_L1_FILE"
 
       # `gh release create` fails if the release already exists (e.g. a re-run of
       # this job), so check first and update instead.

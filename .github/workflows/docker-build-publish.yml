@@ -17,14 +17,14 @@ on:
       tag:
         description: Exact immutable package tag to publish
         required: true
-        default: v1.9.8.3
+        default: v1.9.9.3
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  PACKAGE_TAG: v1.9.8.3
-  PACKAGE_VERSION: 0.198.3
-  PACKAGE_REVISION: 7f3ff1ef8dedbc55587e0e24abcea5f028e1aee0
+  PACKAGE_TAG: v1.9.9.3
+  PACKAGE_VERSION: 0.199.3
+  PACKAGE_REVISION: f9f595f51707b8f017f29f923ddbe6ed7e69a142
 
 jobs:
   publish:
@@ -42,24 +42,30 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout package tag
+      - name: Checkout maintained packaging tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          fetch-depth: 0
 
-      - name: Capture checked-out source revision
+      - name: Prepare exact tagged application source
         id: source
         run: |
-          revision=$(git rev-parse HEAD)
+          git worktree add --detach package-source "$PACKAGE_TAG"
+          revision=$(git -C package-source rev-parse HEAD)
           if [ "$revision" != "$PACKAGE_REVISION" ]; then
             echo "Expected source revision $PACKAGE_REVISION, found $revision" >&2
             exit 1
           fi
+          mkdir package-context
+          git -C package-source archive HEAD | tar -x -C package-context
+          install -m 0644 Dockerfile package-context/Dockerfile
+          install -m 0644 scripts/check_publication_identity.py \
+            package-context/scripts/check_publication_identity.py
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - name: Validate source version
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' package-source/pyproject.toml)
           if [ "$version" != "$PACKAGE_VERSION" ]; then
             echo "Expected pyproject version $PACKAGE_VERSION, found $version" >&2
             exit 1
@@ -72,18 +78,29 @@ jobs:
         run: uv python install 3.11
 
       - name: Build publication distributions
-        run: uv build --out-dir publication-dist
+        run: (cd package-source && uv build --out-dir publication-dist)
+
+      - name: Prepare protected private comparison file
+        id: private-comparison
+        env:
+          AI_NOTICE_PRIVATE_L1_VALUE: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+        run: |
+          target="$RUNNER_TEMP/ai-notice-private-l1"
+          umask 077
+          printf '%s' "$AI_NOTICE_PRIVATE_L1_VALUE" > "$target"
+          chmod 0600 "$target"
+          echo "path=$target" >> "$GITHUB_OUTPUT"
 
       # This runs before registry login or upload. The exact checked-out source
       # and generated wheel/sdist must both pass; the private comparison value
       # is a repository secret and the checker never prints it.
       - name: Preflight immutable package inputs
         env:
-          AI_NOTICE_OPERATOR_L1: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+          AI_NOTICE_PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
         run: |
-          uv run --python 3.11 python scripts/check_publication_identity.py \
-            --git-tree . \
-            --candidate publication-dist \
+          python scripts/check_publication_identity.py \
+            --git-tree package-source \
+            --candidate package-source/publication-dist \
             --require-private-comparison
 
       - name: Set up QEMU
@@ -103,13 +120,13 @@ jobs:
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: .
+          context: ./package-context
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             AI_NOTICE_PUBLICATION_GATE=1
           secrets: |
-            AI_NOTICE_OPERATOR_L1=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
           tags: ${{ env.IMAGE_NAME }}:${{ env.PACKAGE_TAG }}
           provenance: false
           sbom: false
@@ -119,7 +136,13 @@ jobs:
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Immutable v1.9.8.3 package for nextcloud-mcp-server 0.198.3
+            org.opencontainers.image.description=Immutable v1.9.9.3 package for nextcloud-mcp-server 0.199.3
+
+      - name: Remove protected private comparison file
+        if: always()
+        env:
+          PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
+        run: rm -f -- "$PRIVATE_L1_FILE"
 
       - name: Record immutable package digest
         run: |

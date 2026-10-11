@@ -17,6 +17,7 @@ import argparse
 import io
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 APPROVED_NOTICE_AUTHORS = frozenset({"Gary Bajaj"})
-PRIVATE_IDENTITY_ENV = "AI_NOTICE_OPERATOR_L1"
+PRIVATE_IDENTITY_FILE_ENV = "AI_NOTICE_PRIVATE_L1_FILE"
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_DEPTH = 3
@@ -46,7 +47,8 @@ class CandidateError(RuntimeError):
 
 
 def _normalized(value: str) -> str:
-    return unicodedata.normalize("NFKC", value).casefold()
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(normalized.split())
 
 
 def _contains_private_identity(data: bytes, private_identity: str | None) -> bool:
@@ -222,13 +224,39 @@ def _candidate_files(path: Path) -> Iterable[tuple[Path, str]]:
 
 
 def _private_identity(required: bool) -> str | None:
-    value = os.environ.get(PRIVATE_IDENTITY_ENV)
-    if value is None or not value.strip():
+    configured_path = os.environ.get(PRIVATE_IDENTITY_FILE_ENV)
+    if configured_path is None or not configured_path:
         if required:
             raise CandidateError("private identity comparison is unavailable")
         return None
-    value = value.strip()
-    if value in APPROVED_NOTICE_AUTHORS:
+
+    path = Path(configured_path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise CandidateError("private identity comparison input is unavailable") from error
+    if not path.is_absolute() or not stat.S_ISREG(metadata.st_mode):
+        raise CandidateError("private identity comparison input is unsafe")
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise CandidateError("private identity comparison input is unsafe")
+
+    try:
+        value = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise CandidateError("private identity comparison input is invalid") from error
+    if value.endswith("\r\n"):
+        value = value[:-2]
+    elif value.endswith("\n"):
+        value = value[:-1]
+    if (
+        not value
+        or not _normalized(value)
+        or "\n" in value
+        or "\r" in value
+        or "\x00" in value
+    ):
+        raise CandidateError("private identity comparison input is invalid")
+    if _normalized(value) in {_normalized(item) for item in APPROVED_NOTICE_AUTHORS}:
         raise CandidateError("private identity comparison is not distinct")
     return value
 
@@ -311,7 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    comparison = "private+public" if os.environ.get(PRIVATE_IDENTITY_ENV) else "public"
+    comparison = (
+        "private+public"
+        if os.environ.get(PRIVATE_IDENTITY_FILE_ENV)
+        else "public"
+    )
     print(f"publication identity gate: {count} file(s) pass ({comparison} checks)")
     return 0
 

@@ -46,12 +46,12 @@ RUN uv sync --locked --no-dev --no-editable --no-cache --extra semantic --extra 
 # workflow opts in and supplies the protected comparison through a BuildKit
 # secret, which is mounted only for this RUN and never enters an image layer.
 ARG AI_NOTICE_PUBLICATION_GATE=0
-RUN --mount=type=secret,id=AI_NOTICE_OPERATOR_L1 \
+RUN --mount=type=secret,id=AI_NOTICE_PRIVATE_L1_FILE,mode=0600 \
     if [ "$AI_NOTICE_PUBLICATION_GATE" = "1" ]; then \
-        test -s /run/secrets/AI_NOTICE_OPERATOR_L1; \
+        test -s /run/secrets/AI_NOTICE_PRIVATE_L1_FILE; \
         package_dir="$(/opt/venv/bin/python -c 'import pathlib, nextcloud_mcp_server; print(pathlib.Path(nextcloud_mcp_server.__file__).parent)')"; \
         metadata_dir="$(/opt/venv/bin/python -c 'from importlib.metadata import distribution; print(distribution("nextcloud-mcp-server")._path)')"; \
-        AI_NOTICE_OPERATOR_L1="$(cat /run/secrets/AI_NOTICE_OPERATOR_L1)" \
+        AI_NOTICE_PRIVATE_L1_FILE=/run/secrets/AI_NOTICE_PRIVATE_L1_FILE \
             /opt/venv/bin/python scripts/check_publication_identity.py \
                 --candidate /src \
                 --candidate "$package_dir" \
