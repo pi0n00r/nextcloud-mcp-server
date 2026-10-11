@@ -177,7 +177,8 @@ def test_container_publication_enables_the_in_image_private_gate() -> None:
     assert "AI_NOTICE_PRIVATE_L1_FILE=/run/secrets/AI_NOTICE_PRIVATE_L1_FILE" in dockerfile
     assert "--require-private-comparison" in dockerfile
     assert "AI_NOTICE_PUBLICATION_GATE=1" in workflow
-    assert "AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}" in workflow
+    assert "AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}" in workflow
+    assert "AI_NOTICE_OPERATOR_L1" not in workflow
     assert "context: ./package-context" in workflow
     assert "publication-gate-context/exact-source.tar" in workflow
     assert "context: ./publication-gate-context" in workflow

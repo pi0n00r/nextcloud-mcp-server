@@ -24,7 +24,7 @@ on:
         required: true
         type: string
     secrets:
-      AI_NOTICE_OPERATOR_L1:
+      AI_NOTICE_PRIVATE_L1_FILE:
         description: Private operator identity used only by publication preflight
         required: true
 
@@ -97,7 +97,7 @@ jobs:
           push: false
           outputs: type=cacheonly
           secrets: |
-            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
       - name: Smoke test (wheel)
         run: uv run --isolated --no-project --with dist/*.whl nextcloud-mcp-server --help
       - name: Smoke test (source distribution)
@@ -150,7 +150,7 @@ jobs:
           push: false
           outputs: type=cacheonly
           secrets: |
-            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
 
       # `gh release create` fails if the release already exists (e.g. a re-run of
       # this job), so check first and update instead.

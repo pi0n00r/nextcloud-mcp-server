@@ -108,7 +108,7 @@ jobs:
           push: false
           outputs: type=cacheonly
           secrets: |
-            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -127,7 +127,7 @@ jobs:
           build-args: |
             AI_NOTICE_PUBLICATION_GATE=1
           secrets: |
-            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
           tags: ${{ env.IMAGE_NAME }}:${{ env.PACKAGE_TAG }}
           provenance: false
           sbom: false
