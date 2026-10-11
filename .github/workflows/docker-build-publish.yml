@@ -80,34 +80,35 @@ jobs:
       - name: Build publication distributions
         run: (cd package-source && uv build --out-dir publication-dist)
 
-      - name: Prepare protected private comparison file
-        id: private-comparison
-        env:
-          AI_NOTICE_PRIVATE_L1_VALUE: ${{ secrets.AI_NOTICE_OPERATOR_L1 }}
+      - name: Prepare exact publication-gate context
         run: |
-          target="$RUNNER_TEMP/ai-notice-private-l1"
-          umask 077
-          printf '%s' "$AI_NOTICE_PRIVATE_L1_VALUE" > "$target"
-          chmod 0600 "$target"
-          echo "path=$target" >> "$GITHUB_OUTPUT"
-
-      # This runs before registry login or upload. The exact checked-out source
-      # and generated wheel/sdist must both pass; the private comparison value
-      # is a repository secret and the checker never prints it.
-      - name: Preflight immutable package inputs
-        env:
-          AI_NOTICE_PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
-        run: |
-          python scripts/check_publication_identity.py \
-            --git-tree package-source \
-            --candidate package-source/publication-dist \
-            --require-private-comparison
+          mkdir -p publication-gate-context/artifacts
+          git -C package-source archive --format=tar HEAD \
+            > publication-gate-context/exact-source.tar
+          cp package-source/publication-dist/* publication-gate-context/artifacts/
+          install -m 0644 scripts/check_publication_identity.py \
+            publication-gate-context/check_publication_identity.py
+          install -m 0644 Dockerfile.publication-gate \
+            publication-gate-context/Dockerfile
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # This runs before registry login or upload. The exact checked-out source
+      # and generated wheel/sdist must both pass; the private comparison value
+      # is a repository secret and the checker never prints it.
+      - name: Preflight immutable package inputs
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./publication-gate-context
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          secrets: |
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -137,12 +138,6 @@ jobs:
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
             org.opencontainers.image.description=Immutable v1.9.9.3 package for nextcloud-mcp-server 0.199.3
-
-      - name: Remove protected private comparison file
-        if: always()
-        env:
-          PRIVATE_L1_FILE: ${{ steps.private-comparison.outputs.path }}
-        run: rm -f -- "$PRIVATE_L1_FILE"
 
       - name: Record immutable package digest
         run: |

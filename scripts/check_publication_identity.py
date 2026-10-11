@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import io
 import os
 import re
@@ -231,18 +232,28 @@ def _private_identity(required: bool) -> str | None:
         return None
 
     path = Path(configured_path)
+    if not path.is_absolute():
+        raise CandidateError("private identity comparison input is unsafe")
     try:
-        metadata = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > 512
+            ):
+                raise CandidateError("private identity comparison input is unsafe")
+            raw_value = source.read(513)
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise CandidateError("private identity comparison input is unsafe") from error
         raise CandidateError("private identity comparison input is unavailable") from error
-    if not path.is_absolute() or not stat.S_ISREG(metadata.st_mode):
-        raise CandidateError("private identity comparison input is unsafe")
-    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise CandidateError("private identity comparison input is unsafe")
-
     try:
-        value = path.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        value = raw_value.decode("utf-8")
+    except UnicodeDecodeError as error:
         raise CandidateError("private identity comparison input is invalid") from error
     if value.endswith("\r\n"):
         value = value[:-2]
@@ -254,6 +265,8 @@ def _private_identity(required: bool) -> str | None:
         or "\n" in value
         or "\r" in value
         or "\x00" in value
+        or len(value.split()) < 2
+        or len(_normalized(value)) < 8
     ):
         raise CandidateError("private identity comparison input is invalid")
     if _normalized(value) in {_normalized(item) for item in APPROVED_NOTICE_AUTHORS}:

@@ -179,7 +179,9 @@ def test_container_publication_enables_the_in_image_private_gate() -> None:
     assert "AI_NOTICE_PUBLICATION_GATE=1" in workflow
     assert "AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_OPERATOR_L1 }}" in workflow
     assert "context: ./package-context" in workflow
-    assert "--git-tree package-source" in workflow
+    assert "publication-gate-context/exact-source.tar" in workflow
+    assert "context: ./publication-gate-context" in workflow
+    assert "AI_NOTICE_PRIVATE_L1_VALUE" not in workflow
     assert "AI_NOTICE_OPERATOR" + "_L1=" not in workflow
     assert "!scripts/check_publication_identity.py" in dockerignore
 
@@ -288,6 +290,42 @@ def test_private_identity_file_rejects_whitespace_only_value(
     candidate.write_text("safe", encoding="utf-8")
 
     with pytest.raises(gate.CandidateError, match="input is invalid"):
+        gate.inspect(
+            git_tree=None,
+            candidates=[candidate],
+            require_private_comparison=True,
+        )
+
+
+def test_private_identity_file_rejects_generic_single_word(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_file = tmp_path / "private-l1"
+    private_file.write_text("Operator", encoding="utf-8")
+    private_file.chmod(0o600)
+    monkeypatch.setenv(gate.PRIVATE_IDENTITY_FILE_ENV, str(private_file))
+    candidate = tmp_path / "candidate.txt"
+    candidate.write_text("safe", encoding="utf-8")
+
+    with pytest.raises(gate.CandidateError, match="input is invalid"):
+        gate.inspect(
+            git_tree=None,
+            candidates=[candidate],
+            require_private_comparison=True,
+        )
+
+
+def test_private_identity_file_rejects_oversized_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_file = tmp_path / "private-l1"
+    private_file.write_text("Private " + ("Identity" * 80), encoding="utf-8")
+    private_file.chmod(0o600)
+    monkeypatch.setenv(gate.PRIVATE_IDENTITY_FILE_ENV, str(private_file))
+    candidate = tmp_path / "candidate.txt"
+    candidate.write_text("safe", encoding="utf-8")
+
+    with pytest.raises(gate.CandidateError, match="input is unsafe"):
         gate.inspect(
             git_tree=None,
             candidates=[candidate],
