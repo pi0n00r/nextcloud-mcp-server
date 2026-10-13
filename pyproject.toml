@@ -172,6 +172,8 @@ dev = [
     # failure. That job must therefore stay off .github/actions/uv-env, which
     # syncs the dev group -- a comment on the job says so.
     "pyroscope-io>=0.8.0",
+    "certifi>=2026.6.17",
+    "pyyaml>=6.0.3",
 ]
 
 [project.entry-points."nextcloud_mcp_server.plugins"]

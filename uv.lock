@@ -2092,6 +2092,7 @@ semantic = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "certifi" },
     { name = "commitizen" },
     { name = "deptry" },
     { name = "httpx2" },
@@ -2109,6 +2110,7 @@ dev = [
     { name = "pytest-playwright-asyncio" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "pyyaml" },
     { name = "reportlab" },
     { name = "ruff" },
     { name = "ty" },
@@ -2171,6 +2173,7 @@ provides-extras = ["semantic", "documents", "postgres", "observability"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "certifi", specifier = ">=2026.6.17" },
     { name = "commitizen", specifier = ">=4.8.2" },
     { name = "deptry", specifier = ">=0.20.0" },
     { name = "httpx2", specifier = ">=2.5.0" },
@@ -2188,6 +2191,7 @@ dev = [
     { name = "pytest-playwright-asyncio", specifier = ">=0.7.1" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
     { name = "pytest-xdist", specifier = ">=3.6.1" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "reportlab", specifier = ">=4.0.0" },
     { name = "ruff", specifier = ">=0.11.13" },
     { name = "ty", specifier = ">=0.0.84,<0.0.85" },
