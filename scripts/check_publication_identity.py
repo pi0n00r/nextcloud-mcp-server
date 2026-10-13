@@ -250,8 +250,12 @@ def _private_identity(required: bool) -> str | None:
             raw_value = source.read(513)
     except OSError as error:
         if error.errno == errno.ELOOP:
-            raise CandidateError("private identity comparison input is unsafe") from error
-        raise CandidateError("private identity comparison input is unavailable") from error
+            raise CandidateError(
+                "private identity comparison input is unsafe"
+            ) from error
+        raise CandidateError(
+            "private identity comparison input is unavailable"
+        ) from error
     try:
         value = raw_value.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -358,9 +362,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     comparison = (
-        "private+public"
-        if os.environ.get(PRIVATE_IDENTITY_FILE_ENV)
-        else "public"
+        "private+public" if os.environ.get(PRIVATE_IDENTITY_FILE_ENV) else "public"
     )
     print(f"publication identity gate: {count} file(s) pass ({comparison} checks)")
     return 0

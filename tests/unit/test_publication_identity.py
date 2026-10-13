@@ -177,10 +177,14 @@ def test_container_publication_enables_the_in_image_private_gate() -> None:
 
     assert "ARG AI_NOTICE_PUBLICATION_GATE=0" in dockerfile
     assert "--mount=type=secret,id=AI_NOTICE_PRIVATE_L1_FILE" in dockerfile
-    assert "AI_NOTICE_PRIVATE_L1_FILE=/run/secrets/AI_NOTICE_PRIVATE_L1_FILE" in dockerfile
+    assert (
+        "AI_NOTICE_PRIVATE_L1_FILE=/run/secrets/AI_NOTICE_PRIVATE_L1_FILE" in dockerfile
+    )
     assert "--require-private-comparison" in dockerfile
     assert "AI_NOTICE_PUBLICATION_GATE=1" in workflow
-    assert "AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}" in workflow
+    assert (
+        "AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}" in workflow
+    )
     assert "AI_NOTICE_OPERATOR_L1" not in workflow
     assert "context: ./package-context" in workflow
     assert "publication-gate-context/exact-source.tar" in workflow
@@ -377,9 +381,7 @@ def test_private_identity_file_rejects_invalid_utf8_without_echo(
     candidate = tmp_path / "candidate.txt"
     candidate.write_text("safe", encoding="utf-8")
 
-    result = gate.main(
-        ["--candidate", str(candidate), "--require-private-comparison"]
-    )
+    result = gate.main(["--candidate", str(candidate), "--require-private-comparison"])
 
     captured = capsys.readouterr()
     assert result == 2
