@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.199.4"
+version = "0.200.2"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -126,7 +126,7 @@ ignore = ["DEP002", "DEP004"]
 DEP001 = ["pytesseract"]
 
 [build-system]
-requires = ["uv_build>=0.12.1,<0.13.0"]
+requires = ["uv_build>=0.13.3,<0.14.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -160,7 +160,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.84,<0.0.85",
+    "ty>=0.0.89,<0.0.90",
     "pytest-otel>=2.0.1",
     "procrastinate>=3.8",
     "psycopg[binary,pool]>=3.2",

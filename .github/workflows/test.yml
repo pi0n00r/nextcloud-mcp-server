@@ -160,9 +160,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:29335791322254d4b17d8a8ca1a969f9fa13d83b096a2e7891627d094dfb5d58"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:45afe3bebd1eef20b402cafcb87206e3d9f3a27dbc514a21ab8e124d97bbfe8c"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.9@sha256:a97666d6ae931bde78a80cfba8abdf46d436d7b540f31895803f6fb0a012d689"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:a353c1bb14d9d70a4cbd677af586a7848d1e96d26130f225db4af75100609371"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -174,7 +174,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.4@sha256:37b109885aa3cba3e056362a899556a625c986f2c17cd2c0cc157d21c789f53b"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:6d69b9052afab060afe8d004e9b00820f95a040b42db967b31eef9a48661e8bc"
 
           # Mode-specific properties
           - mode: single-user

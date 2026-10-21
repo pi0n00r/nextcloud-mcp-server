@@ -5,6 +5,51 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.200.2 (2026-10-20)
+
+### Fix
+
+- **http**: merge caller headers via httpx.Headers in the factory
+- **client**: send OCS-APIRequest from the httpx client, not per call site
+
+### Refactor
+
+- **webdav**: hoist text/xml content type; document factory scope
+- **client**: make NEXTCLOUD_DEFAULT_HEADERS read-only; clarify mail JSON headers
+
+## v0.200.1 (2026-10-20)
+
+### Fix
+
+- **search**: harden batched file verification per review
+- **auth**: reject unparseable Basic headers with 401
+- **auth**: verify multi-user BasicAuth credentials in the middleware
+
+### Perf
+
+- **search**: verify file results per result instead of re-walking the tagged corpus
+
+## v0.200.0 (2026-10-20)
+
+### Feat
+
+- **talk**: filter talk_get_messages by thread
+- **talk**: support creating and posting into Talk threads
+
+### Fix
+
+- **ci**: keep release smoke test on Python 3.11 (project floor)
+- **ci**: pin Python to 3.14 and cap Renovate below 3.15
+- **lint**: satisfy ty 0.0.89
+- **talk**: drop semicolon from talk_get_messages description
+- **talk**: only map spreed's thread 404 to "thread not found"
+- **documents**: read text inside Word content controls (w:sdt)
+
+### Refactor
+
+- **documents**: split the docx block walk into helpers (cognitive complexity)
+- **talk**: move thread 404 handling out of configure_talk_tools
+
 ## v0.199.4 (2026-10-12)
 
 ### Fix

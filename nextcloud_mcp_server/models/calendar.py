@@ -11,7 +11,7 @@
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
-from typing import Any, List, Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -191,7 +191,7 @@ class CalendarEventSummary(BaseModel):
     calendar_display_name: Optional[str] = Field(
         None, description="Display name of calendar containing this event"
     )
-    reminders: List[dict[str, Any]] = Field(
+    reminders: List[Reminder] = Field(
         default_factory=list, description="Ordered VALARM reminder objects"
     )
     etag: Optional[str] = Field(None, description="Exact CalDAV ETag for versioning")

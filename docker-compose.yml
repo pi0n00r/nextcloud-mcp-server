@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.3-noble@sha256:2bdff1534a7e569fecaf4b10b66ad0d410806e382d9db29ba305448addda97c4
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:99c125f103f5d081ebbc9ffe064e63daf7f688ac33a5f7f29af2d7260a96debf
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -24,7 +24,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:29335791322254d4b17d8a8ca1a969f9fa13d83b096a2e7891627d094dfb5d58}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:45afe3bebd1eef20b402cafcb87206e3d9f3a27dbc514a21ab8e124d97bbfe8c}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -143,7 +143,7 @@ services:
   # raise SEARCH_RERANK_TIMEOUT_SECONDS or lower SEARCH_RERANK_POOL_SIZE, or
   # use the GPU image (drop the "-cpu" suffix) for real workloads.
   infinity:
-    image: docker.io/michaelf34/infinity:0.0.77-cpu@sha256:94db836145f609c508f3f296f3b9bd0e78ae088025e879664d073dfd9f929e96
+    image: docker.io/michaelf34/infinity:0.0.78-cpu@sha256:0dda7c4fd26da2734ffbfa4054f880e81a7c7f941c7aa1f4c257523ee7fc70a3
     restart: always
     command:
       - v2

@@ -185,10 +185,10 @@ class TestSharingOcsHeaders:
     @pytest.mark.parametrize(
         "method_name", ["create_share", "create_public_link", "list_shares"]
     )
-    def test_every_call_carries_the_ocs_header(self, sharing_client, method_name):
-        """Omitting OCS-APIRequest yields statuscode 997, not a 4xx — the kind
-        of failure that gets misread as a server fault."""
-        assert SharingClient._OCS_HEADERS["OCS-APIRequest"] == "true"
+    def test_every_call_uses_shared_ocs_headers(self, sharing_client, method_name):
+        """Sharing adds only endpoint headers; the shared client owns the
+        OCS-APIRequest default verified by test_ocs_headers_are_shared."""
+        assert "OCS-APIRequest" not in SharingClient._OCS_HEADERS
         assert hasattr(sharing_client, method_name)
 
     async def test_997_from_sharing_surfaces_as_auth_error(
