@@ -1,0 +1,322 @@
+"""The one metadata-only structured log line per MCP tool call.
+
+Tool name and arguments also reach Tempo as span attributes, but traces are
+sampled and short-retention. Unsampled logs deliberately omit arguments. The
+remaining fields are asserted because Loki queries and Grafana panels break
+silently when a field is renamed.
+"""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+import pytest
+from mcp import types
+from mcp.client import Client
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
+from mcp.server.context import ServerRequestContext
+from mcp.server.mcpserver import MCPServer
+from mcp.shared.exceptions import MCPError
+
+from nextcloud_mcp_server.observability.metrics import (
+    _sanitize_tool_args,
+    instrument_call_tool_outcomes,
+)
+from nextcloud_mcp_server.server import AVAILABLE_APPS, configure_app_tools
+from nextcloud_mcp_server.server.auth_tools import register_auth_tools
+from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
+
+pytestmark = pytest.mark.unit
+
+LOGGER = "nextcloud_mcp_server.observability.metrics"
+
+
+def _wrap(inner, registered=("nc_semantic_search",)):
+    """Drive the middleware with ``inner`` as the rest of the chain.
+
+    ``registered`` stands in for the tool registry. mcp 2.x has no
+    ``request_handlers`` dict to patch, so the instrumentation is a middleware
+    and the test calls it the way the dispatcher would.
+    """
+    mcp = SimpleNamespace(
+        middleware=[],
+        _tool_manager=SimpleNamespace(
+            get_tool=lambda name: object() if name in registered else None
+        ),
+    )
+    instrument_call_tool_outcomes(mcp)
+    (middleware,) = mcp.middleware
+
+    async def call(ctx):
+        return await middleware(ctx, inner)
+
+    return call
+
+
+def _request(name: str = "nc_semantic_search", **arguments) -> ServerRequestContext:
+    return ServerRequestContext(
+        # client_params=None is the "before initialize" shape; it makes
+        # record_client_session bow out without touching a real ServerSession.
+        session=SimpleNamespace(client_params=None),
+        lifespan_context=None,
+        protocol_version=types.LATEST_PROTOCOL_VERSION,
+        method="tools/call",
+        params={"name": name, "arguments": arguments},
+        request_id=1,
+    )
+
+
+async def _ok(_ctx):
+    return types.CallToolResult(content=[], is_error=False)
+
+
+def _line(caplog):
+    """The single tool-call record, or an assertion failure saying so."""
+    records = [r for r in caplog.records if getattr(r, "mcp_tool", None)]
+    assert len(records) == 1, f"expected one tool-call line, got {len(records)}"
+    return records[0]
+
+
+class TestToolCallLine:
+    async def test_success_logs_name_duration_without_args(self, caplog):
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(_ok)(_request(query="safeguarding policy", limit=3))
+
+        record = _line(caplog)
+        assert record.levelno == logging.INFO
+        assert record.mcp_tool == "nc_semantic_search"
+        assert record.outcome == "success"
+        assert isinstance(record.duration_ms, int)
+        assert not hasattr(record, "mcp_tool_args")
+        # No unregistered-name noise on the normal path
+        assert not hasattr(record, "mcp_tool_requested")
+
+    async def test_tool_error_logs_at_warning(self, caplog):
+        async def inner(_ctx):
+            return types.CallToolResult(content=[], is_error=True)
+
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(inner)(_request())
+
+        record = _line(caplog)
+        assert record.outcome == "tool_error"
+        assert record.levelno == logging.WARNING
+
+    async def test_tool_error_in_the_wire_shape(self, caplog):
+        """What the runner actually hands a middleware: the serialized dict."""
+
+        async def inner(_ctx):
+            return {"content": [], "isError": True}
+
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(inner)(_request())
+
+        assert _line(caplog).outcome == "tool_error"
+
+    async def test_tool_error_through_the_real_runner(self, caplog):
+        """The fakes above return whichever shape they are written with; only a
+        real ``Client(server)`` round-trip shows what the SDK passes along. Every
+        failure was logged as success until this was checked end to end."""
+
+        mcp = MCPServer(name="test-tool-error-outcome")
+
+        @mcp.tool()
+        async def nc_semantic_search() -> str:
+            raise ValueError("board 999 not found")
+
+        instrument_call_tool_outcomes(mcp)
+
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            async with Client(mcp) as client:
+                result = await client.call_tool("nc_semantic_search", {})
+
+        assert result.is_error is True
+        record = _line(caplog)
+        assert record.outcome == "tool_error"
+        assert record.levelno == logging.WARNING
+
+    async def test_protocol_error_logs_and_still_raises(self, caplog):
+        async def inner(_ctx):
+            raise MCPError(code=types.INTERNAL_ERROR, message="boom")
+
+        handler = _wrap(inner)
+        request = _request()
+
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            with pytest.raises(MCPError):
+                await handler(request)
+
+        record = _line(caplog)
+        assert record.outcome == "protocol_error"
+        assert record.levelno == logging.WARNING
+
+    async def test_no_arguments_omits_the_args_field(self, caplog):
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(_ok)(_request())
+
+        assert not hasattr(_line(caplog), "mcp_tool_args")
+
+    async def test_unregistered_name_is_logged_but_not_labelled(self, caplog):
+        """The metric label collapses to "unknown"; the line keeps the typo."""
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(_ok)(_request(name="nc_semantic_serach"))
+
+        record = _line(caplog)
+        assert record.mcp_tool == "unknown"
+        assert record.mcp_tool_requested == "nc_semantic_serach"
+
+    async def test_identity_absent_without_a_token(self, caplog):
+        """BasicAuth / single-user / stdio: no OAuth identity, and no crash."""
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            await _wrap(_ok)(_request(query="x"))
+
+        record = _line(caplog)
+        assert not hasattr(record, "mcp_user")
+        assert not hasattr(record, "mcp_client_id")
+
+    async def test_identity_from_access_token(self, caplog):
+        token = auth_context_var.set(
+            AuthenticatedUser(
+                AccessToken(
+                    token="opaque",
+                    client_id="claude-ai",
+                    scopes=["openid"],
+                    # This codebase stores the username in `resource`
+                    # (unified_verifier.py), not in `subject`.
+                    resource="alice",
+                )
+            )
+        )
+        try:
+            with caplog.at_level(logging.INFO, logger=LOGGER):
+                await _wrap(_ok)(_request(query="x"))
+        finally:
+            auth_context_var.reset(token)
+
+        record = _line(caplog)
+        assert record.mcp_user == "alice"
+        assert record.mcp_client_id == "claude-ai"
+
+
+def test_every_tool_function_is_named_after_the_tool_it_registers():
+    """Keeps the per-tool metrics joinable with the per-call ones.
+
+    ``mcp_tool_calls_total`` / ``mcp_tool_duration_seconds`` label with
+    ``func.__name__`` (from ``@instrument_tool``), while
+    ``mcp_tool_outcomes_total`` and the log line above use the *registered* MCP
+    name. The four OAuth tools used to disagree — ``tool_provision_access`` vs
+    ``provision_nextcloud_access`` — which silently split every dashboard that
+    joined them. A mismatch is invisible at runtime, so it needs a test.
+    """
+    mcp = MCPServer(name="test-tool-names")
+    for app_name in AVAILABLE_APPS:
+        configure_app_tools(mcp, app_name)
+    register_auth_tools(mcp)
+    register_oauth_tools(mcp)
+
+    mismatched = {
+        tool.name: tool.fn.__name__
+        for tool in mcp._tool_manager.list_tools()
+        if tool.fn.__name__ != tool.name
+    }
+
+    assert not mismatched, (
+        "these tools register under a name that differs from their function "
+        f"name, so their metrics and logs disagree: {mismatched}. Rename the "
+        "function to match the registered name."
+    )
+
+
+class TestSanitizeToolArgs:
+    """Arguments here are raw client input — validate_input=False upstream — so
+    redaction cannot assume the keys a tool actually declares."""
+
+    def test_redacts_by_substring_not_exact_match(self):
+        rendered = _sanitize_tool_args(
+            {
+                "query": "notes",
+                "access_token": "eyJ...",
+                "clientSecret": "shh",
+                "refresh_token": "r",
+                "password": "hunter2",
+            }
+        )
+
+        for secret in ("eyJ...", "shh", "hunter2"):
+            assert secret not in rendered
+        assert rendered.count("[redacted]") == 4
+        assert "'query': 'notes'" in rendered
+
+    def test_redacts_a_secret_the_tool_never_declared(self):
+        """A caller can send any key to any tool; the key still gets caught."""
+        assert "hunter2" not in _sanitize_tool_args({"password": "hunter2"})
+
+    def test_long_value_capped_without_hiding_later_arguments(self):
+        rendered = _sanitize_tool_args({"query": "x" * 5000, "path": "/notes/a.md"})
+
+        assert "x" * 150 in rendered
+        assert "x" * 300 not in rendered
+        assert "'path': '/notes/a.md'" in rendered
+
+    def test_free_text_bodies_logged_by_size_only(self):
+        """#1644: note/file bodies and messages never reach the log line."""
+        rendered = _sanitize_tool_args(
+            {
+                "content": "private page text",
+                "message": "hi there",
+                "new_description": ["a", "b"],
+                "message_id": 42,
+                "description": None,
+                "path": "/notes/a.md",
+            }
+        )
+
+        assert "private page text" not in rendered
+        assert "hi there" not in rendered
+        assert "'content': <17 chars>" in rendered
+        assert "'message': <8 chars>" in rendered
+        assert "'new_description': <10 chars>" in rendered
+        assert "'message_id': 42" in rendered
+        assert "'description': None" in rendered
+        assert "'path': '/notes/a.md'" in rendered
+
+    def test_many_arguments_capped_overall(self):
+        rendered = _sanitize_tool_args({f"k{i}": "y" * 150 for i in range(50)})
+
+        assert len(rendered) == 1000
+
+    def test_nothing_worth_logging_returns_none(self):
+        assert _sanitize_tool_args({}) is None
+        assert _sanitize_tool_args(None) is None
+        # ctx and etag are dropped as noise, leaving nothing
+        assert _sanitize_tool_args({"ctx": object(), "etag": "abc"}) is None
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Basic dXNlcjphcHAtcGFzc3dvcmQ=", "Basic"),
+        ("Bearer eyJhbGciOi.payload.sig", "Bearer"),
+        ("bare-token-without-scheme", "<other>"),
+        ("Token abc123", "<other>"),
+    ],
+)
+def test_auth_scheme_never_echoes_credentials(header, expected):
+    """The /mcp auth log line carries the scheme only, never credentials."""
+    from nextcloud_mcp_server.app import _auth_scheme
+
+    assert _auth_scheme(header) == expected

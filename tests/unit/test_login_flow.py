@@ -1,0 +1,283 @@
+"""Unit tests for Login Flow v2 HTTP client.
+
+Tests the LoginFlowV2Client with mocked HTTP responses for:
+- Flow initiation (POST /index.php/login/v2)
+- Flow polling (completed, pending, expired)
+- Error handling
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from nextcloud_mcp_server.auth.login_flow import (
+    LoginFlowInitResponse,
+    LoginFlowPollResult,
+    LoginFlowV2Client,
+    rewrite_url_origin,
+)
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def flow_client():
+    """Create a LoginFlowV2Client for testing."""
+    return LoginFlowV2Client(
+        nextcloud_host="https://cloud.example.com",
+        verify_ssl=False,
+    )
+
+
+def _mock_response(status_code: int, json_data: dict) -> MagicMock:
+    """Create a mock httpx response."""
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = json_data
+    response.raise_for_status = MagicMock()
+    if status_code >= 400:
+        from httpx import HTTPStatusError
+
+        response.raise_for_status.side_effect = HTTPStatusError(
+            "error", request=MagicMock(), response=response
+        )
+    return response
+
+
+async def test_initiate_success(flow_client):
+    """Test successful Login Flow v2 initiation."""
+    mock_response = _mock_response(
+        200,
+        {
+            "login": "https://cloud.example.com/login/v2/grant?token=abc123",
+            "poll": {
+                "endpoint": "https://cloud.example.com/login/v2/poll",
+                "token": "secret-poll-token",
+            },
+        },
+    )
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        result = await flow_client.initiate()
+
+    assert isinstance(result, LoginFlowInitResponse)
+    assert result.login_url == "https://cloud.example.com/login/v2/grant?token=abc123"
+    assert result.poll_endpoint == "https://cloud.example.com/login/v2/poll"
+    assert result.poll_token == "secret-poll-token"
+
+
+async def test_poll_completed(flow_client):
+    """Test polling when user has completed login."""
+    mock_response = _mock_response(
+        200,
+        {
+            "server": "https://cloud.example.com",
+            "loginName": "alice",
+            "appPassword": "aaaaa-bbbbb-ccccc-ddddd-eeeee",
+        },
+    )
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        result = await flow_client.poll(
+            poll_endpoint="https://cloud.example.com/login/v2/poll",
+            poll_token="secret-poll-token",
+        )
+
+    assert isinstance(result, LoginFlowPollResult)
+    assert result.status == "completed"
+    assert result.server == "https://cloud.example.com"
+    assert result.login_name == "alice"
+    assert result.app_password == "aaaaa-bbbbb-ccccc-ddddd-eeeee"
+
+
+async def test_poll_pending(flow_client):
+    """Test polling when login is still pending."""
+    mock_response = _mock_response(404, {})
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        result = await flow_client.poll(
+            poll_endpoint="https://cloud.example.com/login/v2/poll",
+            poll_token="secret-poll-token",
+        )
+
+    assert result.status == "pending"
+    assert result.server is None
+    assert result.app_password is None
+
+
+async def test_poll_expired(flow_client):
+    """Test polling when flow has expired."""
+    mock_response = _mock_response(403, {})
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        result = await flow_client.poll(
+            poll_endpoint="https://cloud.example.com/login/v2/poll",
+            poll_token="expired-token",
+        )
+
+    assert result.status == "expired"
+    assert result.app_password is None
+
+
+async def test_initiate_rewrites_login_url_to_public_host():
+    """When server↔Nextcloud uses an internal host (e.g. the ``app`` Docker
+    service), the browser-facing login URL must be rewritten to the configured
+    public host; the poll endpoint stays on the internal host for server-side
+    polling. Mock URLs use https to match this file's convention (the rewrite
+    is scheme-agnostic, so this exercises the same origin-replacement logic)."""
+    client = LoginFlowV2Client(
+        nextcloud_host="https://nc-internal.test",  # server↔Nextcloud origin
+        verify_ssl=False,
+        public_host="https://cloud.example.com",  # browser-reachable origin
+    )
+    mock_response = _mock_response(
+        200,
+        {
+            # Nextcloud builds these from the request (internal) host.
+            "login": "https://nc-internal.test/login/v2/flow/tok123",
+            "poll": {
+                "endpoint": "https://nc-internal.test/login/v2/poll",
+                "token": "tok",  # value irrelevant here; this test asserts the URLs
+            },
+        },
+    )
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        result = await client.initiate()
+
+    # Browser-facing URL uses the public host...
+    assert result.login_url == "https://cloud.example.com/login/v2/flow/tok123"
+    # ...while the poll endpoint stays on the internal host (server polls it).
+    assert result.poll_endpoint == "https://nc-internal.test/login/v2/poll"
+
+
+async def test_initiate_with_custom_user_agent(flow_client):
+    """Test that custom user agent is passed in the request."""
+    mock_response = _mock_response(
+        200,
+        {
+            "login": "https://cloud.example.com/login/v2/grant?token=abc",
+            "poll": {
+                "endpoint": "https://cloud.example.com/login/v2/poll",
+                "token": "tok",
+            },
+        },
+    )
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "nextcloud_mcp_server.auth.login_flow.nextcloud_httpx_client",
+        return_value=mock_client,
+    ):
+        await flow_client.initiate(user_agent="my-custom-agent")
+
+    # Verify the user agent was passed
+    call_kwargs = mock_client.post.call_args
+    assert call_kwargs.kwargs["headers"]["User-Agent"] == "my-custom-agent"
+
+
+async def test_login_flow_init_response_model():
+    """Test LoginFlowInitResponse Pydantic model validation."""
+    resp = LoginFlowInitResponse(
+        login_url="https://cloud.example.com/login",
+        poll_endpoint="https://cloud.example.com/poll",
+        poll_token="token123",
+    )
+    assert resp.login_url == "https://cloud.example.com/login"
+    assert resp.poll_endpoint == "https://cloud.example.com/poll"
+    assert resp.poll_token == "token123"
+
+
+async def test_login_flow_poll_result_model():
+    """Test LoginFlowPollResult Pydantic model validation."""
+    # Completed result
+    completed = LoginFlowPollResult(
+        status="completed",
+        server="https://cloud.example.com",
+        login_name="bob",
+        app_password="xxxxx-yyyyy-zzzzz-aaaaa-bbbbb",
+    )
+    assert completed.status == "completed"
+    assert completed.login_name == "bob"
+
+    # Pending result
+    pending = LoginFlowPollResult(status="pending")
+    assert pending.status == "pending"
+    assert pending.server is None
+    assert pending.app_password is None
+
+
+# ── rewrite_url_origin tests ─────────────────────────────────────────────
+
+
+async def test_rewrite_url_origin_basic():
+    """Test basic origin rewriting."""
+    result = rewrite_url_origin(
+        "http://localhost/login/v2/poll", "https://cloud.example.com"
+    )
+    assert result == "https://cloud.example.com/login/v2/poll"
+
+
+async def test_rewrite_url_origin_preserves_port():
+    """Test that port in target_host is preserved."""
+    result = rewrite_url_origin("http://localhost/path", "http://app:8080")
+    assert result == "http://app:8080/path"
+
+
+async def test_rewrite_url_origin_preserves_query():
+    """Test that query string and fragment are preserved."""
+    result = rewrite_url_origin(
+        "http://internal/path?token=abc&foo=bar#section",
+        "https://public.example.com",
+    )
+    assert result == "https://public.example.com/path?token=abc&foo=bar#section"
+
+
+async def test_rewrite_url_origin_noop_when_same():
+    """Test that rewriting to the same origin is a no-op."""
+    url = "https://cloud.example.com/login/v2/poll"
+    result = rewrite_url_origin(url, "https://cloud.example.com")
+    assert result == url

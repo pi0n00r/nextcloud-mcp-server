@@ -1,0 +1,1178 @@
+"""PDF chunk highlighting utilities for vector visualization.
+
+This module provides utilities to generate highlighted page images showing
+matched chunks and their context from semantic search results.
+
+The highlighting uses character offsets to precisely locate chunks within
+PDF documents, ensuring accurate highlighting even when text formatting
+varies between indexing and rendering.
+"""
+
+import logging
+import re
+import shutil
+import tempfile
+from collections import defaultdict
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import pymupdf
+from PIL import Image, ImageDraw
+
+from nextcloud_mcp_server.document_processors._pymupdf4llm_classic import (
+    load_classic_pymupdf4llm,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class PDFHighlighter:
+    """Generate highlighted page images from PDF chunks."""
+
+    # Color definitions (RGB, 0-1 range)
+    COLORS = {
+        "yellow": [1, 1, 0],
+        "red": [1, 0, 0],
+        "green": [0, 1, 0],
+        "blue": [0, 0, 1],
+        "orange": [1, 0.5, 0],
+        "pink": [1, 0, 1],
+        "gray": [0.7, 0.7, 0.7],
+        "light_blue": [0.7, 0.9, 1.0],
+        "light_green": [0.7, 1.0, 0.7],
+    }
+
+    @staticmethod
+    def strip_markdown(text: str) -> str:
+        """Remove markdown formatting to improve search accuracy.
+
+        Args:
+            text: Text with potential markdown formatting
+
+        Returns:
+            Plain text with markdown removed
+        """
+        # Remove bold/italic markers
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"\*(.+?)\*", r"\1", text)
+        text = re.sub(r"__(.+?)__", r"\1", text)
+        text = re.sub(r"_(.+?)_", r"\1", text)
+
+        # Remove headers
+        text = re.sub(r"^#+\s+", "", text, flags=re.MULTILINE)
+
+        # Remove inline code
+        text = re.sub(r"`(.+?)`", r"\1", text)
+
+        return text.strip()
+
+    @staticmethod
+    def extract_pdf_text_with_boundaries(
+        pdf_doc: pymupdf.Document,
+    ) -> tuple[str, list[dict]]:
+        """Extract full document text with page boundary tracking.
+
+        Uses pymupdf4llm.to_markdown() for consistency with indexing.
+
+        IMPORTANT: Must use write_images=True to match PyMuPDFProcessor behavior!
+        Even though we don't need the images, we need the image references in the
+        markdown text to maintain consistent character offsets with indexing.
+
+        Args:
+            pdf_doc: Open PyMuPDF document
+
+        Returns:
+            Tuple of (full_text, page_boundaries) where page_boundaries is a list of:
+            {"page": 1, "start_offset": 0, "end_offset": 1234}
+        """
+
+        page_boundaries = []
+        text_parts = []
+        current_offset = 0
+
+        # Loaded lazily, and through the shared classic-extractor loader, for two
+        # reasons. (1) Offsets: indexing runs the classic (pymupdf_rag)
+        # extractor, so recomputing them under layout mode would silently
+        # misalign every highlight -- the exact failure the write_images note
+        # above guards against. (2) Memory: a module-level ``import pymupdf4llm``
+        # here put pymupdf.layout (~1.1 GiB of address space) into the app's
+        # import graph, and ``anyio.to_process`` re-imports the parent's
+        # ``__main__`` inside every PDF parse worker before the worker function
+        # runs -- so this import, in a module the ingest path never calls, was
+        # what left the 1536 MiB RLIMIT_AS worker with ~117 MiB to parse in and
+        # dead-lettered healthy documents (Deck #911).
+        pymupdf4llm = load_classic_pymupdf4llm()
+
+        # Use temp directory for image output (images are discarded after extraction)
+        temp_dir = Path(tempfile.mkdtemp(prefix="pdf_highlight_"))
+
+        for page_idx in range(pdf_doc.page_count):
+            page_md = pymupdf4llm.to_markdown(
+                pdf_doc,
+                pages=[page_idx],
+                write_images=True,  # Must match indexing! Otherwise offsets misalign
+                image_path=temp_dir,
+                page_chunks=False,
+            )
+
+            page_boundaries.append(
+                {
+                    "page": page_idx + 1,  # 1-indexed
+                    "start_offset": current_offset,
+                    "end_offset": current_offset + len(page_md),
+                }
+            )
+
+            text_parts.append(page_md)
+            current_offset += len(page_md)
+
+        full_text = "".join(text_parts)
+
+        # Clean up temp directory and extracted images
+
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            logger.warning("Failed to clean up temp directory %s: %s", temp_dir, e)
+
+        return full_text, page_boundaries
+
+    @staticmethod
+    def find_chunk_page(
+        chunk_start_offset: int,
+        chunk_end_offset: int,
+        page_boundaries: list[dict],
+    ) -> Optional[dict]:
+        """Find which page contains the most of a given chunk.
+
+        Args:
+            chunk_start_offset: Chunk start position in full document
+            chunk_end_offset: Chunk end position in full document
+            page_boundaries: Page boundary list from extract_pdf_text_with_boundaries()
+
+        Returns:
+            Dict with keys: page_num, overlap_chars, page_relative_start, page_relative_end
+            or None if chunk not found on any page
+        """
+        chunk_pages = []
+
+        for boundary in page_boundaries:
+            page_start = boundary["start_offset"]
+            page_end = boundary["end_offset"]
+
+            # Check if chunk overlaps with this page
+            if chunk_start_offset < page_end and chunk_end_offset > page_start:
+                overlap_start = max(chunk_start_offset, page_start)
+                overlap_end = min(chunk_end_offset, page_end)
+                overlap_chars = overlap_end - overlap_start
+
+                chunk_pages.append(
+                    {
+                        "page_num": boundary["page"],
+                        "overlap_chars": overlap_chars,
+                        "page_relative_start": overlap_start - page_start,
+                        "page_relative_end": overlap_end - page_start,
+                    }
+                )
+
+        if not chunk_pages:
+            return None
+
+        # Return page with maximum overlap
+        return max(chunk_pages, key=lambda p: p["overlap_chars"])
+
+    @staticmethod
+    def highlight_chunk_by_word_positions(
+        page: pymupdf.Page,
+        chunk_text: str,
+        color: str = "yellow",
+        search_region: tuple[float, float, float, float] | None = None,
+    ) -> int:
+        """Highlight chunk using word-position matching.
+
+        This method matches words from the chunk to their positions on the PDF page,
+        avoiding text search mismatches between markdown-formatted text and raw PDF text.
+
+        Args:
+            page: PyMuPDF page object
+            chunk_text: Text to highlight (may contain markdown)
+            color: Color name from COLORS dict
+            search_region: Optional (x0, y0, x1, y1) bounding box to constrain search.
+                          If provided, only words within this region are considered.
+
+        Returns:
+            Number of highlight rectangles added
+        """
+        # Tokenize chunk into words (alphanumeric only, lowercase)
+        chunk_words = re.findall(
+            r"\w+", PDFHighlighter.strip_markdown(chunk_text).lower()
+        )
+
+        if not chunk_words:
+            logger.warning("No words found in chunk text")
+            return 0
+
+        # Get all words from page with positions
+        # Format: (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+        try:
+            page_words = page.get_text("words")
+        except Exception as e:
+            logger.error("Failed to extract words from page: %s", e)
+            return 0
+
+        if not page_words:
+            logger.warning("No words found on page")
+            return 0
+
+        # Filter words by search region if provided
+        if search_region:
+            rx0, ry0, rx1, ry1 = search_region
+            # Allow some tolerance (10 points) for words near region boundary
+            tolerance = 10
+            page_words = [
+                w
+                for w in page_words
+                if (
+                    w[0] >= rx0 - tolerance
+                    and w[2] <= rx1 + tolerance
+                    and w[1] >= ry0 - tolerance
+                    and w[3] <= ry1 + tolerance
+                )
+            ]
+            logger.debug(
+                "Filtered to %s words in region (%s, %s, %s, %s)",
+                len(page_words),
+                format(rx0, ".0f"),
+                format(ry0, ".0f"),
+                format(rx1, ".0f"),
+                format(ry1, ".0f"),
+            )
+
+        if not page_words:
+            logger.warning("No words found in search region")
+            return 0
+
+        # Find matching word sequence - use FIRST match, not longest
+        # This ensures we highlight the actual chunk location, not similar text elsewhere
+        matches = []
+
+        # Build a simple word-to-positions index for the first few chunk words
+        # to find candidate starting positions
+        first_chunk_word = chunk_words[0] if chunk_words else ""
+        candidate_starts = []
+
+        for i, pw in enumerate(page_words):
+            page_word = pw[4].lower()
+            # Check if this could be the start of the chunk
+            if (
+                first_chunk_word == page_word
+                or first_chunk_word in page_word
+                or page_word in first_chunk_word
+            ):
+                candidate_starts.append(i)
+
+        # Try each candidate start position and take the FIRST good match
+        for start_pos in candidate_starts:
+            current_matches = []
+            chunk_idx = 0
+            skip_count = 0
+            max_skips = 3  # Allow some formatting differences
+
+            for page_idx in range(start_pos, len(page_words)):
+                if chunk_idx >= len(chunk_words):
+                    break
+
+                page_word = page_words[page_idx][4].lower()
+                chunk_word = chunk_words[chunk_idx]
+
+                # Check for match (allow partial matches for flexibility)
+                if (
+                    chunk_word == page_word
+                    or chunk_word in page_word
+                    or page_word in chunk_word
+                ):
+                    current_matches.append(page_words[page_idx])
+                    chunk_idx += 1
+                    skip_count = 0
+                elif skip_count < max_skips:
+                    # Allow skipping some words (formatting, punctuation)
+                    skip_count += 1
+                    continue
+                else:
+                    break
+
+            # Accept if we matched at least 50% of chunk words
+            if len(current_matches) >= len(chunk_words) * 0.5:
+                matches = current_matches
+                logger.debug(
+                    "Found match at position %s: %s/%s words",
+                    start_pos,
+                    len(matches),
+                    len(chunk_words),
+                )
+                break  # Take FIRST match, not best/longest
+
+        if not matches:
+            logger.debug("No word matches found (chunk has %s words)", len(chunk_words))
+            return 0
+
+        logger.debug(
+            "Matched %s words out of %s chunk words", len(matches), len(chunk_words)
+        )
+
+        # Build rectangles from matched words
+        rects = [pymupdf.Rect(w[0], w[1], w[2], w[3]) for w in matches]
+
+        # Check if matches are contiguous (not scattered across the page)
+        # Scattered matches indicate false positives from common words
+        if len(rects) > 1:
+            # Sort by vertical position then horizontal
+            sorted_matches = sorted(matches, key=lambda w: (round(w[1]), w[0]))
+
+            # Check for large vertical gaps (more than ~2 lines apart)
+            # A typical line height is 12-20 points
+            max_line_gap = 50  # Points - allows for ~2-3 lines gap
+            prev_y = sorted_matches[0][1]
+            large_gaps = 0
+
+            for match in sorted_matches[1:]:
+                y_gap = match[1] - prev_y
+                if y_gap > max_line_gap:
+                    large_gaps += 1
+                prev_y = match[1]
+
+            # If matches are scattered (many large gaps), reject this match
+            # A chunk should be mostly contiguous text
+            if large_gaps > len(matches) * 0.3:  # More than 30% have gaps
+                logger.debug(
+                    "Rejecting scattered matches: %s large gaps out of %s matches",
+                    large_gaps,
+                    len(matches),
+                )
+                return 0
+
+        # Merge adjacent rectangles on the same line for cleaner highlighting
+        merged_rects = []
+        sorted_rects = sorted(rects, key=lambda r: (round(r.y0), r.x0))
+
+        current_rect = None
+        for rect in sorted_rects:
+            if current_rect is None:
+                current_rect = rect
+            elif abs(rect.y0 - current_rect.y0) < 5:  # Same line (within 5 points)
+                current_rect = current_rect | rect  # Union
+            else:
+                merged_rects.append(current_rect)
+                current_rect = rect
+
+        if current_rect:
+            merged_rects.append(current_rect)
+
+        # Add highlights
+        rgb = PDFHighlighter.COLORS.get(color, PDFHighlighter.COLORS["yellow"])
+        for rect in merged_rects:
+            highlight = page.add_highlight_annot(rect)
+            highlight.set_colors({"stroke": rgb})
+            highlight.set_info(
+                content="Chunk from semantic search",
+                title="PDF Highlighter (word-position)",
+            )
+            highlight.update()
+
+        return len(merged_rects)
+
+    @staticmethod
+    def find_unique_phrase(
+        text: str, min_len: int = 30, max_len: int = 80
+    ) -> str | None:
+        """Find a relatively unique phrase from text for location search.
+
+        Looks for phrases that are likely to be unique on the page:
+        - Prefers phrases with numbers or special terms
+        - Avoids very common words
+
+        Args:
+            text: Source text to extract phrase from
+            min_len: Minimum phrase length
+            max_len: Maximum phrase length
+
+        Returns:
+            A phrase likely to be unique, or None if not found
+        """
+        clean_text = PDFHighlighter.strip_markdown(text).strip()
+        if not clean_text:
+            return None
+
+        # Try first sentence (often unique due to context)
+        sentences = re.split(r"[.!?]\s+", clean_text)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if min_len <= len(sentence) <= max_len:
+                return sentence
+            elif len(sentence) > max_len:
+                return sentence[:max_len]
+
+        # Fallback: first N chars
+        if len(clean_text) >= min_len:
+            return clean_text[:max_len]
+
+        return clean_text if clean_text else None
+
+    # Tokeniser for word-level matching: lowercase alphanumeric runs. Punctuation
+    # and whitespace are separators, so markdown markup (``**``, ``|``, ``-``) and
+    # the text layer's spacing differences fall away — the chunk's words match the
+    # page's words regardless of how either side renders structure.
+    _WORD_RE = re.compile(r"[0-9a-z]+")
+
+    # Max non-matching TOKENS tolerated between two matched tokens when growing a
+    # cluster (~10-12 single-token words; fewer for multi-token compounds).
+    # Deliberately generous to bridge stopword / punctuation / markdown-artifact
+    # runs; the densest-run hit count still selects the tightest cluster.
+    # Class-level for tunability / subclassing, consistent with _WORD_RE and COLORS.
+    _CHUNK_MAX_GAP = 12
+
+    @staticmethod
+    def _norm_tokens(s: str) -> list[str]:
+        return PDFHighlighter._WORD_RE.findall(s.lower())
+
+    @staticmethod
+    def _clamp01(v: float) -> float:
+        """Clamp a normalized coordinate to ``[0, 1]``."""
+        return 0.0 if v < 0 else 1.0 if v > 1 else v
+
+    @staticmethod
+    def _page_flat_tokens(
+        page: pymupdf.Page,
+    ) -> list[tuple[str, tuple[float, float, float, float, str, int, int, int]]]:
+        """Flatten a page's words into ``(token, word_tuple)`` pairs, extracted once.
+
+        ``get_text("words")`` + tokenisation is the dominant per-page cost. Callers
+        that locate many chunks on the same page build this once and reuse it (see
+        ``compute_chunk_bboxes_batch``) instead of re-extracting per chunk.
+        """
+        flat: list[
+            tuple[str, tuple[float, float, float, float, str, int, int, int]]
+        ] = []
+        for w in page.get_text("words"):  # (x0,y0,x1,y1, word, block, line, word_no)
+            for tok in PDFHighlighter._norm_tokens(w[4]):  # w[4] is the word str
+                flat.append((tok, w))
+        return flat
+
+    @staticmethod
+    def _find_chunk_line_rects(
+        page: pymupdf.Page,
+        chunk_text: str,
+        flat: list[tuple[str, tuple[float, float, float, float, str, int, int, int]]]
+        | None = None,
+    ) -> list[tuple[float, float, float, float]] | None:
+        """Tight per-line rects for a chunk, located by word-level matching.
+
+        The legacy ``_find_chunk_bbox`` searched a markdown-derived phrase with the
+        page's exact ``search_for`` and kept only the FIRST hit — or dropped the
+        chunk entirely when no phrase matched (~30% of chunks). Markdown markup
+        (table pipes, ``**``, list bullets) never appears in the text layer, so
+        exact phrase search is fragile, and a single estimated-height box doesn't
+        trace the real lines. Instead: tokenise the chunk and the page's words
+        (``get_text("words")``), find the densest contiguous cluster of words whose
+        tokens match the chunk, and return that region merged into one rect per text
+        line (page coordinates). Robust to markdown re-ordering and space-fused
+        tokens; None when the chunk can't be located.
+
+        Location is by content only (no char-offset disambiguation): if the same
+        text repeats on a page, the densest occurrence wins — same behaviour as the
+        legacy first-match phrase search.
+        """
+        want = PDFHighlighter._norm_tokens(PDFHighlighter.strip_markdown(chunk_text))
+        if not want:
+            return None
+        # Reuse a caller-provided per-page (token, word) list when available (the
+        # batch path); otherwise extract this page's words once here.
+        if flat is None:
+            flat = PDFHighlighter._page_flat_tokens(page)
+        if not flat:
+            return None
+        want_set = set(want)
+        cand = [i for i, (t, _) in enumerate(flat) if t in want_set]
+        # Coarse presence gate: require enough of the chunk's DISTINCT words SOMEWHERE
+        # on the page (not necessarily contiguous) before trusting a cluster — keeps a
+        # stray token from yielding a box. Cluster tightness is decided below.
+        if not cand or len({flat[i][0] for i in cand}) < max(2, 0.4 * len(want_set)):
+            return None
+        # Densest contiguous cluster of matching words: split candidates wherever the
+        # gap of non-matching words exceeds MAX_GAP, keep the run with the most hits.
+        # Robust to markdown re-ordering and space-fused tokens (``issueof``,
+        # ``powersunder``) that the text layer splits — we match on the tokens that
+        # DO align and bound the region, instead of an exact contiguous phrase.
+        runs: list[tuple[int, int, int]] = []  # (start_idx, end_idx, hit_count)
+        run_start = prev = cand[0]
+        hits = 1
+        for idx in cand[1:]:
+            if idx - prev <= PDFHighlighter._CHUNK_MAX_GAP:
+                prev, hits = idx, hits + 1
+            else:
+                runs.append((run_start, prev, hits))
+                run_start = prev = idx
+                hits = 1
+        runs.append((run_start, prev, hits))
+        lo, hi, _ = max(runs, key=lambda r: r[2])
+        # Merge the run's words — matched words plus the short gap words between them
+        # — into one rect per (block, line), in reading order. Including gap words
+        # covers the full chunk region (stopwords/punctuation that don't tokenise).
+        lines: dict[tuple, list[float]] = {}
+        order: list[tuple] = []
+        for i in range(lo, hi + 1):
+            w = flat[i][1]
+            key = (w[5], w[6])
+            box = [float(w[0]), float(w[1]), float(w[2]), float(w[3])]
+            if key in lines:
+                cur = lines[key]
+                cur[0], cur[1] = min(cur[0], box[0]), min(cur[1], box[1])
+                cur[2], cur[3] = max(cur[2], box[2]), max(cur[3], box[3])
+            else:
+                lines[key] = box
+                order.append(key)
+        rects = [
+            (lines[key][0], lines[key][1], lines[key][2], lines[key][3])
+            for key in order
+        ]
+        return rects or None
+
+    @staticmethod
+    def _find_chunk_bbox(
+        page: pymupdf.Page, chunk_text: str
+    ) -> tuple[float, float, float, float] | None:
+        """Single union bbox for a chunk (legacy PNG-overlay path).
+
+        Prefer ``_find_chunk_line_rects`` for the stored per-line geometry; this
+        collapses those line rects to one bounding box for the image-render path.
+        Returns (x0, y0, x1, y1) in page coordinates, or None if not found.
+        """
+        rects = PDFHighlighter._find_chunk_line_rects(page, chunk_text)
+        if not rects:
+            return None
+        return (
+            min(r[0] for r in rects),
+            min(r[1] for r in rects),
+            max(r[2] for r in rects),
+            max(r[3] for r in rects),
+        )
+
+    @staticmethod
+    def highlight_chunk_on_page(
+        page: pymupdf.Page,
+        chunk_text: str,
+        color: str = "yellow",
+    ) -> int:
+        """Add bounding box highlight to a PDF page for the given chunk text.
+
+        Uses text search to find the chunk's location on the page, then draws
+        a bounding box around that region. Falls back to character offset estimation
+        if text search fails.
+
+        TODO(#404): this single-chunk PNG path still uses the legacy
+        ``page.search_for`` phrase match, so it has the ~30% miss rate the batch
+        path fixed. Route it through ``_find_chunk_line_rects`` (drawing one rect
+        per line) to bring it to parity; deferred as it's a legacy, internally
+        only path.
+
+        Args:
+            page: PyMuPDF page object
+            chunk_text: Text to highlight (may contain markdown)
+            color: Color name from COLORS dict
+
+        Returns:
+            Number of highlights added (1 for bounding box, 0 if failed)
+        """
+        page_rect = page.rect
+        rgb = PDFHighlighter.COLORS.get(color, PDFHighlighter.COLORS["yellow"])
+
+        # Strip markdown for searching
+        search_text = PDFHighlighter.strip_markdown(chunk_text)
+
+        # Try to find chunk location using text search
+        # Search for progressively shorter phrases until we find a match
+        anchor_rect = None
+        search_phrases = []
+
+        # Build search phrases from chunk text
+        sentences = re.split(r"[.!?]\s+", search_text)
+        for sentence in sentences[:3]:  # Try first 3 sentences
+            sentence = sentence.strip()
+            if len(sentence) >= 20:
+                search_phrases.append(sentence[:80])
+                if len(sentence) >= 40:
+                    search_phrases.append(sentence[:40])
+
+        # Also try first N characters
+        if len(search_text) >= 30:
+            search_phrases.append(search_text[:60])
+            search_phrases.append(search_text[:30])
+
+        for phrase in search_phrases:
+            if not phrase:
+                continue
+            rects = page.search_for(phrase.strip())
+            if rects:
+                anchor_rect = rects[0]  # Use first match
+                logger.debug("Found chunk anchor using phrase: '%s...'", phrase[:30])
+                break
+
+        if not anchor_rect:
+            page_num = page.number + 1 if page.number is not None else "unknown"
+            logger.warning("Could not find chunk text on page %s", page_num)
+            return 0
+
+        # Calculate chunk height based on character count
+        # Estimate ~15 chars per line, ~12pt line height
+        chunk_chars = len(search_text)
+        estimated_lines = max(1, chunk_chars / 60)  # ~60 chars per line typical
+        estimated_height = estimated_lines * 14  # ~14pt per line
+
+        # Build bounding box starting from anchor
+        chunk_rect = pymupdf.Rect(
+            page_rect.x0 + 30,  # Left margin
+            anchor_rect.y0 - 5,  # Start slightly above anchor
+            page_rect.x1 - 30,  # Right margin
+            min(
+                anchor_rect.y0 + estimated_height + 10, page_rect.y1 - 30
+            ),  # Estimated bottom
+        )
+
+        # Draw a visible rectangle around the chunk region
+        shape = page.new_shape()
+        shape.draw_rect(chunk_rect)
+        shape.finish(
+            color=rgb,  # Border color
+            fill=None,  # No fill (transparent)
+            width=2.5,  # Border width
+            dashes="[4 2]",  # Dashed line
+        )
+        shape.commit()
+
+        # Add semi-transparent fill for visibility
+        fill_shape = page.new_shape()
+        fill_shape.draw_rect(chunk_rect)
+        fill_shape.finish(
+            color=None,  # No border
+            fill=[1, 1, 0.7],  # Light yellow fill
+            fill_opacity=0.15,  # Very transparent
+        )
+        fill_shape.commit()
+
+        logger.debug(
+            "Added bounding box at y=%s-%s (estimated %s lines)",
+            format(chunk_rect.y0, ".0f"),
+            format(chunk_rect.y1, ".0f"),
+            format(estimated_lines, ".1f"),
+        )
+
+        return 1
+
+    @staticmethod
+    def highlight_chunk(
+        pdf_bytes: bytes,
+        chunk_start_offset: int,
+        chunk_end_offset: int,
+        stored_page_number: Optional[int] = None,
+        color: str = "yellow",
+        zoom: float = 2.0,
+    ) -> Optional[tuple[bytes, int, int]]:
+        """Generate PNG image of PDF page with highlighted chunk.
+
+        This is the main entry point for highlighting. It:
+        1. Extracts document text with page boundaries
+        2. Finds which page contains the chunk
+        3. Extracts chunk text using character offsets
+        4. Highlights the chunk on the page
+        5. Renders page to PNG
+
+        Args:
+            pdf_bytes: PDF file bytes
+            chunk_start_offset: Chunk start position (document-level)
+            chunk_end_offset: Chunk end position (document-level)
+            stored_page_number: Page number from metadata (optional, for validation)
+            color: Highlight color name
+            zoom: Rendering zoom factor (2.0 = 144 DPI)
+
+        Returns:
+            Tuple of (png_bytes, page_number, highlight_count) or None if failed
+        """
+
+        temp_pdf_path = None
+        try:
+            # Write PDF to temp file with consistent name "pdf.pdf"
+            # This ensures image references match indexing (e.g., pdf-0001.png)
+            # Different temp filenames would cause different markdown text lengths!
+            temp_dir = Path(tempfile.mkdtemp(prefix="pdf_highlight_"))
+            temp_pdf_path = temp_dir / "pdf.pdf"
+            temp_pdf_path.write_bytes(pdf_bytes)
+
+            # Open PDF from temp file
+            doc = pymupdf.open(temp_pdf_path)
+
+            # Extract text with page boundaries
+            full_text, page_boundaries = (
+                PDFHighlighter.extract_pdf_text_with_boundaries(doc)
+            )
+
+            # Find which page contains the chunk
+            chunk_page_info = PDFHighlighter.find_chunk_page(
+                chunk_start_offset, chunk_end_offset, page_boundaries
+            )
+
+            if not chunk_page_info:
+                logger.error("Chunk not found on any page")
+                doc.close()
+                return None
+
+            page_num = chunk_page_info["page_num"]
+
+            # Log if page differs from stored metadata
+            if stored_page_number and stored_page_number != page_num:
+                logger.info(
+                    "Chunk primarily on page %s, metadata says %s",
+                    page_num,
+                    stored_page_number,
+                )
+
+            # Extract page text
+            page_boundary = page_boundaries[page_num - 1]
+            page_start = page_boundary["start_offset"]
+            page_end = page_boundary["end_offset"]
+            page_text = full_text[page_start:page_end]
+
+            # Extract chunk text using page-relative offsets
+            page_relative_start = chunk_page_info["page_relative_start"]
+            page_relative_end = chunk_page_info["page_relative_end"]
+            chunk_text = page_text[page_relative_start:page_relative_end]
+
+            logger.debug(
+                "Extracted %s chars on page %s (offsets %s-%s)",
+                len(chunk_text),
+                page_num,
+                page_relative_start,
+                page_relative_end,
+            )
+
+            # Get page and add highlights
+            page = doc[page_num - 1]
+            highlight_count = PDFHighlighter.highlight_chunk_on_page(
+                page, chunk_text, color
+            )
+
+            if highlight_count == 0:
+                logger.warning("No highlights added")
+                doc.close()
+                return None
+
+            # Render page to PNG
+            mat = pymupdf.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            png_bytes = pix.tobytes("png")
+
+            doc.close()
+
+            logger.info(
+                "Generated %s byte image with %s highlights",
+                format(len(png_bytes), ","),
+                highlight_count,
+            )
+
+            return (png_bytes, page_num, highlight_count)
+
+        except Exception as e:
+            logger.error("Error highlighting chunk: %s", e)
+            return None
+
+        finally:
+            # Clean up temp directory and PDF file
+            if temp_pdf_path and temp_pdf_path.parent.exists():
+                try:
+                    shutil.rmtree(temp_pdf_path.parent)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to delete temp directory %s: %s",
+                        temp_pdf_path.parent,
+                        e,
+                    )
+
+    @staticmethod
+    def compute_chunk_bboxes_batch(
+        pdf_bytes: bytes | None,
+        chunks: list[tuple[int, int, int, int | None, str]],
+        page_boundaries: list[dict],
+        full_text: str,
+        pdf_path: Path | None = None,
+        page_window: int | None = None,
+    ) -> dict[int, tuple[list[tuple[float, float, float, float]], int]]:
+        """Compute normalized bounding boxes for chunks without rendering.
+
+        Lightweight alternative to highlight_chunks_batch — opens the PDF,
+        locates each chunk on its assigned page via word-level token matching
+        (`_find_chunk_line_rects`), and returns page-normalized rectangles
+        (one per text line). Skips the get_pixmap + PIL pipeline entirely, so
+        no PNG bytes are produced.
+
+        **Extraction is page-windowed.** MuPDF retains parsed page objects for
+        the lifetime of the ``Document``, so holding one open across every page
+        of a long document accumulates without bound. Measured on a real
+        4003-page document, this stage cost **+353 MB unwindowed vs +53 MB at
+        the default window** (process peak 685 MB -> 359 MB) -- the allocation
+        that OOMKilled the fast-tier ingest workers. Reopening the document
+        every ``page_window`` pages bounds retention to one window, exactly as
+        ``pypdfium2_fast._extract`` does for text extraction.
+
+        Results are independent of the window: each chunk's bbox depends only on
+        its own page, so grouping by page and processing in windows returns the
+        same mapping as a single pass.
+
+        Args:
+            pdf_bytes: PDF file bytes. May be None when ``pdf_path`` is given.
+            chunks: List of (chunk_index, start_offset, end_offset,
+                stored_page_number, chunk_text). chunk_index is the dict key.
+            page_boundaries: Pre-computed page boundaries from the document
+                processor; each entry is {"page", "start_offset", "end_offset"}.
+            full_text: Full document text (for cross-page chunk handling).
+            pdf_path: Path to the PDF, used in preference to ``pdf_bytes``. The
+                ingest path already has the document spooled on disk, so passing
+                the path skips writing a second copy of it to a temp file.
+            page_window: Pages to process per document open. Defaults to
+                ``document_parse_page_window``; ``0`` disables windowing (one
+                open for the whole document, the pre-fix behaviour).
+
+        Returns:
+            dict mapping chunk_index to (normalized_bboxes, page_number).
+            Each bbox is (x0, y0, x1, y1) in [0, 1] relative to page width
+            and height, top-left origin. Chunks whose bbox cannot be located
+            are omitted from the result.
+        """
+        results: dict[int, tuple[list[tuple[float, float, float, float]], int]] = {}
+
+        if not chunks:
+            return results
+
+        if page_window is None:
+            from nextcloud_mcp_server.config import get_settings  # noqa: PLC0415
+
+            page_window = get_settings().document_parse_page_window
+
+        temp_pdf_path = None
+        try:
+            if pdf_path is not None:
+                source_path = pdf_path
+            else:
+                if pdf_bytes is None:
+                    raise ValueError("one of pdf_bytes or pdf_path is required")
+                temp_dir = Path(tempfile.mkdtemp(prefix="pdf_bbox_batch_"))
+                temp_pdf_path = temp_dir / "pdf.pdf"
+                temp_pdf_path.write_bytes(pdf_bytes)
+                source_path = temp_pdf_path
+
+            # Pass 1: resolve every chunk to its page WITHOUT opening the
+            # document. find_chunk_page needs only offsets, so the grouping
+            # costs no native state -- and it is what lets the render pass be
+            # ordered by page instead of by chunk, which is the prerequisite for
+            # windowing at all.
+            by_page: dict[int, list[tuple[int, str]]] = defaultdict(list)
+            for (
+                chunk_index,
+                start_offset,
+                end_offset,
+                _,
+                _,
+            ) in chunks:
+                chunk_page_info = PDFHighlighter.find_chunk_page(
+                    start_offset, end_offset, page_boundaries
+                )
+                if not chunk_page_info:
+                    logger.debug("Chunk %s: not found on any page", chunk_index)
+                    continue
+
+                page_num = chunk_page_info["page_num"]
+                page_boundary = next(
+                    (b for b in page_boundaries if b["page"] == page_num), None
+                )
+                if page_boundary is None:
+                    logger.debug(
+                        "Chunk %s: page %s not found in boundaries",
+                        chunk_index,
+                        page_num,
+                    )
+                    continue
+
+                # Page-relative slice (handles chunks that span page boundaries)
+                chunk_start_on_page = max(start_offset, page_boundary["start_offset"])
+                chunk_end_on_page = min(end_offset, page_boundary["end_offset"])
+                by_page[page_num].append(
+                    (chunk_index, full_text[chunk_start_on_page:chunk_end_on_page])
+                )
+
+            # Pass 2: render page by page, reopening every `page_window` pages so
+            # MuPDF's retained page objects are released with the Document.
+            pages = sorted(by_page)
+            if not pages:
+                # No chunk resolved to a page. Return before computing the window
+                # -- with windowing disabled the window is len(pages), and
+                # range(0, 0, 0) raises "arg 3 must not be zero", which the outer
+                # handler would report as a bogus bbox error.
+                logger.info("Computed bboxes for 0/%s chunks", len(chunks))
+                return results
+            window = page_window if page_window and page_window > 0 else len(pages)
+            for start in range(0, len(pages), window):
+                # filetype="pdf": source_path is the ingest spool (``*.bin``), so
+                # letting MuPDF infer the type from the suffix finds no handler.
+                doc = pymupdf.open(source_path, filetype="pdf")
+                try:
+                    for page_num in pages[start : start + window]:
+                        page = doc[page_num - 1]
+                        # get_text("words") + tokenisation is the dominant
+                        # per-page cost, so extract once and reuse across every
+                        # chunk on this page -- O(pages), not O(chunks). Scoped
+                        # to the page (not a document-wide cache) so it is freed
+                        # with the window rather than growing to O(document).
+                        flat = PDFHighlighter._page_flat_tokens(page)
+                        page_rect = page.rect
+                        w = page_rect.width or 1.0
+                        h = page_rect.height or 1.0
+                        _c = PDFHighlighter._clamp01
+
+                        for chunk_index, page_relative_text in by_page[page_num]:
+                            rects = PDFHighlighter._find_chunk_line_rects(
+                                page, page_relative_text, flat=flat
+                            )
+                            if not rects:
+                                continue
+                            normalized = [
+                                (_c(r[0] / w), _c(r[1] / h), _c(r[2] / w), _c(r[3] / h))
+                                for r in rects
+                            ]
+                            # Drop any rect that clamped to zero area (off-page
+                            # artifact).
+                            normalized = [
+                                n for n in normalized if n[2] > n[0] and n[3] > n[1]
+                            ]
+                            if not normalized:
+                                continue
+                            results[chunk_index] = (normalized, page_num)
+                finally:
+                    doc.close()
+
+            logger.info("Computed bboxes for %s/%s chunks", len(results), len(chunks))
+            return results
+
+        except Exception as e:
+            logger.error("Error computing chunk bboxes: %s", e)
+            return results
+
+        finally:
+            if temp_pdf_path and temp_pdf_path.parent.exists():
+                try:
+                    shutil.rmtree(temp_pdf_path.parent)
+                except Exception as e:
+                    logger.warning("Failed to clean up temp dir: %s", e)
+
+    @staticmethod
+    def highlight_chunks_batch(
+        pdf_bytes: bytes,
+        chunks: list[tuple[int, int, int, int | None, str]],
+        page_boundaries: list[dict],
+        full_text: str,
+        color: str = "yellow",
+        zoom: float = 2.0,
+    ) -> dict[int, tuple[bytes, int, int]]:
+        """Generate highlighted images for multiple chunks.
+
+        Opens PDF once for rendering, uses pre-computed page boundaries from the
+        document processor. This ensures consistent character offsets between
+        chunking and highlighting.
+
+        Args:
+            pdf_bytes: PDF file bytes
+            chunks: List of (chunk_index, start_offset, end_offset, stored_page_number, chunk_text)
+                    The chunk_index is used as the key in the returned dict.
+                    chunk_text is the actual text content of the chunk.
+            page_boundaries: Pre-computed page boundaries from document processor.
+                            Each entry: {"page": 1, "start_offset": 0, "end_offset": 1234}
+            full_text: Full document text for extracting page-relative portions.
+            color: Highlight color name
+            zoom: Rendering zoom factor (2.0 = 144 DPI)
+
+        Returns:
+            Dict mapping chunk_index to (png_bytes, page_number, highlight_count)
+            Chunks that fail to highlight are omitted from the result.
+        """
+        results: dict[int, tuple[bytes, int, int]] = {}
+
+        if not chunks:
+            return results
+
+        temp_pdf_path = None
+        try:
+            # Write PDF to temp file
+            temp_dir = Path(tempfile.mkdtemp(prefix="pdf_highlight_batch_"))
+            temp_pdf_path = temp_dir / "pdf.pdf"
+            temp_pdf_path.write_bytes(pdf_bytes)
+
+            # Open PDF once (only for rendering, not text extraction)
+            doc = pymupdf.open(temp_pdf_path)
+
+            logger.debug(
+                "Batch highlighting: %s chunks, %s pages",
+                len(chunks),
+                len(page_boundaries),
+            )
+
+            # Group chunks by their target page for efficient rendering
+            # We'll render each page only once with all its highlights
+            chunks_by_page: dict[int, list[tuple[int, str]]] = defaultdict(list)
+
+            for chunk_tuple in chunks:
+                # Unpack chunk tuple - chunk_text is now passed directly
+                chunk_index, start_offset, end_offset, stored_page_num, chunk_text = (
+                    chunk_tuple
+                )
+
+                # Find which page contains this chunk
+                chunk_page_info = PDFHighlighter.find_chunk_page(
+                    start_offset, end_offset, page_boundaries
+                )
+
+                if not chunk_page_info:
+                    logger.warning("Chunk %s: not found on any page", chunk_index)
+                    continue
+
+                page_num = chunk_page_info["page_num"]
+
+                # Log if page differs from stored metadata
+                if stored_page_num and stored_page_num != page_num:
+                    logger.debug(
+                        "Chunk %s: found on page %s, metadata says %s",
+                        chunk_index,
+                        page_num,
+                        stored_page_num,
+                    )
+
+                # Extract page-relative portion of chunk text
+                # This is critical for cross-page chunks where the start
+                # of the chunk might be on a different page. Match by `page` key
+                # (not list index) so out-of-order boundaries can't mislocate.
+                page_boundary = next(
+                    (b for b in page_boundaries if b["page"] == page_num), None
+                )
+                if page_boundary is None:
+                    continue
+                page_start = page_boundary["start_offset"]
+                page_end = page_boundary["end_offset"]
+
+                # Calculate what portion of the chunk appears on this page
+                chunk_start_on_page = max(start_offset, page_start)
+                chunk_end_on_page = min(end_offset, page_end)
+
+                # Extract just the text that appears on this page
+                page_relative_text = full_text[chunk_start_on_page:chunk_end_on_page]
+
+                chunks_by_page[page_num].append((chunk_index, page_relative_text))
+
+            logger.debug(
+                "Chunks distributed across %s unique pages", len(chunks_by_page)
+            )
+
+            # OPTIMIZATION: Render each page ONCE, then draw highlights using PIL
+            # This avoids expensive page.get_pixmap() calls per chunk
+
+            # PIL color for bounding box (RGB tuple)
+            rgb = PDFHighlighter.COLORS.get(color, PDFHighlighter.COLORS["yellow"])
+            pil_color = tuple(int(c * 255) for c in rgb)
+            fill_color = (255, 255, 178, 38)  # Light yellow with alpha
+
+            for page_num, page_chunks in chunks_by_page.items():
+                page = doc[page_num - 1]
+
+                # Render page ONCE to get base image (most expensive operation)
+                mat = pymupdf.Matrix(zoom, zoom)
+                base_pix = page.get_pixmap(matrix=mat, alpha=False)
+                base_png = base_pix.tobytes("png")
+
+                # Convert to PIL Image for fast highlight drawing
+                base_image = Image.open(BytesIO(base_png)).convert("RGBA")
+                page_rect = page.rect
+
+                logger.debug(
+                    "Page %s: rendered once, processing %s chunks",
+                    page_num,
+                    len(page_chunks),
+                )
+
+                for chunk_index, page_relative_text in page_chunks:
+                    try:
+                        # Find chunk bounding box via word-level matching
+                        bbox = PDFHighlighter._find_chunk_bbox(page, page_relative_text)
+
+                        if bbox is None:
+                            logger.warning("Chunk %s: could not find bbox", chunk_index)
+                            continue
+
+                        # Copy base image for this chunk
+                        chunk_image = base_image.copy()
+
+                        # Scale bbox coordinates to pixmap coordinates
+                        scale_x = base_pix.width / page_rect.width
+                        scale_y = base_pix.height / page_rect.height
+                        pil_bbox = (
+                            int(bbox[0] * scale_x),
+                            int(bbox[1] * scale_y),
+                            int(bbox[2] * scale_x),
+                            int(bbox[3] * scale_y),
+                        )
+
+                        # Create transparent overlay for fill (proper alpha blending)
+                        overlay = Image.new("RGBA", chunk_image.size, (0, 0, 0, 0))
+                        overlay_draw = ImageDraw.Draw(overlay)
+                        overlay_draw.rectangle(pil_bbox, fill=fill_color)
+
+                        # Alpha composite the overlay onto the chunk image
+                        chunk_image = Image.alpha_composite(chunk_image, overlay)
+
+                        # Draw border on top (solid, not transparent)
+                        border_draw = ImageDraw.Draw(chunk_image)
+                        border_draw.rectangle(pil_bbox, outline=pil_color, width=3)
+
+                        # Convert back to PNG bytes
+                        output = BytesIO()
+                        chunk_image.convert("RGB").save(output, format="PNG")
+                        png_bytes = output.getvalue()
+
+                        results[chunk_index] = (png_bytes, page_num, 1)
+
+                        logger.debug(
+                            "Chunk %s: %s bytes, page %s, bbox %s",
+                            chunk_index,
+                            format(len(png_bytes), ","),
+                            page_num,
+                            pil_bbox,
+                        )
+
+                    except Exception as e:
+                        logger.error("Chunk %s: error - %s", chunk_index, e)
+                        continue
+
+            doc.close()
+
+            logger.info(
+                "Batch highlighted %s/%s chunks successfully", len(results), len(chunks)
+            )
+
+            return results
+
+        except Exception as e:
+            logger.error("Error in batch highlighting: %s", e)
+            return results
+
+        finally:
+            # Clean up temp directory
+            if temp_pdf_path and temp_pdf_path.parent.exists():
+                try:
+                    shutil.rmtree(temp_pdf_path.parent)
+                except Exception as e:
+                    logger.warning("Failed to clean up temp dir: %s", e)

@@ -1,0 +1,647 @@
+services:
+  # Note: MariaDB is external service. You can find more information about the configuration here:
+  # https://hub.docker.com/_/mariadb
+  db:
+    # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:99c125f103f5d081ebbc9ffe064e63daf7f688ac33a5f7f29af2d7260a96debf
+    restart: always
+    command: --transaction-isolation=READ-COMMITTED
+    volumes:
+      - db:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3306:3306"
+      - "[::1]:3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=password
+      - MYSQL_PASSWORD=password
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+
+  # Note: Redis is an external service. You can find more information about the configuration here:
+  # https://hub.docker.com/_/redis
+  redis:
+    image: docker.io/library/redis:8.10.2-alpine@sha256:615b4cedaff0c1437a1548acae4222572df8c021eeb7382d64cb8b5e3a13ac7a
+    restart: always
+
+  app:
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:f667976416e07240e8f8ecab7151a04c452055aa030660ad84c696cae8a71bad}
+    restart: always
+    ports:
+      - "127.0.0.1:8080:80"
+      - "[::1]:8080:80"
+    depends_on:
+      - redis
+      - db
+    volumes:
+      - nextcloud:/var/www/html
+      - ./app-hooks:/docker-entrypoint-hooks.d:ro
+      # Mount OIDC development directory outside /var/www/html to avoid rsync conflicts
+      # The post-installation hook will register /opt/apps as an additional app directory
+      #- ./third_party:/opt/apps:ro
+      #- ./third_party/oidc:/opt/apps/oidc:ro
+    environment:
+      - NEXTCLOUD_TRUSTED_DOMAINS=app
+      - NEXTCLOUD_ADMIN_USER=admin
+      - NEXTCLOUD_ADMIN_PASSWORD=admin
+      - MYSQL_PASSWORD=password
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+      - MYSQL_HOST=db
+      - REDIS_HOST=redis
+      # Set MCP_SERVER_URL to enable management OAuth client auto-creation
+      # (before-starting hook creates OIDC client + stores credentials in config.php)
+      # Example: MCP_SERVER_URL=http://mcp-login-flow:8004 docker compose --profile login-flow up -d
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
+      # Static OIDC client for mcp-login-flow, created by
+      # app-hooks/before-starting/27-create-login-flow-mcp-client.sh when set.
+      - LOGIN_FLOW_OIDC_CLIENT_ID=${LOGIN_FLOW_OIDC_CLIENT_ID:-}
+      - LOGIN_FLOW_OIDC_CLIENT_SECRET=${LOGIN_FLOW_OIDC_CLIENT_SECRET:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -Ss http://localhost/status.php | grep '\"installed\":true' || exit 1"]
+      interval: 10s
+      timeout: 30s
+      retries: 30
+
+  recipes:
+    image: docker.io/library/nginx:1.31.6-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
+    restart: always
+    volumes:
+      - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
+      - ./tests/fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  unstructured:
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.11@sha256:b1f0eb6be87dbb15edff568a99f6dd2e57072240faff04729e8d91d283f5b86b
+    restart: always
+    ports:
+      - "127.0.0.1:8005:8000"
+      - "[::1]:8005:8000"
+    # Unstructured API runs on port 8000 internally
+    # We expose it on 8005 externally to avoid conflict
+    profiles:
+      - unstructured
+
+  # docling-serve: OCR-strong document parsing (photographed / scanned /
+  # handwritten text). Opt-in via the "docling" profile. Point the MCP server at
+  # it with ENABLE_DOCLING=true + DOCLING_API_URL=http://docling:5001 (and/or
+  # DOCUMENT_OCR_PROVIDER=docling for scanned-PDF OCR). Uses the CPU-only image
+  # variant (docling-serve-cpu) — no CUDA runtime, OCR models baked in — so it
+  # runs on plain GitHub-hosted runners. CPU OCR is slow; give it a generous
+  # DOCLING_TIMEOUT.
+  docling:
+    build:
+      context: .
+      dockerfile: docker/docling/Dockerfile
+      args:
+        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.37.0@sha256:6eda9c524992147c1b0b06a1a9be4894bd68b1f43c86d92c32f996c4c60d18a3
+    image: nextcloud-mcp-docling:local
+    restart: always
+    command: ["docling-serve", "run", "--host", "::"]
+    ports:
+      - "127.0.0.1:5001:5001"
+      - "[::1]:5001:5001"
+    # docling-serve is a Python app (no curl in the image), so probe /health via
+    # the stdlib. Gives local `--profile docling` users a readiness signal and
+    # lets a future `depends_on: condition: service_healthy` gate on it.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:5001/health").read()
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    profiles:
+      - docling
+
+  # Collabora Online (CODE): converts legacy .doc/.xls/.ppt and ODF
+  # .odt/.ods/.odp to OOXML over its stateless POST /cool/convert-to API, for the
+  # native readers to parse (ADR-039). Opt-in via the "collabora" profile; point
+  # the MCP server at it with COLLABORA_URL=http://collabora:9980. convert-to is
+  # only answered for clients in coolwsd's net.post_allow list, whose default
+  # already covers the private ranges a compose network uses. TLS is off because
+  # the MCP server reaches it on the compose network. The image ships no shell,
+  # so there is no container healthcheck; poll /hosting/capabilities instead.
+  collabora:
+    image: docker.io/collabora/code:26.04.4.2.1@sha256:4e983196eb9878f339cc506c38c21f1cc3473bca3d6de883c5de08f9c0cc3a6c
+    restart: always
+    ports:
+      - "127.0.0.1:9980:9980"
+      - "[::1]:9980:9980"
+    environment:
+      - extra_params=--o:ssl.enable=false
+    profiles:
+      - collabora
+
+  # infinity: self-hosted embeddings + CROSS-ENCODER RERANKING. Opt-in via the
+  # "infinity" profile. Infinity provides both OpenAI-compatible /embeddings
+  # and Cohere-protocol /rerank from one self-hosted process.
+  #
+  # CPU image: no CUDA runtime, so it runs on a plain runner or laptop. CPU
+  # cross-encoding is slow — a 200-candidate pool takes tens of seconds — so
+  # raise SEARCH_RERANK_TIMEOUT_SECONDS or lower SEARCH_RERANK_POOL_SIZE, or
+  # use the GPU image (drop the "-cpu" suffix) for real workloads.
+  infinity:
+    image: docker.io/michaelf34/infinity:0.0.78-cpu@sha256:0dda7c4fd26da2734ffbfa4054f880e81a7c7f941c7aa1f4c257523ee7fc70a3
+    restart: always
+    command:
+      - v2
+      - --model-id
+      - BAAI/bge-m3
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --port
+      - "7997"
+    ports:
+      - "127.0.0.1:7997:7997"
+      - "[::1]:7997:7997"
+    volumes:
+      # Model weights are ~2.5 GB and are downloaded on first boot; cache them
+      # so a `docker compose down` isn't a re-download.
+      - infinity-cache:/app/.cache
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:7997/health").read()
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      # Two models to fetch and load before the first probe can pass.
+      start_period: 300s
+    profiles:
+      - infinity
+
+  # Canned stand-in for the embedding gateway's POST /v1/ner, so the login-flow
+  # tests exercise SAR export redaction (ADR-040) without a model. It detects
+  # only the synthetic names hard-coded in tests/fixtures/ner_stub.py.
+  ner-stub:
+    image: docker.io/library/python:3.14-alpine@sha256:01ddf82b43479870a7ea87037b7d68472bef12cc244941843c26bb75bf9a9b04
+    restart: always
+    command: ["python", "/stub/ner_stub.py"]
+    volumes:
+      - ./tests/fixtures/ner_stub.py:/stub/ner_stub.py:ro
+    profiles:
+      - login-flow
+
+  mcp:
+    build: .
+    restart: always
+    command: ["--transport", "streamable-http"]
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "[::1]:8000:8000"
+      - "127.0.0.1:9090:9090"
+      - "[::1]:9090:9090"
+    volumes:
+      - mcp-data:/app/data
+      - ./settings.toml.example:/app/settings.toml:ro
+    environment:
+      - NEXTCLOUD_HOST=http://app:80
+      - NEXTCLOUD_USERNAME=admin
+      - NEXTCLOUD_PASSWORD=admin
+      - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
+
+      # Pin the token DB inside the mcp-data volume so the runtime default
+      # (ephemeral tempfile) doesn't silently apply inside containers.
+      - TOKEN_STORAGE_DB=/app/data/tokens.db
+
+      # Semantic search configuration (ADR-007, ADR-021)
+      - ENABLE_SEMANTIC_SEARCH=true
+      # Search mode (ADR-030): hybrid (default, dense+sparse) | keyword (BM25
+      # sparse only). Set keyword for fully airgapped deployments with NO
+      # embedding endpoint (no Ollama/Bedrock/gateway) — still gives cross-app
+      # Qdrant full-text search. keyword still needs ENABLE_SEMANTIC_SEARCH=true.
+      #- SEARCH_MODE=keyword
+      # The sync scanner runs an initial scan immediately on startup, so the
+      # corpus is indexed without waiting for the first periodic re-scan. A very
+      # short re-scan interval (was 5s) just re-queues the whole corpus faster
+      # than the workers can drain it: on a loaded CI runner pending_count
+      # snowballs (observed 1465 pending), sync never reaches idle, and the
+      # single-user vector tests (test_rag, test_sampling) time out. 30s matches
+      # the tuned multi-user-basic cadence and stays well within the tests' 90s
+      # sync-wait budget.
+      - VECTOR_SYNC_SCAN_INTERVAL=30
+      - VECTOR_SYNC_PROCESSOR_WORKERS=2
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
+
+      #- LOG_FORMAT=json
+
+      # Qdrant configuration (three modes):
+      # 1. Network mode: Set QDRANT_URL=http://qdrant:6333 (requires qdrant service)
+      # 2. In-memory mode: Set QDRANT_LOCATION=:memory: (default if nothing set)
+      # 3. Persistent local: Set QDRANT_LOCATION=/app/data/qdrant (stored in mcp-data volume)
+      - QDRANT_LOCATION=":memory:"
+      #- QDRANT_URL=http://qdrant:6333  # Uncomment for network mode
+      #- QDRANT_API_KEY=${QDRANT_API_KEY:-my_secret_api_key}  # Only for network mode
+
+      # Observability. Both pass through from the host so traces can be sent to
+      # a real collector without editing this file:
+      #   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4317 docker compose up mcp
+      # Unset leaves the endpoint empty, which disables tracing (app.py gates on
+      # its truthiness) -- so the default stays no-op.
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-nextcloud-mcp-docker-compose}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+      # Collection naming: Auto-generated as {deployment-id}-{model-name}
+      # - Deployment ID: OTEL_SERVICE_NAME (if set) or hostname (fallback)
+      # - Model name: OLLAMA_EMBEDDING_MODEL
+      # - Example: "nextcloud-mcp-server-nomic-embed-text"
+      # - Changing models creates new collection (requires re-embedding)
+      # - Set QDRANT_COLLECTION to override auto-generation:
+      #- QDRANT_COLLECTION=nextcloud_content
+
+      # Ollama configuration (optional - uses SimpleEmbeddingProvider if not set)
+      # - OLLAMA_BASE_URL=http://ollama:11434
+      # - OLLAMA_EMBEDDING_MODEL=nomic-embed-text  # Changing this creates new collection
+      # - OLLAMA_VERIFY_SSL=false
+
+      # Document chunking configuration (for vector embeddings)
+      # Tune these based on your embedding model and content type
+      # - DOCUMENT_CHUNK_SIZE=512      # Words per chunk (default: 512)
+      # - DOCUMENT_CHUNK_OVERLAP=50    # Overlapping words (default: 50, recommended: 10-20% of chunk size)
+
+      # Docling OCR-strong parsing backend (docling-serve HTTP API, ADR-031).
+      # Off by default so the normal single-user lane is unchanged. The CI
+      # "docling" lane starts the `docling` profile and sets ENABLE_DOCLING=true +
+      # DOCLING_API_URL=http://docling:5001 to exercise the gated
+      # tests/integration/test_docling_api.py suite. DOCLING_TIMEOUT is bumped in
+      # CI because CPU OCR is slow. Note docling serves PDFs as an OCR provider
+      # (DOCUMENT_OCR_PROVIDER=docling), never as a tier of its own; this
+      # standalone processor handles images.
+      - ENABLE_DOCLING=${ENABLE_DOCLING:-false}
+      # OCR tier (opt-in). The docling lane turns it on with provider=docling so a
+      # scanned PDF escalates fast -> ocr and comes back as docling markdown.
+      - DOCUMENT_OCR_ENABLED=${DOCUMENT_OCR_ENABLED:-false}
+      - DOCUMENT_OCR_PROVIDER=${DOCUMENT_OCR_PROVIDER:-auto}
+      - DOCUMENT_OCR_TIMEOUT_SECONDS=${DOCUMENT_OCR_TIMEOUT_SECONDS:-180}
+      - DOCLING_API_URL=${DOCLING_API_URL:-}
+      - DOCLING_TIMEOUT=${DOCLING_TIMEOUT:-120}
+      # Opt-in VLM pipeline (ADR-032): point docling-serve at its VLM presets
+      # instead of classic OCR. Default "standard" is byte-identical to the
+      # pre-VLM request. VLM is slow (~90-200s/page): for bulk indexing use the
+      # async ingest path (DOCUMENT_OCR_PROVIDER=docling) and raise
+      # DOCUMENT_OCR_TIMEOUT_SECONDS -- do NOT inflate DOCLING_TIMEOUT (interactive).
+      - DOCLING_PIPELINE=${DOCLING_PIPELINE:-standard}
+      - DOCLING_VLM_PRESET=${DOCLING_VLM_PRESET:-}
+      # Opt-in cap on the synchronous nc_webdav_read_file parse; empty = disabled.
+      # A client-friendly bound (e.g. 45-60) makes a slow VLM/OCR read return the
+      # raw file fast instead of blocking past the MCP client's own timeout.
+      - DOCUMENT_READ_TIMEOUT_SECONDS=${DOCUMENT_READ_TIMEOUT_SECONDS:-}
+      # Collabora Online conversion service for legacy/ODF office files
+      # (ADR-039). Empty = those types are not claimed. The CI "collabora" lane
+      # starts the `collabora` profile and sets COLLABORA_URL=http://collabora:9980.
+      - COLLABORA_URL=${COLLABORA_URL:-}
+    profiles:
+      - single-user
+
+  mcp-multi-user-basic:
+    build: .
+    restart: always
+    command: ["--transport", "streamable-http"]
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8003:8000"
+      - "[::1]:8003:8000"
+    environment:
+      # Multi-user BasicAuth pass-through mode (ADR-020, ADR-022)
+      - NEXTCLOUD_HOST=http://app:80
+      - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8003
+      - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
+      - MCP_DEPLOYMENT_MODE=multi_user_basic
+      - ENABLE_BACKGROUND_OPERATIONS=true
+
+      # Token storage (required for middleware initialization).
+      # Source the key from .env — see env.sample. To generate a fresh key:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY must be set in .env (see env.sample)}
+      - TOKEN_STORAGE_DB=/app/data/tokens.db
+
+      - ENABLE_SEMANTIC_SEARCH=true
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
+      # Tuned cadence for the multi-user background-sync integration suite,
+      # which provisions a user, creates a note, then waits ~90s for it to be
+      # indexed. Two independent knobs matter here:
+      #   * USER_POLL_INTERVAL gates how fast the background-sync user manager
+      #     *discovers* a freshly-provisioned user (its scanner runs an initial
+      #     scan immediately on start). The 60s default left too little of the
+      #     90s budget, so drop it to 5s for prompt discovery.
+      #   * SCAN_INTERVAL gates *re-scan* churn. Each scan re-queues the user's
+      #     whole corpus, so a very short interval (e.g. 5s) floods the single
+      #     processor worker faster than it drains on slower CI runners
+      #     (pending climbs, indexed stays 0). Keep it moderate: the immediate
+      #     initial scan already indexes the corpus once; 30s re-scans avoid
+      #     the flood while still catching a note created just after that scan.
+      - VECTOR_SYNC_USER_POLL_INTERVAL=5
+      - VECTOR_SYNC_SCAN_INTERVAL=30
+      - VECTOR_SYNC_PROCESSOR_WORKERS=1
+
+      # OAuth client for the MCP server's IdP registration. Falls back to DCR
+      # if unset — but with Nextcloud's built-in `oidc` app, DCR clients expire
+      # after ~1h (client_expire_time) and break auth permanently (see #907).
+      # For any non-CI deployment, register a static client and set these:
+      # - NEXTCLOUD_OIDC_CLIENT_ID=your_client_id
+      # - NEXTCLOUD_OIDC_CLIENT_SECRET=your_client_secret
+
+      # Management API allowlist (ADR-018): only Astrolabe-issued tokens may
+      # call /api/management/*. Default test client_id used by the
+      # configure_astrolabe_for_mcp_server fixture.
+      - ALLOWED_MGMT_CLIENT=nextcloudMcpServerUIPublicClient
+
+      # NO admin credentials - credentials come from client Authorization header
+    volumes:
+      - multi-user-basic-data:/app/data
+      - ./settings.toml.example:/app/settings.toml:ro
+    profiles:
+      - multi-user-basic
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0@sha256:27b3230fbabb8c9ff3c66c864cf09dcd8a41aca82e5100679d109ef0eeb05741
+    command:
+      - "start-dev"
+      - "--import-realm"
+      - "--hostname=http://localhost:8888"
+      - "--hostname-strict=false"
+      - "--hostname-backchannel-dynamic=true"
+      - "--features=preview"  # Enable Legacy V1 token exchange (supports both Standard V2 and Legacy V1)
+    ports:
+      - "127.0.0.1:8888:8080"
+      - "[::1]:8888:8080"
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /realms/nextcloud-mcp HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q 'HTTP/1.1 200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    profiles:
+      - keycloak
+
+  mcp-keycloak:
+    build: .
+    command: ["--transport", "streamable-http", "--oauth", "--port", "8002"]
+    restart: always
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      app:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8002:8002"
+      - "[::1]:8002:8002"
+    environment:
+      - PORT=8002
+      # Generic OIDC configuration (external IdP mode - Keycloak)
+      # Provider auto-detected from OIDC_DISCOVERY_URL issuer
+      # Using internal Docker hostname for discovery to get consistent issuer
+      - OIDC_DISCOVERY_URL=http://keycloak:8080/realms/nextcloud-mcp/.well-known/openid-configuration
+      - NEXTCLOUD_OIDC_CLIENT_ID=nextcloud-mcp-server
+      - NEXTCLOUD_OIDC_CLIENT_SECRET=mcp-secret-change-in-production
+      - OIDC_JWKS_URI=http://keycloak:8080/realms/nextcloud-mcp/protocol/openid-connect/certs
+
+      # Nextcloud API endpoint (for accessing APIs with validated token)
+      - NEXTCLOUD_HOST=http://app:80
+      - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8002
+      - NEXTCLOUD_RESOURCE_URI=nextcloud  # ADR-005: Keycloak uses client IDs as audiences, not URLs
+      - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8888/realms/nextcloud-mcp
+      # External-IdP mode: the OAuth issuer (above) is Keycloak, but Login Flow
+      # v2 must send the browser to *Nextcloud*. NEXTCLOUD_HOST is the internal
+      # Docker hostname, so give the browser-reachable Nextcloud URL explicitly.
+      - NEXTCLOUD_PUBLIC_URL=http://localhost:8080
+
+      # Refresh token storage (ADR-002 Tier 1 & 2). Source from .env.
+      - ENABLE_BACKGROUND_OPERATIONS=true
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY must be set in .env (see env.sample)}
+      - TOKEN_STORAGE_DB=/app/data/tokens.db
+
+      # Login Flow v2 (ADR-022) with external IdP — derived from the
+      # auto-detected LOGIN_FLOW deployment mode; no separate flag needed.
+      - ENABLE_DCR=true
+      # CIMD (GH #1470): trust claude.ai's Client ID Metadata Document
+      - CIMD_ALLOWED_HOSTS=claude.ai
+
+      # OAuth scopes (optional - uses defaults if not specified)
+      - NEXTCLOUD_OIDC_SCOPES=openid profile email offline_access notes.read notes.write calendar.read calendar.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write sharing.read sharing.write todo.read todo.write
+
+      # NO admin credentials - using external IdP OAuth only!
+    volumes:
+      - keycloak-tokens:/app/data
+      - ./settings.toml.example:/app/settings.toml:ro
+    profiles:
+      - keycloak
+
+  # Login Flow v2 mode (ADR-022)
+  # Test with: docker compose --profile login-flow up --build -d
+  mcp-login-flow:
+    build: .
+    restart: always
+    # --oauth enables the OAuth/OIDC identity layer that Login Flow v2 builds on
+    # (user identity via OAuth session, Nextcloud access via app passwords)
+    command: ["--transport", "streamable-http", "--oauth", "--port", "8004"]
+    depends_on:
+      app:
+        condition: service_healthy
+      ner-stub:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8004:8004"
+      - "[::1]:8004:8004"
+    environment:
+      - PORT=8004
+      - NEXTCLOUD_HOST=http://app:80
+      - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8004
+      #- NEXTCLOUD_MCP_SERVER_URL=https://nextcloud-mcp-dev.tail148d5.ts.net
+      - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
+
+      # Login Flow v2 (ADR-022) — the deployment mode is the single switch;
+      # the browser-based app-password layer is derived automatically.
+      - MCP_DEPLOYMENT_MODE=login_flow
+
+      # The MCP server's own OIDC client. With LOGIN_FLOW_OIDC_CLIENT_ID/_SECRET
+      # set (CI generates them) it is a STATIC client, created by
+      # app-hooks/before-starting/27-create-login-flow-mcp-client.sh. That is
+      # required from oidc 2.5.0, which never approves an RFC 8707 resource for
+      # a DCR client (`invalid_target`), and it is what a real self-hosted
+      # login_flow deployment should use anyway: the built-in `oidc` app also
+      # deletes DCR clients after ~1h (see #907 and docs/login-flow-v2.md →
+      # Troubleshooting). Unset, the server falls back to DCR (oidc < 2.5.0).
+      - NEXTCLOUD_OIDC_CLIENT_ID=${LOGIN_FLOW_OIDC_CLIENT_ID:-}
+      - NEXTCLOUD_OIDC_CLIENT_SECRET=${LOGIN_FLOW_OIDC_CLIENT_SECRET:-}
+
+      # Token storage (required for app password + session persistence).
+      # Source the key from .env — see env.sample. To generate a fresh key:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY must be set in .env (see env.sample)}
+      - TOKEN_STORAGE_DB=/app/data/tokens.db
+
+      # Semantic search
+      - ENABLE_SEMANTIC_SEARCH=true
+      - VECTOR_SYNC_SCAN_INTERVAL=60
+      - VECTOR_SYNC_PROCESSOR_WORKERS=1
+      # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
+      # Without it the route is not mounted and vector sync relies on polling.
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
+
+      # Management API allowlist (ADR-018) — permits Astrolabe and the static
+      # `nextcloudMcpServerUIPublicClient` used by login-flow integration tests.
+      - ALLOWED_MGMT_CLIENT=astrolabeMcpClientOAuth00000000000,nextcloudMcpServerUIPublicClient
+
+      # SAR export (ADR-040): opt-in, enabled here for the SAR tests. Names are
+      # detected via the gateway's /v1/ner, stubbed here like the `mcp`
+      # service. OCR and reranking are off by default, so nothing else routes
+      # through the gateway.
+      - SAR_ENABLED=${SAR_ENABLED:-true}
+      - EMBEDDING_GATEWAY_URL=${EMBEDDING_GATEWAY_URL:-http://ner-stub:8080}
+
+      # Observability -- same host passthrough as the `mcp` service. This is the
+      # profile Astrolabe drives, so it is the one to point at a collector when
+      # tracing the search/chunk-context path end to end.
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-nextcloud-mcp-login-flow}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - login-flow-data:/app/data
+      - ./settings.toml.example:/app/settings.toml:ro
+    profiles:
+      - login-flow
+
+  qdrant:
+    image: docker.io/qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    restart: always
+    ports:
+      - "127.0.0.1:6333:6333"  # REST API
+      - "[::1]:6333:6333"
+      - "127.0.0.1:6334:6334"  # gRPC (optional)
+      - "[::1]:6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-my_secret_api_key}
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /qdrant/.qdrant-initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    profiles:
+      - qdrant
+
+  # Centralized Postgres backend for token storage. Used by:
+  #   1. Integration tests gated on @pytest.mark.postgres — they read
+  #      TEST_DATABASE_URL=postgresql+psycopg://mcp:mcp@localhost:5433/mcp.
+  #   2. Manual smoke testing of the HA (multi-replica) deployment story.
+  # Bring up with:  docker compose --profile postgres up -d postgres-test
+  # See ADR-026 for the pluggable-database-backend design.
+  postgres-test:
+    image: docker.io/library/postgres:18-alpine@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp
+      POSTGRES_DB: mcp
+    ports:
+      - "127.0.0.1:5433:5432"
+      - "[::1]:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp -d mcp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    profiles:
+      - postgres
+
+  # GreenMail: standalone SMTP/IMAP test server for exercising the Nextcloud
+  # Mail app end-to-end (#965 follow-up). `greenmail.auth.disabled` makes any
+  # login succeed and auto-creates the mailbox, so the Nextcloud Mail account
+  # provisioned by the post-installation hook can connect without seeding users.
+  # SMTP 3025 / IMAP 3143 are the plaintext ports (ssl-mode "none").
+  greenmail:
+    image: docker.io/greenmail/standalone:2.1.13@sha256:3df66b7edd01c8a301343ca5e3601d8674760d4708655573560c24745e624fb2
+    restart: always
+    environment:
+      - GREENMAIL_OPTS=-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose
+    ports:
+      # Plaintext SMTP/IMAP + the management REST API (8080 → 8085 to avoid the
+      # host 8080 already taken by the `app` service).
+      - "127.0.0.1:3025:3025"
+      - "[::1]:3025:3025"
+      - "127.0.0.1:3143:3143"
+      - "[::1]:3143:3143"
+      - "127.0.0.1:8085:8080"
+      - "[::1]:8085:8080"
+    healthcheck:
+      # The slim JRE base has no curl/wget, but the Ubuntu base ships bash, so
+      # probe the IMAP port directly (open once `setup.test.all` has bound it).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3143"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles:
+      - mail
+
+  # OpenLDAP backend for the `ldap` lane — reproduces GH #980 (DAV paths built
+  # from loginName instead of the canonical Nextcloud UID). Nextcloud's
+  # user_ldap backend derives an internal UID from the LDAP UUID that differs
+  # from the login (`alice`), which single-user / user_oidc / login-by-email
+  # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
+  # so the custom LDIF is always applied.
+  openldap:
+    image: docker.io/vegardit/openldap:2.6.10@sha256:ffe216e09673d9b3f561a6b02e691bab44a2f9849f7d3bb8be16957f6f826dae
+    environment:
+      - LDAP_INIT_ORG_DN=dc=example,dc=org
+      - LDAP_INIT_ORG_NAME=Example Org
+      - LDAP_INIT_ROOT_USER_PW=ldap_admin_pw
+      # Plain LDAP on 389 is enough for the internal test network; skip the
+      # self-signed LDAPS setup so user_ldap can connect without TLS fuss.
+      - LDAP_LDAPS_ENABLED=false
+    volumes:
+      # Seed ou=people + the divergent `alice` user (evaluated on first launch;
+      # no data volume, so it re-seeds fresh on every `up`).
+      - ./ldap/bootstrap.ldif:/opt/ldifs/init_org_entries.ldif:ro
+    ports:
+      - "127.0.0.1:1389:389"
+      - "[::1]:1389:389"
+    # Searching for the seeded `alice` entry (not just a port probe) means
+    # "healthy" == "bootstrap LDIF applied" — the app-hook can rely on that.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "ldapsearch",
+          "-x",
+          "-H",
+          "ldap://localhost",
+          "-b",
+          "uid=alice,ou=people,dc=example,dc=org",
+          "-D",
+          "uid=admin,dc=example,dc=org",
+          "-w",
+          "ldap_admin_pw",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    profiles:
+      - ldap
+
+volumes:
+  nextcloud:
+  db:
+  keycloak-tokens:
+  login-flow-data:
+  qdrant-data:
+  mcp-data:
+  multi-user-basic-data:
+  infinity-cache:

@@ -1,0 +1,728 @@
+"""Integration tests for Calendar VTODO (task) MCP tools."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta
+
+import pytest
+from mcp import ClientSession
+
+from nextcloud_mcp_server.client import NextcloudClient
+
+logger = logging.getLogger(__name__)
+pytestmark = pytest.mark.integration
+
+
+async def test_mcp_todo_complete_workflow(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test complete todo workflow via MCP tools with verification via NextcloudClient."""
+
+    calendar_name = temporary_calendar
+    todo_uid = None
+
+    try:
+        # 1. Create todo via MCP
+        logger.info("Creating todo in %s via MCP", calendar_name)
+        tomorrow = datetime.now() + timedelta(days=1)
+
+        create_result = await nc_mcp_client.call_tool(
+            "nc_calendar_create_todo",
+            {
+                "calendar_name": calendar_name,
+                "summary": "MCP Test Task",
+                "description": "Test task created via MCP tools",
+                "status": "NEEDS-ACTION",
+                "priority": 3,
+                "due": tomorrow.strftime("%Y-%m-%dT18:00:00Z"),
+                "categories": "testing,mcp",
+            },
+        )
+        assert create_result.is_error is False
+
+        # Extract UID from the result
+        result_data = create_result.content[0].text
+
+        result_json = json.loads(result_data)
+        todo_uid = result_json["uid"]
+        logger.info("Created todo with UID: %s", todo_uid)
+
+        # 2. Verify todo creation via client
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        assert any(t["uid"] == todo_uid for t in todos)
+        created_todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert created_todo["summary"] == "MCP Test Task"
+        assert created_todo["status"] == "NEEDS-ACTION"
+        assert created_todo["priority"] == 3
+
+        # 3. List todos via MCP
+        logger.info("Listing todos in %s via MCP", calendar_name)
+        list_result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name},
+        )
+        assert list_result.is_error is False
+
+        list_data = json.loads(list_result.content[0].text)
+        assert "todos" in list_data
+        assert any(t["uid"] == todo_uid for t in list_data["todos"])
+
+        # 4. Update todo via MCP
+        logger.info("Updating todo %s via MCP", todo_uid)
+        update_result = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
+                "summary": "MCP Test Task Updated",
+                "status": "IN-PROCESS",
+                "priority": 1,
+                "percent_complete": 50,
+            },
+        )
+        assert update_result.is_error is False
+
+        # 5. Verify update via client
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        updated_todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert updated_todo["summary"] == "MCP Test Task Updated"
+        assert updated_todo["status"] == "IN-PROCESS"
+        assert updated_todo["priority"] == 1
+        assert updated_todo["percent_complete"] == 50
+
+        # 6. Delete todo via MCP
+        logger.info("Deleting todo %s via MCP", todo_uid)
+        delete_result = await nc_mcp_client.call_tool(
+            "nc_calendar_delete_todo",
+            {"calendar_name": calendar_name, "todo_uid": todo_uid},
+        )
+        assert delete_result.is_error is False
+
+        # 7. Verify deletion via client
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        assert not any(t["uid"] == todo_uid for t in todos)
+
+        logger.info("Complete todo workflow test passed")
+
+    finally:
+        # Cleanup in case of failure
+        if todo_uid:
+            try:
+                await nc_client.calendar.delete_todo(calendar_name, todo_uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_list_todos_with_filters(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test listing todos with various filters via MCP tools."""
+
+    calendar_name = temporary_calendar
+    created_uids = []
+
+    try:
+        # Create test todos with different properties
+        test_todos = [
+            {
+                "summary": "High Priority Task",
+                "status": "NEEDS-ACTION",
+                "priority": 1,
+                "categories": "urgent,work",
+            },
+            {
+                "summary": "In Progress Task",
+                "status": "IN-PROCESS",
+                "priority": 5,
+                "categories": "work",
+            },
+            {
+                "summary": "Low Priority Task",
+                "status": "NEEDS-ACTION",
+                "priority": 9,
+                "categories": "someday",
+            },
+        ]
+
+        # Create todos via client
+        for todo_data in test_todos:
+            result = await nc_client.calendar.create_todo(calendar_name, todo_data)
+            created_uids.append(result["uid"])
+
+        # Test 1: Filter by status
+        logger.info("Testing filter by status")
+        result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name, "status": "NEEDS-ACTION"},
+        )
+        assert result.is_error is False
+
+        data = json.loads(result.content[0].text)
+        needs_action_todos = [t for t in data["todos"] if t["uid"] in created_uids]
+        assert len(needs_action_todos) == 2  # Two NEEDS-ACTION todos
+
+        # Test 2: Filter by priority
+        logger.info("Testing filter by minimum priority")
+        result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name, "min_priority": 1},
+        )
+        assert result.is_error is False
+        data = json.loads(result.content[0].text)
+        high_priority_todos = [t for t in data["todos"] if t["uid"] in created_uids]
+        assert len(high_priority_todos) >= 1  # At least the priority 1 todo
+
+        # Test 3: Filter by categories
+        logger.info("Testing filter by categories")
+        result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name, "categories": "work"},
+        )
+        assert result.is_error is False
+        data = json.loads(result.content[0].text)
+        work_todos = [t for t in data["todos"] if t["uid"] in created_uids]
+        assert len(work_todos) >= 2  # Two todos with "work" category
+
+        # Test 4: Filter by summary text
+        logger.info("Testing filter by summary text")
+        result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name, "summary_contains": "Priority"},
+        )
+        assert result.is_error is False
+        data = json.loads(result.content[0].text)
+        priority_todos = [t for t in data["todos"] if t["uid"] in created_uids]
+        assert len(priority_todos) == 2  # Two have "Priority" in summary (High, Low)
+
+        logger.info("List todos with filters test passed")
+
+    finally:
+        # Cleanup
+        for uid in created_uids:
+            try:
+                await nc_client.calendar.delete_todo(calendar_name, uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_search_todos_across_calendars(
+    nc_mcp_client: ClientSession,
+    nc_client: NextcloudClient,
+    temporary_calendar: str,
+    shared_calendar_2: str,
+):
+    """Test searching todos across multiple calendars via MCP tools.
+
+    Note: Uses two shared test calendars to avoid rate limiting.
+    """
+
+    cal1_name = temporary_calendar  # First shared test calendar
+    cal2_name = shared_calendar_2  # Second shared test calendar
+    created_uids = []
+
+    try:
+        # Use existing shared calendars (no creation needed, avoiding rate limits)
+
+        # Create todos in both calendars
+        result1 = await nc_client.calendar.create_todo(
+            cal1_name,
+            {
+                "summary": "Task in Calendar 1",
+                "status": "NEEDS-ACTION",
+                "categories": "cal1",
+            },
+        )
+        created_uids.append((cal1_name, result1["uid"]))
+
+        result2 = await nc_client.calendar.create_todo(
+            cal2_name,
+            {
+                "summary": "Task in Calendar 2",
+                "status": "IN-PROCESS",
+                "categories": "cal2",
+            },
+        )
+        created_uids.append((cal2_name, result2["uid"]))
+
+        # Search across all calendars via MCP
+        logger.info("Searching todos across all calendars via MCP")
+        search_result = await nc_mcp_client.call_tool(
+            "nc_calendar_search_todos",
+            {},
+        )
+        assert search_result.is_error is False
+
+        data = json.loads(search_result.content[0].text)
+        assert "todos" in data
+
+        # Verify both todos are in the results
+        found_uids = {t["uid"] for t in data["todos"]}
+        assert result1["uid"] in found_uids
+        assert result2["uid"] in found_uids
+        # Every calendar was readable, so nothing was silently skipped
+        assert data["errors"] == []
+
+        # A percent-encoded calendar name (as it appears in hrefs) resolves to
+        # the same calendar instead of being encoded a second time.
+        encoded_name = "".join(f"%{b:02X}" for b in cal1_name.encode())
+        encoded_result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos", {"calendar_name": encoded_name}
+        )
+        assert encoded_result.is_error is False
+        encoded_data = json.loads(encoded_result.content[0].text)
+        assert result1["uid"] in {t["uid"] for t in encoded_data["todos"]}
+
+        # Verify calendar_name is included
+        our_todos = [
+            t for t in data["todos"] if t["uid"] in [result1["uid"], result2["uid"]]
+        ]
+        for todo in our_todos:
+            assert "calendar_name" in todo
+            assert todo["calendar_name"] in [cal1_name, cal2_name]
+
+        # Test search with status filter
+        logger.info("Searching with status filter via MCP")
+        search_result = await nc_mcp_client.call_tool(
+            "nc_calendar_search_todos",
+            {"status": "IN-PROCESS"},
+        )
+        assert search_result.is_error is False
+        data = json.loads(search_result.content[0].text)
+        in_process_todos = [
+            t for t in data["todos"] if t["uid"] in [uid for _, uid in created_uids]
+        ]
+        assert len(in_process_todos) >= 1
+
+        logger.info("Search todos across calendars test passed")
+
+    finally:
+        # Cleanup: Only delete todos, not calendars (they're reused/built-in)
+        for cal_name, uid in created_uids:
+            try:
+                await nc_client.calendar.delete_todo(cal_name, uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_todo_status_transitions(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test transitioning through different todo statuses via MCP tools."""
+
+    calendar_name = temporary_calendar
+    todo_uid = None
+
+    try:
+        # Create todo
+        result = await nc_client.calendar.create_todo(
+            calendar_name,
+            {"summary": "Status Transition Test", "status": "NEEDS-ACTION"},
+        )
+        todo_uid = result["uid"]
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        todo = next(t for t in todos if t["uid"] == todo_uid)
+
+        # Transition: NEEDS-ACTION → IN-PROCESS
+        logger.info("Transitioning todo to IN-PROCESS via MCP")
+        update_result = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "etag": todo["etag"],
+                "status": "IN-PROCESS",
+                "percent_complete": 25,
+            },
+        )
+        assert update_result.is_error is False
+
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert todo["status"] == "IN-PROCESS"
+        assert todo["percent_complete"] == 25
+
+        # Transition: IN-PROCESS → COMPLETED
+        logger.info("Transitioning todo to COMPLETED via MCP")
+        completed_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        update_result = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "etag": todo["etag"],
+                "status": "COMPLETED",
+                "percent_complete": 100,
+                "completed": completed_time,
+            },
+        )
+        assert update_result.is_error is False
+
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert todo["status"] == "COMPLETED"
+        assert todo["percent_complete"] == 100
+        assert "completed" in todo
+
+        logger.info("Todo status transitions test passed")
+
+    finally:
+        if todo_uid:
+            try:
+                await nc_client.calendar.delete_todo(calendar_name, todo_uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_todo_with_dates(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test creating and managing todos with date fields via MCP tools."""
+
+    calendar_name = temporary_calendar
+    todo_uid = None
+
+    try:
+        now = datetime.now()
+        start_date = (now + timedelta(days=1)).strftime("%Y-%m-%dT09:00:00Z")
+        due_date = (now + timedelta(days=7)).strftime("%Y-%m-%dT17:00:00Z")
+
+        # Create todo with dates via MCP
+        logger.info("Creating todo with dates via MCP")
+        create_result = await nc_mcp_client.call_tool(
+            "nc_calendar_create_todo",
+            {
+                "calendar_name": calendar_name,
+                "summary": "Task with Dates",
+                "description": "Test task with various date fields",
+                "status": "NEEDS-ACTION",
+                "dtstart": start_date,
+                "due": due_date,
+            },
+        )
+        assert create_result.is_error is False
+
+        result_data = json.loads(create_result.content[0].text)
+        todo_uid = result_data["uid"]
+
+        # Verify dates via client
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        created_todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert created_todo["summary"] == "Task with Dates"
+        assert "dtstart" in created_todo
+        assert "due" in created_todo
+
+        logger.info("Todo with dates test passed")
+
+    finally:
+        if todo_uid:
+            try:
+                await nc_client.calendar.delete_todo(calendar_name, todo_uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_todo_categories(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test creating and managing todos with categories via MCP tools."""
+
+    calendar_name = temporary_calendar
+    todo_uid = None
+
+    try:
+        # Create todo with multiple categories via MCP
+        logger.info("Creating todo with categories via MCP")
+        create_result = await nc_mcp_client.call_tool(
+            "nc_calendar_create_todo",
+            {
+                "calendar_name": calendar_name,
+                "summary": "Task with Categories",
+                "status": "NEEDS-ACTION",
+                "categories": "work,meeting,important,quarterly",
+            },
+        )
+        assert create_result.is_error is False
+
+        result_data = json.loads(create_result.content[0].text)
+        todo_uid = result_data["uid"]
+
+        # Verify categories via client
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        created_todo = next(t for t in todos if t["uid"] == todo_uid)
+        assert "categories" in created_todo
+        categories_str = created_todo["categories"]
+        assert "work" in categories_str
+        assert "meeting" in categories_str
+        assert "important" in categories_str
+        assert "quarterly" in categories_str
+
+        # Update categories via MCP
+        logger.info("Updating todo categories via MCP")
+        update_result = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "etag": created_todo["etag"],
+                "categories": "updated,new-category",
+            },
+        )
+        assert update_result.is_error is False
+
+        # Verify updated categories
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        updated_todo = next(t for t in todos if t["uid"] == todo_uid)
+        categories_str = updated_todo["categories"]
+        assert "updated" in categories_str
+        assert "new-category" in categories_str
+
+        logger.info("Todo categories test passed")
+
+    finally:
+        if todo_uid:
+            try:
+                await nc_client.calendar.delete_todo(calendar_name, todo_uid)
+            except Exception:
+                pass
+
+
+async def test_mcp_todo_href_mismatch(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """Test that todos with filename != UID are handled correctly (issue #629).
+
+    When a CalDAV object is stored with a filename different from its VTODO UID,
+    the server returns an href based on the filename. list_todos must return the
+    correct server-assigned href, and delete_todo must actually remove the todo.
+    """
+    calendar_name = temporary_calendar
+    todo_uid = str(uuid.uuid4())
+    different_filename = str(uuid.uuid4())
+
+    # Build iCal content with a UID that differs from the filename
+    ical_content = (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "PRODID:-//Test//Test//EN\r\n"
+        "BEGIN:VTODO\r\n"
+        f"UID:{todo_uid}\r\n"
+        "SUMMARY:Href Mismatch Test\r\n"
+        "STATUS:NEEDS-ACTION\r\n"
+        "END:VTODO\r\n"
+        "END:VCALENDAR\r\n"
+    )
+
+    try:
+        # PUT the todo with a filename that differs from the UID
+        calendar = nc_client.calendar._get_calendar(calendar_name)
+        put_url = f"{calendar.url}{different_filename}.ics"
+        await calendar.client.put(
+            put_url,
+            ical_content,
+            {"Content-Type": "text/calendar; charset=utf-8"},
+        )
+
+        # list_todos via MCP should return href containing the filename, not the UID
+        list_result = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos",
+            {"calendar_name": calendar_name},
+        )
+        assert list_result.is_error is False
+
+        list_data = json.loads(list_result.content[0].text)
+        our_todo = next((t for t in list_data["todos"] if t["uid"] == todo_uid), None)
+        assert our_todo is not None, f"Todo {todo_uid} not found in list_todos"
+        assert different_filename in our_todo["href"], (
+            f"Expected href to contain filename '{different_filename}', "
+            f"got '{our_todo['href']}'"
+        )
+        assert todo_uid not in our_todo["href"], (
+            f"href should NOT contain the UID '{todo_uid}', got '{our_todo['href']}'"
+        )
+
+        # delete_todo via MCP should actually remove the todo
+        delete_result = await nc_mcp_client.call_tool(
+            "nc_calendar_delete_todo",
+            {"calendar_name": calendar_name, "todo_uid": todo_uid},
+        )
+        assert delete_result.is_error is False
+
+        # Verify it's really gone
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        assert not any(t["uid"] == todo_uid for t in todos), (
+            "Todo should have been deleted but still exists"
+        )
+
+        logger.info("Todo href mismatch test passed")
+
+    finally:
+        # Cleanup in case of failure
+        try:
+            await nc_client.calendar.delete_todo(calendar_name, todo_uid)
+        except Exception:
+            pass
+
+
+async def test_mcp_complete_todo_sets_all_three_properties(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """nc_calendar_complete_todo must set STATUS, PERCENT-COMPLETE and COMPLETED.
+
+    Doing this via nc_calendar_update_todo requires knowing all three are needed;
+    passing status="COMPLETED" alone leaves PERCENT-COMPLETE stale and writes no
+    completion timestamp.
+    """
+    calendar_name = temporary_calendar
+    unique = uuid.uuid4().hex[:8]
+
+    create_result = await nc_mcp_client.call_tool(
+        "nc_calendar_create_todo",
+        {
+            "calendar_name": calendar_name,
+            "summary": f"Complete-me {unique}",
+            "percent_complete": 25,
+        },
+    )
+    assert create_result.is_error is False
+    todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
+
+    complete_result = await nc_mcp_client.call_tool(
+        "nc_calendar_complete_todo",
+        {"calendar_name": calendar_name, "todo_uid": todo_uid, "etag": etag},
+    )
+    assert complete_result.is_error is False
+    payload = json.loads(complete_result.content[0].text)
+    assert payload["success"] is True
+    assert payload["status"] == "COMPLETED"
+    assert payload["percent_complete"] == 100
+    assert payload["completed"]
+
+    # Verify against the server, not just the response envelope.
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    stored = next(t for t in todos if t["uid"] == todo_uid)
+    assert stored["status"] == "COMPLETED"
+    assert stored["percent_complete"] == 100
+
+
+async def test_mcp_complete_todo_accepts_explicit_timestamp(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """A caller-supplied COMPLETED timestamp is written verbatim."""
+    calendar_name = temporary_calendar
+    unique = uuid.uuid4().hex[:8]
+
+    create_result = await nc_mcp_client.call_tool(
+        "nc_calendar_create_todo",
+        {"calendar_name": calendar_name, "summary": f"Backdated {unique}"},
+    )
+    assert create_result.is_error is False
+    todo_uid = json.loads(create_result.content[0].text)["uid"]
+    todos = await nc_client.calendar.list_todos(calendar_name)
+    etag = next(t["etag"] for t in todos if t["uid"] == todo_uid)
+
+    complete_result = await nc_mcp_client.call_tool(
+        "nc_calendar_complete_todo",
+        {
+            "calendar_name": calendar_name,
+            "todo_uid": todo_uid,
+            "etag": etag,
+            "completed": "2026-01-01T09:00:00+00:00",
+        },
+    )
+    assert complete_result.is_error is False
+    assert (
+        json.loads(complete_result.content[0].text)["completed"]
+        == "2026-01-01T09:00:00+00:00"
+    )
+
+
+async def test_stale_etag_refuses_the_write_end_to_end(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient, temporary_calendar: str
+):
+    """A contended read-modify-write cycle must lose, not silently overwrite.
+
+    The unit tests pin the tool's plumbing against a mocked client; only this
+    exercises the part that is really in question -- that Nextcloud's own
+    If-Match evaluation refuses the second write. A mock can be made to raise
+    412 whether or not the header ever reaches Sabre.
+
+    The second update stands in for a concurrent client: it is a real write
+    that moves the ETag on, after which the first caller's copy is stale
+    exactly as it would be in a race.
+    """
+    calendar_name = temporary_calendar
+    todo_uid = None
+
+    try:
+        create_result = await nc_mcp_client.call_tool(
+            "nc_calendar_create_todo",
+            {"calendar_name": calendar_name, "summary": "ETag contention"},
+        )
+        assert create_result.is_error is False
+        todo_uid = json.loads(create_result.content[0].text)["uid"]
+
+        # Read the ETag the way a caller would.
+        listed = await nc_mcp_client.call_tool(
+            "nc_calendar_list_todos", {"calendar_name": calendar_name}
+        )
+        # ``todos``, not ``results``: ListTodosResponse names its list field
+        # after the resource. Several other list responses in this codebase do
+        # use ``results``, which is exactly why this is worth pinning in a
+        # comment rather than rediscovering.
+        todo = next(
+            t
+            for t in json.loads(listed.content[0].text)["todos"]
+            if t["uid"] == todo_uid
+        )
+        first_etag = todo["etag"]
+        assert first_etag, "list_todos returned no ETag to guard with"
+
+        # Matching ETag: accepted, and hands back the next one.
+        accepted = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "summary": "First writer wins",
+                "etag": first_etag,
+            },
+        )
+        assert accepted.is_error is False, accepted.content[0].text
+        second_etag = json.loads(accepted.content[0].text)["etag"]
+        assert second_etag and second_etag != first_etag
+
+        # The original ETag is now stale: the write must be refused, readably.
+        refused = await nc_mcp_client.call_tool(
+            "nc_calendar_update_todo",
+            {
+                "calendar_name": calendar_name,
+                "todo_uid": todo_uid,
+                "summary": "Second writer must not clobber",
+                "etag": first_etag,
+            },
+        )
+        assert refused.is_error is True
+        assert "nc_calendar_list_todos" in refused.content[0].text
+
+        # ...and the refusal really did leave the stored copy alone.
+        todos = await nc_client.calendar.list_todos(calendar_name)
+        stored = next(t for t in todos if t["uid"] == todo_uid)
+        assert stored["summary"] == "First writer wins"
+    finally:
+        if todo_uid:
+            await nc_client.calendar.delete_todo(calendar_name, todo_uid)

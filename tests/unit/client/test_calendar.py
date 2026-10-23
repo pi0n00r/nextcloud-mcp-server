@@ -1,0 +1,2353 @@
+"""Unit tests for the CalendarClient construction path.
+
+These pin the wiring into ``caldav.aio.AsyncDAVClient``. caldav v3.x prefers
+``niquests`` over ``httpx`` and rejects ``httpx.Auth`` objects when ``niquests``
+is the active backend (issue #731), so we no longer build an httpx auth object
+ourselves — we pass the raw credential plus an explicit ``auth_type`` and let
+caldav build whichever auth its backend needs.
+"""
+
+import logging
+from datetime import timedelta
+from types import SimpleNamespace
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+def test_basic_auth_passes_password_and_auth_type_basic(mocker):
+    """Password path: pass ``password=`` + ``auth_type='basic'``, no ``auth=`` arg.
+
+    The previous wiring passed ``auth=httpx.BasicAuth(...)`` which caldav-on-niquests
+    rejects with "Unexpected non-callable authentication" — the regression #731 came
+    in via caldav 3.x's mandatory niquests dependency.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient("https://cloud.example.org", "alice", password="app-pw-1234")
+
+    mock_dav_client.assert_called_once()
+    call_kwargs = mock_dav_client.call_args.kwargs
+    assert call_kwargs["url"] == "https://cloud.example.org/remote.php/dav/"
+    assert call_kwargs["username"] == "alice"
+    assert call_kwargs["password"] == "app-pw-1234"
+    assert call_kwargs["auth_type"] == "basic"
+    # Critical: no httpx.Auth object — that's what broke under niquests.
+    assert "auth" not in call_kwargs
+
+
+def test_token_passes_token_and_auth_type_bearer(mocker):
+    """Token path: pass ``password=<token>`` + ``auth_type='bearer'``.
+
+    caldav v3 reuses the ``password`` slot for bearer tokens — see
+    ``async_davclient.build_auth_object``.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient("https://cloud.example.org", "alice", token="oauth-bearer-xyz")
+
+    call_kwargs = mock_dav_client.call_args.kwargs
+    assert call_kwargs["password"] == "oauth-bearer-xyz"
+    assert call_kwargs["auth_type"] == "bearer"
+    assert "auth" not in call_kwargs
+
+
+def test_no_credentials_leaves_dav_client_unauthenticated(mocker):
+    """Defensive: if neither credential is provided, don't pass any auth kwargs.
+
+    AsyncDAVClient handles its own discovery when no auth is configured; we
+    don't want to silently inject an empty password.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient("https://cloud.example.org", "alice")
+
+    call_kwargs = mock_dav_client.call_args.kwargs
+    assert "password" not in call_kwargs
+    assert "auth_type" not in call_kwargs
+    assert "auth" not in call_kwargs
+
+
+def test_password_takes_precedence_over_token(mocker):
+    """If a caller supplies both, password wins. Documents the precedence so a
+    future caller passing both isn't surprised by which one selects auth_type.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient(
+        "https://cloud.example.org",
+        "alice",
+        password="app-pw",
+        token="bearer-tok",
+    )
+
+    call_kwargs = mock_dav_client.call_args.kwargs
+    assert call_kwargs["password"] == "app-pw"
+    assert call_kwargs["auth_type"] == "basic"
+
+
+def test_auth_username_used_for_credential_uid_for_fallback_path(mocker):
+    """OIDC users: the loginName authenticates, the UID seeds DAV fallback paths.
+
+    Nextcloud keys app-password auth on the loginName (which can differ from
+    the UID), but discovery starts from a UID-based calendar home fallback. The
+    two identities must not be conflated.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient(
+        "https://cloud.example.org",
+        "Ada Lovelace",  # UID
+        auth_username="ada@example.com",  # loginName
+        password="app-pw-1234",
+    )
+
+    # Credential identity → loginName
+    assert mock_dav_client.call_args.kwargs["username"] == "ada@example.com"
+    # Fallback path identity -> UID
+    assert client.username == "Ada Lovelace"
+    assert (
+        client._calendar_home_url
+        == "https://cloud.example.org/remote.php/dav/calendars/Ada Lovelace/"
+    )
+
+
+def test_auth_username_defaults_to_username(mocker):
+    """Backwards compat: without ``auth_username`` the UID is used for both,
+    so single-user / OAuth callers (UID == loginName) are unchanged.
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+
+    assert mock_dav_client.call_args.kwargs["username"] == "alice"
+
+
+def test_webcal_caching_header_enabled_on_client(mocker):
+    """The client is constructed with the webcal-caching header turned on.
+
+    This is what makes Nextcloud expose external subscriptions as queryable
+    CachedSubscription calendars, so their events are readable through the
+    normal event/search tools (issue #830).
+    """
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+
+    headers = mock_dav_client.call_args.kwargs["headers"]
+    assert headers["X-NC-CalDAV-Webcal-Caching"] == "On"
+
+
+# --- a UID containing a space must not reach caldav unencoded ---
+
+
+def test_calendar_url_is_encoded_for_a_uid_with_a_space():
+    """``DAVObject.__init__`` rejects any URL containing a space."""
+    # Unmocked: the guard under test is caldav's own.
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "Ada Lovelace")
+
+    assert (
+        client._get_calendar_url("personal")
+        == "https://cloud.example.org/remote.php/dav/calendars/Ada%20Lovelace/personal/"
+    )
+    assert client._get_calendar("personal") is not None
+
+
+def test_home_url_is_normalised_before_storage(mocker):
+    """The client stores one form internally, so it can encode exactly once.
+
+    An internal representation choice, not a constraint on the server: whatever
+    ``calendar-home-set`` returns is decoded on the way in (as
+    ``BaseNextcloudClient._ensure_principal_id`` does) and re-encoded at the
+    point of use. The round trip is lossless.
+    """
+    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+
+    home_url = client._calendar_home_url_from_home_set(
+        "/remote.php/dav/calendars/Ada%20Lovelace/"
+    )
+
+    assert (
+        home_url == "https://cloud.example.org/remote.php/dav/calendars/Ada Lovelace/"
+    )
+
+    client._calendar_home_url = home_url
+    assert (
+        client._get_calendar_url("personal")
+        == "https://cloud.example.org/remote.php/dav/calendars/Ada%20Lovelace/personal/"
+    )
+
+
+async def test_event_objects_from_a_report_re_encode_their_href(mocker):
+    """caldav decodes the hrefs it parses, so events built from one need re-encoding."""
+    import datetime as dt
+
+    from caldav.response import DAVResponse
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    ics = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt-1\r\n"
+        "DTSTART:20260901T090000Z\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    body = f"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+ <d:response>
+  <d:href>/remote.php/dav/calendars/Ada%20Lovelace/personal/evt-1.ics</d:href>
+  <d:propstat><d:prop>
+    <d:getetag>"tag-1"</d:getetag>
+    <c:calendar-data>{ics}</c:calendar-data>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+</d:multistatus>""".encode()
+
+    client = CalendarClient("https://cloud.example.org", "Ada Lovelace")
+    calendar = client._get_calendar("personal")
+    mocker.patch.object(
+        calendar.client,
+        "report",
+        mocker.AsyncMock(return_value=DAVResponse.from_bytes(body)),
+    )
+
+    events = await client._search_events_by_date(
+        calendar,
+        dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 9, 30, tzinfo=dt.UTC),
+    )
+
+    assert len(events) == 1
+    assert (
+        str(events[0].url)
+        == "https://cloud.example.org/remote.php/dav/calendars/Ada%20Lovelace/personal/evt-1.ics"
+    )
+
+
+def test_a_calendar_name_containing_a_hash_is_not_truncated():
+    """``#``/``?`` are literal characters in a DAV path, not URL delimiters.
+
+    Splitting the URL before encoding reads them as a fragment/query and drops
+    the rest, which is the spurious-404 failure ``encode_dav_path`` was added
+    to fix (PR #891).
+    """
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+
+    assert (
+        client._get_calendar_url("My #1 Calendar")
+        == "https://cloud.example.org/remote.php/dav/calendars/alice/My%20%231%20Calendar/"
+    )
+    assert (
+        client._get_calendar_url("Q1?plan")
+        == "https://cloud.example.org/remote.php/dav/calendars/alice/Q1%3Fplan/"
+    )
+
+
+@pytest.mark.parametrize(
+    "decoded, encoded",
+    [
+        ("personal_shared_by_Ada Lovelace", "personal_shared_by_Ada%20Lovelace"),
+        ("Müller", "M%C3%BCller"),
+    ],
+)
+def test_a_percent_encoded_calendar_name_is_not_encoded_twice(decoded, encoded):
+    """Names are passed as they appear in hrefs; ``%20`` must not become ``%2520``,
+    which silently REPORTs an empty calendar instead of failing."""
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+
+    url = client._get_calendar_url(decoded)
+    assert client._get_calendar_url(encoded) == url
+    assert url.endswith(f"/alice/{encoded}/")
+    assert "%25" not in url
+
+
+async def test_event_objects_from_a_report_keep_a_hash_in_their_href(mocker):
+    """An event whose UID contains '#' must not have its URL truncated.
+
+    Nextcloud names the object after the client-supplied UID, and caldav
+    decodes the href it parses -- so ``evt%231.ics`` reaches us as ``evt#1.ics``
+    and has to be re-encoded, not split on.
+    """
+    import datetime as dt
+
+    from caldav.response import DAVResponse
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    ics = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt#1\r\n"
+        "DTSTART:20260901T090000Z\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    body = f"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+ <d:response>
+  <d:href>/remote.php/dav/calendars/alice/personal/evt%231.ics</d:href>
+  <d:propstat><d:prop>
+    <d:getetag>"tag-1"</d:getetag>
+    <c:calendar-data>{ics}</c:calendar-data>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+</d:multistatus>""".encode()
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+    calendar = client._get_calendar("personal")
+    mocker.patch.object(
+        calendar.client,
+        "report",
+        mocker.AsyncMock(return_value=DAVResponse.from_bytes(body)),
+    )
+
+    events = await client._search_events_by_date(
+        calendar,
+        dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 9, 30, tzinfo=dt.UTC),
+    )
+
+    assert len(events) == 1
+    assert (
+        str(events[0].url)
+        == "https://cloud.example.org/remote.php/dav/calendars/alice/personal/evt%231.ics"
+    )
+
+
+async def test_list_calendars_puts_an_encoded_home_url_on_the_wire(mocker):
+    """``_calendar_home_url`` is stored decoded, so the PROPFIND must encode it."""
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "Ada Lovelace")
+    propfind = mocker.patch.object(
+        client._dav_client,
+        "propfind",
+        mocker.AsyncMock(
+            return_value=mocker.Mock(
+                raw='<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>'
+            )
+        ),
+    )
+    mocker.patch.object(client, "_ensure_calendar_home", mocker.AsyncMock())
+
+    await client.list_calendars()
+
+    assert (
+        propfind.call_args.args[0]
+        == "https://cloud.example.org/remote.php/dav/calendars/Ada%20Lovelace/"
+    )
+
+
+# --- calendar-home-set absolute-path normalization (issue #1007) ---
+
+
+def test_home_set_absolute_path_resolves_against_origin_not_subpath(mocker):
+    """An absolute calendar-home-set path resolves against the origin.
+
+    When Nextcloud is served under a subpath, calendar-home-set returns an
+    absolute path that already includes that subpath (e.g.
+    ``/nextcloud/remote.php/dav/calendars/David/``). Resolving it against the
+    full base URL would double the subpath and yield an unroutable URL, which
+    then hits Apache's default routing and 405s with an HTML body that fails
+    CalDAV XML parsing (issue #1007). It must resolve against the origin only.
+    """
+    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    # No credentials needed: the method under test derives the URL purely from
+    # base_url, and constructing without auth keeps this free of S2068 (hard-
+    # coded credential) noise.
+    client = CalendarClient("https://host/nextcloud", "David")
+
+    home_url = client._calendar_home_url_from_home_set(
+        "/nextcloud/remote.php/dav/calendars/David/"
+    )
+
+    assert home_url == "https://host/nextcloud/remote.php/dav/calendars/David/"
+
+
+def test_home_set_absolute_path_resolves_against_root_origin(mocker):
+    """Root-hosted deployments keep resolving absolute paths correctly."""
+    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+
+    home_url = client._calendar_home_url_from_home_set(
+        "/remote.php/dav/calendars/alice/"
+    )
+
+    assert home_url == "https://cloud.example.org/remote.php/dav/calendars/alice/"
+
+
+# --- list_calendars: regular + external subscription parsing (issue #830) ---
+
+# A multistatus body with the calendar home, one regular calendar, and one
+# external subscription (cs:subscribed) carrying a cs:source href and an
+# Apple-namespace color.
+_LIST_CALENDARS_MULTISTATUS = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ical="http://apple.com/ns/ical/">
+    <d:response>
+        <d:href>/remote.php/dav/calendars/alice/</d:href>
+        <d:propstat>
+            <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+            <d:status>HTTP/1.1 200 OK</d:status>
+        </d:propstat>
+    </d:response>
+    <d:response>
+        <d:href>/remote.php/dav/calendars/alice/personal/</d:href>
+        <d:propstat>
+            <d:prop>
+                <d:displayname>Personal</d:displayname>
+                <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+                <c:calendar-description>My personal calendar</c:calendar-description>
+                <cs:calendar-color>#FF0000</cs:calendar-color>
+            </d:prop>
+            <d:status>HTTP/1.1 200 OK</d:status>
+        </d:propstat>
+    </d:response>
+    <d:response>
+        <d:href>/remote.php/dav/calendars/alice/holidays/</d:href>
+        <d:propstat>
+            <d:prop>
+                <d:displayname>Public Holidays</d:displayname>
+                <d:resourcetype><d:collection/><cs:subscribed/></d:resourcetype>
+                <ical:calendar-color>#00FF00</ical:calendar-color>
+                <cs:source><d:href>https://example.com/holidays.ics</d:href></cs:source>
+            </d:prop>
+            <d:status>HTTP/1.1 200 OK</d:status>
+        </d:propstat>
+    </d:response>
+</d:multistatus>"""
+
+
+def _calendar_client_with_propfind(mocker, raw_xml: str):
+    """Build a CalendarClient whose DAV client returns ``raw_xml`` from PROPFIND."""
+    mock_dav_client = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
+    )
+    instance = mock_dav_client.return_value
+    instance.propfind = mocker.AsyncMock(return_value=mocker.Mock(raw=raw_xml))
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+    return client, instance
+
+
+async def test_list_calendars_includes_external_subscription(mocker):
+    """External subscriptions are returned alongside regular calendars and are
+    flagged read-only with their source feed URL (issue #830).
+    """
+    client, _ = _calendar_client_with_propfind(mocker, _LIST_CALENDARS_MULTISTATUS)
+
+    calendars = await client.list_calendars()
+
+    by_name = {cal["name"]: cal for cal in calendars}
+    # The calendar home (plain collection) is not reported.
+    assert set(by_name) == {"personal", "holidays"}
+
+    personal = by_name["personal"]
+    assert personal["display_name"] == "Personal"
+    assert personal["description"] == "My personal calendar"
+    assert personal["color"] == "#FF0000"
+    assert personal["read_only"] is False
+    assert personal["source"] is None
+
+    holidays = by_name["holidays"]
+    assert holidays["display_name"] == "Public Holidays"
+    assert holidays["read_only"] is True
+    assert holidays["source"] == "https://example.com/holidays.ics"
+    # Subscriptions store their color under the Apple iCal namespace.
+    assert holidays["color"] == "#00FF00"
+
+
+async def test_list_calendars_disables_webcal_caching_for_propfind(mocker):
+    """The listing PROPFIND overrides the client-wide header to "Off" so
+    subscriptions surface as cs:subscribed (with a source) rather than as
+    opaque regular calendars.
+    """
+    client, instance = _calendar_client_with_propfind(
+        mocker, _LIST_CALENDARS_MULTISTATUS
+    )
+
+    await client.list_calendars()
+
+    kwargs = instance.propfind.call_args.kwargs
+    assert kwargs["headers"]["X-NC-CalDAV-Webcal-Caching"] == "Off"
+    # The custom property XML must travel as ``body`` — caldav's ``props=``
+    # expects a list of property names and would discard a raw XML string,
+    # sending an empty <prop/> that returns neither resourcetype nor cs:source.
+    assert "cs:source" in kwargs["body"]
+    assert "props" not in kwargs
+
+
+async def test_list_calendars_model_round_trip(mocker):
+    """The dicts returned by list_calendars validate against the Calendar model,
+    mirroring the server's ``Calendar(**cal_data)`` mapping.
+    """
+    client, _ = _calendar_client_with_propfind(mocker, _LIST_CALENDARS_MULTISTATUS)
+
+    from nextcloud_mcp_server.models.calendar import Calendar
+
+    calendars = [Calendar(**cal) for cal in await client.list_calendars()]
+    holidays = next(c for c in calendars if c.name == "holidays")
+    assert holidays.read_only is True
+    assert holidays.source == "https://example.com/holidays.ics"
+
+
+def _calendar_client(mocker):
+    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    return CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+
+
+async def test_delete_todo_retries_once_with_scheduling_disabled(mocker):
+    """A plain caldav 403 gets one low-level scheduling-disabled retry."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "task@example.invalid"
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(return_value=SimpleNamespace(status=204))
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        delete=mocker.AsyncMock(side_effect=caldav_error.AuthorizationError("403")),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result == {"status_code": 204}
+    todo.delete.assert_awaited_once()
+    client._dav_client.delete.assert_awaited_once_with(
+        todo.url, headers={"X-NC-Scheduling": "false"}
+    )
+
+
+async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
+    """The permanent-purge path is gated by Nextcloud's exact collision text."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "arbiter-cpow-drift@example.invalid"
+    low_level_403 = caldav_error.AuthorizationError(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        reason="Forbidden",
+    )
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(
+            side_effect=[low_level_403, SimpleNamespace(status=204, raw="")]
+        )
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        delete=mocker.AsyncMock(side_effect=caldav_error.AuthorizationError("403")),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+    client._purge_todo_trash_entries = mocker.AsyncMock(return_value=2)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result == {"status_code": 204, "stale_trash_entries_purged": 2}
+    client._purge_todo_trash_entries.assert_awaited_once_with(uid)
+    assert client._dav_client.delete.await_count == 2
+
+
+async def test_delete_todo_unrelated_403_does_not_purge_trash(mocker):
+    """Authorization errors without the collision signature remain read-only."""
+    from caldav.lib import error as caldav_error
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "plain-task"
+    client = CalendarClient.__new__(CalendarClient)
+    client._ensure_calendar_home = mocker.AsyncMock()
+    client._get_calendar = mocker.Mock(return_value=object())
+    low_level_403 = caldav_error.AuthorizationError(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        reason="Forbidden",
+    )
+    client._dav_client = SimpleNamespace(
+        delete=mocker.AsyncMock(side_effect=low_level_403)
+    )
+    todo = SimpleNamespace(
+        url="https://cloud.example.org/calendars/alice/persona/legacy.ics",
+        delete=mocker.AsyncMock(side_effect=caldav_error.AuthorizationError("403")),
+    )
+    client._async_object_by_uid = mocker.AsyncMock(return_value=todo)
+    client._purge_todo_trash_entries = mocker.AsyncMock(return_value=0)
+
+    result = await client.delete_todo("persona", uid)
+
+    assert result["status_code"] == 403
+    assert result["success"] is False
+    client._purge_todo_trash_entries.assert_awaited_once_with(uid)
+    assert client._dav_client.delete.await_count == 1
+
+
+async def test_purge_todo_trash_entries_deletes_only_exact_uid_matches(mocker):
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    uid = "target@example.invalid"
+    report_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/trashbin/objects/41.ics</d:href>
+    <d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:{uid}
+SUMMARY:Exact match
+END:VTODO
+END:VCALENDAR
+</c:calendar-data></d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/trashbin/objects/42.ics</d:href>
+    <d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:not-{uid}
+SUMMARY:Text-match false positive
+END:VTODO
+END:VCALENDAR
+</c:calendar-data></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"""
+    client = CalendarClient.__new__(CalendarClient)
+    client._calendar_home_url = (
+        "https://cloud.example.org/remote.php/dav/calendars/alice/"
+    )
+    client._dav_client = SimpleNamespace(
+        request=mocker.AsyncMock(
+            return_value=SimpleNamespace(status=207, raw=report_xml)
+        ),
+        delete=mocker.AsyncMock(return_value=SimpleNamespace(status=204)),
+    )
+
+    result = await client._purge_todo_trash_entries(uid)
+
+    assert result == 1
+    client._dav_client.delete.assert_awaited_once_with(
+        "https://cloud.example.org/remote.php/dav/calendars/alice/"
+        "trashbin/objects/41.ics"
+    )
+
+
+def test_event_reminders_round_trip_and_preserve_on_unrelated_update(mocker):
+    client = _calendar_client(mocker)
+
+    ical = client._create_ical_event(
+        {
+            "title": "Fundraising",
+            "start_datetime": "2026-06-26T12:00:00+03:00",
+            "end_datetime": "2026-06-26T13:00:00+03:00",
+            "reminders": [
+                {
+                    "trigger_at": "2026-06-26T10:00:00+03:00",
+                    "description": "absolute reminder",
+                },
+                {"minutes_before": 30, "related": "START"},
+            ],
+        },
+        "event-uid",
+    )
+
+    parsed = client._parse_ical_event(ical)
+    assert parsed is not None
+    assert len(parsed["reminders"]) == 2
+    assert parsed["reminders"][0]["action"] == "DISPLAY"
+    assert parsed["reminders"][0]["trigger_at"].startswith("2026-06-26T07:00:00")
+    assert parsed["reminders"][1]["minutes_before"] == 30
+    assert parsed["reminders"][1]["related"] == "START"
+
+    updated = client._merge_ical_properties(ical, {"location": "Office"}, "event-uid")
+    reparsed = client._parse_ical_event(updated)
+    assert reparsed is not None
+    assert reparsed["reminders"] == parsed["reminders"]
+
+
+def test_email_valarm_details_survive_explicit_round_trip(mocker):
+    client = _calendar_client(mocker)
+
+    ical = client._create_ical_event(
+        {
+            "title": "Funding reminder",
+            "start_datetime": "2026-06-26T12:00:00+03:00",
+            "reminders": [
+                {
+                    "action": "EMAIL",
+                    "description": "Email body",
+                    "summary": "Email subject",
+                    "trigger": "-PT30M",
+                    "duration_seconds": 300,
+                    "repeat": 2,
+                    "attendees": ["alice@example.org", "mailto:bob@example.org"],
+                }
+            ],
+        },
+        "event-uid",
+    )
+
+    parsed = client._parse_ical_event(ical)
+    assert parsed is not None
+    reminder = parsed["reminders"][0]
+    assert reminder["action"] == "EMAIL"
+    assert reminder["summary"] == "Email subject"
+    assert reminder["duration"] == "PT5M"
+    assert reminder["duration_seconds"] == 300
+    assert reminder["repeat"] == 2
+    assert reminder["attendees"] == ["alice@example.org", "bob@example.org"]
+
+    updated = client._merge_ical_properties(
+        ical, {"reminders": parsed["reminders"]}, "event-uid"
+    )
+    reparsed = client._parse_ical_event(updated)
+    assert reparsed is not None
+    assert reparsed["reminders"] == parsed["reminders"]
+
+
+def test_event_reminders_empty_list_clears_valarms(mocker):
+    client = _calendar_client(mocker)
+    ical = client._create_ical_event(
+        {
+            "title": "Fundraising",
+            "start_datetime": "2026-06-26T12:00:00+03:00",
+            "reminder_minutes": 15,
+        },
+        "event-uid",
+    )
+
+    cleared = client._merge_ical_properties(ical, {"reminders": []}, "event-uid")
+    parsed = client._parse_ical_event(cleared)
+    assert parsed is not None
+    assert "reminders" not in parsed
+    assert "VALARM" not in cleared
+
+
+def test_todo_reminders_round_trip_and_update_by_ordered_list(mocker):
+    client = _calendar_client(mocker)
+    ical = client._create_ical_todo(
+        {
+            "summary": "Submit funding request",
+            "reminders": [{"trigger": "-PT6H", "description": "relative reminder"}],
+        },
+        "todo-uid",
+    )
+
+    parsed = client._parse_ical_todo(ical)
+    assert parsed is not None
+    assert parsed["reminders"][0]["minutes_before"] == 360
+
+    updated = client._merge_ical_todo_properties(
+        ical,
+        {
+            "reminders": [
+                {"trigger": "-PT1H", "description": "updated"},
+                {"offset_seconds": -300},
+            ]
+        },
+    )
+    reparsed = client._parse_ical_todo(updated)
+    assert reparsed is not None
+    assert [r["minutes_before"] for r in reparsed["reminders"]] == [60, 5]
+    assert reparsed["reminders"][0]["description"] == "updated"
+
+
+def test_expand_without_window_returns_master_event(mocker):
+    """A recurring event with no expansion window falls back to the master VEVENT.
+
+    Guards against a revert to the `assert start_datetime is not None` that used
+    to sit inside the try block, where the AssertionError was caught by
+    `except Exception` and logged as a failed recurrence expansion rather than
+    the missing-window caller error it is (python:S5779). The fallback value is
+    identical either way — only the diagnosis differs — so the assertion here is
+    that no expansion is attempted.
+    """
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    client = CalendarClient("https://cloud.example.org", "alice", password="app-pw")
+    mocker.patch.object(
+        CalendarClient, "_extract_vevent_data", return_value={"uid": "master"}
+    )
+    expand = mocker.patch(
+        "nextcloud_mcp_server.client.calendar.recurring_ical_events.of"
+    )
+
+    cal = mocker.MagicMock()
+    cal.walk.return_value = [{"rrule": "FREQ=DAILY"}]
+
+    result = client._expand_event_occurrences(
+        cal, start_datetime=None, end_datetime=None, do_expand=True
+    )
+
+    assert result == [{"uid": "master"}]
+    expand.assert_not_called()
+
+
+# ============= Event property round-trips (GH #1251) =============
+#
+# These cover parameters the tools accepted but never wrote to the iCal. Every
+# assertion goes through a reparse rather than a substring check, because the
+# failure mode being guarded against is a property that serialises but does not
+# survive being read back.
+
+
+def _pure_client():
+    """A CalendarClient for the pure iCal helpers.
+
+    Built without going through ``__init__`` so no DAV client — and no
+    credential — is involved; the helpers under test only touch dicts and
+    icalendar objects.
+    """
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    return CalendarClient.__new__(CalendarClient)
+
+
+def _vevent(ical):
+    from icalendar import Calendar as ICalendar
+
+    return ICalendar.from_ical(ical).walk("VEVENT")[0]
+
+
+def _rrule(ical):
+    return _vevent(ical).get("rrule").to_ical().decode()
+
+
+def _valarms(ical):
+    return [sub for sub in _vevent(ical).subcomponents if sub.name == "VALARM"]
+
+
+TIMED_EVENT = {
+    "title": "Standup",
+    "start_datetime": "2026-02-10T10:00:00Z",
+    "end_datetime": "2026-02-10T11:00:00Z",
+}
+
+
+def test_recurrence_end_date_uses_utc_datetime_until_for_timed_events():
+    """RFC 5545 §3.3.10: a DATE-TIME DTSTART requires a UTC DATE-TIME UNTIL.
+
+    A date-only end is inclusive — bounding at midnight would drop the
+    occurrence happening later that same day.
+    """
+    ical = _pure_client()._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-until-timed",
+    )
+
+    assert _rrule(ical) == "FREQ=WEEKLY;UNTIL=20260630T235959Z;BYDAY=TU"
+
+
+def test_recurrence_end_date_uses_date_until_for_all_day_events():
+    """A DATE-valued DTSTART requires a DATE UNTIL, not a date-time.
+
+    Mismatched value types make clients discard the recurrence set, so the
+    series silently never ends.
+    """
+    ical = _pure_client()._create_ical_event(
+        {
+            "title": "Bin day",
+            "start_datetime": "2026-02-10",
+            "end_datetime": "2026-02-11",
+            "all_day": True,
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-until-allday",
+    )
+
+    assert _rrule(ical) == "FREQ=WEEKLY;UNTIL=20260630;BYDAY=TU"
+
+
+def test_all_day_end_date_drops_a_time_of_day_visibly(caplog):
+    """An all-day series can only be bounded by a DATE, so a time is dropped.
+
+    That is the sole correct reading rather than a caller error, but it should
+    not happen invisibly — every other lossy edge in this change set says so.
+    """
+    with caplog.at_level(logging.DEBUG, logger="nextcloud_mcp_server.client.calendar"):
+        ical = _pure_client()._create_ical_event(
+            {
+                "title": "Bin day",
+                "start_datetime": "2026-02-10",
+                "end_datetime": "2026-02-11",
+                "all_day": True,
+                "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+                "recurrence_end_date": "2026-06-30T18:00:00",
+            },
+            "uid-allday-truncate",
+        )
+
+    assert _rrule(ical) == "FREQ=WEEKLY;UNTIL=20260630;BYDAY=TU"
+    assert "cannot express in UNTIL" in caplog.text
+
+
+@pytest.mark.parametrize("bound", ["COUNT=5", "UNTIL=20260101T000000Z"])
+def test_recurrence_end_date_rejects_a_rule_that_already_bounds_itself(bound):
+    """Two end conditions in one request is a contradiction, not a preference.
+
+    RFC 5545 forbids COUNT and UNTIL together, and silently picking a winner is
+    exactly the ignore-the-argument behaviour this change removes.
+    """
+    event_data = {
+        **TIMED_EVENT,
+        "recurrence_rule": f"FREQ=DAILY;{bound}",
+        "recurrence_end_date": "2026-06-30",
+    }
+
+    with pytest.raises(ValueError, match="conflicts with"):
+        _pure_client()._create_ical_event(event_data, "uid-conflict")
+
+
+def test_recurrence_rule_applies_without_an_explicit_recurring_flag():
+    """A rule is itself the intent to recur.
+
+    Requiring ``recurring=True`` as well made the argument a no-op on create
+    while update honoured it unconditionally.
+    """
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "recurrence_rule": "FREQ=DAILY"}, "uid-implied"
+    )
+
+    assert _rrule(ical) == "FREQ=DAILY"
+
+
+def test_recurring_false_suppresses_the_rule_on_create():
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "recurrence_rule": "FREQ=DAILY", "recurring": False},
+        "uid-suppressed",
+    )
+
+    assert "rrule" not in _vevent(ical)
+
+
+def test_update_end_date_alone_rebounds_the_stored_rule():
+    """Moving the end of an already-bounded series is an edit, not a conflict."""
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-rebound",
+    )
+
+    moved = client._merge_ical_properties(stored, {"recurrence_end_date": "2026-07-31"})
+
+    assert _rrule(moved) == "FREQ=WEEKLY;UNTIL=20260731T235959Z;BYDAY=TU"
+
+
+def test_end_date_follows_the_dtstart_written_in_the_same_update():
+    """UNTIL's value type must track the *new* DTSTART, not the replaced one.
+
+    Flipping a timed series to all-day while setting recurrence_end_date in one
+    call used to compute the value type from the stored DTSTART, because the
+    recurrence block ran before ``_apply_date_updates``. The result was a DATE
+    DTSTART against a date-time UNTIL — the mismatch clients silently discard.
+    """
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {**TIMED_EVENT, "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU"}, "uid-flip"
+    )
+
+    flipped = client._merge_ical_properties(
+        stored,
+        {
+            "all_day": True,
+            "start_datetime": "2026-03-10",
+            "end_datetime": "2026-03-11",
+            "recurrence_end_date": "2026-06-30",
+        },
+    )
+
+    assert _rrule(flipped) == "FREQ=WEEKLY;UNTIL=20260630;BYDAY=TU"
+
+
+def test_end_date_follows_a_timed_dtstart_written_in_the_same_update():
+    """The mirror case: all-day flipped to timed takes a UTC date-time UNTIL."""
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            "title": "Bin day",
+            "start_datetime": "2026-02-10",
+            "end_datetime": "2026-02-11",
+            "all_day": True,
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+        },
+        "uid-flip-back",
+    )
+
+    flipped = client._merge_ical_properties(
+        stored,
+        {
+            "all_day": False,
+            "start_datetime": "2026-03-10T09:00:00Z",
+            "end_datetime": "2026-03-10T10:00:00Z",
+            "recurrence_end_date": "2026-06-30",
+        },
+    )
+
+    assert _rrule(flipped) == "FREQ=WEEKLY;UNTIL=20260630T235959Z;BYDAY=TU"
+
+
+def test_update_recurring_false_clears_the_series():
+    """``recurring=False`` used to do nothing; only ``recurrence_rule=""`` worked."""
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {**TIMED_EVENT, "recurrence_rule": "FREQ=DAILY"}, "uid-clear"
+    )
+
+    cleared = client._merge_ical_properties(stored, {"recurring": False})
+
+    assert "rrule" not in _vevent(cleared)
+
+
+def test_color_round_trips_and_can_be_removed():
+    client = _pure_client()
+    stored = client._create_ical_event({**TIMED_EVENT, "color": "tomato"}, "uid-color")
+
+    assert client._parse_ical_event(stored)["color"] == "tomato"
+
+    recoloured = client._merge_ical_properties(stored, {"color": "slateblue"})
+    assert client._parse_ical_event(recoloured)["color"] == "slateblue"
+
+    removed = client._merge_ical_properties(stored, {"color": ""})
+    assert "color" not in client._parse_ical_event(removed)
+
+
+def test_hex_color_is_written_but_warns(caplog):
+    """Nextcloud resolves COLOR through a CSS3 name table, so hex never renders.
+
+    The property is still written for other CalDAV clients; the warning is what
+    stops the caller believing it will show up in Nextcloud.
+    """
+    with caplog.at_level(logging.WARNING):
+        ical = _pure_client()._create_ical_event(
+            {**TIMED_EVENT, "color": "#FF0000"}, "uid-hex"
+        )
+
+    assert str(_vevent(ical).get("color")) == "#FF0000"
+    assert "CSS3 colour names" in caplog.text
+
+
+# ============= Ordered reminders (supersedes PR #969) =============
+
+
+def test_ordered_reminders_round_trip_in_order():
+    """Order is part of the contract: VALARMs come back as they were written."""
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "reminders": [
+                {"action": "EMAIL", "minutes_before": 60, "description": "Prep"},
+                {"action": "DISPLAY", "trigger": "-PT90S", "description": "Now"},
+                {
+                    "action": "DISPLAY",
+                    "trigger_at": "2026-02-09T20:00:00Z",
+                    "description": "Absolute",
+                },
+            ],
+        },
+        "uid-reminders",
+    )
+
+    reminders = client._parse_ical_event(ical)["reminders"]
+
+    assert [r["description"] for r in reminders] == ["Prep", "Now", "Absolute"]
+    # A whole-minute offset comes back as minutes_before; anything else keeps
+    # its raw duration, so exactly one trigger field is ever present.
+    assert reminders[0]["minutes_before"] == 60
+    assert reminders[1]["trigger"] == "-PT1M30S"
+    assert "minutes_before" not in reminders[1]
+    assert reminders[2]["trigger_at"].startswith("2026-02-09T20:00:00")
+
+
+def test_read_reminders_validate_as_the_reminder_model():
+    """What we hand back must be accepted as input again.
+
+    ``Reminder`` permits exactly one trigger field, so a read path emitting both
+    a duration and its minute equivalent would break the round-trip.
+    """
+    from nextcloud_mcp_server.models.calendar import Reminder
+
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "reminders": [
+                {"minutes_before": 30, "related": "END"},
+                {"trigger": "-PT90S"},
+                {"trigger_at": "2026-02-09T20:00:00Z"},
+            ],
+        },
+        "uid-revalidate",
+    )
+
+    for reminder in client._parse_ical_event(ical)["reminders"]:
+        Reminder(**reminder)
+
+
+def test_email_reminder_carries_a_summary():
+    """RFC 5545 §3.6.6 requires SUMMARY on an EMAIL alarm — it is the subject.
+
+    Nextcloud addresses the message from the event's ATTENDEEs and the
+    calendar's sharees, so no alarm-level ATTENDEE is needed.
+    """
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "reminders": [{"action": "EMAIL", "minutes_before": 15}]},
+        "uid-email",
+    )
+
+    alarm = _valarms(ical)[0]
+    assert str(alarm.get("action")) == "EMAIL"
+    assert str(alarm.get("summary")) == "Standup"
+    assert str(alarm.get("description"))
+
+
+def test_audio_alarm_carries_no_description():
+    """RFC 5545 §3.8.6.1: ``audioprop`` has no DESCRIPTION.
+
+    DISPLAY and EMAIL require one, AUDIO does not admit one. Writing it anyway
+    produces a spec-invalid component that only lenient parsers forgive.
+    """
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "reminders": [{"action": "AUDIO", "minutes_before": 10}]},
+        "uid-audio",
+    )
+
+    alarm = _valarms(ical)[0]
+    assert str(alarm.get("action")) == "AUDIO"
+    assert alarm.get("description") is None
+    assert alarm.get("summary") is None
+
+
+def test_negative_minutes_before_is_rejected():
+    """The name says 'before'; a negative value would silently mean 'after'."""
+    from pydantic import ValidationError
+
+    from nextcloud_mcp_server.models.calendar import Reminder
+
+    with pytest.raises(ValidationError):
+        Reminder(minutes_before=-5)
+
+
+def test_related_is_omitted_from_an_absolute_trigger():
+    """RELATED qualifies a duration. On a DATE-TIME trigger it is invalid iCal."""
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "reminders": [{"trigger_at": "2026-02-09T20:00:00Z"}]},
+        "uid-related",
+    )
+
+    trigger = _valarms(ical)[0].get("trigger")
+    assert "RELATED" not in trigger.params
+    assert trigger.params.get("VALUE") == "DATE-TIME"
+
+
+def test_related_survives_on_a_duration_trigger():
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "reminders": [{"minutes_before": 10, "related": "END"}]},
+        "uid-related-duration",
+    )
+
+    assert _valarms(ical)[0].get("trigger").params.get("RELATED") == "END"
+
+
+def test_reminder_email_shorthand_adds_a_second_email_alarm():
+    """The legacy pair stays supported: DISPLAY, plus EMAIL at the same offset."""
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "reminder_minutes": 15, "reminder_email": True},
+        "uid-shorthand",
+    )
+
+    alarms = _valarms(ical)
+    assert [str(a.get("action")) for a in alarms] == ["DISPLAY", "EMAIL"]
+    assert {a.get("trigger").dt for a in alarms} == {timedelta(minutes=-15)}
+
+
+def _shorthand_event():
+    """An event carrying both shorthand alarms, as the create path builds them."""
+    client = _pure_client()
+    return client, client._create_ical_event(
+        {**TIMED_EVENT, "reminder_minutes": 15, "reminder_email": True},
+        "uid-shorthand-update",
+    )
+
+
+def test_reminder_email_alone_keeps_the_stored_offset():
+    """Updating one shorthand field must not erase what the other one set.
+
+    ``reminder_email`` on its own used to find no ``reminder_minutes``, clear
+    every VALARM and return before adding any back — silent total loss, and
+    worse than master, where the flag was merely inert.
+    """
+    client, stored = _shorthand_event()
+
+    updated = client._merge_ical_properties(stored, {"reminder_email": False})
+
+    reminders = client._parse_ical_event(updated)["reminders"]
+    assert [r["action"] for r in reminders] == ["DISPLAY"]
+    assert reminders[0]["minutes_before"] == 15
+
+
+def test_reminder_minutes_alone_keeps_the_stored_email_alarm():
+    """The mirror case: changing the offset must not drop the EMAIL alarm."""
+    client, stored = _shorthand_event()
+
+    updated = client._merge_ical_properties(stored, {"reminder_minutes": 45})
+
+    reminders = client._parse_ical_event(updated)["reminders"]
+    assert [r["action"] for r in reminders] == ["DISPLAY", "EMAIL"]
+    assert {r["minutes_before"] for r in reminders} == {45}
+
+
+def test_reminder_email_alone_can_add_an_email_alarm_to_a_display_only_event():
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {**TIMED_EVENT, "reminder_minutes": 20}, "uid-display-only"
+    )
+
+    updated = client._merge_ical_properties(stored, {"reminder_email": True})
+
+    reminders = client._parse_ical_event(updated)["reminders"]
+    assert [r["action"] for r in reminders] == ["DISPLAY", "EMAIL"]
+    assert {r["minutes_before"] for r in reminders} == {20}
+
+
+def test_recurrence_end_reads_back_under_the_name_it_is_written_with():
+    """A value read off an event must be usable as an update argument.
+
+    The write side is ``recurrence_end_date``; surfacing the read side as
+    ``recurrence_end`` would hand callers a key that does nothing when passed
+    back — the same accept-then-ignore trap this change set exists to remove.
+    """
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-readback",
+    )
+
+    parsed = client._parse_ical_event(ical)
+    assert "recurrence_end" not in parsed
+    assert parsed["recurrence_end_date"].startswith("2026-06-30")
+
+    # Feeding it straight back must be a no-op, not a rejection or a shift.
+    reapplied = client._merge_ical_properties(
+        ical, {"recurrence_end_date": parsed["recurrence_end_date"]}
+    )
+    assert _rrule(reapplied) == _rrule(ical)
+
+
+def test_shorthand_warns_when_collapsing_several_representable_alarms(caplog):
+    """Two alarms the shorthand can each express still collapse into one.
+
+    The earlier check only looked for a missing ``minutes_before``, so a pair of
+    DISPLAY alarms at different offsets was judged representable and silently
+    became a single alarm. The warning has to compare against what the rebuild
+    actually produces, not against one shape it cannot express.
+    """
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "reminders": [
+                {"minutes_before": 10, "description": "Event reminder"},
+                {"minutes_before": 30, "description": "Event reminder"},
+            ],
+        },
+        "uid-collapse",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        updated = client._merge_ical_properties(stored, {"reminder_minutes": 5})
+
+    assert "does not reproduce" in caplog.text
+    assert [
+        r["minutes_before"] for r in client._parse_ical_event(updated)["reminders"]
+    ] == [5]
+
+
+def test_shorthand_warns_when_dropping_a_related_qualifier(caplog):
+    """``RELATED=END`` is representable-looking but not carried by the rebuild."""
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "reminders": [{"minutes_before": 10, "related": "END"}],
+        },
+        "uid-related-loss",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        client._merge_ical_properties(stored, {"reminder_minutes": 10})
+
+    assert "does not reproduce" in caplog.text
+
+
+def test_shorthand_is_quiet_when_the_rebuild_reproduces_the_stored_alarms(caplog):
+    """The warning must not cry wolf on the case it is meant to allow."""
+    client, stored = _shorthand_event()
+
+    with caplog.at_level(logging.WARNING):
+        client._merge_ical_properties(stored, {"reminder_minutes": 15})
+
+    assert "does not reproduce" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"reminder_minutes": 45},
+        {"reminder_email": False},
+        {"reminder_minutes": 45, "reminder_email": False},
+    ],
+    ids=["new-offset", "drop-email", "both"],
+)
+def test_shorthand_is_quiet_when_the_caller_is_simply_changing_the_value(
+    caplog, update
+):
+    """Changing the offset, or dropping the email alarm, is the request itself.
+
+    An earlier version compared each stored offset against the new target, so it
+    fired on the most ordinary update there is — nudging a reminder's offset.
+    A warning that fires on the common path trains the reader to ignore it, which
+    costs exactly the shape-loss cases it exists to surface.
+    """
+    client, stored = _shorthand_event()
+
+    with caplog.at_level(logging.WARNING):
+        client._merge_ical_properties(stored, update)
+
+    assert "does not reproduce" not in caplog.text
+
+
+def test_shorthand_update_warns_before_replacing_alarms_it_cannot_express(caplog):
+    """The shorthand carries one whole-minute offset, so richer alarms are lost.
+
+    That is inherent to the two-field form rather than a bug, but it is
+    destructive, so it must not happen quietly — the caller needs to know the
+    reminders list is the tool for editing those.
+    """
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "reminders": [
+                {"trigger_at": "2026-02-09T20:00:00Z", "description": "Absolute"},
+                {"trigger": "-PT90S", "description": "Sub-minute"},
+            ],
+        },
+        "uid-unrepresentable",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        updated = client._merge_ical_properties(stored, {"reminder_minutes": 30})
+
+    assert "does not reproduce" in caplog.text
+    reminders = client._parse_ical_event(updated)["reminders"]
+    assert [r["minutes_before"] for r in reminders] == [30]
+
+
+def test_reminder_minutes_zero_still_clears_everything():
+    """An explicit zero is a request to remove the alarms, not a missing value."""
+    client, stored = _shorthand_event()
+
+    updated = client._merge_ical_properties(stored, {"reminder_minutes": 0})
+
+    assert "reminders" not in client._parse_ical_event(updated)
+
+
+def test_recurrence_end_date_is_utc_even_for_a_tzid_bound_dtstart():
+    """RFC 5545 §3.3.10: UNTIL is UTC whenever DTSTART is a date-time.
+
+    A TZID-bound DTSTART is the case most likely to tempt a local-time UNTIL,
+    which clients would reject along with the whole recurrence set.
+    """
+    ical = _pure_client()._create_ical_event(
+        {
+            "title": "NY standup",
+            "start_datetime": "2026-02-10T10:00:00",
+            "end_datetime": "2026-02-10T11:00:00",
+            "timezone": "America/New_York",
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-tzid-until",
+    )
+
+    assert str(_vevent(ical)["DTSTART"].params.get("TZID")) == "America/New_York"
+    # 23:59:59 in New York on the 30th, expressed as the UTC instant RFC 5545
+    # requires: 03:59:59 on July 1st.
+    assert _rrule(ical) == "FREQ=WEEKLY;UNTIL=20260701T035959Z;BYDAY=TU"
+
+
+def test_evening_occurrence_survives_its_own_recurrence_end_date():
+    """The last occurrence must not be dropped for being late in the day.
+
+    An evening event in a zone behind UTC has a real instant on the *following*
+    UTC date. Anchoring the inclusive end-of-day to UTC midnight put the cutoff
+    before that instant, silently excluding the very occurrence the caller named
+    the end date to keep. 21:00 on 2026-06-30 in New York is 01:00Z on 07-01,
+    which a UTC-anchored ``UNTIL=20260630T235959Z`` would have excluded.
+    """
+    ical = _pure_client()._create_ical_event(
+        {
+            "title": "Evening class",
+            "start_datetime": "2026-06-02T21:00:00",
+            "end_datetime": "2026-06-02T22:00:00",
+            "timezone": "America/New_York",
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU",
+            "recurrence_end_date": "2026-06-30",
+        },
+        "uid-evening",
+    )
+
+    component = _vevent(ical)
+    until = component.get("rrule")["UNTIL"][0]
+    last_occurrence = component["DTSTART"].dt.replace(month=6, day=30)
+
+    assert until >= last_occurrence, (
+        f"UNTIL {until} excludes the 2026-06-30 occurrence at {last_occurrence}"
+    )
+
+
+def test_unrelated_update_preserves_reminders_but_empty_list_clears_them():
+    """Omission preserves, ``[]`` clears — the distinction the API promises."""
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {**TIMED_EVENT, "reminders": [{"minutes_before": 10}, {"minutes_before": 60}]},
+        "uid-preserve",
+    )
+
+    preserved = client._merge_ical_properties(stored, {"location": "Office"})
+    assert len(client._parse_ical_event(preserved)["reminders"]) == 2
+
+    cleared = client._merge_ical_properties(stored, {"reminders": []})
+    assert "reminders" not in client._parse_ical_event(cleared)
+
+
+def test_todo_reminders_round_trip():
+    """VTODOs had no alarm handling at all before this change."""
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {
+            "summary": "Water plants",
+            "reminders": [{"trigger": "-PT6H", "description": "Soon"}],
+        },
+        "uid-todo-reminder",
+    )
+
+    assert client._parse_ical_todo(ical)["reminders"] == [
+        {"action": "DISPLAY", "description": "Soon", "minutes_before": 360}
+    ]
+
+
+def test_todo_reminder_without_a_description_says_todo():
+    """The per-component default has to reach the explicit reminders branch.
+
+    ``Reminder.description`` deliberately defaults to None so the caller's
+    component-specific wording wins. A model-level default would silently label
+    every todo alarm "Event reminder", since the todo tools expose no
+    reminder_minutes shorthand to carry the distinction.
+    """
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {"summary": "Water plants", "reminders": [{"minutes_before": 30}]},
+        "uid-todo-default",
+    )
+
+    assert client._parse_ical_todo(ical)["reminders"][0]["description"] == (
+        "Todo reminder"
+    )
+
+
+FOREIGN_ALARM_TODO = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Other Client//EN
+BEGIN:VTODO
+UID:uid-foreign
+SUMMARY:Backup
+BEGIN:VALARM
+ACTION:PROCEDURE
+TRIGGER;RELATED=PARENT:-PT30M
+DESCRIPTION:Legacy
+END:VALARM
+END:VTODO
+END:VCALENDAR
+"""
+
+
+def test_foreign_valarm_action_does_not_break_the_model(caplog):
+    """Stored data comes from any CalDAV client, not just this one.
+
+    RFC 5545 lets ACTION carry any IANA or ``X-`` token, and RELATED anything at
+    all in a malformed file. Left unnormalised, either fails ``Reminder``'s
+    Literal — and because ``Todo(**todo_data)`` is built in a plain list
+    comprehension, that would fail the entire listing rather than the one item.
+    Nextcloud discards an alarm it does not recognise; so do we.
+    """
+    from nextcloud_mcp_server.models.calendar import Todo
+
+    with caplog.at_level(logging.WARNING):
+        todo_data = _pure_client()._parse_ical_todo(FOREIGN_ALARM_TODO)
+
+    assert todo_data["reminders"] == [
+        {"action": "DISPLAY", "description": "Legacy", "minutes_before": 30}
+    ]
+    assert "PROCEDURE" in caplog.text
+
+    # The model is what actually crashed the listing, so build it.
+    todo = Todo(**todo_data)
+    assert todo.reminders[0].action == "DISPLAY"
+    assert todo.reminders[0].related is None
+
+
+def _todo_with_alarm(alarm_body: str) -> str:
+    return (
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Other Client//EN\n"
+        "BEGIN:VTODO\nUID:uid-malformed\nSUMMARY:Backup\n"
+        f"BEGIN:VALARM\n{alarm_body}\nEND:VALARM\n"
+        "END:VTODO\nEND:VCALENDAR\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "alarm_body",
+    [
+        "ACTION:PROCEDURE\nTRIGGER:-PT30M\nDESCRIPTION:Legacy",
+        "ACTION:X-CUSTOM-THING\nTRIGGER:-PT30M",
+        "ACTION:DISPLAY\nTRIGGER;RELATED=PARENT:-PT30M",
+        "ACTION:DISPLAY\nDESCRIPTION:No trigger at all",
+        "ACTION:DISPLAY",
+    ],
+    ids=[
+        "legacy-procedure-action",
+        "x-prefixed-action",
+        "foreign-related-param",
+        "missing-trigger",
+        "bare-action-only",
+    ],
+)
+def test_no_stored_alarm_shape_can_break_a_listing(alarm_body):
+    """Whatever another CalDAV client wrote, one alarm costs at most itself.
+
+    ``Todo(**todo_data)`` is built in a plain list comprehension, so a
+    ValidationError from any nested Reminder fails the entire
+    ``nc_calendar_list_todos`` call rather than the single item. Every field the
+    model constrains — the action Literal, the related Literal, the exactly-one
+    trigger rule — is therefore normalised or dropped on the way out of the iCal,
+    and this covers each of those shapes rather than the one that was reported.
+    """
+    from nextcloud_mcp_server.models.calendar import Todo
+
+    todo_data = _pure_client()._parse_ical_todo(_todo_with_alarm(alarm_body))
+
+    todo = Todo(**todo_data)
+    for reminder in todo.reminders:
+        assert reminder.action in ("DISPLAY", "EMAIL", "AUDIO")
+        assert reminder.related in (None, "START", "END")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"minutes_before": 5, "trigger": "-PT5M"},
+        {"trigger_at": "2026-01-01T00:00:00Z", "related": "END"},
+    ],
+    ids=["no-trigger", "two-triggers", "related-with-absolute"],
+)
+def test_reminder_model_rejects_incoherent_triggers(payload):
+    from pydantic import ValidationError
+
+    from nextcloud_mcp_server.models.calendar import Reminder
+
+    with pytest.raises(ValidationError):
+        Reminder(**payload)
+
+
+# ============= Todo DUE/DTSTART value type (GH #1274) =============
+
+
+def test_date_only_todo_dates_stay_dates():
+    """A whole-day due date must not widen to midnight UTC (#1274).
+
+    ``2026-08-08`` came back as ``2026-08-08T00:00:00+00:00``, which is both a
+    different value than the caller gave and the wrong day west of UTC.
+    """
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {"summary": "Call the mechanic", "due": "2026-08-08", "dtstart": "2026-08-08"},
+        "uid-todo-date",
+    )
+
+    assert "DUE;VALUE=DATE:20260808" in ical
+    parsed = client._parse_ical_todo(ical)
+    assert parsed["due"] == "2026-08-08"
+    assert parsed["dtstart"] == "2026-08-08"
+
+
+def test_timed_todo_dates_still_carry_a_zone():
+    """The DATE-TIME path retains an explicit caller-supplied zone."""
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {"summary": "Standup", "due": "2026-08-08T14:30:00Z"}, "uid-todo-timed"
+    )
+
+    assert client._parse_ical_todo(ical)["due"] == "2026-08-08T14:30:00+00:00"
+
+
+def test_timed_todo_promotes_toronto_offset_to_iana_timezone():
+    """The date-only fix must retain the fork's canonical Toronto TZID."""
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {"summary": "Toronto", "due": "2026-08-08T14:30:00-04:00"},
+        "uid-todo-toronto",
+    )
+
+    assert "DUE;TZID=America/Toronto:20260808T143000" in ical
+    assert "BEGIN:VTIMEZONE" in ical
+    assert client._parse_ical_todo(ical)["due"] == "2026-08-08T14:30:00-04:00"
+
+
+def test_mixed_todo_dates_stay_date_times():
+    """RFC 5545 ties DUE's value type to DTSTART's, so a time on either side wins."""
+    client = _pure_client()
+    ical = client._create_ical_todo(
+        {"summary": "Ship it", "dtstart": "2026-08-08", "due": "2026-08-09T17:00:00Z"},
+        "uid-todo-mixed",
+    )
+
+    parsed = client._parse_ical_todo(ical)
+    assert parsed["dtstart"] == "2026-08-08T00:00:00+00:00"
+    assert parsed["due"] == "2026-08-09T17:00:00+00:00"
+
+
+def test_updating_only_the_due_date_inherits_the_stored_value_type():
+    """An all-day todo stays all-day when its due date is moved."""
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Renew passport", "due": "2026-08-08", "dtstart": "2026-08-01"},
+        "uid-todo-update",
+    )
+
+    merged = client._merge_ical_todo_properties(stored, {"due": "2026-09-30"})
+
+    parsed = client._parse_ical_todo(merged)
+    assert parsed["due"] == "2026-09-30"
+    assert parsed["dtstart"] == "2026-08-01"
+
+
+def test_making_only_one_half_of_a_whole_day_pair_timed_is_rejected():
+    """The unsupplied side would be stranded as a DATE (RFC 5545 §3.8.2.3).
+
+    Rewriting the stored DUE to match would mean inventing a time of day for a
+    property the caller never mentioned — and midnight would land it *before*
+    the new DTSTART. The VEVENT path rejects the same flip.
+    """
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Move house", "due": "2026-08-08", "dtstart": "2026-08-01"},
+        "uid-todo-half-flip",
+    )
+
+    with pytest.raises(ValueError, match="dtstart and due"):
+        client._merge_ical_todo_properties(stored, {"dtstart": "2026-08-08T09:00:00Z"})
+
+
+def test_making_a_whole_day_todo_timed_works_when_both_sides_are_given():
+    """The rejection above is about the partial update, not the flip itself."""
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Move house", "due": "2026-08-08", "dtstart": "2026-08-01"},
+        "uid-todo-full-flip",
+    )
+
+    merged = client._merge_ical_todo_properties(
+        stored, {"dtstart": "2026-08-08T09:00:00Z", "due": "2026-08-08T17:00:00Z"}
+    )
+
+    parsed = client._parse_ical_todo(merged)
+    assert parsed["dtstart"] == "2026-08-08T09:00:00+00:00"
+    assert parsed["due"] == "2026-08-08T17:00:00+00:00"
+
+
+def test_an_unparseable_date_does_not_silently_rebuild_the_todo():
+    """The rebuild fallback answers bad input by dropping stored properties."""
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Keep me", "categories": "home", "due": "2026-08-08"},
+        "uid-todo-bad-date",
+    )
+
+    with pytest.raises(ValueError):
+        client._merge_ical_todo_properties(stored, {"due": "not-a-date"})
+
+
+def test_a_non_value_error_does_not_silently_rebuild_the_todo():
+    """Only ValueError used to propagate; everything else rebuilt from the update dict.
+
+    A malformed reminder raises AttributeError, which the catch-all answered by
+    returning ``_create_ical_todo(todo_data, ...)`` — a todo carrying nothing but the
+    fields of this one failed call, with the stored summary, categories and due date
+    dropped and success reported.
+    """
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Keep me", "categories": "home", "due": "2026-08-08"},
+        "uid-todo-bad-reminder",
+    )
+
+    with pytest.raises(AttributeError):
+        client._merge_ical_todo_properties(stored, {"reminders": ["not-a-mapping"]})
+
+
+def test_unrelated_todo_update_survives_a_stored_mismatch():
+    """The guard must only fire for the pair the caller is actually writing."""
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Legacy", "due": "2026-08-08"}, "uid-todo-untouched"
+    ).replace("DTSTAMP", "DTSTART;VALUE=DATE-TIME:20260801T090000Z\r\nDTSTAMP", 1)
+
+    merged = client._merge_ical_todo_properties(stored, {"summary": "Renamed"})
+
+    parsed = client._parse_ical_todo(merged)
+    assert parsed["summary"] == "Renamed"
+    assert parsed["due"] == "2026-08-08"
+
+
+def test_updating_a_timed_todo_with_a_bare_date_keeps_it_timed():
+    """A stored DATE-TIME DTSTART forbids a DATE-valued DUE, so it widens."""
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Review PR", "dtstart": "2026-08-08T09:00:00Z"}, "uid-todo-timed-up"
+    )
+
+    merged = client._merge_ical_todo_properties(stored, {"due": "2026-08-09"})
+
+    assert client._parse_ical_todo(merged)["due"] == "2026-08-09T00:00:00+00:00"
+
+
+class TestDurationWithoutDtend:
+    """RFC 5545 3.6.1 lets a VEVENT carry DURATION instead of DTEND.
+
+    Parsed with no end at all, such an event reads as zero-length -- so it
+    consumes no time and blocks nothing in availability, and every tool that
+    reports an end time reports none.
+    """
+
+    ICS = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n"
+        "BEGIN:VEVENT\r\nUID:dur-1\r\nSUMMARY:Workshop\r\n"
+        "{dtstart}"
+        "{extra}"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+
+    @staticmethod
+    def _parse(ics: str) -> dict:
+        return _pure_client()._extract_vevent_data(_vevent(ics))
+
+    def test_duration_becomes_an_end_datetime(self):
+        data = self._parse(
+            self.ICS.format(
+                dtstart="DTSTART:20260210T100000Z\r\n", extra="DURATION:PT90M\r\n"
+            )
+        )
+        assert data["start_datetime"] == "2026-02-10T10:00:00+00:00"
+        assert data["end_datetime"] == "2026-02-10T11:30:00+00:00"
+
+    def test_dtend_still_wins_over_duration(self):
+        data = self._parse(
+            self.ICS.format(
+                dtstart="DTSTART:20260210T100000Z\r\n",
+                extra="DTEND:20260210T103000Z\r\nDURATION:PT90M\r\n",
+            )
+        )
+        assert data["end_datetime"] == "2026-02-10T10:30:00+00:00"
+
+    def test_duration_inherits_the_start_timezone(self):
+        data = self._parse(
+            self.ICS.format(
+                dtstart="DTSTART;TZID=Europe/Amsterdam:20260210T100000\r\n",
+                extra="DURATION:PT1H\r\n",
+            )
+        )
+        assert data["end_datetime"].startswith("2026-02-10T11:00:00")
+        assert data["end_tz"] == "Europe/Amsterdam"
+
+    def test_all_day_duration_stays_a_date(self):
+        data = self._parse(
+            self.ICS.format(
+                dtstart="DTSTART;VALUE=DATE:20260210\r\n", extra="DURATION:P2D\r\n"
+            )
+        )
+        assert data["all_day"] is True
+        assert data["end_datetime"] == "2026-02-12"
+
+    def test_neither_dtend_nor_duration_leaves_no_end(self):
+        data = self._parse(
+            self.ICS.format(dtstart="DTSTART:20260210T100000Z\r\n", extra="")
+        )
+        assert "end_datetime" not in data
+
+
+# --- ORGANIZER / ATTENDEE scheduling properties -----------------------------
+#
+# Nextcloud only sends iTIP messages -- including the CANCEL on delete -- for an
+# event whose ORGANIZER is the calendar user. The Calendar web app adds it as
+# soon as an attendee is added; a raw CalDAV PUT has to do the same.
+
+
+def _organizer():
+    from icalendar import vCalAddress, vText
+
+    organizer = vCalAddress("mailto:owner@example.com")
+    organizer.params["CN"] = vText("Owner Name")
+    return organizer
+
+
+def _attendees_by_address(ical):
+    from nextcloud_mcp_server.client.calendar import _as_list
+
+    return {
+        str(a).lower().removeprefix("mailto:"): a
+        for a in _as_list(_vevent(ical).get("attendee"))
+    }
+
+
+def test_create_with_attendees_sets_organizer_and_scheduling_params():
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"},
+        "uid-organizer",
+        organizer=_organizer(),
+    )
+
+    vevent = _vevent(ical)
+    assert str(vevent["organizer"]) == "mailto:owner@example.com"
+    assert vevent["organizer"].params["CN"] == "Owner Name"
+
+    attendees = _attendees_by_address(ical)
+    assert set(attendees) == {"owner@example.com", "guest@example.com"}
+
+    owner = attendees["owner@example.com"].params
+    assert owner["ROLE"] == "CHAIR"
+    assert owner["PARTSTAT"] == "ACCEPTED"
+
+    guest = attendees["guest@example.com"].params
+    assert guest["ROLE"] == "REQ-PARTICIPANT"
+    assert guest["PARTSTAT"] == "NEEDS-ACTION"
+    assert guest["RSVP"] == "TRUE"
+
+
+def test_create_without_attendees_sets_no_organizer():
+    ical = _pure_client()._create_ical_event(
+        dict(TIMED_EVENT), "uid-no-attendees", organizer=_organizer()
+    )
+
+    vevent = _vevent(ical)
+    assert "ORGANIZER" not in vevent
+    assert "ATTENDEE" not in vevent
+
+
+def test_create_with_unknown_organizer_still_adds_attendees():
+    """If the principal address cannot be resolved, attendees are not dropped."""
+    ical = _pure_client()._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"},
+        "uid-no-organizer",
+    )
+
+    assert "ORGANIZER" not in _vevent(ical)
+    assert set(_attendees_by_address(ical)) == {"guest@example.com"}
+
+
+def test_update_adds_missing_organizer_and_keeps_existing_replies():
+    client = _pure_client()
+    created = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"}, "uid-merge"
+    )
+    # The guest has since accepted -- an update must not reset that.
+    accepted = created.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED").replace(
+        ";RSVP=TRUE", ""
+    )
+
+    merged = client._merge_ical_properties(
+        accepted,
+        {"attendees": "guest@example.com,second@example.com"},
+        organizer=_organizer(),
+    )
+
+    vevent = _vevent(merged)
+    assert str(vevent["organizer"]) == "mailto:owner@example.com"
+
+    attendees = _attendees_by_address(merged)
+    assert set(attendees) == {
+        "owner@example.com",
+        "guest@example.com",
+        "second@example.com",
+    }
+    assert attendees["guest@example.com"].params["PARTSTAT"] == "ACCEPTED"
+    assert attendees["second@example.com"].params["PARTSTAT"] == "NEEDS-ACTION"
+
+
+def test_update_keeps_foreign_organizer():
+    """An event organised by someone else keeps its ORGANIZER."""
+    client = _pure_client()
+    created = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"},
+        "uid-foreign",
+        organizer=_organizer(),
+    )
+    foreign = created.replace("owner@example.com", "boss@example.com")
+
+    merged = client._merge_ical_properties(
+        foreign, {"attendees": "guest@example.com"}, organizer=_organizer()
+    )
+
+    assert str(_vevent(merged)["organizer"]) == "mailto:boss@example.com"
+    assert "owner@example.com" not in _attendees_by_address(merged)
+
+
+def test_parse_single_attendee_is_not_split_into_characters():
+    """A lone ATTENDEE is a bare vCalAddress; iterating it walked its characters."""
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"}, "uid-single"
+    )
+
+    event = client._parse_ical_event(ical)
+
+    assert event is not None
+    assert event["attendees"] == "guest@example.com"
+
+
+def test_parse_returns_organizer():
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"},
+        "uid-parse-organizer",
+        organizer=_organizer(),
+    )
+
+    event = client._parse_ical_event(ical)
+
+    assert event is not None
+    assert event["organizer"] == "owner@example.com"
+    assert event["attendees"] == "owner@example.com,guest@example.com"
+
+
+async def test_organizer_address_comes_from_principal(mocker):
+    principal = mocker.Mock()
+    principal.calendar_user_address_set = mocker.AsyncMock(
+        return_value=[
+            "/remote.php/dav/principals/users/owner/",
+            "mailto:owner@example.com",
+        ]
+    )
+    principal.get_display_name = mocker.AsyncMock(return_value="Owner Name")
+    client = _pure_client()
+    client._dav_client = mocker.Mock(
+        get_principal=mocker.AsyncMock(return_value=principal)
+    )
+
+    organizer = await client._organizer_address()
+    again = await client._organizer_address()
+
+    assert organizer is not None
+    assert str(organizer) == "mailto:owner@example.com"
+    assert organizer.params["CN"] == "Owner Name"
+    assert again is organizer
+    principal.calendar_user_address_set.assert_awaited_once()
+
+
+async def test_organizer_address_without_mailto_returns_none(mocker):
+    principal = mocker.Mock()
+    principal.calendar_user_address_set = mocker.AsyncMock(
+        return_value=["/remote.php/dav/principals/users/owner/"]
+    )
+    client = _pure_client()
+    client._dav_client = mocker.Mock(
+        get_principal=mocker.AsyncMock(return_value=principal)
+    )
+
+    assert await client._organizer_address() is None
+
+
+async def test_create_event_threads_organizer_into_the_put(mocker):
+    """create_event resolves the organizer and writes it into the stored iCal."""
+    client = _pure_client()
+    calendar = mocker.Mock()
+    calendar.save_event = mocker.AsyncMock(
+        return_value=mocker.Mock(url="https://x/e.ics")
+    )
+    mocker.patch.object(client, "_ensure_calendar_home", mocker.AsyncMock())
+    mocker.patch.object(client, "_get_calendar", return_value=calendar)
+    resolve = mocker.patch.object(
+        client, "_organizer_address", mocker.AsyncMock(return_value=_organizer())
+    )
+
+    await client.create_event(
+        "personal", {**TIMED_EVENT, "attendees": "guest@example.com"}
+    )
+
+    resolve.assert_awaited_once()
+    stored = calendar.save_event.await_args.kwargs["ical"]
+    assert str(_vevent(stored)["organizer"]) == "mailto:owner@example.com"
+
+
+async def test_create_event_without_attendees_skips_organizer_lookup(mocker):
+    """No attendees means no scheduling, so no principal round-trip."""
+    client = _pure_client()
+    calendar = mocker.Mock()
+    calendar.save_event = mocker.AsyncMock(
+        return_value=mocker.Mock(url="https://x/e.ics")
+    )
+    mocker.patch.object(client, "_ensure_calendar_home", mocker.AsyncMock())
+    mocker.patch.object(client, "_get_calendar", return_value=calendar)
+    resolve = mocker.patch.object(client, "_organizer_address", mocker.AsyncMock())
+
+    await client.create_event("personal", dict(TIMED_EVENT))
+
+    resolve.assert_not_awaited()
+
+
+def test_update_of_legacy_event_adds_missing_organizer():
+    """An event stored with attendees but no ORGANIZER gets one on any update."""
+    client = _pure_client()
+    legacy = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"}, "uid-legacy"
+    )
+    accepted = legacy.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED")
+
+    merged = client._merge_ical_properties(
+        accepted, {"title": "Renamed"}, organizer=_organizer()
+    )
+
+    assert str(_vevent(merged)["organizer"]) == "mailto:owner@example.com"
+    attendees = _attendees_by_address(merged)
+    assert set(attendees) == {"owner@example.com", "guest@example.com"}
+    assert attendees["guest@example.com"].params["PARTSTAT"] == "ACCEPTED"
+
+
+async def test_update_event_resolves_organizer_for_legacy_attendees(mocker):
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {**TIMED_EVENT, "attendees": "guest@example.com"}, "uid-legacy-put"
+    )
+    event = mocker.Mock(data=stored, url="https://x/e.ics")
+    event.load = mocker.Mock(return_value=None)
+    mocker.patch.object(client, "_ensure_calendar_home", mocker.AsyncMock())
+    mocker.patch.object(client, "_get_calendar", return_value=mocker.Mock())
+    mocker.patch.object(
+        client, "_async_object_by_uid", mocker.AsyncMock(return_value=event)
+    )
+    mocker.patch.object(
+        client, "_require_current_etag", mocker.AsyncMock(return_value='"e"')
+    )
+    put = mocker.patch.object(
+        client, "_conditional_update", mocker.AsyncMock(return_value='"n"')
+    )
+    resolve = mocker.patch.object(
+        client, "_organizer_address", mocker.AsyncMock(return_value=_organizer())
+    )
+
+    await client.update_event("personal", "uid-legacy-put", {"title": "x"}, etag='"e"')
+
+    resolve.assert_awaited_once()
+    written = put.await_args.args[1]
+    assert str(_vevent(written)["organizer"]) == "mailto:owner@example.com"
+
+
+# --- bulk operations on recurring series (#1499) ------------------------------
+
+
+def test_expanded_occurrence_carries_recurrence_id():
+    import datetime as dt
+
+    from icalendar import Calendar
+
+    client = _pure_client()
+    ical = client._create_ical_event(
+        {
+            **TIMED_EVENT,
+            "start_datetime": "2026-09-21T10:00:00",
+            "end_datetime": "2026-09-21T10:30:00",
+            "recurrence_rule": "FREQ=WEEKLY;COUNT=4",
+        },
+        "uid-series",
+    )
+
+    occurrences = client._expand_event_occurrences(
+        Calendar.from_ical(ical),
+        dt.datetime(2026, 9, 28),
+        dt.datetime(2026, 9, 29),
+        do_expand=True,
+    )
+
+    assert len(occurrences) == 1
+    assert occurrences[0]["recurrence_id"].startswith("2026-09-28T10:00:00")
+    assert not occurrences[0].get("recurring")
+
+
+def _match(uid, recurring=False, calendar="personal"):
+    event = {"uid": uid, "title": uid, "calendar_name": calendar}
+    if recurring:
+        # How an expanded occurrence of a series comes back from a listing.
+        event["recurrence_id"] = "2026-09-28T10:00:00"
+    return event
+
+
+def test_bulk_targets_dedupes_and_skips_series_without_opt_in():
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    events = [_match("single"), _match("series", True), _match("series", True)]
+
+    targets, skipped = CalendarClient._bulk_targets(events, False, "delete")
+
+    assert [e["uid"] for e in targets] == ["single"]
+    assert [(s["uid"], s["status"]) for s in skipped] == [("series", "skipped")]
+
+
+def test_bulk_targets_acts_on_series_once_with_opt_in():
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    events = [
+        _match("series", True),
+        _match("series", True),
+        _match("series", True, "work"),
+    ]
+
+    targets, skipped = CalendarClient._bulk_targets(events, True, "update")
+
+    assert [(e["uid"], e["calendar_name"]) for e in targets] == [
+        ("series", "personal"),
+        ("series", "work"),
+    ]
+    assert skipped == []
+
+
+def test_bulk_targets_never_moves_a_series():
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    targets, skipped = CalendarClient._bulk_targets(
+        [_match("series", True)], True, "move"
+    )
+
+    assert targets == []
+    assert skipped[0]["status"] == "skipped"
+
+
+# --- VTIMEZONE RDATE layout --------------------------------------------------
+#
+# ``Timezone.from_tzinfo`` writes every DST transition into one comma-separated
+# RDATE. ical.js (Thunderbird) reads only the first value of each RDATE, so the
+# zone degrades to its standard offset and summer-time events land an hour off.
+# One RDATE property per value is what it can read.
+
+
+def _rdate_props(vtimezone):
+    """Every RDATE property of every sub-component, as a flat list."""
+    props = []
+    for sub in vtimezone.subcomponents:
+        rdate = sub.get("RDATE")
+        if rdate is None:
+            continue
+        props.extend(rdate if isinstance(rdate, list) else [rdate])
+    return props
+
+
+def _rdate_values(vtimezone):
+    return sorted(d.dt for p in _rdate_props(vtimezone) for d in p.dts)
+
+
+def _vtimezones(ical):
+    from icalendar import Calendar as ICalendar
+
+    return ICalendar.from_ical(ical).walk("VTIMEZONE")
+
+
+def _multi_valued_rdates(vtimezone):
+    return [p for p in _rdate_props(vtimezone) if len(p.dts) != 1]
+
+
+def test_split_vtimezone_rdates_leaves_one_value_per_rdate():
+    from zoneinfo import ZoneInfo
+
+    from icalendar import Timezone
+
+    from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
+
+    tz = Timezone.from_tzinfo(ZoneInfo("Europe/Berlin"))
+    before = _rdate_values(tz)
+    # Guard the premise: icalendar really does emit comma-separated RDATEs.
+    assert _multi_valued_rdates(tz)
+
+    result = _split_vtimezone_rdates(tz)
+
+    assert result is tz
+    assert len(before) > 2
+    assert _rdate_props(result)
+    assert _multi_valued_rdates(result) == []
+    assert _rdate_values(result) == before
+
+
+def test_split_vtimezone_rdates_survives_serialisation():
+    from zoneinfo import ZoneInfo
+
+    from icalendar import Timezone
+
+    from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
+
+    tz = _split_vtimezone_rdates(Timezone.from_tzinfo(ZoneInfo("Europe/Berlin")))
+    lines = [
+        line for line in tz.to_ical().decode().splitlines() if line.startswith("RDATE")
+    ]
+
+    assert lines
+    assert all("," not in line for line in lines)
+
+
+@pytest.mark.parametrize("zone", ["UTC", "Asia/Tokyo"])
+def test_split_vtimezone_rdates_ignores_zones_without_dst(zone):
+    from zoneinfo import ZoneInfo
+
+    from icalendar import Timezone
+
+    from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
+
+    tz = Timezone.from_tzinfo(ZoneInfo(zone))
+    before = tz.to_ical()
+
+    _split_vtimezone_rdates(tz)
+
+    assert tz.to_ical() == before
+    assert _multi_valued_rdates(tz) == []
+
+
+def test_created_event_vtimezone_has_one_value_per_rdate():
+    ical = _pure_client()._create_ical_event(
+        {
+            "title": "Summer meeting",
+            "start_datetime": "2026-07-10T10:00:00",
+            "end_datetime": "2026-07-10T11:00:00",
+            "timezone": "Europe/Berlin",
+        },
+        "uid-berlin",
+    )
+
+    zones = _vtimezones(ical)
+
+    assert [str(z.get("TZID")) for z in zones] == ["Europe/Berlin"]
+    assert _rdate_props(zones[0])
+    assert _multi_valued_rdates(zones[0]) == []
+
+
+def test_created_event_without_dst_zone_is_unaffected():
+    ical = _pure_client()._create_ical_event(
+        {
+            "title": "Tokyo call",
+            "start_datetime": "2026-07-10T10:00:00",
+            "end_datetime": "2026-07-10T11:00:00",
+            "timezone": "Asia/Tokyo",
+        },
+        "uid-tokyo",
+    )
+
+    zones = _vtimezones(ical)
+
+    assert [str(z.get("TZID")) for z in zones] == ["Asia/Tokyo"]
+    assert _multi_valued_rdates(zones[0]) == []
+
+
+def test_merge_heals_a_vtimezone_written_by_an_older_version():
+    from zoneinfo import ZoneInfo
+
+    from icalendar import Calendar as ICalendar
+    from icalendar import Timezone
+
+    client = _pure_client()
+    stored = client._create_ical_event(
+        {
+            "title": "Summer meeting",
+            "start_datetime": "2026-07-10T10:00:00",
+            "end_datetime": "2026-07-10T11:00:00",
+            "timezone": "Europe/Berlin",
+        },
+        "uid-heal",
+    )
+    # Rebuild the stored object as an older version wrote it: the VTIMEZONE
+    # straight from icalendar, comma-separated RDATEs and all.
+    cal = ICalendar.from_ical(stored)
+    old_style = Timezone.from_tzinfo(ZoneInfo("Europe/Berlin"))
+    cal.subcomponents[:] = [old_style, *cal.walk("VEVENT")]
+    old_ical = cal.to_ical().decode()
+    assert _multi_valued_rdates(_vtimezones(old_ical)[0])
+    old_dtstart = _vevent(old_ical).get("dtstart")
+
+    merged = client._merge_ical_properties(old_ical, {"title": "Renamed"})
+
+    zones = _vtimezones(merged)
+    assert [str(z.get("TZID")) for z in zones] == ["Europe/Berlin"]
+    assert _multi_valued_rdates(zones[0]) == []
+    assert _rdate_values(zones[0]) == _rdate_values(_vtimezones(old_ical)[0])
+    vevent = _vevent(merged)
+    assert str(vevent.get("summary")) == "Renamed"
+    assert vevent.get("dtstart").dt == old_dtstart.dt
+    assert vevent.get("dtstart").params["TZID"] == old_dtstart.params["TZID"]

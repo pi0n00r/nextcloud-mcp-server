@@ -1,0 +1,1252 @@
+"""Central registry for document processors."""
+
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
+
+from nextcloud_mcp_server.config import get_settings
+from nextcloud_mcp_server.document_source import DocumentSource
+from nextcloud_mcp_server.observability.metrics import (
+    record_document_classification,
+    record_document_escalation,
+    record_document_parse,
+)
+from nextcloud_mcp_server.observability.tracing import trace_operation
+
+from .base import DocumentProcessor, ProcessingResult, ProcessorError
+from .classifier import (
+    DocClassification,
+    classify_from_text,
+    image_coverage_per_page,
+    image_coverage_per_page_from_path,
+)
+from .escalation import TIER_LADDER, EscalationDecision
+from .ocr import OCR_BATCH_PENDING_KEY
+
+logger = logging.getLogger(__name__)
+
+PDF_MIME_TYPE = "application/pdf"
+
+# parse_failed_reason for "no registered processor claims this mime type".
+UNSUPPORTED_TYPE_REASON = "unsupported_type"
+
+
+def _unsupported_type_result(
+    content_type: str, registered: list[str]
+) -> ProcessingResult:
+    """Permanent, non-raising failure for a mime type nothing can parse.
+
+    Returned rather than raised (Deck #1016): a ``ProcessorError`` from dispatch
+    unwinds past the ingest caller's ``if not result.success:`` block -- the one
+    that owns dead-lettering -- and lands in the generic retry handler, which
+    treats the fault as transient and lets the next scan re-queue the document.
+    Forever, because "nothing is registered for this type" never changes on its
+    own. Failing gracefully instead routes it to the dead-letter marker, whose
+    signature covers the configured processor set (see
+    ``escalation.escalation_tiers_signature``) so enabling a processor later
+    re-drives the document.
+    """
+    return ProcessingResult(
+        text="",
+        metadata={"parse_failed_reason": UNSUPPORTED_TYPE_REASON},
+        processor="registry",
+        success=False,
+        error=(
+            f"No processor found for type: {content_type}. "
+            f"Registered processors: {', '.join(registered)}"
+        ),
+    )
+
+
+@dataclass
+class _LadderState:
+    """What the PDF ladder knows between rungs.
+
+    ``from_tier`` is the tier whose output produced the current classification --
+    used as the ``from_tier`` of a subsequent OCR hop so a fast->structured->ocr
+    cascade is attributed correctly (that hop is from ``structured``, not a second
+    ``fast`` escalation). ``structured_failed`` marks a document whose structured
+    parse FAILED: it is terminal, so the OCR gate must not treat it as a fallback.
+    """
+
+    result: ProcessingResult
+    classification: DocClassification | None
+    from_tier: str = "fast"
+    structured_failed: bool = False
+
+    def advance_to_structured(
+        self,
+        result: ProcessingResult,
+        classify: Callable[[ProcessingResult, bool], DocClassification | None],
+    ) -> None:
+        """Adopt a successful structured parse and re-classify from it."""
+        self.result = result
+        self.from_tier = "structured"
+        # record=False: the document was already counted at the fast tier.
+        self.classification = classify(result, False)
+
+
+class ProcessorRegistry:
+    """Central registry for document processors.
+
+    Manages registration and routing of document processing requests to
+    appropriate processors based on MIME types and priorities.
+
+    Example:
+        registry = ProcessorRegistry()
+        registry.register(UnstructuredProcessor(...), priority=10)
+        registry.register(TesseractProcessor(...), priority=5)
+
+        # Auto-select processor based on MIME type
+        result = await registry.process(pdf_bytes, "application/pdf")
+
+        # Force specific processor
+        result = await registry.process(img_bytes, "image/png", processor_name="tesseract")
+    """
+
+    def __init__(self):
+        self._processors: dict[str, tuple[DocumentProcessor, int]] = {}
+        self._priority_order: list[str] = []
+
+    def register(self, processor: DocumentProcessor, priority: int = 0):
+        """Register a document processor.
+
+        Args:
+            processor: Processor instance to register
+            priority: Higher priority processors are tried first (default: 0)
+        """
+        name = processor.name
+
+        if name in self._processors:
+            logger.warning("Processor '%s' already registered, replacing", name)
+
+        self._processors[name] = (processor, priority)
+
+        # Update priority order
+        if name in self._priority_order:
+            self._priority_order.remove(name)
+
+        # Insert in priority order (higher priority first)
+        inserted = False
+        for i, existing_name in enumerate(self._priority_order):
+            existing_priority = self._processors[existing_name][1]
+            if priority > existing_priority:
+                self._priority_order.insert(i, name)
+                inserted = True
+                break
+
+        if not inserted:
+            self._priority_order.append(name)
+
+        logger.info(
+            "Registered processor: %s (priority=%s, supports=%s types)",
+            name,
+            priority,
+            len(processor.supported_mime_types),
+        )
+
+    def get_processor(self, name: str) -> DocumentProcessor | None:
+        """Get a processor by name.
+
+        Args:
+            name: Processor name
+
+        Returns:
+            DocumentProcessor instance or None if not found
+        """
+        if name in self._processors:
+            return self._processors[name][0]
+        return None
+
+    def find_processor(self, content_type: str) -> DocumentProcessor | None:
+        """Find the first processor that supports the given MIME type.
+
+        Processors are checked in priority order (highest priority first).
+
+        Args:
+            content_type: MIME type to match
+
+        Returns:
+            First matching processor or None
+        """
+        for name in self._priority_order:
+            processor = self._processors[name][0]
+            if processor.supports(content_type):
+                logger.debug("Found processor '%s' for type '%s'", name, content_type)
+                return processor
+
+        logger.debug("No processor found for type '%s'", content_type)
+        return None
+
+    def list_processors(self) -> list[str]:
+        """List all registered processor names in priority order.
+
+        Returns:
+            List of processor names (highest priority first)
+        """
+        return list(self._priority_order)
+
+    def supported_mime_types(self) -> set[str]:
+        """Every MIME type some registered processor can read."""
+        return {
+            mime
+            for p, _ in self._processors.values()
+            for mime in p.supported_mime_types
+        }
+
+    async def process(
+        self,
+        content: bytes,
+        content_type: str,
+        filename: str | None = None,
+        processor_name: str | None = None,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+    ) -> ProcessingResult:
+        """Process a document using available processors.
+
+        Args:
+            content: Document bytes
+            content_type: MIME type
+            filename: Optional filename for format detection
+            processor_name: Force specific processor (or None for auto-select)
+            options: Processing options passed to processor
+            progress_callback: Optional async callback for progress updates
+
+        Returns:
+            ProcessingResult with extracted text and metadata. A mime type no
+            registered processor claims comes back as ``success=False`` /
+            ``parse_failed_reason="unsupported_type"`` rather than raising, so
+            callers dead-letter it instead of retrying forever (Deck #1016).
+
+        Raises:
+            ProcessorError: If a named ``processor_name`` is unknown, or the
+                selected processor fails
+        """
+        # Forced processor bypasses tiering.
+        if processor_name:
+            processor = self.get_processor(processor_name)
+            if not processor:
+                raise ProcessorError(
+                    f"Processor '{processor_name}' not found. "
+                    f"Available: {', '.join(self.list_processors())}"
+                )
+            return await self._run_processor(
+                processor, content, content_type, filename, options, progress_callback
+            )
+
+        # PDFs go through the tiered pipeline (tier-0 classify -> tier-1 fast ->
+        # tier-3 OCR escalation). Everything else uses priority selection.
+        if content_type.split(";")[0].strip().lower() == PDF_MIME_TYPE:
+            return await self._process_pdf(
+                content, content_type, filename, options, progress_callback
+            )
+
+        processor = self.find_processor(content_type)
+        if not processor:
+            return _unsupported_type_result(content_type, self.list_processors())
+        return await self._run_processor(
+            processor, content, content_type, filename, options, progress_callback
+        )
+
+    def _pdf_processor_for_tier(self, tier: str) -> DocumentProcessor | None:
+        """First registered processor of ``tier`` that handles PDFs."""
+        for name in self._priority_order:
+            processor = self._processors[name][0]
+            if processor.tier == tier and processor.supports(PDF_MIME_TYPE):
+                return processor
+        return None
+
+    async def _process_pdf(
+        self,
+        content: bytes,
+        content_type: str,
+        filename: str | None,
+        options: dict[str, Any] | None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ),
+    ) -> ProcessingResult:
+        """Tiered PDF pipeline, bytes-backed.
+
+        Adapter over :meth:`_run_pdf_ladder`: the ladder's decisions are identical
+        either way, only *how* a tier is run and classified differs. See
+        :meth:`_process_pdf_source` for the file-backed twin.
+        """
+        settings = get_settings()
+
+        oversize = self._oversize_result(content, filename, settings)
+        if oversize is not None:
+            return oversize
+
+        async def run(
+            processor: DocumentProcessor, escalated: bool
+        ) -> ProcessingResult:
+            return await self._run_processor(
+                processor,
+                content,
+                content_type,
+                filename,
+                options,
+                progress_callback,
+                escalated=escalated,
+            )
+
+        def classify(
+            result: ProcessingResult, record: bool
+        ) -> DocClassification | None:
+            return self._classify_result(
+                result, content, settings, record=record, filename=filename
+            )
+
+        return await self._run_pdf_ladder(
+            content_type, filename, options, settings, run, classify
+        )
+
+    async def _process_pdf_source(
+        self,
+        source: DocumentSource,
+        options: dict[str, Any] | None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ),
+    ) -> ProcessingResult:
+        """Tiered PDF pipeline against a file-backed source.
+
+        The path-backed twin of :meth:`_process_pdf`. Every tier opens the spool
+        file directly and scan detection classifies from that path, so a document
+        streamed to disk is never materialised into memory to run the ladder --
+        which is what lets the interactive read tool (and any other in-process
+        caller) parse a large PDF in a pod sized for the API role.
+        """
+        settings = get_settings()
+
+        # The size the guard needs is already known from the download; rejecting
+        # here costs no read at all.
+        oversize = self.oversize_result_for_size(source.size, source.filename, settings)
+        if oversize is not None:
+            return oversize
+
+        async def run(
+            processor: DocumentProcessor, escalated: bool
+        ) -> ProcessingResult:
+            return await self._run_processor_source(
+                processor, source, options, progress_callback, escalated=escalated
+            )
+
+        def classify(
+            result: ProcessingResult, record: bool
+        ) -> DocClassification | None:
+            # ``content`` is unused when a source is given -- scan detection reads
+            # the path instead of the bytes.
+            return self._classify_result(
+                result,
+                b"",
+                settings,
+                record=record,
+                filename=source.filename,
+                source=source,
+            )
+
+        return await self._run_pdf_ladder(
+            source.content_type, source.filename, options, settings, run, classify
+        )
+
+    @staticmethod
+    def _escalation_reason(classification: DocClassification) -> str:
+        """Why the classifier wants to leave the current tier."""
+        if classification.recommended_tier == "structured":
+            return "corrupt_glyphs"
+        if classification.total_chars == 0:
+            return "empty_text"
+        return "low_confidence"
+
+    async def _run_pdf_ladder(
+        self,
+        content_type: str,
+        filename: str | None,
+        options: dict[str, Any] | None,
+        settings: Any,
+        run: Callable[[DocumentProcessor, bool], Awaitable[ProcessingResult]],
+        classify: Callable[[ProcessingResult, bool], DocClassification | None],
+    ) -> ProcessingResult:
+        """Tiered PDF pipeline, independent of how the document is held.
+
+        pypdfium2 ``fast`` extracts first; classification is then derived from
+        that text (no PDF re-open), and a scanned/no-text-layer doc escalates to
+        the ``ocr`` tier when enabled. ``document_tier1_engine="pymupdf"`` is a
+        deprecated rollback that pins the structured engine instead.
+
+        ``run(processor, escalated)`` and ``classify(result, record)`` are supplied
+        by the bytes- and source-backed adapters above; the size guard has already
+        been applied by the caller (it needs the size, which each holds differently).
+
+        The three rungs above ``fast`` are one method each -- they share only the
+        :class:`_LadderState` they hand along, and each is a separate decision:
+        recover a bad text layer, honour a markdown request, or pay for OCR.
+        """
+        if settings.document_tier1_engine == "pymupdf":
+            return await self._run_rollback_engine(content_type, run)
+
+        fast = self._pdf_processor_for_tier("fast")
+        if fast is None:
+            processor = self.find_processor(content_type)
+            if processor is None:
+                raise ProcessorError("No PDF processor registered")
+            return await run(processor, False)
+
+        result = await run(fast, False)
+
+        # Tier-0 classification from the extraction (cheap: text-only, no PDF
+        # re-open). Scan detection (image analysis, re-opens the PDF) runs only
+        # when OCR + detect_scanned are enabled, so its cost is paid by
+        # OCR-opted-in tenants only. Shared with the external per-tier path via
+        # _classify_result.
+        state = _LadderState(result=result, classification=classify(result, True))
+
+        await self._escalate_structured(state, filename, run, classify)
+        await self._promote_markdown(state, options, filename, settings, run, classify)
+        return await self._escalate_ocr(state, filename, settings, run)
+
+    async def _run_rollback_engine(
+        self,
+        content_type: str,
+        run: Callable[[DocumentProcessor, bool], Awaitable[ProcessingResult]],
+    ) -> ProcessingResult:
+        """``document_tier1_engine=pymupdf``: pin the structured engine, no ladder."""
+        processor = self._pdf_processor_for_tier("structured")
+        if processor is None:
+            # The rollback was set to opt OUT of pypdfium2, so falling back
+            # to it (the highest-priority PDF processor) silently would
+            # defeat that intent -- warn loudly.
+            processor = self.find_processor(content_type)
+            if processor is None:
+                raise ProcessorError("No PDF processor registered")
+            logger.warning(
+                "document_tier1_engine=pymupdf but no 'structured' processor "
+                "is registered; falling back to '%s'",
+                processor.name,
+            )
+        return await run(processor, False)
+
+    async def _escalate_structured(
+        self,
+        state: "_LadderState",
+        filename: str | None,
+        run: Callable[[DocumentProcessor, bool], Awaitable[ProcessingResult]],
+        classify: Callable[[ProcessingResult, bool], DocClassification | None],
+    ) -> None:
+        """Recover a poor fast extraction at the structured tier.
+
+        Mirrors the external per-tier path so both modes behave identically. A
+        glyph-corrupt layer (the extractor leaked raw glyph codes -- the
+        broken-/ToUnicode case) OR a low-quality-but-non-empty layer first tries
+        the structured (pymupdf) tier: free, in-cluster, and able to recover both.
+        Only a scanned / no-text-layer doc (total_chars == 0) skips structured --
+        a text extractor cannot conjure text from a pure raster -- and drops
+        straight to the OCR gate. Structured is therefore NOT gated on
+        document_ocr_enabled. Its output is re-classified (record=False -- the doc
+        was already counted at the fast tier) so a doc that is ALSO partly scanned
+        still reaches the OCR gate.
+        """
+        classification = state.classification
+        if classification is None or classification.page_count <= 0:
+            return
+        if not (
+            classification.recommended_tier == "structured"
+            or (
+                classification.recommended_tier == "ocr"
+                and classification.total_chars > 0
+            )
+        ):
+            return
+
+        structured = self._pdf_processor_for_tier("structured")
+        if structured is None:
+            # Structured isn't registered: mirror the external
+            # next_available_tier, which skips the missing rung and lands on
+            # OCR. Leave the recommendation unchanged so the OCR gate picks it
+            # up (incl. a glyph-corrupt "structured" recommendation).
+            logger.debug(
+                "No structured processor registered; %s falls through to the "
+                "OCR gate (recommended_tier=%s)",
+                filename or "<bytes>",
+                classification.recommended_tier,
+            )
+            return
+
+        reason = (
+            "corrupt_glyphs"
+            if classification.recommended_tier == "structured"
+            else "low_confidence"
+        )
+        record_document_escalation("fast", "structured", reason)
+        logger.info(
+            "Escalating %s fast->structured (reason=%s)",
+            filename or "<bytes>",
+            reason,
+        )
+        structured_result = await run(structured, True)
+        if structured_result.success:
+            state.advance_to_structured(structured_result, classify)
+            return
+
+        state.structured_failed = True
+        logger.warning(
+            "structured escalation did not succeed for %s (%s); keeping "
+            "the tier-1 result (OCR not attempted)",
+            filename or "<bytes>",
+            structured_result.metadata.get("parse_failed_reason", "error"),
+        )
+
+    async def _promote_markdown(
+        self,
+        state: "_LadderState",
+        options: dict[str, Any] | None,
+        filename: str | None,
+        settings: Any,
+        run: Callable[[DocumentProcessor, bool], Awaitable[ProcessingResult]],
+        classify: Callable[[ProcessingResult, bool], DocClassification | None],
+    ) -> None:
+        """Honour ``options["prefer_markdown"]`` (an interactive read, not ingest).
+
+        The fast tier only ever returns the flat text layer, so promote to the
+        structured engine -- pymupdf4llm is what reconstructs headings/tables.
+        Bounded by the same page ceiling that tier applies internally
+        (document_markdown_max_pages): above it the tier returns raw text anyway,
+        so paying for a superlinear re-parse would buy nothing. A doc with no text
+        layer at all is left to the OCR gate, which produces markdown of its own --
+        a text extractor cannot conjure text from raster.
+
+        Every path that does not produce markdown records WHY, so the caller can be
+        told rather than left to infer it from the absence of headings.
+        """
+        classification = state.classification
+        if not (options or {}).get("prefer_markdown"):
+            return
+        if state.from_tier != "fast" or not state.result.success:
+            return
+        if classification is not None and classification.total_chars == 0:
+            return
+
+        structured = self._pdf_processor_for_tier("structured")
+        max_pages = settings.document_markdown_max_pages
+        page_count = int(state.result.metadata.get("page_count", 0) or 0)
+        if structured is None:
+            state.result.metadata["markdown_skipped_reason"] = "not_registered"
+            return
+        if max_pages <= 0:
+            state.result.metadata["markdown_skipped_reason"] = "disabled"
+            return
+        if page_count > max_pages:
+            state.result.metadata["markdown_skipped_reason"] = "page_ceiling"
+            return
+
+        record_document_escalation("fast", "structured", "markdown_requested")
+        logger.info(
+            "Escalating %s fast->structured (reason=markdown_requested)",
+            filename or "<bytes>",
+        )
+        markdown_result = await run(structured, True)
+        if markdown_result.success:
+            state.advance_to_structured(markdown_result, classify)
+            return
+
+        # Keep the fast text rather than failing the read, and say why the
+        # markdown the caller asked for is not there.
+        state.result.metadata["markdown_skipped_reason"] = "parse_failed"
+        logger.warning(
+            "markdown promotion did not succeed for %s (%s); keeping the tier-1 text",
+            filename or "<bytes>",
+            markdown_result.metadata.get("parse_failed_reason", "error"),
+        )
+
+    async def _escalate_ocr(
+        self,
+        state: "_LadderState",
+        filename: str | None,
+        settings: Any,
+        run: Callable[[DocumentProcessor, bool], Awaitable[ProcessingResult]],
+    ) -> ProcessingResult:
+        """Pay for OCR when the classifier says a text extractor cannot do better.
+
+        Only under ``document_ocr_mode=sync``. Batch OCR is worker-only, so on this
+        inline path ``batch`` makes ``structured`` the terminal tier (see the gate
+        below); ``sync`` is what grants inline requests access to OCR.
+
+        Fires for a scanned / no-text-layer doc (recommended "ocr"), and also for
+        an unresolved "structured" recommendation -- a glyph-corrupt doc whose
+        structured rung wasn't registered -- so the inline path falls through to
+        OCR exactly like the external next_available_tier. ``structured_failed``
+        excludes a doc whose structured parse FAILED (terminal, like the external
+        path). A fast FAILURE (result.success False, no classification) is NOT
+        escalated: a PDF pypdfium2 can't open is a hard failure (OCR reads the same
+        bytes and would usually fail too). The page_count guard skips a zero-page
+        (empty/corrupt) PDF, which OCR can't help either.
+
+        Whenever the classifier wants OCR but it does not run, the reason is
+        recorded on the result metadata (``ocr_escalation_skipped``) so an
+        interactive caller can be told plainly that the text it is holding is what
+        a text extractor could recover, rather than silently receiving a near-empty
+        parse. Ingest ignores these keys.
+
+        NOTE: the suppressed-escalation metric (document_escalation_suppressed_total,
+        the "what-if OCR" signal; Deck #324) is intentionally NOT emitted on this
+        inline/memory path -- it is instrumented only on the per-tier external path
+        (vector/processor._parse_pdf_tier via evaluate_escalation). When OCR is off
+        here the would-be escalation is simply not taken; operators reading the
+        suppressed counter are on the procrastinate fleet.
+        """
+        result = state.result
+        classification = state.classification
+        if (
+            classification is None
+            or state.structured_failed
+            or classification.recommended_tier not in ("ocr", "structured")
+            or classification.page_count <= 0
+        ):
+            return result
+
+        reason = self._escalation_reason(classification)
+        result.metadata["ocr_recommended_reason"] = reason
+        if not settings.document_ocr_enabled:
+            result.metadata["ocr_escalation_skipped"] = "disabled"
+            return result
+
+        # Batch OCR defers its poll across procrastinate retries, which only the
+        # external worker path can do -- the inline/memory pool threads no per-doc
+        # identity through ``options``, so ``_process_batch`` raises there by
+        # construction (see ocr.py ``_batch_identity``). Escalating anyway burns a
+        # full structured re-parse per attempt for an OCR call that CANNOT succeed,
+        # and because OCR failure is non-fatal ("an enhancement, not a gate") the
+        # document is never dead-lettered -- it is simply re-discovered and
+        # re-parsed on the next scan, indefinitely. That loop OOMKilled a tenant's
+        # API Pod (Deck #1226). Under batch, the inline ladder therefore stops at
+        # structured; OCR belongs to the document-processing pipeline alone.
+        # Under sync, both the external processors and inline requests may escalate.
+        if settings.document_ocr_mode == "batch":
+            result.metadata["ocr_escalation_skipped"] = "batch_worker_only"
+            return result
+
+        # Inline (memory pool) path: no queues to hop, so resolve the OCR tier
+        # via the same availability walk the queue path uses.
+        ocr_tier = self.next_available_tier(state.from_tier, settings, minimum="ocr")
+        ocr = self._pdf_processor_for_tier(ocr_tier) if ocr_tier else None
+        # `ocr is not None` already implies `ocr_tier is not None` at runtime,
+        # but the type checker can't infer that across the conditional above,
+        # so the explicit guard narrows `ocr_tier` to `str` for the
+        # record_document_escalation(from_tier, ocr_tier, reason) call below.
+        if ocr is None or ocr_tier is None:
+            result.metadata["ocr_escalation_skipped"] = "not_registered"
+            return result
+
+        record_document_escalation(state.from_tier, ocr_tier, reason)
+        logger.info(
+            "Escalating %s %s->%s (reason=%s)",
+            filename or "<bytes>",
+            state.from_tier,
+            ocr_tier,
+            reason,
+        )
+        ocr_result = await run(ocr, True)
+        # OCR is an enhancement, not a gate: if it can't run (no backend
+        # configured / API down) or returns nothing, keep the tier-1 result
+        # rather than failing the document. Otherwise an operator who enables OCR
+        # without credentials would make scanned docs fail entirely -- strictly
+        # worse than off.
+        if ocr_result.success:
+            return ocr_result
+        result.metadata["ocr_escalation_failed"] = ocr_result.metadata.get(
+            "parse_failed_reason", "error"
+        )
+        logger.warning(
+            "OCR escalation to %s did not succeed for %s (%s); keeping the "
+            "tier-1 result",
+            ocr_tier,
+            filename or "<bytes>",
+            ocr_result.metadata.get("parse_failed_reason", "error"),
+        )
+        return result
+
+    def oversize_result_for_size(
+        self, size_bytes: int, filename: str | None, settings: Any
+    ) -> ProcessingResult | None:
+        """Pre-parse size guard evaluated against a known byte size.
+
+        Split out from :meth:`_oversize_result` so the cap can be applied to a
+        size learned *before* the download (WebDAV ``getcontentlength``, carried
+        on ``DocumentTask.size_bytes``). Applying it there means an over-cap
+        document is never fetched at all -- the old byte-based form could only
+        reject a file already fully resident in memory, which is how a 531 MB PDF
+        OOMKilled a worker before the cap was ever evaluated.
+
+        Returns an explicit ``oversize`` failure so the caller marks the
+        placeholder "failed" instead of retrying; 0 disables the cap.
+        """
+        # Local named for what it caps, not for PDFs; the setting keeps its
+        # pre-existing name, which is out of scope to rename here.
+        max_size_mb = settings.document_max_pdf_size_mb
+        if max_size_mb > 0 and size_bytes > max_size_mb * 1024 * 1024:
+            size_mb = size_bytes / (1024 * 1024)
+            logger.warning(
+                "Document %s is %.1f MB (> %.1f MB cap); failing fast as oversize",
+                filename or "<bytes>",
+                size_mb,
+                max_size_mb,
+            )
+            return ProcessingResult(
+                text="",
+                metadata={"parse_failed_reason": "oversize"},
+                processor="size_guard",
+                success=False,
+                error=(
+                    f"Document exceeds size cap: {size_mb:.1f} MB > {max_size_mb:.1f} MB"
+                ),
+            )
+        return None
+
+    def _oversize_result(
+        self, content: bytes, filename: str | None, settings: Any
+    ) -> ProcessingResult | None:
+        """Pre-parse size guard, shared by the inline and per-tier paths.
+
+        A pathologically large PDF (e.g. a 42 MB scanned DUDE) burns the OCR
+        timeout for 0 chars. Return an explicit ``oversize`` failure so the
+        caller marks the placeholder "failed" instead of retrying; 0 disables the
+        cap. An explicit ``processor_name`` override (``registry.process``)
+        bypasses tiering entirely and is intentionally not size-gated (power-user
+        escape hatch). Skipping ``_run_processor`` means the rejection is counted
+        on ``bridgette_document_parse_failed_total{oversize}`` (via
+        ``vector/processor.py``) but deliberately not on the parse-duration
+        histogram -- there is no parse to time.
+
+        Backstop for callers without a pre-fetch size; prefer
+        :meth:`oversize_result_for_size` when the size is known up front.
+        """
+        return self.oversize_result_for_size(len(content), filename, settings)
+
+    def _classify_result(
+        self,
+        result: ProcessingResult,
+        content: bytes,
+        settings: Any,
+        *,
+        record: bool,
+        filename: str | None = None,
+        source: DocumentSource | None = None,
+    ) -> DocClassification | None:
+        """Tier-0 classification of a parse result (text-only, cheap).
+
+        Shared by the inline memory-backend pipeline (:meth:`_process_pdf`) and
+        the external per-tier path (:meth:`evaluate_escalation`). Returns
+        ``None`` when classification is disabled, the parse failed, or the
+        classifier raised -- best-effort, a classify failure must never break
+        indexing. ``record`` emits the classification metrics; set it only at the
+        FIRST classification of a document (the ``fast`` tier) so the per-doc
+        counters aren't multiplied across tiers.
+        """
+        if not (settings.document_classify_enabled and result.success):
+            return None
+        try:
+            image_coverage = None
+            # Scan detection feeds the OCR tier, so run it whenever OCR is enabled.
+            if settings.document_ocr_enabled and settings.document_ocr_detect_scanned:
+                try:
+                    # Pick the access that does no I/O for this source type:
+                    # a spooled document hands over its path for free, while an
+                    # in-memory one hands over its buffer for free. Calling
+                    # path() on an in-memory source would write the whole buffer
+                    # to disk -- and this runs synchronously on the event loop,
+                    # so that would stall every other in-flight document.
+                    if source is None:
+                        image_coverage = image_coverage_per_page(content)
+                    elif source.is_file_backed:
+                        image_coverage = image_coverage_per_page_from_path(
+                            str(source.path())
+                        )
+                    else:
+                        image_coverage = image_coverage_per_page(source.read_bytes())
+                except Exception:
+                    # Best-effort: fall back to text-only signals. WARNING (not
+                    # DEBUG) so a systematic scan-detection failure on an
+                    # OCR-enabled tenant is visible at LOG_LEVEL=INFO.
+                    logger.warning(
+                        "Scan detection failed for %s; using text-only signals",
+                        filename or "<bytes>",
+                    )
+            classification = classify_from_text(
+                result.text,
+                result.metadata.get("page_boundaries") or [],
+                min_text_quality=settings.document_ocr_min_text_quality,
+                min_page_chars=settings.document_ocr_min_page_chars,
+                page_fraction=settings.document_ocr_page_fraction,
+                glyph_corruption_ratio=settings.document_glyph_corruption_ratio,
+                image_coverage=image_coverage,
+            )
+        except Exception:
+            logger.warning(
+                "Tier-0 classification failed for %s",
+                filename or "<bytes>",
+            )
+            return None
+        if record:
+            record_document_classification(
+                classification.recommended_tier,
+                classification.flags,
+                classification.mean_text_quality,
+                classification.ocr_page_fraction,
+            )
+        return classification
+
+    def _tier_available(
+        self, tier: str, settings: Any, *, ignore_ocr_enabled: bool = False
+    ) -> bool:
+        """Whether ``tier`` can run a PDF parse right now.
+
+        A tier is available when it has a registered PDF processor and is
+        enabled; the ``ocr`` tier additionally requires ``DOCUMENT_OCR_ENABLED``
+        (so OCR stays opt-in and a misconfigured tenant never escalates to a
+        backend it hasn't turned on).
+
+        ``ignore_ocr_enabled`` drops only the OCR-enabled gate (not the registered-
+        processor requirement): it answers "would this tier run if OCR were turned
+        on?" — used to compute the *ideal* escalation target for the what-if-OCR
+        suppressed-escalation signal. (The ``ocr`` tier has the
+        ``document_ocr_enabled`` gate; non-OCR tiers have none.)
+        """
+        if self._pdf_processor_for_tier(tier) is None:
+            return False
+        # The OCR tier is opt-in via ``document_ocr_enabled`` (unless we're computing
+        # the what-if ideal target). Non-OCR tiers have no enabled gate.
+        if (
+            not ignore_ocr_enabled
+            and tier == "ocr"
+            and not settings.document_ocr_enabled
+        ):
+            return False
+        return True
+
+    def next_available_tier(
+        self,
+        current_tier: str,
+        settings: Any,
+        *,
+        minimum: str | None = None,
+        ignore_ocr_enabled: bool = False,
+    ) -> str | None:
+        """First escalation target above ``current_tier`` that can actually run.
+
+        Walks the ladder strictly above ``current_tier`` (and not below
+        ``minimum``'s rung, when given) and returns the first
+        :meth:`_tier_available` tier. ``None`` means no higher tier can run --
+        ``current_tier`` is then terminal and its result is indexed as-is.
+        ``ignore_ocr_enabled`` is forwarded to :meth:`_tier_available` to find the
+        *ideal* target ignoring the OCR-enabled gate (see ``evaluate_escalation``).
+        """
+        try:
+            cur_idx = TIER_LADDER.index(current_tier)
+        except ValueError:
+            return None
+        start_idx = cur_idx + 1
+        if minimum is not None:
+            try:
+                start_idx = max(start_idx, TIER_LADDER.index(minimum))
+            except ValueError:
+                pass
+        for tier in TIER_LADDER[start_idx:]:
+            if self._tier_available(
+                tier, settings, ignore_ocr_enabled=ignore_ocr_enabled
+            ):
+                return tier
+        return None
+
+    async def process_source(
+        self,
+        source: DocumentSource,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+    ) -> ProcessingResult:
+        """Inline tiered processing of a file-backed source.
+
+        PDFs run the inline tiered pipeline against the file itself
+        (:meth:`_process_pdf_source`), so the document is never materialised to
+        drive the ladder. Non-PDFs are handed the source directly. Note that only
+        the two PDF engines override ``process_source`` today, so any other
+        processor still materialises the document via the base-class default --
+        off the event loop through ``run_sync``, so it no longer blocks, but the
+        memory is still proportional to document size until that processor grows
+        a path-based override.
+        """
+        if source.content_type.split(";")[0].strip().lower() == PDF_MIME_TYPE:
+            return await self._process_pdf_source(source, options, progress_callback)
+
+        processor = self.find_processor(source.content_type)
+        if not processor:
+            return _unsupported_type_result(source.content_type, self.list_processors())
+        return await self._run_processor_source(
+            processor, source, options, progress_callback
+        )
+
+    async def process_tier_source(
+        self,
+        source: DocumentSource,
+        tier: str,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+    ) -> ProcessingResult:
+        """Run exactly ONE tier against a file-backed source.
+
+        The path-based twin of :meth:`process_tier`. Applying the size guard to
+        ``source.size`` avoids materialising a document only to reject it, and
+        handing the processor the source lets the PDF engines open by path
+        instead of holding the bytes.
+        """
+        oversize = self.oversize_result_for_size(
+            source.size, source.filename, get_settings()
+        )
+        if oversize is not None:
+            return oversize
+        processor = self._pdf_processor_for_tier(tier)
+        if processor is None:
+            raise ProcessorError(
+                f"No '{tier}'-tier PDF processor registered "
+                f"(available: {', '.join(self.list_processors())})"
+            )
+        return await self._run_processor_source(
+            processor,
+            source,
+            options,
+            progress_callback,
+            escalated=(tier != TIER_LADDER[0]),
+        )
+
+    async def process_tier(
+        self,
+        content: bytes,
+        content_type: str,
+        filename: str | None,
+        tier: str,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+    ) -> ProcessingResult:
+        """Run exactly ONE extraction tier's processor on a PDF (external path).
+
+        The per-tier procrastinate fleet calls this for the tier matching the
+        job's queue. Escalation to the next tier is decided separately by
+        :meth:`evaluate_escalation` and effected by the queue's retry strategy as
+        a queue-hop -- never inline here. ``escalated`` is set for any tier above
+        the cheapest so the parse span/metrics reflect an escalated attempt.
+        """
+        oversize = self._oversize_result(content, filename, get_settings())
+        if oversize is not None:
+            return oversize
+        processor = self._pdf_processor_for_tier(tier)
+        if processor is None:
+            raise ProcessorError(
+                f"No '{tier}'-tier PDF processor registered "
+                f"(available: {', '.join(self.list_processors())})"
+            )
+        return await self._run_processor(
+            processor,
+            content,
+            content_type,
+            filename,
+            options,
+            progress_callback,
+            escalated=(tier != TIER_LADDER[0]),
+        )
+
+    def evaluate_escalation_source(
+        self,
+        result: ProcessingResult,
+        source: DocumentSource,
+        current_tier: str,
+        settings: Any,
+    ) -> EscalationDecision | None:
+        """:meth:`evaluate_escalation` against a file-backed source.
+
+        Scan detection re-opens the document; giving it the path keeps that off
+        the bytes, so a large scan is not materialised just to be classified.
+        """
+        return self._evaluate_escalation(
+            result, b"", current_tier, settings, filename=source.filename, source=source
+        )
+
+    def evaluate_escalation(
+        self,
+        result: ProcessingResult,
+        content: bytes,
+        current_tier: str,
+        settings: Any,
+        *,
+        filename: str | None = None,
+    ) -> EscalationDecision | None:
+        """Bytes-based adapter; see :meth:`_evaluate_escalation`."""
+        return self._evaluate_escalation(
+            result, content, current_tier, settings, filename=filename
+        )
+
+    def _evaluate_escalation(
+        self,
+        result: ProcessingResult,
+        content: bytes,
+        current_tier: str,
+        settings: Any,
+        *,
+        filename: str | None = None,
+        source: DocumentSource | None = None,
+    ) -> EscalationDecision | None:
+        """Decide whether ``current_tier``'s result must escalate (external path).
+
+        Returns an :class:`EscalationDecision` (``"hop"`` or ``"suppressed"``)
+        when the classifier judges the parse too poor to index, else ``None``
+        (index as-is). Reuses the tier-0 classifier as the post-parse quality
+        gate, so the signal is identical to the inline pipeline's.
+
+        A hard parse FAILURE (``result.success`` False) is never escalated: a
+        corrupt/encrypted PDF one engine can't open usually defeats the others
+        too (OCR reads the same bytes), so the caller marks it failed instead.
+
+        Target-tier routing:
+
+        - ``total_chars == 0`` (scanned / no text layer) -> target the ``ocr`` tier
+          directly. Text-extractor tiers (``structured``) cannot conjure text from a
+          pure raster scan, so a structured hop would just be wasted.
+        - glyph-corrupt text layer (``recommended_tier == "structured"``) -> target
+          the ``structured`` tier; pymupdf re-extracts a broken-/ToUnicode layer
+          correctly, so OCR is never the target for this case.
+        - low-confidence but non-empty layer -> escalate to the next tier, so a
+          different in-cluster extractor can try before paying for OCR.
+
+        Hop vs suppressed: if the ideal target tier can run, return a ``"hop"``.
+        If it can't run **only because it's disabled** (OCR off — the *ideal*
+        tier exists ignoring the enabled gate, but the *available* one does not),
+        return ``"suppressed"`` so the caller records the would-be hop and indexes
+        the current tier's output as terminal (OCR stays opt-in + cost-free, but
+        the latent demand is observable). If no higher tier exists *at all* (no
+        processor registered), it's genuinely terminal -> ``None``.
+        """
+        classification = self._classify_result(
+            result,
+            content,
+            settings,
+            record=(current_tier == TIER_LADDER[0]),
+            filename=filename,
+            source=source,
+        )
+        if classification is None or classification.recommended_tier not in (
+            "structured",
+            "ocr",
+        ):
+            return None
+        # A zero-page (empty/corrupt) PDF gains nothing from any tier.
+        if classification.page_count <= 0:
+            return None
+        minimum: str | None
+        if classification.recommended_tier == "structured":
+            # Glyph-corrupt text layer (the extractor leaked glyph codes): a
+            # different in-cluster extractor (the structured/pymupdf tier) recovers
+            # it -- never pay for OCR here. Target the structured rung specifically.
+            minimum = "structured"
+            reason = "corrupt_glyphs"
+        elif classification.total_chars == 0:
+            # Scanned / no text layer: target the OCR tier.
+            minimum = "ocr"
+            reason = "empty_text"
+        else:
+            minimum = None
+            reason = "low_confidence"
+        to_tier = self.next_available_tier(current_tier, settings, minimum=minimum)
+        if to_tier is not None:
+            return EscalationDecision("hop", to_tier, reason)
+        # No tier can run as configured. Distinguish "disabled (e.g. OCR off)"
+        # from "no such tier at all" by re-resolving ignoring the enabled gate.
+        ideal = self.next_available_tier(
+            current_tier, settings, minimum=minimum, ignore_ocr_enabled=True
+        )
+        if ideal is not None:
+            return EscalationDecision("suppressed", ideal, reason)
+        return None
+
+    async def _run_processor_source(
+        self,
+        processor: DocumentProcessor,
+        source: DocumentSource,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+        *,
+        escalated: bool = False,
+    ) -> ProcessingResult:
+        """Run one processor against a file-backed source."""
+        return await self._run_processor(
+            processor,
+            b"",
+            source.content_type,
+            source.filename,
+            options,
+            progress_callback,
+            escalated=escalated,
+            source=source,
+        )
+
+    async def _run_processor(
+        self,
+        processor: DocumentProcessor,
+        content: bytes,
+        content_type: str,
+        filename: str | None = None,
+        options: dict[str, Any] | None = None,
+        progress_callback: (
+            Callable[[float, float | None, str | None], Awaitable[None]] | None
+        ) = None,
+        *,
+        escalated: bool = False,
+        source: DocumentSource | None = None,
+    ) -> ProcessingResult:
+        """Run one processor with the per-processor span + parse metrics.
+
+        When ``source`` is given the processor is driven through
+        ``process_source`` (so a PDF engine opens by path rather than holding the
+        bytes) and ``content`` is ignored. The instrumentation is identical
+        either way, which is why this is one method rather than two.
+        """
+        if source is not None:
+            content_type = source.content_type
+            filename = source.filename
+        tier = processor.tier
+        logger.info(
+            "Processing with '%s' processor",
+            processor.name,
+            extra={
+                "processor": processor.name,
+                "tier": tier,
+                "mime_type": content_type,
+            },
+        )
+
+        byte_size = source.size if source is not None else len(content)
+        start_time = time.time()
+        with trace_operation(
+            "document_processor.parse",
+            attributes={
+                "processor.name": processor.name,
+                "processor.tier": tier,
+                "mime_type": content_type,
+                "byte_size": byte_size,
+                "escalated": escalated,
+            },
+            record_exception=True,
+        ) as span:
+            try:
+                if source is not None:
+                    result = await processor.process_source(
+                        source, options, progress_callback
+                    )
+                else:
+                    result = await processor.process(
+                        content, content_type, filename, options, progress_callback
+                    )
+            except Exception:
+                duration = time.time() - start_time
+                record_document_parse(
+                    processor.name,
+                    tier,
+                    duration,
+                    byte_size=byte_size,
+                    status="error",
+                )
+                # Structured error signal for Loki (the processor logs the
+                # traceback; this adds the aggregatable fields). The span
+                # records the exception itself via record_exception=True.
+                logger.warning(
+                    "Parse failed for %s with '%s' after %.2fs",
+                    filename or "<bytes>",
+                    processor.name,
+                    duration,
+                    extra={
+                        "processor": processor.name,
+                        "tier": tier,
+                        "byte_size": byte_size,
+                        "duration_ms": round(duration * 1000, 1),
+                        "status": "error",
+                    },
+                )
+                raise
+
+            duration = time.time() - start_time
+            # Record the tier that actually produced this result so downstream
+            # (Qdrant payload pipeline_tier, analytics) reflects escalation
+            # instead of a hardcoded "fast".
+            result.metadata.setdefault("pipeline_tier", tier)
+            pages = int(result.metadata.get("page_count", 0) or 0)
+            chars = len(result.text)
+            # A batch-OCR poll still in flight (GPU booting / batch queued) returns
+            # success=False + the pending sentinel; _parse_pdf_tier re-queues it via
+            # BatchPending, so it is NOT a parse failure. Record it as a distinct
+            # status="pending" — otherwise every poll inflates
+            # document_parse_total{status="error"} and the parse-rate dashboard shows
+            # GPU-boot polling as errors. Genuine failures stay "error"; worker-killed
+            # failures land in document_parse_failed_total.
+            if result.metadata.get(OCR_BATCH_PENDING_KEY):
+                status = "pending"
+            elif result.success:
+                status = "success"
+            else:
+                status = "error"
+            record_document_parse(
+                processor.name,
+                tier,
+                duration,
+                pages=pages,
+                chars=chars,
+                byte_size=byte_size,
+                status=status,
+            )
+            if span is not None:
+                span.set_attribute("page_count", pages)
+                span.set_attribute("char_count", chars)
+                span.set_attribute("processor.success", result.success)
+
+            logger.info(
+                "Parsed %s with '%s': %s pages, %s chars in %.2fs",
+                filename or "<bytes>",
+                processor.name,
+                pages,
+                chars,
+                duration,
+                extra={
+                    "processor": processor.name,
+                    "tier": tier,
+                    "pages": pages,
+                    "chars": chars,
+                    "byte_size": byte_size,
+                    "duration_ms": round(duration * 1000, 1),
+                    "status": status,
+                },
+            )
+            return result
+
+
+# Global registry instance
+_registry = ProcessorRegistry()
+
+
+def get_registry() -> ProcessorRegistry:
+    """Get the global processor registry.
+
+    Returns:
+        Singleton ProcessorRegistry instance
+    """
+    return _registry

@@ -1,0 +1,151 @@
+# AGENTS.md — Nextcloud MCP Server (pi0n00r fork)
+
+This repo is Gary Bajaj's fork of `cbcoutinho/nextcloud-mcp-server` (AGPL-3.0).
+The fork's purpose is to fix three regressions surfaced during the 2026-04
+work cycle and integrate byte-preserving DAVx5-style CardDAV semantics:
+
+1. **A.1 — Photo clobber** on every contact updated through the legacy
+   `nc_contacts_update_contact`. Every contact in Gary's address book that
+   had been previously updated through this tool had its `PHOTO` blob
+   silently dropped (corpus-wide loss disclosed 2026-04-26). Root cause:
+   `_merge_vcard_properties` split on `\n` and `strip()`-ed lines, breaking
+   RFC 5545 line-folding for PHOTO base64 blocks and X-properties.
+2. **A.2 — `nc_webdav_write_file`** silently truncating writes near 20KB.
+3. **A.3 — Schema gaps** for UID-less / FN-less / non-Latin vCards.
+
+The fix is in three places:
+
+- `nextcloud_mcp_server/client/vcard_parser.py` — NEW. Byte-preserving
+  line-oriented vCard parser. Parses into `(folded-line, parsed-property)`
+  tuples; untouched lines emit verbatim from `original_bytes`; only
+  modified lines regenerate per RFC 6350 §3.2 + RFC 5545 §3.1.
+- `nextcloud_mcp_server/client/contacts.py` — rewritten to route writes
+  through the new parser and surface `EtagConflictError` on 412.
+- `nextcloud_mcp_server/client/webdav.py` — `write_file` now routes
+  bodies above `CHUNK_THRESHOLD` (1MB) through NC's chunked-upload v2
+  endpoint, eliminating the silent-truncation failure mode.
+
+## Patch ownership after v0.159.1
+
+Do not preserve a historical fork commit merely because it was once needed.
+The v0.150.0 and v0.151.0 upstream merges transferred ownership of several
+behaviors. v0.151.1 adds one fork-local concurrency guard:
+
+| Surface | Upstream-owned behavior | Fork behavior still required |
+|---|---|---|
+| Calendar date updates | Preserve stored all-day value type, TZID, and valid `DTEND` | Strict offset-required parser, Toronto/DST promotion, and ordered VALARM support |
+| Calendar ergonomics | Optional `calendar_name` for all-calendar searches; complete-todo tool | `completed_at` compatibility alias |
+| CalDAV deletion | Structured delete-refusal responses | Exact legacy scheduling retry and stale-trash collision purge |
+| Deck updates | Preserve card order and due date during partial updates | Follow-up update when a Deck version ignores `duedate` during create |
+| WebDAV reads | Bounded streaming, short-read detection, ETag reporting, and document-to-text/Markdown parsing through `parse_document` | Retry one stale pooled GET or verified short read |
+| WebDAV writes | Fail-closed simple PUTs with ETag preconditions and generic MOVE/COPY destination guards | A.2 chunked upload and atomic final-MOVE destination ETag enforcement |
+| Notes attachment cleanup | Refuse to delete a non-empty old attachment directory after a category move | None |
+| Transport policy | Canonical `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, and `CORS_ALLOW_ORIGINS` configuration | Gateway-secret middleware and temporary aliases for the retired `MCP_DNS_REBINDING_ALLOWED_*` names |
+| Webhooks | Server-resolved callback URI, admin gate, and redacted logging | None |
+| Schema migrations | Alembic migration engine, revision scripts, and process-wide serialization of Alembic command entry points | None |
+| Container runtime | Non-root `appuser` at UID 1000/GID 0 with an immutable `/opt/venv` | Follow the latest `pi0n00r/uvicorn` default branch; run `--host :: --dual-stack` for one first-class IPv4/IPv6 listener |
+
+The left column is retired as fork patch debt: accept upstream changes there
+unless they regress the stated contract. The right column remains
+load-bearing and must keep focused regression coverage. A.1/A.2/A.3,
+transport gateway-secret middleware and legacy configuration aliases, and
+legacy Arbiter deletion repair remain active fork patches. The explicit
+Mistral embedding timeout is now upstream-owned but remains load-bearing. The
+Uvicorn fork is also load-bearing: refreshing its lock or replacing it requires
+an IPv4 and IPv6 container-listener smoke.
+
+## Repo layout
+
+```
+nextcloud_mcp_server/
+├── client/
+│   ├── contacts.py         CardDAV client — byte-preserving rewrite
+│   ├── vcard_parser.py     Line-oriented vCard parser (load-bearing core)
+│   ├── webdav.py           WebDAV client — chunked upload >1MB
+│   └── ...
+├── models/
+│   ├── contacts.py         Pydantic schemas — UID optional, NFC, FN fallback
+│   └── ...
+├── server/
+│   ├── contacts.py         11-op MCP tool surface (unified namespace)
+│   └── ...
+tests/
+├── client/
+│   ├── contacts/test_byte_preserving.py    T1–T10 + A.3 schema gaps
+│   └── webdav/test_size_limit.py           Chunk-threshold sanity
+scripts/
+└── lint-ai-notice.sh       CI lint enforcing the 10-field AI-NOTICE block
+```
+
+## The unified `nc_contacts_*` tool surface (11 ops)
+
+| # | Op | Purpose |
+|---|---|---|
+| 1 | `nc_contacts_list_addressbooks` | List addressbooks |
+| 2 | `nc_contacts_create_addressbook` | Create an address book |
+| 3 | `nc_contacts_delete_addressbook` | Delete an address book |
+| 4 | `nc_contacts_list_contacts` | List contacts (`include_vcard`, `include_etag` flags) |
+| 5 | `nc_contacts_search_contacts` | Search contacts |
+| 6 | `nc_contacts_get_contact` | Read one contact with vCard, ETag, and mapped fields |
+| 7 | `nc_contacts_create_contact` | Create from `vcard_text` or structured fields |
+| 8 | `nc_contacts_patch_contact` | Surgical byte-preserving edit; If-Match required |
+| 9 | `nc_contacts_put_contact` | Full vCard replacement; If-Match required |
+| 10 | `nc_contacts_delete_contact` | Delete; If-Match optional but recommended |
+| 11 | `nc_contacts_update_contact` | Compatibility shim for structured updates |
+
+`nc_contacts_update_contact` is retained as a compatibility shim. New
+integrations should use `nc_contacts_patch_contact` or
+`nc_contacts_put_contact` so concurrency and preservation semantics are
+explicit.
+
+## Build / test
+
+```bash
+# Dev install (uses uv, matches upstream)
+uv sync --dev
+
+# Run the byte-preserving test corpus
+uv run pytest tests/client/contacts/test_byte_preserving.py -v
+
+# Run the complete unit suite with warnings treated as errors
+uv run --frozen pytest -q -W error -m unit -n auto -o "addopts=-p no:asyncio"
+
+# Lint the AI-NOTICE block on every Python source file
+bash scripts/lint-ai-notice.sh
+```
+
+Live integration tests against a real Nextcloud instance require:
+
+```bash
+export NEXTCLOUD_HOST=https://nextcloud.example.com
+export NEXTCLOUD_USERNAME=test_user
+export NEXTCLOUD_PASSWORD="<scoped-app-password>" # never logged
+uv run pytest tests/client/contacts/ -v
+```
+
+## Conventions (load-bearing for any contributor — human or AI)
+
+- **No JSON↔vCard round-trip on properties not being modified.** If a
+  property isn't in the change set, its bytes round-trip verbatim. Period.
+- **`If-Match` mandatory on every CardDAV write.** Concurrency is
+  ETag-based; 412 surfaces to the caller as `EtagConflictError`. No silent
+  retries unless the caller opts in via `retry_on_conflict=True`.
+- **Logs never include the NC app password or any X-Isla-Auth value.**
+  Healthz output returns auth-presence (`"ok"`/`"missing"`) not values.
+- **AI-NOTICE on every Python source file** under `nextcloud_mcp_server/`
+  and `tests/`. The 10-field block (Schema-Version through Contact) is
+  enforced by `scripts/lint-ai-notice.sh`. See `LICENSE.md` for the
+  posture's license tie-in.
+
+## Licensing
+
+This repo is **AGPL-3.0-or-later**, matching upstream
+`cbcoutinho/nextcloud-mcp-server`. Full text in `LICENSE.md`. The
+exploitation-deterrence posture is set per source file in the AI-NOTICE
+block; see `LICENSE.md § AI-NOTICE` for what each field signals.
+
+## Contribution posture
+
+Contributions to this fork must target `pi0n00r/master`. Keep changes scoped,
+preserve the byte-preserving CardDAV and chunked WebDAV invariants, and include
+focused regression coverage for any changed data path.

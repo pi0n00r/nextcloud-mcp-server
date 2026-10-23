@@ -1,0 +1,899 @@
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from httpx import HTTPStatusError, RequestError
+
+from nextcloud_mcp_server.client.base import BaseNextcloudClient
+from nextcloud_mcp_server.client.ocs import OCS_REQUEST_HEADERS
+from nextcloud_mcp_server.models.deck import (
+    DeckACL,
+    DeckAttachment,
+    DeckBoard,
+    DeckCard,
+    DeckComment,
+    DeckConfig,
+    DeckLabel,
+    DeckSession,
+    DeckStack,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_duedate(duedate: Optional[str]) -> Optional[str]:
+    """Convert an offset-aware due date to the UTC ``Z`` form Deck parses reliably.
+
+    Deck's PHP date handling is unreliable with non-UTC offsets, so an
+    offset-aware value is converted to the same instant in UTC. Naive and
+    unparseable strings are passed through untouched — this normalises, it does
+    not validate, and rejecting a format Deck might accept would be worse than
+    forwarding it.
+
+    An empty string maps to ``None`` so "clear the due date" is expressible;
+    previously it went on the wire as ``""``, where Deck's behaviour is undefined.
+
+    ``strftime`` rather than ``isoformat()``: the latter yields ``+00:00`` and
+    keeps microseconds, neither of which is what Deck stores.
+    """
+    if duedate is None:
+        return None
+    if not duedate.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(duedate.replace("Z", "+00:00"))
+    except ValueError:
+        logger.debug("Passing through unparseable duedate %r unchanged", duedate)
+        return duedate
+    if parsed.tzinfo is None:
+        return duedate
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class DeckClient(BaseNextcloudClient):
+    """Client for Nextcloud Deck app operations."""
+
+    app_name = "deck"
+
+    # Own copy -- see the note in GroupsClient. Used by the /ocs/v2.php
+    # endpoints below (config, comments, sessions), NOT by the Deck REST API;
+    # see _get_deck_headers for why that one differs.
+    _OCS_HEADERS: dict[str, str] = dict(OCS_REQUEST_HEADERS)
+
+    def _get_deck_headers(
+        self, additional_headers: Optional[Dict[str, str]] = None
+    ) -> Dict[str, str]:
+        """Get standard headers required for Deck's own REST API.
+
+        Deliberately NOT ``_OCS_HEADERS``. These calls go to
+        ``/index.php/apps/deck/api/v1.0/...`` -- Deck's app REST API, not an
+        ``/ocs/v2.php`` route -- and they send ``Content-Type`` where the OCS
+        constant sends ``Accept``. That difference is left alone on purpose:
+        the endpoints work as-is, and swapping the header would be a
+        behaviour change riding along in a de-duplication pass. If it is ever
+        revisited, it is a change to Deck's REST calls only. ``OCS-APIRequest``
+        comes from the shared httpx client, as for every other call.
+        """
+        headers = {"Content-Type": "application/json"}
+        if additional_headers:
+            headers.update(additional_headers)
+        return headers
+
+    # Boards
+    async def get_boards(
+        self, details: bool = False, if_modified_since: Optional[str] = None
+    ) -> List[DeckBoard]:
+        additional_headers = {}
+        if if_modified_since:
+            additional_headers["If-Modified-Since"] = if_modified_since
+        headers = self._get_deck_headers(additional_headers)
+        params = {"details": "true"} if details else {}
+        response = await self._make_request(
+            "GET", "/apps/deck/api/v1.0/boards", headers=headers, params=params
+        )
+        return [DeckBoard(**board) for board in response.json()]
+
+    async def create_board(self, title: str, color: str) -> DeckBoard:
+        json_data = {"title": title, "color": color}
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST", "/apps/deck/api/v1.0/boards", json=json_data, headers=headers
+        )
+        return DeckBoard(**response.json())
+
+    async def get_board(self, board_id: int) -> DeckBoard:
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "GET", f"/apps/deck/api/v1.0/boards/{board_id}", headers=headers
+        )
+        return DeckBoard(**response.json())
+
+    async def update_board(
+        self,
+        board_id: int,
+        title: Optional[str] = None,
+        color: Optional[str] = None,
+        archived: Optional[bool] = None,
+    ) -> None:
+        json_data = {}
+        if title is not None:
+            json_data["title"] = title
+        if color is not None:
+            json_data["color"] = color
+        if archived is not None:
+            json_data["archived"] = archived
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}",
+            json=json_data,
+            headers=headers,
+        )
+
+    async def delete_board(self, board_id: int) -> None:
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "DELETE", f"/apps/deck/api/v1.0/boards/{board_id}", headers=headers
+        )
+
+    async def undo_delete_board(self, board_id: int) -> None:
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/undo_delete",
+            headers=headers,
+        )
+
+    async def add_acl_rule(
+        self,
+        board_id: int,
+        type: int,
+        participant: str,
+        permission_edit: bool,
+        permission_share: bool,
+        permission_manage: bool,
+    ) -> DeckACL:
+        json_data = {
+            "type": type,
+            "participant": participant,
+            "permissionEdit": permission_edit,
+            "permissionShare": permission_share,
+            "permissionManage": permission_manage,
+        }
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/acl",
+            json=json_data,
+            headers=headers,
+        )
+        return DeckACL(**response.json())
+
+    async def update_acl_rule(
+        self,
+        board_id: int,
+        acl_id: int,
+        permission_edit: Optional[bool] = None,
+        permission_share: Optional[bool] = None,
+        permission_manage: Optional[bool] = None,
+    ) -> None:
+        json_data = {}
+        if permission_edit is not None:
+            json_data["permissionEdit"] = permission_edit
+        if permission_share is not None:
+            json_data["permissionShare"] = permission_share
+        if permission_manage is not None:
+            json_data["permissionManage"] = permission_manage
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/acl/{acl_id}",
+            json=json_data,
+            headers=headers,
+        )
+
+    async def delete_acl_rule(self, board_id: int, acl_id: int) -> None:
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "DELETE",
+            f"/apps/deck/api/v1.0/boards/{board_id}/acl/{acl_id}",
+            headers=headers,
+        )
+
+    async def clone_board(
+        self,
+        board_id: int,
+        with_cards: bool = False,
+        with_assignments: bool = False,
+        with_labels: bool = False,
+        with_due_date: bool = False,
+        move_cards_to_left_stack: bool = False,
+        restore_archived_cards: bool = False,
+    ) -> DeckBoard:
+        json_data = {
+            "withCards": with_cards,
+            "withAssignments": with_assignments,
+            "withLabels": with_labels,
+            "withDueDate": with_due_date,
+            "moveCardsToLeftStack": move_cards_to_left_stack,
+            "restoreArchivedCards": restore_archived_cards,
+        }
+        response = await self._make_request(
+            "POST", f"/apps/deck/api/v1.0/boards/{board_id}/clone", json=json_data
+        )
+        return DeckBoard(**response.json())
+
+    # Stacks
+    async def get_stacks(
+        self, board_id: int, if_modified_since: Optional[str] = None
+    ) -> List[DeckStack]:
+        additional_headers = {}
+        if if_modified_since:
+            additional_headers["If-Modified-Since"] = if_modified_since
+        headers = self._get_deck_headers(additional_headers)
+        response = await self._make_request(
+            "GET", f"/apps/deck/api/v1.0/boards/{board_id}/stacks", headers=headers
+        )
+        return [DeckStack(**stack) for stack in response.json()]
+
+    async def get_archived_stacks(self, board_id: int) -> List[DeckStack]:
+        response = await self._make_request(
+            "GET", f"/apps/deck/api/v1.0/boards/{board_id}/stacks/archived"
+        )
+        return [DeckStack(**stack) for stack in response.json()]
+
+    async def get_stack(self, board_id: int, stack_id: int) -> DeckStack:
+        response = await self._make_request(
+            "GET", f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}"
+        )
+        return DeckStack(**response.json())
+
+    async def create_stack(self, board_id: int, title: str, order: int) -> DeckStack:
+        json_data = {"title": title, "order": order}
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks",
+            json=json_data,
+            headers=headers,
+        )
+        return DeckStack(**response.json())
+
+    async def update_stack(
+        self,
+        board_id: int,
+        stack_id: int,
+        title: Optional[str] = None,
+        order: Optional[int] = None,
+    ) -> None:
+        json_data = {}
+        if title is not None:
+            json_data["title"] = title
+        if order is not None:
+            json_data["order"] = order
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}",
+            json=json_data,
+            headers=headers,
+        )
+
+    async def delete_stack(self, board_id: int, stack_id: int) -> None:
+        await self._make_request(
+            "DELETE", f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}"
+        )
+
+    # Cards
+    async def get_card(self, board_id: int, stack_id: int, card_id: int) -> DeckCard:
+        headers = self._get_deck_headers()
+        # v1.1 (Deck >= 1.3.0), not v1.0, for the sake of ``attachments``: on
+        # v1.0 CardService::find strips every attachment that is not a legacy
+        # ``deck_file``, so a card whose files were attached from the Files app
+        # comes back with attachmentCount > 0 and an empty attachments array.
+        response = await self._make_request(
+            "GET",
+            f"/apps/deck/api/v1.1/boards/{board_id}/stacks/{stack_id}/cards/{card_id}",
+            headers=headers,
+        )
+        return DeckCard(**response.json())
+
+    async def create_card(
+        self,
+        board_id: int,
+        stack_id: int,
+        title: str,
+        type: str = "plain",
+        order: int = 999,
+        description: Optional[str] = None,
+        duedate: Optional[str] = None,
+    ) -> DeckCard:
+        json_data = {
+            "title": title,
+            "type": type,
+            "order": order,
+        }
+        if description is not None:
+            json_data["description"] = description
+        if duedate is not None:
+            json_data["duedate"] = _normalize_duedate(duedate)
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards",
+            json=json_data,
+            headers=headers,
+        )
+        card = DeckCard(**response.json())
+
+        # Some Deck versions ignore duedate on create despite accepting it.
+        if duedate is not None and card.duedate is None:
+            await self.update_card(
+                board_id=board_id,
+                stack_id=stack_id,
+                card_id=card.id,
+                duedate=duedate,
+            )
+            card = await self.get_card(board_id, stack_id, card.id)
+
+        return card
+
+    @staticmethod
+    def _card_update_payload(
+        current: DeckCard,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        type: Optional[str] = None,
+        owner: Optional[str] = None,
+        order: Optional[int] = None,
+        duedate: Optional[str] = None,
+        archived: Optional[bool] = None,
+        done: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build the full-replacement body for a card update.
+
+        Deck's card PUT replaces the whole card, so every field the caller did
+        *not* supply has to be carried over from ``current``. ``order``,
+        ``duedate`` and ``archived`` were previously only sent when explicitly
+        passed, so a title-only update reset the card's order to 0 and cleared its
+        due date. ``move_card_to_board`` already sent order and duedate
+        unconditionally — the two payload builders simply disagreed.
+
+        Every fallback tests ``is not None``, never truthiness: ``order=0`` is a
+        legitimate first position and ``archived=False`` is meaningful, so
+        ``order or current.order`` would silently discard both.
+
+        ``done`` is deliberately not carried over. ``move_card_to_board``'s
+        docstring records that the internal route does not accept a ``done``
+        value, so the two routes genuinely differ here; preserving it blind could
+        re-stamp a done timestamp. Left as an explicit omission pending an
+        integration test that shows whether this route clears it.
+        """
+        return {
+            # Title is required by the API
+            "title": title if title is not None else current.title,
+            # Type is required by the API
+            "type": type if type is not None else current.type,
+            # Owner is required by the API (model validator ensures it's a string)
+            "owner": owner if owner is not None else current.owner,
+            # Description must be sent to preserve it (PUT clears omitted fields)
+            "description": description
+            if description is not None
+            else (current.description or ""),
+            "order": order if order is not None else current.order,
+            "duedate": _normalize_duedate(
+                duedate
+                if duedate is not None
+                else (current.duedate.isoformat() if current.duedate else None)
+            ),
+            "archived": archived if archived is not None else current.archived,
+            **({"done": done} if done is not None else {}),
+        }
+
+    async def update_card(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        type: Optional[str] = None,
+        owner: Optional[str] = None,
+        order: Optional[int] = None,
+        duedate: Optional[str] = None,
+        archived: Optional[bool] = None,
+        done: Optional[str] = None,
+    ) -> None:
+        # Deck PUT API is a full replacement - all required fields must be sent.
+        # Fetch current card to preserve values for fields not being updated.
+        current_card = await self.get_card(board_id, stack_id, card_id)
+
+        json_data = self._card_update_payload(
+            current_card,
+            title=title,
+            description=description,
+            type=type,
+            owner=owner,
+            order=order,
+            duedate=duedate,
+            archived=archived,
+            done=done,
+        )
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}",
+            json=json_data,
+            headers=headers,
+        )
+
+    async def delete_card(self, board_id: int, stack_id: int, card_id: int) -> None:
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "DELETE",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}",
+            headers=headers,
+        )
+
+    async def archive_card(self, board_id: int, stack_id: int, card_id: int) -> None:
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/archive",
+        )
+
+    async def unarchive_card(self, board_id: int, stack_id: int, card_id: int) -> None:
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/unarchive",
+        )
+
+    async def assign_label_to_card(
+        self, board_id: int, stack_id: int, card_id: int, label_id: int
+    ) -> None:
+        json_data = {"labelId": label_id}
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/assignLabel",
+            json=json_data,
+        )
+
+    async def remove_label_from_card(
+        self, board_id: int, stack_id: int, card_id: int, label_id: int
+    ) -> None:
+        json_data = {"labelId": label_id}
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/removeLabel",
+            json=json_data,
+        )
+
+    async def assign_user_to_card(
+        self, board_id: int, stack_id: int, card_id: int, user_id: str
+    ) -> None:
+        json_data = {"userId": user_id}
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/assignUser",
+            json=json_data,
+        )
+
+    async def unassign_user_from_card(
+        self, board_id: int, stack_id: int, card_id: int, user_id: str
+    ) -> None:
+        json_data = {"userId": user_id}
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/unassignUser",
+            json=json_data,
+        )
+
+    async def assign_dependent_card(
+        self, board_id: int, stack_id: int, card_id: int, dependent_card_id: int
+    ) -> DeckCard:
+        """Record that ``card_id`` depends on ``dependent_card_id``.
+
+        Mirrors Deck's "Add dependent card" card action. The dependency is
+        directional: it is stored on ``card_id`` and surfaces in that card's
+        ``dependentCards`` list. The caller needs read access to the dependent
+        card. Returns the updated (depending) card.
+        """
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/dependentCards/{dependent_card_id}",
+            headers=headers,
+        )
+        return DeckCard(**response.json())
+
+    async def remove_dependent_card(
+        self, board_id: int, stack_id: int, card_id: int, dependent_card_id: int
+    ) -> DeckCard:
+        """Remove the dependency of ``card_id`` on ``dependent_card_id``.
+
+        Returns the updated (depending) card.
+        """
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "DELETE",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/dependentCards/{dependent_card_id}",
+            headers=headers,
+        )
+        return DeckCard(**response.json())
+
+    async def reorder_card(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        order: int,
+        target_stack_id: int,
+    ) -> None:
+        # Reorder is intentionally restricted to moves *within* a single board.
+        # Deck's reorder route (CardService::reorder) only reassigns stackId and
+        # does NOT remap board-scoped labels, so handing it a stack on another
+        # board silently orphans the card's labels (they keep the old boardId).
+        # Cross-board moves must go through move_card_to_board(), which uses the
+        # card-update route (CardService::update) and remaps labels by title.
+        # A same-stack reorder can't cross a board boundary, so skip the lookup.
+        if target_stack_id != stack_id:
+            board_stack_ids = {stack.id for stack in await self.get_stacks(board_id)}
+            if target_stack_id not in board_stack_ids:
+                raise ValueError(
+                    f"target_stack_id {target_stack_id} is not a stack on board "
+                    f"{board_id}; reorder_card only moves cards within a board. "
+                    "Use move_card_to_board() to move a card to another board."
+                )
+
+        # Use the non-API route /cards/{cardId}/reorder which correctly reads
+        # stackId from the body. The API route /api/.../stacks/{stackId}/cards/...
+        # has a parameter conflict where URL stackId overrides body stackId.
+        # See: https://github.com/cbcoutinho/nextcloud-mcp-server/issues/469
+        json_data = {"order": order, "stackId": target_stack_id}
+        headers = self._get_deck_headers()
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/cards/{card_id}/reorder",
+            json=json_data,
+            headers=headers,
+        )
+
+    async def move_card_to_board(
+        self,
+        source_board_id: int,
+        source_stack_id: int,
+        card_id: int,
+        target_board_id: int,
+        target_stack_id: int,
+        order: int = 0,
+    ) -> DeckCard:
+        """Move a card to a stack on a different (or the same) board.
+
+        Unlike :meth:`reorder_card`, this goes through the card-update route
+        (``CardService::update``). When the destination stack is on a different
+        board, Deck remaps the card's board-scoped labels by title — assigning
+        the same-titled label on the destination board, or cloning it there
+        when the user has board-manage permission — instead of leaving orphaned
+        labels behind. This mirrors Deck's native "Move/copy card" action. Card
+        identity (id, comments, attachments), ``archived`` state, the due date
+        and ``assignedUsers`` are preserved — the move does not re-validate
+        assignees against the destination board, so an assigned user without
+        access to the target board stays assigned but may not be able to act on
+        the card.
+
+        The internal ``/apps/deck/cards/{cardId}`` route is used: it reads the
+        target ``stackId`` from the body (the board/stack-scoped API route
+        instead binds ``stackId`` from the URL — issue #469 — and 404s for a
+        card that isn't already on that board). The controller derives ``owner``
+        from the session user and does not accept a ``done`` value, so a "done"
+        card is re-marked done after the move; Deck stamps the current time
+        there, so the original done timestamp is not preserved (a limitation of
+        what this route exposes).
+
+        The done re-mark is best-effort: the move itself has already committed
+        by then, so if that follow-up fails the card is left on the target
+        board without its done state (logged as a warning) rather than raising
+        and implying the move failed.
+        """
+        # Validate the destination so target_board_id is load-bearing: the move
+        # itself is driven by stackId, so without this a stack on another board
+        # would relocate the card while the reported board is wrong.
+        target_stack_ids = {
+            stack.id for stack in await self.get_stacks(target_board_id)
+        }
+        if target_stack_id not in target_stack_ids:
+            raise ValueError(
+                f"target_stack_id {target_stack_id} is not a stack on target "
+                f"board {target_board_id}."
+            )
+
+        current = await self.get_card(source_board_id, source_stack_id, card_id)
+
+        json_data: dict[str, Any] = {
+            # The route placeholder is {cardId} but the controller reads the
+            # card id from the body, so it must be sent explicitly.
+            "id": card_id,
+            "title": current.title,
+            "type": current.type,
+            "stackId": target_stack_id,
+            "order": order,
+            "description": current.description or "",
+            # Sent explicitly as None when absent (update_card omits the key);
+            # both are equivalent here — the route reads duedate and there's
+            # nothing to clear on a card that never had one.
+            "duedate": _normalize_duedate(
+                current.duedate.isoformat() if current.duedate else None
+            ),
+            # 0 keeps the card live (a positive value would soft-delete it)
+            "deletedAt": current.deletedAt or 0,
+        }
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "PUT",
+            f"/apps/deck/cards/{card_id}",
+            json=json_data,
+            headers=headers,
+        )
+        moved = DeckCard(**response.json())
+
+        # This route clears `done`; restore the done *state* if the card had it
+        # (the timestamp is refreshed to now — see the docstring note). The move
+        # has already committed, so this is best-effort: on failure, warn with
+        # the card's new location rather than raising as if the move failed.
+        if current.done is not None:
+            try:
+                await self._make_request(
+                    "PUT", f"/apps/deck/cards/{card_id}/done", headers=headers
+                )
+                moved = await self.get_card(target_board_id, target_stack_id, card_id)
+            except (HTTPStatusError, RequestError) as e:
+                logger.warning(
+                    "Card %s moved to board %s stack %s but restoring done "
+                    "state failed: %s",
+                    card_id,
+                    target_board_id,
+                    target_stack_id,
+                    e,
+                )
+
+        return moved
+
+    # Labels
+    async def get_label(self, board_id: int, label_id: int) -> DeckLabel:
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "GET",
+            f"/apps/deck/api/v1.0/boards/{board_id}/labels/{label_id}",
+            headers=headers,
+        )
+        return DeckLabel(**response.json())
+
+    async def create_label(self, board_id: int, title: str, color: str) -> DeckLabel:
+        json_data = {"title": title, "color": color}
+        headers = self._get_deck_headers()
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/labels",
+            json=json_data,
+            headers=headers,
+        )
+        return DeckLabel(**response.json())
+
+    async def update_label(
+        self,
+        board_id: int,
+        label_id: int,
+        title: Optional[str] = None,
+        color: Optional[str] = None,
+    ) -> None:
+        json_data = {}
+        if title is not None:
+            json_data["title"] = title
+        if color is not None:
+            json_data["color"] = color
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/labels/{label_id}",
+            json=json_data,
+        )
+
+    async def delete_label(self, board_id: int, label_id: int) -> None:
+        await self._make_request(
+            "DELETE", f"/apps/deck/api/v1.0/boards/{board_id}/labels/{label_id}"
+        )
+
+    # Attachments
+    async def get_attachments(
+        self, board_id: int, stack_id: int, card_id: int
+    ) -> List[DeckAttachment]:
+        # v1.1 for the same reason as get_card: v1.0 returns only deck_file.
+        response = await self._make_request(
+            "GET",
+            f"/apps/deck/api/v1.1/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments",
+        )
+        return [DeckAttachment(**attachment) for attachment in response.json()]
+
+    async def get_attachment_file(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        attachment_id: int,
+        file_type: str = "deck_file",
+    ) -> Any:
+        # Every route that addresses one attachment by id resolves that id
+        # against ``type`` (server-side default deck_file), so a Files-share
+        # attachment is only found with type=file. Applies equally to
+        # update/delete/restore below.
+        # This endpoint returns the raw file, so we return the raw response content
+        response = await self._make_request(
+            "GET",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments/{attachment_id}",
+            params={"type": file_type},
+        )
+        return response.content
+
+    async def upload_attachment(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        file_data: bytes,
+        file_type: str = "file",
+    ) -> DeckAttachment:
+        # The API expects binary data directly, not JSON
+        headers = {"Content-Type": "application/octet-stream"}
+        params = {"type": file_type}
+        response = await self._make_request(
+            "POST",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments",
+            headers=headers,
+            params=params,
+            data=file_data,
+        )
+        return DeckAttachment(**response.json())
+
+    async def update_attachment(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        attachment_id: int,
+        file_data: bytes,
+        file_type: str = "deck_file",
+    ) -> DeckAttachment:
+        headers = {"Content-Type": "application/octet-stream"}
+        params = {"type": file_type}
+        response = await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments/{attachment_id}",
+            headers=headers,
+            params=params,
+            data=file_data,
+        )
+        return DeckAttachment(**response.json())
+
+    async def delete_attachment(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        attachment_id: int,
+        file_type: str = "deck_file",
+    ) -> None:
+        # See get_attachment_file on why ``type`` has to be sent.
+        await self._make_request(
+            "DELETE",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments/{attachment_id}",
+            params={"type": file_type},
+        )
+
+    async def restore_attachment(
+        self,
+        board_id: int,
+        stack_id: int,
+        card_id: int,
+        attachment_id: int,
+        file_type: str = "deck_file",
+    ) -> None:
+        await self._make_request(
+            "PUT",
+            f"/apps/deck/api/v1.0/boards/{board_id}/stacks/{stack_id}/cards/{card_id}/attachments/{attachment_id}/restore",
+            params={"type": file_type},
+        )
+
+    # OCS API Endpoints (Config, Comments, Sessions)
+    async def get_config(self) -> DeckConfig:
+        headers = self._OCS_HEADERS
+        response = await self._make_request(
+            "GET", "/ocs/v2.php/apps/deck/api/v1.0/config", headers=headers
+        )
+        return DeckConfig(**response.json()["ocs"]["data"])
+
+    async def set_config_value(
+        self, key: str, value: Any, board_id: Optional[int] = None
+    ) -> Any:
+        path = f"/ocs/v2.php/apps/deck/api/v1.0/config/{key}"
+        if board_id:
+            path = f"/ocs/v2.php/apps/deck/api/v1.0/config/board:{board_id}:{key}"
+        json_data = {"value": value}
+        response = await self._make_request(
+            "POST",
+            path,
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )
+        return response.json()["ocs"]["data"]
+
+    async def get_comments(
+        self, card_id: int, limit: int = 20, offset: int = 0
+    ) -> List[DeckComment]:
+        params = {"limit": limit, "offset": offset}
+        response = await self._make_request(
+            "GET",
+            f"/ocs/v2.php/apps/deck/api/v1.0/cards/{card_id}/comments",
+            params=params,
+            headers=self._OCS_HEADERS,
+        )
+        return [DeckComment(**comment) for comment in response.json()["ocs"]["data"]]
+
+    async def create_comment(
+        self, card_id: int, message: str, parent_id: Optional[int] = None
+    ) -> DeckComment:
+        json_data = {"message": message}
+        if parent_id is not None:
+            json_data["parentId"] = parent_id
+        response = await self._make_request(
+            "POST",
+            f"/ocs/v2.php/apps/deck/api/v1.0/cards/{card_id}/comments",
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )
+        return DeckComment(**response.json()["ocs"]["data"])
+
+    async def update_comment(
+        self, card_id: int, comment_id: int, message: str
+    ) -> DeckComment:
+        json_data = {"message": message}
+        response = await self._make_request(
+            "PUT",
+            f"/ocs/v2.php/apps/deck/api/v1.0/cards/{card_id}/comments/{comment_id}",
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )
+        return DeckComment(**response.json()["ocs"]["data"])
+
+    async def delete_comment(self, card_id: int, comment_id: int) -> None:
+        await self._make_request(
+            "DELETE",
+            f"/ocs/v2.php/apps/deck/api/v1.0/cards/{card_id}/comments/{comment_id}",
+            headers=self._OCS_HEADERS,
+        )
+
+    async def create_session(self, board_id: int) -> DeckSession:
+        json_data = {"boardId": board_id}
+        response = await self._make_request(
+            "PUT",
+            "/ocs/v2.php/apps/deck/api/v1.0/session/create",
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )
+        return DeckSession(**response.json()["ocs"]["data"])
+
+    async def sync_session(self, board_id: int, token: str) -> None:
+        json_data = {"boardId": board_id, "token": token}
+        await self._make_request(
+            "POST",
+            "/ocs/v2.php/apps/deck/api/v1.0/session/sync",
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )
+
+    async def close_session(self, board_id: int, token: str) -> None:
+        json_data = {"boardId": board_id, "token": token}
+        await self._make_request(
+            "POST",
+            "/ocs/v2.php/apps/deck/api/v1.0/session/close",
+            json=json_data,
+            headers=self._OCS_HEADERS,
+        )

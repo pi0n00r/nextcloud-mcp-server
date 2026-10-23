@@ -1,0 +1,538 @@
+"""MCP tool registration for the Nextcloud Talk (spreed) integration."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+import logging
+import uuid
+
+from httpx import HTTPStatusError
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+
+from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.capabilities import require_capability
+from nextcloud_mcp_server.client.talk import TalkClient
+from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.models.talk import (
+    AddParticipantResponse,
+    CreateConversationResponse,
+    GetConversationResponse,
+    ListConversationsResponse,
+    ListMessagesResponse,
+    ListParticipantsResponse,
+    MarkAsReadResponse,
+    ReactionsResponse,
+    SendMessageResponse,
+    TalkMessage,
+    TalkParticipantSource,
+    TalkRoomType,
+)
+from nextcloud_mcp_server.observability.metrics import instrument_tool
+
+logger = logging.getLogger(__name__)
+
+
+# spreed advertises a 32000-character limit on chat messages (docs/chat.md);
+# we enforce it client-side for a clearer error than the server's 413.
+_MESSAGE_MAX_LENGTH = 32000
+
+
+def _validate_message_text(message: str) -> None:
+    # Reject both empty strings and whitespace-only strings — spreed
+    # would happily post the latter as a visually-blank message.
+    if not message or not message.strip():
+        raise ToolError("Message text must not be empty or whitespace-only")
+    if len(message) > _MESSAGE_MAX_LENGTH:
+        raise ToolError(
+            f"Message too long: {len(message)} characters (max {_MESSAGE_MAX_LENGTH})"
+        )
+
+
+def _validate_thread_params(
+    thread_id: int | None, thread_title: str | None, reply_to: int | None
+) -> None:
+    """Reject thread parameter combinations spreed's semantics can't satisfy.
+
+    Not documented in docs/chat.md at the time of writing -- confirmed
+    against a live Talk v24.0.5 instance: sending `threadTitle` (no
+    `replyTo`) starts a brand-new thread with this message as its root;
+    sending `threadId` posts a follow-up message inside an existing one.
+    A caller cannot ask for both a brand-new thread and an existing one,
+    and a thread's root message is not itself a reply.
+    """
+    if thread_id is not None and thread_title is not None:
+        raise ToolError(
+            "thread_id and thread_title are mutually exclusive: thread_id "
+            "posts into an existing thread, thread_title starts a new one"
+        )
+    if thread_title is not None:
+        if not thread_title.strip():
+            raise ToolError("thread_title must not be empty or whitespace-only")
+        if reply_to is not None:
+            raise ToolError(
+                "thread_title and reply_to are mutually exclusive: a new "
+                "thread is started as a root message, not as a reply"
+            )
+
+
+def _ocs_error(e: HTTPStatusError) -> str | None:
+    """Return spreed's ``ocs.data.error`` code from a 404, if it sent one."""
+    if e.response.status_code != 404:
+        return None
+    try:
+        data = e.response.json()["ocs"]["data"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return data.get("error") if isinstance(data, dict) else None
+
+
+async def _get_messages(
+    talk: TalkClient,
+    token: str,
+    *,
+    limit: int,
+    last_known_message_id: int | None,
+    include_last_known: bool,
+    thread_id: int | None,
+) -> tuple[list[TalkMessage], int | None]:
+    """Read chat history without moving the read marker.
+
+    Kept out of ``configure_talk_tools`` so the 404 translation does not add
+    to that function's complexity.
+    """
+    try:
+        return await talk.get_messages(
+            token,
+            limit=limit,
+            last_known_message_id=last_known_message_id,
+            look_into_future=False,
+            set_read_marker=False,
+            include_last_known=include_last_known,
+            thread_id=thread_id,
+        )
+    except HTTPStatusError as e:
+        # spreed answers 404 {"error": "thread"} for an unknown thread (Talk
+        # 23+). An unknown room or non-participant is also a 404, with no
+        # "error" key, and must not be reported as a missing thread.
+        if thread_id is not None and _ocs_error(e) == "thread":
+            raise ToolError(
+                f"Thread {thread_id} not found in conversation {token}"
+            ) from e
+        raise
+
+
+def configure_talk_tools(mcp: MCPServer) -> None:
+    """Configure Nextcloud Talk (spreed) MCP tools."""
+
+    # Read tools
+
+    @mcp.tool(
+        title="List Talk Conversations",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.read")
+    @instrument_tool
+    async def talk_list_conversations(
+        ctx: Context,
+        modified_since: int | None = None,
+        include_status: bool = False,
+    ) -> ListConversationsResponse:
+        """List the user's Talk conversations (rooms).
+
+        Args:
+            modified_since: Optional Unix timestamp. Only conversations
+                modified after this time are returned.
+            include_status: Whether to include user-status info for
+                one-to-one conversations.
+        """
+        client = await get_client(ctx)
+        rooms = await client.talk.list_conversations(
+            modified_since=modified_since,
+            include_status=include_status,
+        )
+        return ListConversationsResponse(results=rooms, total=len(rooms))
+
+    @mcp.tool(
+        title="Get Talk Conversation",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.read")
+    @instrument_tool
+    async def talk_get_conversation(
+        ctx: Context, token: str
+    ) -> GetConversationResponse:
+        """Get details of a Talk conversation by its token.
+
+        Args:
+            token: Unique room token (returned by ``talk_list_conversations``).
+        """
+        client = await get_client(ctx)
+        conversation = await client.talk.get_conversation(token)
+        return GetConversationResponse(conversation=conversation)
+
+    @mcp.tool(
+        title="Get Talk Messages",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.read")
+    @instrument_tool
+    async def talk_get_messages(
+        ctx: Context,
+        token: str,
+        limit: int = 50,
+        last_known_message_id: int | None = None,
+        include_last_known: bool = False,
+        thread_id: int | None = None,
+    ) -> ListMessagesResponse:
+        """Read chat history for a Talk conversation.
+
+        Returns the most recent messages (older first when paginated).
+        Does not move the user's read marker. Call
+        ``talk_mark_as_read`` separately if desired.
+
+        Args:
+            token: Conversation token.
+            limit: Max messages per page. Valid range is 1-200 (spreed
+                caps server-side at 200). Values outside this range are
+                clamped. Default 50.
+            last_known_message_id: Pagination cursor — pass the
+                ``last_known_message_id`` from the previous response to
+                fetch the next (older) page. An empty page with no
+                ``last_known_message_id`` means there is no older history.
+            include_last_known: Include the cursor message in the page
+                instead of starting just before it.
+            thread_id: Optional ID of a thread (its root message ID) to read
+                only that thread: the root message plus every message posted
+                inside it. Use a message's ``threadId``, or the ``id`` of the
+                root returned by ``talk_send_message`` with ``thread_title``.
+                Pagination with ``last_known_message_id`` works the same
+                within the thread. The thread is complete once the root
+                message (``id`` equal to ``thread_id``) has been returned.
+                An unknown thread is an error on Talk 23+, while Talk 22
+                returns an empty page instead.
+        """
+        client = await get_client(ctx)
+        messages, last_given = await _get_messages(
+            client.talk,
+            token,
+            limit=limit,
+            last_known_message_id=last_known_message_id,
+            include_last_known=include_last_known,
+            thread_id=thread_id,
+        )
+        return ListMessagesResponse(
+            conversation_token=token,
+            results=messages,
+            count=len(messages),
+            last_known_message_id=last_given,
+        )
+
+    @mcp.tool(
+        title="List Talk Conversation Participants",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.read")
+    @instrument_tool
+    async def talk_list_participants(
+        ctx: Context, token: str, include_status: bool = False
+    ) -> ListParticipantsResponse:
+        """List the participants of a Talk conversation.
+
+        Args:
+            token: Conversation token.
+            include_status: Include each participant's user-status info.
+        """
+        client = await get_client(ctx)
+        participants = await client.talk.list_participants(
+            token, include_status=include_status
+        )
+        return ListParticipantsResponse(
+            conversation_token=token,
+            results=participants,
+            count=len(participants),
+        )
+
+    # Write tools
+
+    @mcp.tool(
+        title="Send Talk Message",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_send_message(
+        ctx: Context,
+        token: str,
+        message: str,
+        reply_to: int | None = None,
+        thread_id: int | None = None,
+        thread_title: str | None = None,
+        silent: bool = False,
+    ) -> SendMessageResponse:
+        """Post a chat message into a Talk conversation as the user.
+
+        A random ``referenceId`` is attached so spreed dedupes the post
+        if the request is retried.
+
+        Args:
+            token: Conversation token.
+            message: Message text (max 32000 characters).
+            reply_to: Optional parent message ID to thread the reply.
+            thread_id: Optional ID of an existing thread to post into (the
+                thread's root message ID). Mutually exclusive with
+                thread_title.
+            thread_title: Optional title that starts a brand-new thread,
+                with this message as its root. Mutually exclusive with
+                thread_id and with reply_to. Instances that do not
+                advertise the "threads" feature under the spreed OCS
+                capability are expected to ignore it rather than error, so
+                this is not gated client-side -- normal message sending
+                and reply_to must keep working regardless.
+            silent: When True the message is delivered without push
+                notifications (e.g. for status updates).
+        """
+        _validate_message_text(message)
+        _validate_thread_params(thread_id, thread_title, reply_to)
+        client = await get_client(ctx)
+        posted = await client.talk.send_message(
+            token,
+            message,
+            reply_to=reply_to,
+            thread_id=thread_id,
+            thread_title=thread_title,
+            # 32 hex chars, no dashes — spreed accepts either UUID format.
+            reference_id=uuid.uuid4().hex,
+            silent=silent,
+        )
+        return SendMessageResponse(message=posted)
+
+    @mcp.tool(
+        title="Mark Talk Conversation as Read",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_mark_as_read(
+        ctx: Context,
+        token: str,
+        last_read_message: int | None = None,
+    ) -> MarkAsReadResponse:
+        """Move the user's read marker forward in a Talk conversation.
+
+        Args:
+            token: Conversation token.
+            last_read_message: Optional message ID to mark as the new
+                read position. When omitted, spreed marks everything
+                currently in the room as read.
+        """
+        client = await get_client(ctx)
+        await client.talk.mark_as_read(token, last_read_message=last_read_message)
+        return MarkAsReadResponse(
+            success=True,
+            message="Conversation marked as read",
+            conversation_token=token,
+            last_read_message=last_read_message,
+        )
+
+    @mcp.tool(
+        title="Create Talk Conversation",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_create_conversation(
+        ctx: Context,
+        room_name: str | None = None,
+        room_type: TalkRoomType = 2,
+        invite: str | None = None,
+    ) -> CreateConversationResponse:
+        """Create a new Talk conversation (room).
+
+        Args:
+            room_name: Display name for the room. Required for a group (2) or
+                public (3) room. Omit it for a one-to-one room, which spreed
+                names after the other participant.
+            room_type: 2 for a group room (default), 3 for a public room, 1 for
+                a one-to-one room.
+            invite: User or group ID to add at creation time. Required for a
+                one-to-one room, where it is the other participant and is what
+                defines the room. Optional otherwise.
+        """
+        if room_type == 1:
+            # A one-to-one room is defined by who is in it, not by a name --
+            # spreed accepts the create with no roomName at all. Without an
+            # invite there is no second participant, so there is no room.
+            if not invite or not invite.strip():
+                raise ToolError(
+                    "invite is required for a one-to-one room (room_type=1): "
+                    "the other participant is what identifies the room"
+                )
+        elif not room_name or not room_name.strip():
+            raise ToolError(
+                f"room_name is required for room_type={room_type} and must not "
+                "be empty or whitespace-only"
+            )
+
+        client = await get_client(ctx)
+        conversation = await client.talk.create_conversation(
+            room_type=room_type,
+            room_name=room_name,
+            invite=invite,
+        )
+        return CreateConversationResponse(conversation=conversation)
+
+    @mcp.tool(
+        title="Add Talk Participant",
+        annotations=ToolAnnotations(
+            # Adding someone already in the room succeeds as a no-op (verified
+            # against Talk 22.0.17), so repeating the call leaves the same state.
+            idempotent_hint=True,
+            open_world_hint=True,
+        ),
+    )
+    @require_scopes("talk.write")
+    @instrument_tool
+    async def talk_add_participant(
+        ctx: Context,
+        token: str,
+        participant: str,
+        source: TalkParticipantSource = "users",
+    ) -> AddParticipantResponse:
+        """Add a participant to a group or public Talk conversation.
+
+        A one-to-one conversation cannot take additional participants -- the
+        server rejects that with a room-type error.
+
+        Args:
+            token: Conversation token.
+            participant: Identifier to add, interpreted according to `source`.
+            source: Where the identifier comes from - "users" (default),
+                "groups", "emails", "circles", or "federated_users".
+        """
+        if not participant or not participant.strip():
+            raise ToolError("participant must not be empty or whitespace-only")
+
+        client = await get_client(ctx)
+        await client.talk.add_participant(token, participant, source=source)
+        return AddParticipantResponse(
+            conversation_token=token,
+            participant=participant,
+            source=source,
+            message=f"Added {participant} ({source}) to the conversation",
+        )
+
+    @mcp.tool(
+        title="List Talk Message Reactions",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("talk.read")
+    @require_capability("spreed", feature="reactions")
+    @instrument_tool
+    async def talk_list_reactions(
+        ctx: Context,
+        token: str,
+        message_id: int,
+        reaction: str | None = None,
+    ) -> ReactionsResponse:
+        """List the reactions on a Talk chat message, grouped by emoji.
+
+        Args:
+            token: Conversation token.
+            message_id: ID of the message to read reactions from.
+            reaction: Optional single emoji to filter to.
+        """
+        client = await get_client(ctx)
+        reactions = await client.talk.list_reactions(
+            token, message_id, reaction=reaction
+        )
+        return ReactionsResponse(
+            conversation_token=token,
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
+        )
+
+    @mcp.tool(
+        title="React to Talk Message",
+        annotations=ToolAnnotations(
+            # Reactions are a set: reacting twice with the same emoji leaves the
+            # same state (spreed answers 201 then 200).
+            idempotent_hint=True,
+            open_world_hint=True,
+        ),
+    )
+    @require_scopes("talk.write")
+    @require_capability("spreed", feature="reactions")
+    @instrument_tool
+    async def talk_react(
+        ctx: Context,
+        token: str,
+        message_id: int,
+        reaction: str,
+    ) -> ReactionsResponse:
+        """React to a Talk chat message with an emoji.
+
+        Returns the message's reactions after the change, so the caller does
+        not need a follow-up read.
+
+        Args:
+            token: Conversation token.
+            message_id: ID of the message to react to.
+            reaction: The emoji to react with.
+        """
+        client = await get_client(ctx)
+        reactions = await client.talk.add_reaction(token, message_id, reaction)
+        return ReactionsResponse(
+            conversation_token=token,
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
+        )
+
+    @mcp.tool(
+        title="Remove Talk Message Reaction",
+        annotations=ToolAnnotations(
+            destructive_hint=True,
+            # Same end state when repeated, though the server reports the second
+            # removal as a 404 rather than a no-op.
+            idempotent_hint=True,
+            open_world_hint=True,
+        ),
+    )
+    @require_scopes("talk.write")
+    @require_capability("spreed", feature="reactions")
+    @instrument_tool
+    async def talk_remove_reaction(
+        ctx: Context,
+        token: str,
+        message_id: int,
+        reaction: str,
+    ) -> ReactionsResponse:
+        """Remove the user's own reaction from a Talk chat message.
+
+        Removing a reaction the user has not made is reported by the server as
+        a not-found error rather than succeeding silently.
+
+        Args:
+            token: Conversation token.
+            message_id: ID of the message to remove the reaction from.
+            reaction: The emoji to remove.
+        """
+        client = await get_client(ctx)
+        reactions = await client.talk.remove_reaction(token, message_id, reaction)
+        return ReactionsResponse(
+            conversation_token=token,
+            message_id=message_id,
+            reactions=reactions,
+            distinct_emoji=len(reactions),
+        )

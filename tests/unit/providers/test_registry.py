@@ -1,0 +1,206 @@
+"""Unit tests for create_provider() — dynaconf-driven auto-detection."""
+
+import pytest
+
+from nextcloud_mcp_server.config import _reload_config
+from nextcloud_mcp_server.providers import (
+    BedrockProvider,
+    MistralProvider,
+    OllamaProvider,
+    OpenAIProvider,
+    SimpleProvider,
+    get_provider,
+    reset_provider,
+)
+from nextcloud_mcp_server.providers.bedrock import BOTO3_AVAILABLE
+
+
+def _clear_provider_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip every provider-selection env var so each test starts clean."""
+    for name in (
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "BEDROCK_EMBEDDING_MODEL",
+        "BEDROCK_GENERATION_MODEL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_EMBEDDING_MODEL",
+        "OPENAI_GENERATION_MODEL",
+        "MISTRAL_API_KEY",
+        "MISTRAL_BASE_URL",
+        "MISTRAL_EMBEDDING_MODEL",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_EMBEDDING_MODEL",
+        "OLLAMA_GENERATION_MODEL",
+        "OLLAMA_VERIFY_SSL",
+        "SIMPLE_EMBEDDING_DIMENSION",
+        "EMBEDDING_DIMENSIONS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def clean_provider_env(monkeypatch):
+    """Reset provider singleton + dynaconf cache around each test."""
+    _clear_provider_envs(monkeypatch)
+    reset_provider()
+    _reload_config()
+    yield monkeypatch
+    reset_provider()
+
+
+@pytest.mark.unit
+def test_registry_falls_back_to_simple(clean_provider_env):
+    """No provider env set → SimpleProvider (with default dimension)."""
+    provider = get_provider()
+    assert isinstance(provider, SimpleProvider)
+    assert provider.get_dimension() == 384
+
+
+@pytest.mark.unit
+def test_registry_picks_simple_with_custom_dimension(clean_provider_env):
+    """SIMPLE_EMBEDDING_DIMENSION flows through dynaconf to SimpleProvider."""
+    clean_provider_env.setenv("SIMPLE_EMBEDDING_DIMENSION", "512")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, SimpleProvider)
+    assert provider.get_dimension() == 512
+
+
+@pytest.mark.unit
+def test_registry_threads_embedding_dimensions_to_openai(clean_provider_env):
+    """EMBEDDING_DIMENSIONS must actually reach the constructed provider.
+
+    A setting can be present in _DEFAULTS and the Settings dataclass yet be
+    dropped on the way to the provider — either by an omission in _FIELD_MAP
+    (which silently disabled OCR batch mode, Deck #332) or by a missing kwarg in
+    create_provider(). Neither shows up in a settings-only assertion, so assert
+    on the provider instance.
+    """
+    clean_provider_env.setenv("OPENAI_API_KEY", "test-key")
+    clean_provider_env.setenv("EMBEDDING_DIMENSIONS", "512")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._requested_dimensions == 512
+
+
+@pytest.mark.unit
+def test_registry_threads_embedding_dimensions_to_ollama(clean_provider_env, mocker):
+    """Same wire-through, for the other provider that supports truncation."""
+    mocker.patch(
+        "nextcloud_mcp_server.providers.ollama.OllamaProvider._check_model_is_loaded"
+    )
+    clean_provider_env.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    clean_provider_env.setenv("EMBEDDING_DIMENSIONS", "256")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, OllamaProvider)
+    assert provider._requested_dimensions == 256
+
+
+@pytest.mark.unit
+def test_registry_threads_embed_batch_knobs_to_ollama(clean_provider_env, mocker):
+    """The GH #1345 knobs must actually reach the provider, not just validate.
+
+    ``test_provider_defaults_match_the_settings_defaults`` pins the provider's
+    *fallback* constants against ``config._DEFAULTS``, but never calls
+    ``create_provider()`` — so swapping which settings field feeds which kwarg
+    here would go unnoticed. Distinct non-default values catch exactly that.
+    """
+    mocker.patch(
+        "nextcloud_mcp_server.providers.ollama.OllamaProvider._check_model_is_loaded"
+    )
+    clean_provider_env.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    clean_provider_env.setenv("OLLAMA_EMBED_MAX_BATCH_CHARS", "8000")
+    clean_provider_env.setenv("OLLAMA_EMBED_TIMEOUT", "30")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, OllamaProvider)
+    assert provider.max_batch_chars == 8000
+    # Positional httpx.Timeout: read/write/pool take the value, connect stays 5s.
+    assert provider.client.timeout.read == 30
+    assert provider.client.timeout.connect == 5
+
+
+@pytest.mark.unit
+def test_registry_leaves_dimensions_unset_by_default(clean_provider_env):
+    """Unset EMBEDDING_DIMENSIONS means full width, not a coerced 0."""
+    clean_provider_env.setenv("OPENAI_API_KEY", "test-key")
+    _reload_config()
+
+    provider = get_provider()
+    assert provider._requested_dimensions is None
+
+
+@pytest.mark.unit
+def test_registry_picks_mistral_when_api_key_set(clean_provider_env, mocker):
+    """MISTRAL_API_KEY alone is enough to select MistralProvider."""
+    # MistralProvider eagerly constructs the SDK client in __init__; stub it
+    # so the test doesn't depend on the SDK accepting arbitrary keys.
+    mocker.patch("nextcloud_mcp_server.providers.mistral.Mistral")
+    clean_provider_env.setenv("MISTRAL_API_KEY", "test-key")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, MistralProvider)
+
+
+@pytest.mark.unit
+def test_registry_picks_ollama_when_base_url_set(clean_provider_env, mocker):
+    """OLLAMA_BASE_URL selects OllamaProvider."""
+    # OllamaProvider eagerly probes /api/tags in __init__; stub it out.
+    mocker.patch(
+        "nextcloud_mcp_server.providers.ollama.OllamaProvider._check_model_is_loaded"
+    )
+    clean_provider_env.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, OllamaProvider)
+
+
+@pytest.mark.unit
+def test_registry_openai_wins_over_mistral_and_ollama(clean_provider_env):
+    """OpenAI takes priority when multiple provider env vars are set."""
+    clean_provider_env.setenv("OPENAI_API_KEY", "openai-key")
+    clean_provider_env.setenv("MISTRAL_API_KEY", "mistral-key")
+    clean_provider_env.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, OpenAIProvider)
+
+
+@pytest.mark.unit
+def test_registry_mistral_wins_over_ollama(clean_provider_env, mocker):
+    """Mistral takes priority over Ollama when both are configured."""
+    # Stub the Mistral SDK constructor for the same reason as the sibling
+    # picker test — keeps the registry test independent of SDK key validation.
+    mocker.patch("nextcloud_mcp_server.providers.mistral.Mistral")
+    clean_provider_env.setenv("MISTRAL_API_KEY", "mistral-key")
+    clean_provider_env.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, MistralProvider)
+
+
+@pytest.mark.unit
+def test_registry_bedrock_wins_when_aws_region_set(clean_provider_env):
+    """AWS_REGION alone routes to Bedrock, even with other providers configured."""
+    if not BOTO3_AVAILABLE:
+        pytest.skip("boto3 not installed")
+
+    clean_provider_env.setenv("AWS_REGION", "us-east-1")
+    clean_provider_env.setenv("OPENAI_API_KEY", "openai-key")
+    clean_provider_env.setenv("MISTRAL_API_KEY", "mistral-key")
+    _reload_config()
+
+    provider = get_provider()
+    assert isinstance(provider, BedrockProvider)

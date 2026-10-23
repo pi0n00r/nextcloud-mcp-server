@@ -1,0 +1,497 @@
+"""Integration tests for Nextcloud Collectives MCP tools."""
+
+import json
+import logging
+import uuid
+
+import pytest
+from mcp import ClientSession
+
+logger = logging.getLogger(__name__)
+pytestmark = pytest.mark.integration
+
+
+# --- Fixtures ---
+
+
+@pytest.fixture(scope="session")
+async def temporary_collective(nc_mcp_client: ClientSession):
+    """Create a temporary collective for testing. Cleaned up after session."""
+    unique_suffix = uuid.uuid4().hex[:8]
+    name = f"MCP Test Collective {unique_suffix}"
+
+    result = await nc_mcp_client.call_tool(
+        "collectives_create_collective",
+        {"name": name, "emoji": "🧪"},
+    )
+    assert result.is_error is False, f"Failed to create collective: {result.content}"
+    data = json.loads(result.content[0].text)
+    collective_id = data["id"]
+    logger.info("Created temporary collective: %s (ID: %s)", name, collective_id)
+
+    # Get the landing page ID — filter by parentId == 0 (root page)
+    pages_result = await nc_mcp_client.call_tool(
+        "collectives_get_pages",
+        {"collective_id": collective_id},
+    )
+    pages_data = json.loads(pages_result.content[0].text)
+    root_pages = [p for p in pages_data["pages"] if p["parentId"] == 0]
+    assert root_pages, "Expected at least one root page (landing page)"
+    landing_page_id = root_pages[0]["id"]
+
+    yield {
+        "id": collective_id,
+        "name": name,
+        "landing_page_id": landing_page_id,
+    }
+
+    # Cleanup: trash and permanently delete the collective via MCP tools
+    try:
+        await nc_mcp_client.call_tool(
+            "collectives_trash_collective",
+            {"collective_id": collective_id},
+        )
+        await nc_mcp_client.call_tool(
+            "collectives_delete_collective",
+            {"collective_id": collective_id},
+        )
+        logger.info("Cleaned up collective: %s", collective_id)
+    except Exception as e:
+        logger.warning("Cleanup of collective %s failed: %s", collective_id, e)
+
+
+# --- Tool Discovery ---
+
+
+async def test_collectives_tools_available(nc_mcp_client: ClientSession):
+    """Verify all Collectives MCP tools are registered."""
+    tools = await nc_mcp_client.list_tools()
+    tool_names = [tool.name for tool in tools.tools]
+
+    expected_tools = [
+        "collectives_get_collectives",
+        "collectives_create_collective",
+        "collectives_set_collective_emoji",
+        "collectives_trash_collective",
+        "collectives_delete_collective",
+        "collectives_get_pages",
+        "collectives_get_page",
+        "collectives_create_page",
+        "collectives_move_page",
+        "collectives_trash_page",
+        "collectives_restore_page",
+        "collectives_set_page_emoji",
+        "collectives_search_pages",
+        "collectives_get_tags",
+        "collectives_create_tag",
+        "collectives_assign_tag",
+        "collectives_remove_tag",
+        "collectives_get_trashed_pages",
+        "collectives_get_trashed_collectives",
+        "collectives_restore_collective",
+    ]
+
+    for expected in expected_tools:
+        assert expected in tool_names, (
+            f"Expected tool '{expected}' not found in available tools"
+        )
+
+    logger.info("All %s Collectives tools registered", len(expected_tools))
+
+
+# --- Collective CRUD ---
+
+
+async def test_collectives_list(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test listing collectives includes the temporary one."""
+    result = await nc_mcp_client.call_tool("collectives_get_collectives", {})
+    assert result.is_error is False
+
+    data = json.loads(result.content[0].text)
+    assert data["success"] is True
+    assert data["total"] >= 1
+
+    collective_ids = [c["id"] for c in data["collectives"]]
+    assert temporary_collective["id"] in collective_ids
+    logger.info("Found %s collectives", data["total"])
+
+
+async def test_collectives_set_collective_emoji(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test setting a collective's emoji."""
+    result = await nc_mcp_client.call_tool(
+        "collectives_set_collective_emoji",
+        {"collective_id": temporary_collective["id"], "emoji": "📖"},
+    )
+    assert result.is_error is False
+
+    data = json.loads(result.content[0].text)
+    assert data["success"] is True
+    assert data["collective_id"] == temporary_collective["id"]
+    logger.info("Collective emoji updated")
+
+
+async def test_collectives_clear_collective_emoji(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test clearing a collective's emoji by passing null."""
+    cid = temporary_collective["id"]
+
+    # Set an emoji first
+    set_result = await nc_mcp_client.call_tool(
+        "collectives_set_collective_emoji",
+        {"collective_id": cid, "emoji": "🔬"},
+    )
+    assert set_result.is_error is False
+
+    # Clear the emoji by passing null
+    clear_result = await nc_mcp_client.call_tool(
+        "collectives_set_collective_emoji",
+        {"collective_id": cid, "emoji": None},
+    )
+    assert clear_result.is_error is False
+    data = json.loads(clear_result.content[0].text)
+    assert data["collective_id"] == cid
+    logger.info("Collective emoji cleared")
+
+
+# --- Page CRUD ---
+
+
+async def test_collectives_page_workflow(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test the full page lifecycle: create, read, set emoji, trash, restore."""
+    cid = temporary_collective["id"]
+    landing_id = temporary_collective["landing_page_id"]
+
+    # 1. Create a page
+    unique_title = f"Test Page {uuid.uuid4().hex[:8]}"
+    create_result = await nc_mcp_client.call_tool(
+        "collectives_create_page",
+        {"collective_id": cid, "parent_id": landing_id, "title": unique_title},
+    )
+    assert create_result.is_error is False
+    create_data = json.loads(create_result.content[0].text)
+    page_id = create_data["id"]
+    assert create_data["collective_id"] == cid
+    assert create_data["parent_id"] == landing_id
+    logger.info("Created page: %s (ID: %s)", unique_title, page_id)
+
+    # 2. List pages — should include the new page
+    list_result = await nc_mcp_client.call_tool(
+        "collectives_get_pages",
+        {"collective_id": cid},
+    )
+    assert list_result.is_error is False
+    list_data = json.loads(list_result.content[0].text)
+    page_ids = [p["id"] for p in list_data["pages"]]
+    assert page_id in page_ids
+    logger.info("Page found in list (%s pages)", list_data["total"])
+
+    # 3. Get page with content
+    get_result = await nc_mcp_client.call_tool(
+        "collectives_get_page",
+        {"collective_id": cid, "page_id": page_id},
+    )
+    assert get_result.is_error is False
+    get_data = json.loads(get_result.content[0].text)
+    assert get_data["page"]["id"] == page_id
+    assert get_data["page"]["title"] == unique_title
+    # New pages have empty content (empty string or None)
+    logger.info("Page metadata retrieved")
+
+    # 4. Set page emoji
+    emoji_result = await nc_mcp_client.call_tool(
+        "collectives_set_page_emoji",
+        {"collective_id": cid, "page_id": page_id, "emoji": "🚀"},
+    )
+    assert emoji_result.is_error is False
+    logger.info("Page emoji set")
+
+    # 5. Trash the page
+    trash_result = await nc_mcp_client.call_tool(
+        "collectives_trash_page",
+        {"collective_id": cid, "page_id": page_id},
+    )
+    assert trash_result.is_error is False
+    logger.info("Page trashed")
+
+    # 6. Verify page is in trash
+    trashed_result = await nc_mcp_client.call_tool(
+        "collectives_get_trashed_pages",
+        {"collective_id": cid},
+    )
+    assert trashed_result.is_error is False
+    trashed_data = json.loads(trashed_result.content[0].text)
+    trashed_ids = [p["id"] for p in trashed_data["pages"]]
+    assert page_id in trashed_ids
+    logger.info("Page found in trash")
+
+    # 7. Restore from trash
+    restore_result = await nc_mcp_client.call_tool(
+        "collectives_restore_page",
+        {"collective_id": cid, "page_id": page_id},
+    )
+    assert restore_result.is_error is False
+    logger.info("Page restored from trash")
+
+    # 8. Verify page is back in pages list
+    list_result2 = await nc_mcp_client.call_tool(
+        "collectives_get_pages",
+        {"collective_id": cid},
+    )
+    list_data2 = json.loads(list_result2.content[0].text)
+    page_ids2 = [p["id"] for p in list_data2["pages"]]
+    assert page_id in page_ids2
+    logger.info("Page verified restored to pages list")
+
+
+async def test_collectives_get_landing_page_content(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test that the landing page has auto-generated content readable via WebDAV."""
+    cid = temporary_collective["id"]
+    landing_id = temporary_collective["landing_page_id"]
+
+    result = await nc_mcp_client.call_tool(
+        "collectives_get_page",
+        {"collective_id": cid, "page_id": landing_id},
+    )
+    assert result.is_error is False
+
+    data = json.loads(result.content[0].text)
+    assert data["page"]["fileName"] == "Readme.md"
+    assert data["content"] is not None, (
+        "Landing page should have auto-generated content"
+    )
+    assert len(data["content"]) > 0, "Landing page should have non-empty content"
+    logger.info("Landing page content: %s bytes", len(data["content"]))
+
+
+async def test_collectives_move_page(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test moving a page (rename)."""
+    cid = temporary_collective["id"]
+    landing_id = temporary_collective["landing_page_id"]
+
+    # Create a page to move
+    create_result = await nc_mcp_client.call_tool(
+        "collectives_create_page",
+        {
+            "collective_id": cid,
+            "parent_id": landing_id,
+            "title": f"Movable Page {uuid.uuid4().hex[:8]}",
+        },
+    )
+    assert create_result.is_error is False
+    page_id = json.loads(create_result.content[0].text)["id"]
+
+    # Move (rename) the page
+    new_title = f"Renamed Page {uuid.uuid4().hex[:8]}"
+    move_result = await nc_mcp_client.call_tool(
+        "collectives_move_page",
+        {
+            "collective_id": cid,
+            "page_id": page_id,
+            "title": new_title,
+        },
+    )
+    assert move_result.is_error is False
+
+    data = json.loads(move_result.content[0].text)
+    assert data["page_id"] == page_id
+    assert "moved" in data["message"]
+    assert new_title in data["message"]
+    logger.info("Page renamed to: %s", new_title)
+
+    # Cleanup
+    await nc_mcp_client.call_tool(
+        "collectives_trash_page",
+        {"collective_id": cid, "page_id": page_id},
+    )
+
+
+# --- Tags ---
+
+
+async def test_collectives_tag_workflow(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test tag lifecycle: create tag, assign to page, remove from page."""
+    cid = temporary_collective["id"]
+    landing_id = temporary_collective["landing_page_id"]
+
+    # 1. Create a tag
+    tag_name = f"test-tag-{uuid.uuid4().hex[:6]}"
+    create_tag_result = await nc_mcp_client.call_tool(
+        "collectives_create_tag",
+        {"collective_id": cid, "name": tag_name, "color": "FF5733"},
+    )
+    assert create_tag_result.is_error is False
+    tag_data = json.loads(create_tag_result.content[0].text)
+    tag_id = tag_data["id"]
+    assert tag_data["name"] == tag_name
+    assert tag_data["color"] == "FF5733"
+    logger.info("Created tag: %s (ID: %s)", tag_name, tag_id)
+
+    # 2. List tags — should include the new tag
+    list_tags_result = await nc_mcp_client.call_tool(
+        "collectives_get_tags",
+        {"collective_id": cid},
+    )
+    assert list_tags_result.is_error is False
+    tags_data = json.loads(list_tags_result.content[0].text)
+    tag_ids = [t["id"] for t in tags_data["tags"]]
+    assert tag_id in tag_ids
+    logger.info("Tag found in list (%s tags)", tags_data["total"])
+
+    # 3. Create a page to tag
+    page_result = await nc_mcp_client.call_tool(
+        "collectives_create_page",
+        {
+            "collective_id": cid,
+            "parent_id": landing_id,
+            "title": f"Tagged Page {uuid.uuid4().hex[:8]}",
+        },
+    )
+    assert page_result.is_error is False
+    page_id = json.loads(page_result.content[0].text)["id"]
+
+    # 4. Assign tag to page
+    assign_result = await nc_mcp_client.call_tool(
+        "collectives_assign_tag",
+        {"collective_id": cid, "page_id": page_id, "tag_id": tag_id},
+    )
+    assert assign_result.is_error is False
+    logger.info("Tag %s assigned to page %s", tag_id, page_id)
+
+    # 5. Remove tag from page
+    remove_result = await nc_mcp_client.call_tool(
+        "collectives_remove_tag",
+        {"collective_id": cid, "page_id": page_id, "tag_id": tag_id},
+    )
+    assert remove_result.is_error is False
+    logger.info("Tag %s removed from page %s", tag_id, page_id)
+
+    # Cleanup
+    await nc_mcp_client.call_tool(
+        "collectives_trash_page",
+        {"collective_id": cid, "page_id": page_id},
+    )
+
+
+# --- Search ---
+
+
+async def test_collectives_search(
+    nc_mcp_client: ClientSession, temporary_collective: dict
+):
+    """Test full-text search within a collective."""
+    cid = temporary_collective["id"]
+
+    # Search for text in the landing page (contains "Welcome")
+    result = await nc_mcp_client.call_tool(
+        "collectives_search_pages",
+        {"collective_id": cid, "query": "Welcome"},
+    )
+    assert result.is_error is False
+
+    data = json.loads(result.content[0].text)
+    assert data["success"] is True
+    assert data["query"] == "Welcome"
+    assert data["collective_id"] == cid
+    # Search may or may not find results depending on indexing timing
+    logger.info("Search returned %s results for 'Welcome'", data["total"])
+
+
+# --- Collective Trash / Restore / Delete ---
+
+
+async def test_collectives_trash_restore_delete_workflow(
+    nc_mcp_client: ClientSession,
+):
+    """Test the full collective lifecycle: create, trash, list trashed, restore, trash, delete."""
+    # Create a throwaway collective
+    name = f"Lifecycle Test {uuid.uuid4().hex[:8]}"
+    create_result = await nc_mcp_client.call_tool(
+        "collectives_create_collective",
+        {"name": name},
+    )
+    assert create_result.is_error is False
+    created = json.loads(create_result.content[0].text)
+    cid = created["id"]
+    logger.info("Created collective %s (ID: %s)", name, cid)
+
+    # Trash the collective
+    trash_result = await nc_mcp_client.call_tool(
+        "collectives_trash_collective",
+        {"collective_id": cid},
+    )
+    assert trash_result.is_error is False
+    logger.info("Collective moved to trash")
+
+    # List trashed collectives — should include ours
+    list_trash_result = await nc_mcp_client.call_tool(
+        "collectives_get_trashed_collectives",
+        {},
+    )
+    assert list_trash_result.is_error is False
+    trash_data = json.loads(list_trash_result.content[0].text)
+    trashed_ids = [c["id"] for c in trash_data["collectives"]]
+    assert cid in trashed_ids
+    logger.info("Found %s trashed collectives", trash_data["total"])
+
+    # Restore the collective
+    restore_result = await nc_mcp_client.call_tool(
+        "collectives_restore_collective",
+        {"collective_id": cid},
+    )
+    assert restore_result.is_error is False
+    restore_data = json.loads(restore_result.content[0].text)
+    assert restore_data["collective_id"] == cid
+    assert "restored" in restore_data["message"].lower()
+    logger.info("Collective restored from trash")
+
+    # Trash again, then permanently delete
+    trash_result2 = await nc_mcp_client.call_tool(
+        "collectives_trash_collective",
+        {"collective_id": cid},
+    )
+    assert trash_result2.is_error is False
+
+    delete_result = await nc_mcp_client.call_tool(
+        "collectives_delete_collective",
+        {"collective_id": cid},
+    )
+    assert delete_result.is_error is False
+    delete_data = json.loads(delete_result.content[0].text)
+    assert "permanently deleted" in delete_data["message"].lower()
+    logger.info("Collective permanently deleted")
+
+
+# --- Error Handling ---
+
+
+async def test_collectives_get_page_not_found(nc_mcp_client: ClientSession):
+    """Test getting a non-existent page returns an error."""
+    result = await nc_mcp_client.call_tool(
+        "collectives_get_page",
+        {"collective_id": 999999, "page_id": 999999},
+    )
+    assert result.is_error is True
+    logger.info("Non-existent page correctly returned error")
+
+
+async def test_collectives_get_pages_not_found(nc_mcp_client: ClientSession):
+    """Test listing pages for a non-existent collective returns an error."""
+    result = await nc_mcp_client.call_tool(
+        "collectives_get_pages",
+        {"collective_id": 999999},
+    )
+    assert result.is_error is True
+    logger.info("Non-existent collective correctly returned error")

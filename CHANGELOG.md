@@ -1,0 +1,4829 @@
+# Changelog - MCP Server
+
+All notable changes to the Nextcloud MCP Server will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
+
+## v0.200.5 (2026-10-21)
+
+### Fix
+
+- **client**: don't read a streamed request body in the request log hook
+
+## v0.200.4 (2026-10-21)
+
+### Fix
+
+- **auth**: store rotated refresh tokens with the IdP's lifetime (fixes #411)
+
+## v0.200.3 (2026-10-21)
+
+### Fix
+
+- **search**: address review — error wording, label docs, pass-through tests
+- **search**: fail fast when the query cannot be embedded, run bm25 keyword-only
+
+### Refactor
+
+- **search**: bound the query embed with a context manager
+
+## v0.200.2 (2026-10-20)
+
+### Fix
+
+- **http**: merge caller headers via httpx.Headers in the factory
+- **client**: send OCS-APIRequest from the httpx client, not per call site
+
+### Refactor
+
+- **webdav**: hoist text/xml content type; document factory scope
+- **client**: make NEXTCLOUD_DEFAULT_HEADERS read-only; clarify mail JSON headers
+
+## v0.200.1 (2026-10-20)
+
+### Fix
+
+- **search**: harden batched file verification per review
+- **auth**: reject unparseable Basic headers with 401
+- **auth**: verify multi-user BasicAuth credentials in the middleware
+
+### Perf
+
+- **search**: verify file results per result instead of re-walking the tagged corpus
+
+## v0.200.0 (2026-10-20)
+
+### Feat
+
+- **talk**: filter talk_get_messages by thread
+- **talk**: support creating and posting into Talk threads
+
+### Fix
+
+- **ci**: keep release smoke test on Python 3.11 (project floor)
+- **ci**: pin Python to 3.14 and cap Renovate below 3.15
+- **lint**: satisfy ty 0.0.89
+- **talk**: drop semicolon from talk_get_messages description
+- **talk**: only map spreed's thread 404 to "thread not found"
+- **documents**: read text inside Word content controls (w:sdt)
+
+### Refactor
+
+- **documents**: split the docx block walk into helpers (cognitive complexity)
+- **talk**: move thread 404 handling out of configure_talk_tools
+
+## v0.199.4 (2026-10-12)
+
+### Fix
+
+- **logging**: render a None body argument as None, not its size
+- **logging**: never log Authorization credentials or tool-call bodies
+
+### Refactor
+
+- **logging**: extract per-argument rendering to cut complexity
+
+## v0.199.3 (2026-10-09)
+
+### Fix
+
+- **documents**: mark the worker-interrupt catch as intentional for Sonar
+- **documents**: contain a parse worker's KeyboardInterrupt
+
+## v0.199.2 (2026-10-09)
+
+### Fix
+
+- **mail**: only sync on MailboxNotCachedException, log, bound-test
+- **mail**: sync uncached mailboxes before listing messages
+
+## v0.199.1 (2026-10-08)
+
+### Fix
+
+- **calendar**: anchor UNTIL on the caller's offset; store absolute TRIGGER as UTC
+- **calendar**: store fixed-offset datetimes as UTC
+
+## v0.199.0 (2026-10-08)
+
+### BREAKING CHANGE
+
+- the semantic-search dependencies are no longer installed
+by default. Deployments using ENABLE_SEMANTIC_SEARCH / VECTOR_SYNC_ENABLED
+from PyPI must install `nextcloud-mcp-server[semantic]`. The Docker image
+is unaffected.
+
+### Feat
+
+- plugin entry points, with SAR as the first plugin
+
+### Fix
+
+- name the plugin when its tool or route registration fails
+- plugin load errors name the entry point; status survives a faulty plugin
+- harden plugin loading and keep stdio's tool set unchanged
+- hint at the documents extra only for types it would parse
+- guard semantic-only CLI paths on an install without the extra
+- address Sonar shelldre:S7688 in the login-flow client hook; doc oidc 2.5 + DCR
+- **auth**: work with Nextcloud oidc 2.5's stricter client auth and resource policy
+
+### Refactor
+
+- move plugin availability flags out of get_server_status
+- keep the semantic stack out of the core import path
+
+
+- move the semantic-search stack into a `semantic` extra
+
+## v0.198.5 (2026-10-06)
+
+### Fix
+
+- **webdav**: strip the `-zstd` content-coding suffix from ETags
+- **sar**: render failed index rows that carry no reason
+- **sar**: allow a blank reason per document on export
+
+### Refactor
+
+- **sar**: name the index reason fragment and assert the title survives
+
+## v0.198.4 (2026-10-04)
+
+### Fix
+
+- **mcp**: advertise the package version in every server handshake
+- **mcp**: return Calendar and Tables lists as one complete content block
+- **calendar**: fail closed rather than rebuilding VTODOs from partial updates
+- **calendar**: emit one VTIMEZONE RDATE per line for client interoperability
+- **webdav**: prefer extension-specific MIME types over generic server answers
+
+## v0.198.3 (2026-10-01)
+
+### Fix
+
+- **storage**: disable psycopg auto-prepare on the Postgres engine
+
+## v0.198.2 (2026-10-01)
+
+### Fix
+
+- **vector-sync**: page SEARCH correctly and never delete on partial discovery
+
+## v0.198.1 (2026-09-30)
+
+### Fix
+
+- **auth**: accept any port on portless loopback CIMD redirect URIs
+
+## v0.198.0 (2026-09-28)
+
+### BREAKING CHANGE
+
+- SAR cases and redacted export are no longer served
+implicitly when vector sync and EMBEDDING_GATEWAY_URL are configured.
+Set SAR_ENABLED=true to keep them.
+
+### Feat
+
+- **sar**: SAR is opt-in per deployment via SAR_ENABLED
+
+## v0.197.1 (2026-09-27)
+
+### Fix
+
+- **redaction**: a detected job title is redacted whole, never split
+- **redaction**: role and relationship words are never names
+- **redaction**: a window never starts inside a word longer than the overlap
+- **redaction**: cut NER windows on whitespace, never mid-word
+
+## v0.197.0 (2026-09-27)
+
+### BREAKING CHANGE
+
+- /api/v1/status reports sar_available instead of
+sar_export_available, and the SAR tools and routes now require the
+sar.read or sar.write scope. Clients need to request them.
+- NerClient.detect() now takes the labels to request and
+returns (label, surface) pairs; detect_names() is replaced by
+detect_entities(), which returns (names, addresses). The gateway NER
+consumer pact now sends labels ["person", "address"] under the provider
+state "the gateway detects person names and addresses".
+
+### Feat
+
+- **sar**: sar.read and sar.write scopes; advertise sar_available
+- **sar**: case searches with the search page's filters, logged in the case
+- **redaction**: redact addresses and UK postcodes in SAR archives
+- **sar**: persisted SAR cases shared by Astrolabe and MCP agents (ADR-040)
+- **sar**: /api/v1/sar/exports for the Astrolabe app (ADR-040)
+- **sar**: redacted SAR export archives via sar_export_submit (ADR-040)
+- **redaction**: gateway NER client and person-name redaction core
+
+### Fix
+
+- **redaction**: keep only the subject's address or its leading part
+- **sar**: a case search's log entry is built before the search runs
+- **sar**: cap and dedupe the search log; case search needs semantic.read
+- **sar**: export what was locked, render off the event loop
+- **sar**: no lost updates when a case is edited concurrently
+- **sar**: no semicolons in SAR tool descriptions
+- **redaction**: number a bare token as the one person it belongs to
+- **sar**: refuse '.'/'..' segments in output_folder
+- **redaction**: an NER error never repeats the response's entity text
+- **redaction**: title-free name phrase is one form; validate NER_TIMEOUT_SECONDS
+- **redaction**: bool-first index guard in NerClient._parse; test bool index
+- **redaction**: order bool guard first for Sonar S2583; document sort key
+- **redaction**: address review round 1
+
+### Refactor
+
+- **sar**: split complex functions; 5xx on case creation is retryable
+- **redaction**: re-scope the core to SAR export archives (ADR-040)
+
+### Perf
+
+- **sar**: load case files concurrently when listing cases
+
+## v0.196.0 (2026-09-27)
+
+### BREAKING CHANGE
+
+- with VECTOR_SYNC_INDEXABLE_MIME_TYPES unset, tagged
+.msg, .txt, .md and .csv files are now indexed, as are ODF and legacy
+Office files when COLLABORA_URL is set, and whatever types an optional
+processor claims when one is configured (Unstructured, Tesseract,
+Docling, custom HTTP: images, EPUB, RTF, ...). Set the variable to keep
+the previous scope.
+
+### Feat
+
+- **vector-sync**: index every file type an enabled processor reads
+
+### Fix
+
+- **webdav**: reading a text file stays raw now that text has a processor
+
+## v0.195.5 (2026-09-27)
+
+### Fix
+
+- **calendar**: accept percent-encoded calendar names, report skipped calendars
+
+## v0.195.4 (2026-09-25)
+
+### Fix
+
+- **documents**: skip the RLIMIT_AS cap when the OS refuses it
+
+## v0.195.3 (2026-09-24)
+
+### Fix
+
+- **contacts**: drop only unparseable vCard properties, not the whole contact
+
+## v0.195.2 (2026-09-24)
+
+### Fix
+
+- **observability**: classify tool errors from the wire-shaped result
+
+### Refactor
+
+- **observability**: extract _is_tool_error to keep complexity in bounds
+
+## v0.195.1 (2026-09-23)
+
+### Fix
+
+- **webdav**: scope a range read's failed-parse fallback to the slice
+- **webdav**: reap the read-path parse worker, add page-range reads
+
+### Refactor
+
+- **pymupdf**: lift the one_shot check out of process_source
+
+## v0.195.0 (2026-09-19)
+
+### Feat
+
+- **processors**: read legacy and ODF office files via a shared Collabora service (ADR-039)
+- **vector-sync**: discover office and Outlook documents, not only PDFs
+
+### Fix
+
+- **vector-sync**: index only formats this build can read; webhook follows the setting
+- **vector-sync**: treat an empty indexable-MIME list as "index nothing"
+
+### Perf
+
+- **vector-sync**: expand each tagged folder's types concurrently
+
+## v0.194.0 (2026-09-19)
+
+### BREAKING CHANGE
+
+- parsing_metadata keys pptx_pictures_found and
+pptx_pictures_captioned (added in 0.193.0) are renamed to
+pictures_found and pictures_captioned.
+
+### Feat
+
+- **processors**: read .xlsx natively via openpyxl (ADR-038)
+- **processors**: read .docx natively via python-docx (ADR-038)
+
+### Fix
+
+- **xlsx**: order xl/media naturally so the caption cap takes the first pictures
+- **docx**: treat direct numbering as a list item; pin same-paragraph picture order
+- **config**: warn when OFFICE_CAPTION_* and PPTX_CAPTION_* are both set
+
+### Refactor
+
+- **ooxml**: share pptx picture captioning with the other OOXML readers
+
+## v0.193.1 (2026-09-18)
+
+### Fix
+
+- **calendar**: drop semicolon from create_meeting description
+- **calendar**: bind create_meeting events to a timezone (#1502)
+
+## v0.193.0 (2026-09-18)
+
+### Feat
+
+- **pptx**: caption raster pictures via docling-serve (ADR-037)
+
+### Fix
+
+- **pptx**: split the noqa comment from its explanation
+
+### Refactor
+
+- **pptx**: extract caption/assemble helpers out of process()
+
+## v0.192.0 (2026-09-18)
+
+### BREAKING CHANGE
+
+- nc_calendar_bulk_operations skips events that belong to a
+recurring series unless apply_to_series=true is passed; previously the whole
+series was updated or deleted.
+
+### Fix
+
+- **calendar**: bulk ops no longer rewrite a whole recurring series per occurrence
+- **calendar**: set ORGANIZER on events with attendees
+
+## v0.191.0 (2026-09-17)
+
+### Feat
+
+- **processors**: native PPTX reader via python-pptx
+- **docling**: auto-serve OOXML office formats (PPTX/DOCX/XLSX)
+
+### Fix
+
+- **processors**: harden PPTX reader against real-world decks
+
+## v0.190.1 (2026-09-17)
+
+### Fix
+
+- **deps**: bump pact installer sha256 and let renovate manage it
+
+## v0.190.0 (2026-09-17)
+
+### Feat
+
+- **auth**: accept CIMD client_ids and emit RFC 9207 iss (#1470)
+
+### Fix
+
+- **auth**: reject percent-encoded dot segments in a CIMD client_id
+- **auth**: close CIMD NAT64 SSRF gap and rate-limit document fetches
+- **webdav**: use snake_case ToolAnnotations hints on the tag tools
+
+### Refactor
+
+- **auth**: let a registered client win over CIMD resolution
+
+## v0.189.0 (2026-09-16)
+
+### Feat
+
+- **webdav**: add trash bin and file version tools
+
+### Fix
+
+- **webdav**: add OCS header to trash/version calls, skip a redundant fileid lookup
+- **webdav**: correct restore idempotency, refusals and numeric fields
+
+### Refactor
+
+- **webdav**: typed responses and exclusion guards for trash/versions
+
+## v0.188.1 (2026-09-15)
+
+### Fix
+
+- **contacts**: keep the mapper's photo default, opt out only in list/search
+- **contacts**: make photo payloads opt-in and add paging
+
+## v0.188.0 (2026-09-15)
+
+### Feat
+
+- **webdav**: expose file tags
+
+### Fix
+
+- **webdav**: apply @with_links to nc_webdav_find_by_tag_name
+
+### Refactor
+
+- **webdav**: typed responses and exclusion guards for the tag tools
+
+## v0.187.1 (2026-09-12)
+
+### Fix
+
+- **ingest**: count an empty download on the truncation panel
+- **ingest**: refuse empty document payloads instead of dead-lettering them
+
+### Refactor
+
+- **ocr**: name the no-filename log placeholder
+
+## v0.187.0 (2026-09-12)
+
+### Feat
+
+- **calendar**: implement nc_calendar_find_availability
+
+### Fix
+
+- **calendar**: reject an unknown availability timezone
+- **calendar**: refuse availability when a calendar cannot be read
+
+## v0.186.0 (2026-09-11)
+
+### Feat
+
+- **shopping_list**: add Nextcloud Shopping List app support
+
+### Fix
+
+- **shopping_list**: correct the duplicate-name claim in add_items
+- **tests**: classify tool annotations by the verb, not the app name
+
+### Refactor
+
+- **shopping_list**: give add_items a typed item schema
+
+## v0.185.5 (2026-09-11)
+
+### Fix
+
+- **calendar**: encode DAV URLs by one rule, not two
+- **calendar**: percent-encode DAV URLs built from decoded path segments
+
+### Refactor
+
+- **client**: move the DAV encoders into a shared module
+
+## v0.185.4 (2026-09-11)
+
+### Fix
+
+- **processors**: batch OCR is worker-only — stop the inline escalation loop
+
+## v0.185.3 (2026-09-09)
+
+### Fix
+
+- **deck**: send the attachment type on every id-addressed route
+- **deck**: link card attachments and stop hiding Files-share ones
+
+## v0.185.2 (2026-09-09)
+
+### Fix
+
+- **auth**: resolve the Login Flow caller's UID from Nextcloud, not IdP claims
+
+## v0.185.1 (2026-09-08)
+
+### Fix
+
+- **auth**: verify the Login Flow granter is the caller (GHSA-84qv-22q6-x82r)
+
+## v0.185.0 (2026-09-05)
+
+### BREAKING CHANGE
+
+- requires mcp>=2.1,<3 (protocol 2026-07-28). Server-initiated
+elicitation no longer reaches 2026-era clients — progressive consent degrades to
+message_only, with the login URL carried in the returned message. Deployments
+pinning mcp<2 must stay on the previous release.
+
+### Feat
+
+- **mcp**: migrate to python-sdk v2 (protocol 2026-07-28)
+
+### Fix
+
+- **errors**: restore the tool-failure message mcp 2.x withholds
+- **sharing**: a bare RuntimeError loses its message under mcp 2.x
+
+### Refactor
+
+- **semantic**: restore a dropped TODO and tighten the extracted signatures
+- **semantic**: type the two parameters the extraction left bare
+- **server**: decompose semantic.py and cookbook.py
+- **server**: lift deck tool registration to module level
+- **server**: lift notes + mail tool registration to module level
+
+## v0.184.5 (2026-09-04)
+
+### Fix
+
+- **auth**: poll pending login flow before reporting stored scopes
+
+## v0.184.4 (2026-09-04)
+
+### Perf
+
+- **calendar**: query calendars concurrently in cross-calendar search
+
+## v0.184.3 (2026-09-03)
+
+### Fix
+
+- **ocr**: compare batch-job provider prefixes case-insensitively
+- **ocr**: re-submit a batch job whose provider no longer matches the model
+- **ocr**: keep token-provider failures out of the batch-poll PENDING remap
+- **ocr**: treat a 429 on a batch poll as pending, honouring Retry-After
+- **ocr**: a batch poll with no answer is pending, not a dropped document
+
+### Refactor
+
+- **ocr**: extract the tracked-job lookup out of _process_batch
+
+## v0.184.2 (2026-09-01)
+
+### Perf
+
+- **sharing**: bundle both compaction settings in one helper
+- **sharing**: emit compact separators from the raw-JSON share tools
+- **server**: serialise tool results without indentation
+
+## v0.184.1 (2026-08-30)
+
+### Fix
+
+- **webdav**: normalise etags mangled by a compressing proxy
+
+### Refactor
+
+- **webdav**: fold suffix handling into the existing etag normalizer
+
+## v0.184.0 (2026-08-30)
+
+### Feat
+
+- **calendar**: surface free/busy transparency for calendars and events
+
+## v0.183.1 (2026-08-28)
+
+### Fix
+
+- **deps**: update dependency icalendar to >=7.3.0,<7.4.0
+
+## v0.183.0 (2026-08-28)
+
+### Feat
+
+- **vector**: meter the stale-chunk prune delete (#1399 review r2)
+
+### Fix
+
+- **vector**: resolve placeholder-vs-index by rule, not by scroll order
+- **vector**: never fail a successful index on a prune error (#1399 review)
+- **vector**: prune stale chunk points so re-indexing converges
+
+### Perf
+
+- **vector**: run the placeholder/index lookups concurrently (#1399 review r4)
+
+## v0.182.0 (2026-08-26)
+
+### Feat
+
+- **links**: link straight to the file from search results and reads
+
+## v0.181.1 (2026-08-26)
+
+### Fix
+
+- **ci**: point the pact CLI customManager at the script that holds the version
+
+## v0.181.0 (2026-08-22)
+
+### BREAKING CHANGE
+
+- nc_calendar_update_todo returns UpdateTodoResponse instead of
+a raw dict. The response gains the BaseResponse envelope (success, timestamp)
+plus calendar_name, and drops status_code -- a failed update raises rather
+than reporting a status. nc_calendar_complete_todo's response gains an etag
+field, which is additive.
+
+### Feat
+
+- **calendar**: make ETag concurrency reachable from the todo tools
+
+### Fix
+
+- **calendar**: stop logging a lost ETag race as a server error
+- **test**: read the todo list under `todos`, the key the model actually uses
+- **calendar**: put the suppression on the line Sonar anchors S107 to
+- **calendar**: use a valid suppression comment, so S107 is actually silenced
+- **calendar**: silence S107 with a reason, close the test asymmetry, document etag
+- **test**: identify modules by package-relative path, not bare filename
+- **ocs**: guard the whole package, not just the client that was already fixed
+- **client**: use a valid suppression comment on the jitter helper
+- **client**: jitter the lock backoff so two callers stop colliding
+- **client**: retry a transient 423 Locked, with its own short budget
+- **test**: assert the one-to-one pairing spreed actually records
+
+### Refactor
+
+- **ocs**: make the shared header constant read-only
+- **client**: put every OCS client on the shared header constant
+- **sharing**: route the OCS calls through _make_request
+- **client**: compute the lock backoff once
+
+## v0.180.0 (2026-08-21)
+
+### Feat
+
+- **talk**: gate the reaction tools on spreed's advertised feature flag
+- **talk**: add conversation, participant and reaction tools
+
+### Fix
+
+- **test**: assert the wire key for room type, not the model field name
+- **test**: stop deleting a one-to-one room spreed refuses to delete
+- **talk**: let a one-to-one room be created without a name
+
+### Refactor
+
+- **talk**: rename the reaction count, cover the ValueError seam
+
+## v0.179.0 (2026-08-19)
+
+### Feat
+
+- **search**: rerank without an embedding gateway
+
+### Refactor
+
+- **config**: unpack the rerank model partition once
+
+## v0.178.1 (2026-08-18)
+
+### Fix
+
+- **ci**: build the image from the checked-out tag, not the event commit
+
+## v0.178.0 (2026-08-18)
+
+### Feat
+
+- **vector**: meter chunks_ingested at indexing
+
+## v0.177.2 (2026-08-18)
+
+### Fix
+
+- **providers**: retry only genuinely-transient Ollama transport errors
+- **providers**: log a failed Ollama batch once, not once per retry attempt
+- **providers**: log the batch shape on every Ollama embed failure
+- **providers**: give Ollama the transient retry every other provider has
+- **providers**: bound Ollama embed requests by characters, not item count
+- **vector**: clear the dead-letter marker only after the upsert succeeds
+- **vector**: dead-letter documents after repeated index failures
+
+## v0.177.1 (2026-08-18)
+
+### Fix
+
+- **collectives**: stop OCSError double-prefixing the status code
+- **client**: preserve mail's falsy-statuscode default, finish the extraction
+- **webdav**: escape caller values in SEARCH predicates
+- **providers**: bound Mistral embedding requests at 120s
+
+### Refactor
+
+- **client**: centralise OCS envelope parsing and name 997
+
+## v0.177.0 (2026-08-18)
+
+### BREAKING CHANGE
+
+- `create_share` / `nc_share_create` now reject a `shareType=3`
+(public link) call that also carries `shareWith`, and a recipient-typed call
+that omits it. Both combinations previously reached the server: the first
+silently produced an anonymous public link while reporting success, which is
+the defect being fixed. A caller relying on either now gets a `ValueError` /
+`ToolError` instead of a share. Recorded as breaking so it is discoverable by
+version rather than by surprise, even though the prior behaviour was wrong.
+
+### Feat
+
+- **client**: wire the streaming path into DAV error typing too
+- **client**: surface the DAV layer's own explanation on failure
+
+### Fix
+
+- **calendar**: give CalDAV writes ETag concurrency control
+- **client**: unblock the Sonar gate, keep the error message on one line
+- **client**: avoid a self-referential __cause__, and test the wiring
+- **sharing**: attach the public-link redirect only where it applies
+- **sharing**: stop the rejection pointing agents at a nonexistent tool
+- **sharing**: reject shareType/shareWith pairings that silently misfire
+
+### Refactor
+
+- **client**: drop the dead logger, type request, sharpen the docstring
+
+### Perf
+
+- **calendar**: close the last per-event ETag round trip
+- **calendar**: batch the todo-listing ETag fetch
+- **calendar**: ask the date-range REPORT for getetag
+
+## v0.176.5 (2026-08-17)
+
+### Fix
+
+- **auth**: report an empty JWKS as no_signing_keys, not unknown
+
+## v0.176.4 (2026-08-17)
+
+### Fix
+
+- **webdav**: give an unfiltered SEARCH an explicit match-all predicate
+
+## v0.176.3 (2026-08-17)
+
+### Fix
+
+- **auth**: read `azp` as the client id when a token has no `client_id`
+
+## v0.176.2 (2026-08-17)
+
+### Fix
+
+- **migrations**: serialize Alembic commands on a process-wide lock
+
+## v0.176.0 (2026-08-17)
+
+### BREAKING CHANGE
+
+- the webhook registration API is removed. `GET/POST /api/v1/webhooks`,
+`DELETE /api/v1/webhooks/{id}` and the `/app/webhooks` management pane now 404, and the
+`registered_webhooks` table is dropped. Webhook delivery is configured in Astrolabe's
+admin settings (`mcp_server_url` + `mcp_webhook_secret` + sync presets); the
+`/webhooks/nextcloud` ingress and `WEBHOOK_SECRET` are unchanged.
+
+### Feat
+
+- **vector**: deliver file changes over webhooks; drop webhook registration
+
+## v0.175.0 (2026-08-15)
+
+### Feat
+
+- **providers**: request Matryoshka output width via EMBEDDING_DIMENSIONS
+
+## v0.174.1 (2026-08-15)
+
+### Fix
+
+- **providers**: detect embedding dimension for OpenAI/Mistral models
+
+## v0.174.0 (2026-08-15)
+
+### Feat
+
+- **webdav**: read and post comments on files (#1308)
+
+### Fix
+
+- **webdav**: drop the namespace constant, send OCS-APIRequest on comments
+- **comments**: treat a message blank by either trim rule as blank
+
+## v0.173.1 (2026-08-14)
+
+### Fix
+
+- **ingest**: dead-letter documents whose mime type has no processor
+
+## v0.173.0 (2026-08-13)
+
+### Feat
+
+- **observability**: log metadata for every MCP tool call; arguments remain in sampled traces
+
+## v0.172.0 (2026-08-12)
+
+### BREAKING CHANGE
+
+- deck_create_card no longer echoes `description` back in its
+response. The caller just supplied it, and card descriptions are full
+markdown bodies. Read it from deck_get_card if it is genuinely needed.
+
+### Feat
+
+- **links**: point notes, files and deck responses back at Nextcloud
+
+### Fix
+
+- **links**: link every deck tool whose result still has a card to open
+
+## v0.171.0 (2026-08-12)
+
+### Feat
+
+- **deck**: gate card-dependency tools on Deck >= 1.18.0
+- **deck**: add card dependency tools
+
+### Fix
+
+- **deck**: mark deck_assign_dependent_card as non-idempotent
+
+## v0.170.2 (2026-08-12)
+
+### Fix
+
+- **deps**: update pymupdf to v1.28.2
+
+## v0.170.1 (2026-08-12)
+
+### Fix
+
+- flag a wildcard that uvicorn treats as an inert literal
+- apply log config before the startup trust-list report
+- honor X-Forwarded-For from configured proxies (#1284)
+
+## v0.170.0 (2026-08-12)
+
+### Feat
+
+- gate MCP tools on upstream app capabilities
+
+### Fix
+
+- read the capability-gating flag as a real boolean
+
+## v0.169.2 (2026-08-11)
+
+### Fix
+
+- **auth**: don't dispose shared storage in the per-session MCP lifespan
+
+## v0.169.1 (2026-08-11)
+
+### Feat
+
+- **talk**: expose conversation creation and participant management
+- **talk**: add reaction listing, creation, and deletion tools
+
+### Fix
+
+- **talk**: preserve the requested emoji in flat reaction responses
+- declare phantom runtime dependencies (#1285)
+
+### Test
+
+- **talk**: cover client contracts and the agent-facing tool surface
+## v0.169.0 (2026-08-09)
+
+### Feat
+
+- **usage**: add chunks_stored retention meter
+
+### Fix
+
+- **usage**: skip zero-value chunks_stored rows
+
+### Refactor
+
+- **usage**: extract the day-boundary sleep into a pure helper
+
+### Perf
+
+- **usage**: bail before the hybrid count on an empty corpus
+
+## v0.168.0 (2026-08-09)
+
+### BREAKING CHANGE
+
+- the OAuth token is now enforced on every tool call in
+login_flow mode, not just on tool visibility. A NULL stored grant no longer
+bypasses it. Operators must ensure the OIDC client permits every scope in use —
+the Astrolabe client hook was missing mail.read, mail.write, mail.send,
+talk.read and talk.write; it is fixed here, but the hook skips already
+configured installs, so existing deployments need `occ oidc:update` (or delete
+and recreate the client) and users must re-consent. Users provisioned through
+`nc_auth_provision_access` before this release hold an explicit scope list that
+cannot contain semantic.read; one `nc_auth_update_scopes(add_scopes=
+["semantic.read"])` or `PATCH /api/v1/users/{id}/scopes` grants it. No
+migration is required.
+
+### Fix
+
+- **auth**: drop a semicolon from the nc_auth_provision_access description
+- **auth**: reject an empty scope list instead of reading it as unrestricted
+- **auth**: consolidate provisioning onto the OAuth token's scopes
+
+## v0.167.0 (2026-08-09)
+
+### Feat
+
+- **search**: link every semantic-search result to its chunk in Astrolabe
+
+### Fix
+
+- **search**: validate the browser base URL by parsing it, not by prefix
+
+### Refactor
+
+- **search**: close the two round-2 nits on the chunk-link builder
+
+## v0.166.1 (2026-08-08)
+
+### Fix
+
+- **calendar**: reject a partial todo update that strands DUE or DTSTART
+- **calendar**: keep a date-only todo due date a DATE
+
+## v0.166.0 (2026-08-05)
+
+### Feat
+
+- **calendar**: write the parameters the tools only pretended to accept
+
+### Fix
+
+- **calendar**: stop the shorthand warning firing on ordinary offset changes
+- **calendar**: name the read-side end date consistently, widen shorthand loss detection
+- **calendar**: keep DESCRIPTION off AUDIO alarms and reject negative offsets
+- **calendar**: warn on the last silent recurrence conflict, reject triggerless reminders cleanly
+- **calendar**: drop VALARMs with no usable TRIGGER instead of failing the listing
+- **calendar**: normalise foreign VALARM data instead of failing the listing
+- **calendar**: build the inclusive UNTIL in DTSTART's zone, not UTC
+- **calendar**: stop the reminder shorthand erasing what the caller omitted
+- **calendar**: stop pinning recurring=False on every create call
+- **calendar**: compute UNTIL from the DTSTART being written, not the stored one
+
+### Refactor
+
+- **calendar**: name the fallback VALARM descriptions
+- **calendar**: split the UNTIL and VALARM readers to clear S3776
+
+## v0.165.0 (2026-08-04)
+
+### Feat
+
+- **search**: min_relevance, a filter on the number the caller was shown
+- **search**: a [0,1] relevance value on every search result
+
+### Fix
+
+- **search**: clear the Sonar gate, and pin the shared fit base rate
+- **search**: map relevance with the fusion that actually ran
+
+### Refactor
+
+- **search**: type the filter, and stop a comment describing its neighbour
+
+## v0.164.1 (2026-08-04)
+
+### Fix
+
+- **search**: namespace the default rerank model id
+
+## v0.164.0 (2026-08-03)
+
+### Feat
+
+- **search**: accept rerank on /api/v1/vector-viz/search
+
+### Fix
+
+- **search**: rerank before verify-on-read on the visualization endpoint
+- **search**: keep the rerank capability gate in its original position
+
+## v0.163.0 (2026-08-03)
+
+### Feat
+
+- **auth**: record token-endpoint grants with credentials fingerprinted
+
+### Fix
+
+- **auth**: count grants that fail by raising, not just by returning
+- **auth**: log repeated form keys instead of silently dropping them
+- **auth**: count every grant failure, not just IdP-side ones
+
+## v0.162.1 (2026-08-03)
+
+### Fix
+
+- **observability**: give an absent client_id one spelling, not two
+- **observability**: make the fleet metric say why it isn't recording
+
+## v0.162.0 (2026-08-02)
+
+### Feat
+
+- **observability**: record why each OAuth token is rejected, and for whom
+- **observability**: record MCP client fleet and tool-delivery semantics
+
+### Fix
+
+- **observability**: record a management grant only once the allowlist clears
+- **observability**: remove unreachable return left by the chain refactor
+- **observability**: record a fallback chain as one rejection, not one per stage
+- **observability**: drop the duplicate log I added in round 7
+- **observability**: record valid only once an AccessToken exists
+- **observability**: record a token validation once, at acceptance
+- **observability**: classify JWKS fetch failures as network_error
+- **observability**: keep the verified client_id on allowlist rejections
+- **observability**: record the last silent rejection path (opaque, no validator)
+- **observability**: derive rejection result from reason; close remaining gaps
+- **observability**: remove test-order coupling and falsy-value accessor bug
+- **observability**: bound the cardinality of caller-chosen metric labels
+
+## v0.161.0 (2026-08-02)
+
+### Feat
+
+- **search**: expose optional reranking on both search entrypoints
+- **search**: distinguish a routine rerank skip from a real failure
+- **search**: add cross-encoder rerank machinery (unused until wired)
+- **observability**: measure both semantic-search entrypoints equally
+
+### Fix
+
+- **search**: keep unscored rows behind reranked ones in the HTTP re-sort
+- **search**: cut the rerank pool back before verify-on-read on the HTTP path
+- **search**: correct total_found for doc_types, and stop skips reading as outages
+- **search**: carry rerank_score through context expansion
+- **search**: test the granularity echo, use the constant, satisfy Sonar
+- **search**: record failed rerank latency, log truncation, split entry parsing
+- **search**: make the grouped rerank-pool precedence explicit and tested
+- **observability**: bound the algorithm metric label against caller input
+- **observability**: record vector_search errors, and cover the MCP metric paths
+- **observability**: keep the algorithm label stable, and meter the third entrypoint
+- **observability**: label HTTP search usage with the http surface
+- **search**: report the real group limit on the qdrant query span
+- **search**: request exact group count in grouped hybrid search
+
+## v0.160.1 (2026-08-02)
+
+## v0.160.0 (2026-08-02)
+
+### Feat
+
+- **errors**: render tool failures in LLM-friendly form
+
+### Fix
+
+- **errors**: give 429 a back-off hint instead of the generic 4xx one
+
+### Refactor
+
+- **collectives**: raise HTTP errors directly instead of returning them
+
+## v0.159.2 (2026-08-02)
+
+### Fix
+
+- **calendar**: treat a not-yet-started series as having no backlog
+- **calendar**: report the unfinished backlog of recurring todos
+- **calendar**: expand VTODO recurrences client-side
+
+## v0.159.1 (2026-08-01)
+
+### Fix
+
+- **notes**: never delete a non-empty old attachment directory
+
+### Perf
+
+- **tests**: parallelise the unit suite and the single-user integration lane
+
+## v0.159.0 (2026-08-01)
+
+### BREAKING CHANGE
+
+- the container now runs as uid 1000 instead of root, and
+the /app/.oauth mount point is gone. Volumes created by an earlier
+release contain root-owned files; auth/storage.py chmods tokens.db on
+startup, which raises PermissionError for a non-owner, so a stale volume
+fails to start rather than degrading. Recreate dev volumes with
+`docker compose down -v`, or `chown -R 1000:0` a persisted host
+directory. Any /app/.oauth mount should simply be dropped.
+
+### Feat
+
+- drop the dead /app/.oauth EFS mount from the ECS task
+- run the container as uid 1000 with the venv outside /app
+
+### Fix
+
+- set HOME=/tmp so the parsing path works as uid 1000
+
+### Refactor
+
+- run as a real appuser account instead of a bare numeric uid
+
+## v0.158.0 (2026-08-01)
+
+### Feat
+
+- **mail**: index only tagged messages via MAIL_INDEX_TAG
+- **mail**: add write tools — flags, tags, move, delete (#1148)
+
+### Fix
+
+- **mail**: read back flags, and correct move/delete idempotency
+- **mail**: skip the deletion pass when any mailbox listing failed
+- **mail**: index the singleton view, not the threaded one
+
+### Refactor
+
+- **mail**: share the default tag colour, tidy the CSRF docstring
+
+## v0.157.0 (2026-08-01)
+
+### Feat
+
+- **config**: warn on env vars that look like a misspelled setting
+
+### Refactor
+
+- **config**: scope the warning tests' caplog and note the cache omission
+- **auth**: delete the never-rendered welcome.html template
+- **config**: drop three settings nothing ever read
+
+## v0.156.2 (2026-08-01)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.29,<1.30
+
+## v0.156.1 (2026-07-31)
+
+### Fix
+
+- **security**: don't double-escape username in the navbar
+- **security**: autoescape the admin UI templates and escape IdP-derived values
+- **reliability**: drop the unreachable deck-card guard, cover the new guards
+- **reliability**: close the Sonar bug findings in our own code
+- **security**: close the Sonar BLOCKER/MAJOR findings in our own code
+
+## v0.156.0 (2026-07-31)
+
+### Feat
+
+- **api**: expose granularity on POST /api/v1/search; cap grouped prefetch
+- **search**: add granularity="document" to nc_semantic_search
+
+### Fix
+
+- **search**: surface the doc_id caveat to callers; reject granularity on dense
+
+## v0.155.2 (2026-07-31)
+
+### Fix
+
+- **observability**: guard span status read on non-recording spans
+
+## v0.155.1 (2026-07-31)
+
+### Fix
+
+- **search**: scope the ACL owner branch to the subtrees actually shared
+- **search**: pin the RRF constant in tests and correct the threshold docs
+- **search**: set an explicit RRF ranking constant instead of Qdrant's k=2
+- **search**: drop the dense-search score_threshold default to 0.0
+- **fork**: retain byte-preserving CardDAV updates, atomic chunked WebDAV
+  writes, stale pooled-read recovery, transport compatibility aliases, and
+  dual-stack serving
+
+## v0.155.0 (2026-07-30)
+
+### BREAKING CHANGE
+
+- the `nc_semantic_search_answer` MCP tool is removed.
+Clients wanting a generated answer should call `nc_semantic_search` and
+generate from the returned documents themselves. The
+`OLLAMA_GENERATION_MODEL`, `OPENAI_GENERATION_MODEL` and
+`BEDROCK_GENERATION_MODEL` settings are removed and now ignored.
+
+### Feat
+
+- **mcp**: remove MCP sampling, text generation and the RAG eval harness
+
+### Fix
+
+- **retry**: cap the first retry delay at max_delay
+
+### Refactor
+
+- **retry**: reuse the shared backoff helper for the startup probes
+- **config**: derive the field→env map from Settings
+- **providers**: collapse the duplicate embedding package into providers/
+- **viz**: drop dead settings store and stray template blanks
+- **viz**: drop dead Plotly CDN load and stale viz-UI docs
+- **viz**: remove the in-repo vector-visualization UI
+
+## v0.154.2 (2026-07-30)
+
+### Fix
+
+- **ingest**: stop unreadable PDFs from re-queueing forever
+
+### Refactor
+
+- **pymupdf**: hoist the unnamed-document log placeholder to a constant
+
+## v0.154.1 (2026-07-29)
+
+### Fix
+
+- **scanner**: stream Qdrant deletion-tracking scrolls instead of materialising every point
+
+## v0.154.0 (2026-07-28)
+
+### Feat
+
+- **deck**: split over-long card comments instead of just rejecting them
+
+### Fix
+
+- **splitter**: measure length with PHP's trim charlist, not Python's
+- **splitter**: fail loudly if the prefix fixed point never converges
+- **deck**: give each comment operation its own 403 explanation
+
+## v0.153.0 (2026-07-28)
+
+### Feat
+
+- **observability**: publish dead-lettered documents as a scrapeable gauge
+
+### Fix
+
+- **pdf**: restore the parse worker's memory headroom and unmask its failures
+
+## v0.152.0 (2026-07-28)
+
+### BREAKING CHANGE
+
+- the tenant.id span attribute and the TENANT_ID setting are
+removed. Attribute traces by resource.k8s.namespace.name instead. TENANT_ID
+may still be set in the environment; the application now ignores it.
+
+### Fix
+
+- **observability**: guard POD_* env wiring, drop stale TENANT_ID doc
+- **observability**: never let profiling crashloop the ingest worker
+
+### Refactor
+
+- **cli**: extract the ingest worker run loop; use monkeypatch in tests
+
+## v0.151.1 (2026-07-26)
+
+### Fix
+
+- **storage**: serialize all in-process Alembic commands so concurrent MCP
+  sessions cannot corrupt Alembic's process-global context proxy and crash
+  with `KeyError: 'config'` or `KeyError: 'script'`
+
+## v0.151.0 (2026-07-26)
+
+### BREAKING CHANGE
+
+- nc_webdav_read_file no longer accepts `force_processor`; it is
+replaced by `parse_document` ("auto" | "markdown" | "raw", default "auto").
+ENABLE_DOCUMENT_PROCESSING is removed -- parsing on read is a per-call decision
+and each optional processor registers from its own ENABLE_* flag.
+utils.document_parser.parse_document(bytes, ...) -> (text, metadata) is replaced
+by parse_document_source(source, ...) -> ProcessingResult, and
+WebDavClient.stream_to_file now returns (written, content_type, etag).
+
+### Feat
+
+- **webdav**: destination etag precondition for move and copy
+- **security**: configurable transport security and CORS origins
+- **webdav**: return the new etag from write_file
+- **webdav**: read documents as text/markdown, not base64
+
+### Fix
+
+- optional Table.ownership and explicit provider timeouts
+- **api**: escape the rejected webhook uri in logs
+- **api**: log the rejected webhook uri, not just the resolved one
+- **api**: resolve webhook uri server-side and gate registration on admin
+- **webdav**: only report a markdown gap to a caller who asked for markdown
+
+### Refactor
+
+- **webdav**: extract the shared MOVE/COPY implementation
+- **webdav**: route stream_to_file's etag through _normalize_etag
+- **webdav**: split the PDF ladder into one method per rung
+
+## v0.150.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- nc_webdav_move_resource and nc_webdav_copy_resource now return
+MoveResourceResponse / CopyResourceResponse instead of a raw dict. The
+status_code field keeps its meaning, so field-level consumers are unaffected;
+callers treating the result as a plain mapping must switch to attribute access.
+
+### Fix
+
+- **deck**: preserve order and due date on partial card updates
+
+### Refactor
+
+- **webdav**: typed responses for move and copy tools
+
+## v0.149.0 (2026-07-25)
+
+### Feat
+
+- **calendar**: optional calendar_name and a complete-todo tool
+
+## v0.148.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- OAuth scope enforcement now actually applies to tool calls.
+Sessions whose token or stored app-password scopes do not cover a tool were
+silently allowed and are now denied with InsufficientScopeError; under OAuth,
+a request arriving without a verified token is denied rather than treated as
+BasicAuth. Deployments relying on the previous permissive behaviour must grant
+the required scopes (nc_auth_update_scopes, or
+PATCH /api/v1/users/{user_id}/scopes).
+
+### Fix
+
+- **auth**: fail closed in check_scopes when OAuth has no token
+- **auth**: enforce @require_scopes at runtime
+
+## v0.147.2 (2026-07-25)
+
+### Fix
+
+- **calendar**: structured handling for CalDAV delete refusals
+
+## v0.147.1 (2026-07-25)
+
+### Fix
+
+- **calendar**: don't warn when a stored TZID isn't an IANA name
+- **calendar**: clamp all-day DTEND on the explicit flip path too
+- **calendar**: preserve value type and timezone when updating events
+
+### Refactor
+
+- **calendar**: address SonarCloud findings on the update path
+
+## v0.147.0 (2026-07-25)
+
+### Feat
+
+- **contacts**: pad ADR components to the documented seven
+- **contacts**: surface addresses, name parts and X-* extensions
+
+### Fix
+
+- **contacts**: copy the whole parameter section when rewriting a line
+- **contacts**: match TYPE parameter with a regex, not an upper-cased index
+- **contacts**: preserve lowercase TYPE parameters on rewrite
+- **contacts**: preserve vCard line folding on update
+
+## v0.146.0 (2026-07-25)
+
+### BREAKING CHANGE
+
+- nc_contacts_update_contact now returns an
+UpdateContactResponse instead of None, and no longer rebuilds the vCard from
+the supplied fields when the existing card cannot be fetched — it raises. A
+caller that relied on update creating a missing contact must call
+nc_contacts_create_contact instead.
+
+### Fix
+
+- **contacts**: don't report a landed update as failed
+- **contacts**: stop rebuilding vCards on update
+
+## v0.145.1 (2026-07-24)
+
+### Fix
+
+- **docling**: capture progress result via holder to satisfy Sonar flow analysis
+- **types**: resolve ty 0.0.62 diagnostics after the version bump
+
+### Refactor
+
+- **webdav**: return typed BaseResponse models from read/write tools
+
+## v0.145.0 (2026-07-23)
+
+### BREAKING CHANGE
+
+- nc_webdav_write_file no longer silently overwrites an
+existing file. Omitting if_match now creates a file and fails if it already
+exists; to overwrite, pass the etag from nc_webdav_read_file, or if_match="*"
+to force it.
+
+### Fix
+
+- **webdav**: make writes fail-closed to guarantee zero data loss
+- **webdav**: detect concurrent edits and locks on write, guard oversized writes
+
+### Refactor
+
+- **webdav**: extract write precondition/conflict helpers (Sonar S3776)
+
+## v0.144.2 (2026-07-23)
+
+### Perf
+
+- **observability**: split DB connect from execute; fix 1s bucket ceiling
+
+## v0.144.1 (2026-07-23)
+
+### Fix
+
+- **api**: resolve SonarCloud findings on the new webhook 400 path
+- **auth**: capture tracebacks in webhook_routes catch-alls + document raise
+- **api**: stop broad handlers masking faults in the webhook/admin surface
+
+## v0.144.0 (2026-07-21)
+
+### Feat
+
+- **vector**: folder-ancestor scope filter for shared docs (ADR-033 Phase 3)
+- **vector**: per-user display paths for shared docs (ADR-033 Phase 2)
+- **vector**: pin shared-doc file_path to the owner (ADR-033 Phase 1)
+
+### Fix
+
+- **client**: namespace-agnostic get_fileid parse + clarify ancestor first-write
+- **vector**: address review round 1 (ADR-033)
+
+## v0.143.1 (2026-07-20)
+
+### Fix
+
+- **pdf**: keep the parse worker on pymupdf4llm's classic extractor
+- **pdf**: return picklable chunks from the isolated parse worker
+- **deps**: adapt to pymupdf4llm 1.28 page metadata and pin the PDF stack
+
+## v0.143.0 (2026-07-20)
+
+### Feat
+
+- **health**: probe the tenant collection, not cluster readyz, for Qdrant health
+
+### Fix
+
+- **health**: guard collection-name resolution and URL-encode the probe path
+
+### Refactor
+
+- **health**: drop the unreachable /readyz fallback, test the caller's gate
+
+## v0.142.2 (2026-07-20)
+
+### Fix
+
+- **vector**: clear the SonarCloud quality gate on the PCA tests
+
+### Perf
+
+- **vector**: fit PCA via thin SVD instead of a covariance eigendecomposition
+
+## v0.142.1 (2026-07-20)
+
+### Fix
+
+- **ci**: restore GitHub Releases, revive pact deployment recording, clean up stale artifacts (#1116)
+
+## v0.142.0 (2026-07-19)
+
+### BREAKING CHANGE
+
+- GET /api/v1/pdf-preview is removed. Management clients that still call
+it must be upgraded before relying on this REST API line.
+
+### Feat
+
+- **observability**: correlate requests with the caller's request id
+- **observability**: link inbound requests into the caller's trace
+- **api**: remove pdf-preview endpoint, rasterize in the browser
+
+### Fix
+
+- **observability**: keep the traceback on the uncaught-exception path
+- **observability**: mark handler-caught 5xx responses as error spans
+- **observability**: let the endpoint scheme select the OTLP transport
+
+### Refactor
+
+- drop code the pdf-preview removal orphaned
+
+## v0.141.4 (2026-07-19)
+
+### Fix
+
+- **client**: stop the response log hook buffering every body
+
+## v0.141.3 (2026-07-19)
+
+### Fix
+
+- **search**: window the chunk-bbox pass to bound MuPDF page retention
+
+## v0.141.2 (2026-07-19)
+
+### Fix
+
+- **ingest**: repair the malformed noqa suppression in _text_only_chunks
+- **ingest**: reject a negative markdown page ceiling at startup
+- **ingest**: gate markdown reconstruction on page count
+
+## v0.141.1 (2026-07-18)
+
+### Fix
+
+- **ingest**: materialise in-memory sources into the configured spool dir
+- **ingest**: clean up the buffered fallback's temp file
+- **ingest**: stream document downloads instead of buffering them
+
+## v0.141.0 (2026-07-18)
+
+### Feat
+
+- **ingest**: parse PDFs from a path instead of bytes
+- **webdav**: add a streaming download that never buffers the whole body
+- **observability**: record ingest corpus size distribution
+
+### Fix
+
+- **ingest**: apply the pre-flight size gate to webhook-triggered indexing
+- **ingest**: offload the spooled read in the process_source default
+- **ingest**: keep document materialisation off the event loop
+- **ingest**: bound concurrent isolated parse subprocesses
+- **ingest**: reject over-cap PDFs before downloading them
+- **ingest**: fold the PDF size cap into the escalation signature
+- **ingest**: bound fast-tier PDF parse memory with page windowing
+
+## v0.140.4 (2026-07-17)
+
+### Fix
+
+- **client**: skip Content-Length truncation check on compressed responses
+
+## v0.140.3 (2026-07-16)
+
+### Refactor
+
+- **tests**: use item.path over the legacy item.fspath
+
+## v0.140.2 (2026-07-16)
+
+### Fix
+
+- **tests**: make CI actually run every test under tests/unit/
+
+## v0.140.1 (2026-07-16)
+
+### Fix
+
+- **ci**: retry pact publish + tighten ADR outage wording
+- **ci**: report measured elapsed time in broker-probe error
+- **ci**: probe pact broker before use + retry provider verification
+
+## v0.140.0 (2026-07-16)
+
+### Feat
+
+- **ingest**: safe per-tier worker concurrency (serialize pypdfium2/pymupdf) + overrides
+
+### Fix
+
+- **ingest**: serialize the pdf-preview PyMuPDF render + validate tier concurrency
+
+## v0.139.3 (2026-07-15)
+
+### Refactor
+
+- **usage**: round-2 review nits (batch drop-log detail)
+- **usage**: address round-1 review nits (semconv span attr, rollback test)
+
+### Perf
+
+- **usage**: batch per-document metering into one transaction + trace DB writes
+
+## v0.139.2 (2026-07-15)
+
+### Fix
+
+- **config,vector**: clear settings caches between tests; dedup bbox stamp
+- **vector**: stamp bbox_source on no-boundaries exit; dedup bbox test helpers
+
+### Perf
+
+- **ingest**: cut worker CPU + trace the highlight step
+
+## v0.139.1 (2026-07-15)
+
+### Fix
+
+- **scanner**: converge shared-file deletion tracking on acl_principals + fail-safe empty-discovery gate
+
+### Refactor
+
+- **scanner**: split _plan_file_deletions to clear SonarCloud findings
+
+## v0.139.0 (2026-07-15)
+
+### Feat
+
+- **metrics**: emit astrolabe_qdrant_source_bytes_total for corpus-weighted density
+
+## v0.138.1 (2026-07-13)
+
+### Fix
+
+- **auth**: guarantee oauth_context storage in login_flow mode (#1068)
+
+## v0.138.0 (2026-07-13)
+
+### Feat
+
+- **auth**: short-circuit DCR for pre-configured static clients
+
+### Fix
+
+- **auth**: guard DCR short-circuit against ambiguous static matches
+- **auth**: stabilize client_id_issued_at and validate wildcard port syntax
+- **auth**: guard find_client_for_redirect_uris against non-list input
+
+## v0.137.0 (2026-07-12)
+
+### Feat
+
+- **observability**: add Pyroscope continuous profiling (push SDK)
+
+### Fix
+
+- **observability**: repair worker test helper; fail open on configure
+- **deps**: move pyroscope-io to an optional `observability` extra
+- **observability**: resolve SonarCloud security-gate findings
+
+## v0.136.0 (2026-07-11)
+
+### Feat
+
+- **chunker**: greedy page-packing + chunking_config_version + density sweep harness
+
+### Fix
+
+- **chunker**: clear SonarCloud gate + warn on page-pack misconfig
+
+## v0.135.0 (2026-07-11)
+
+### Feat
+
+- **webdav**: opt-in interactive read-parse timeout cap
+- **config**: add DOCLING_PIPELINE/DOCLING_VLM_PRESET settings
+- **documents**: thread pipeline/vlm_preset through docling convert_file
+
+## v0.134.0 (2026-07-11)
+
+### Feat
+
+- **metrics**: current-in-Qdrant chunk-density snapshot histogram
+
+### Fix
+
+- **metrics**: avoid false truncated flag at exact scan-cap boundary
+
+## v0.133.2 (2026-07-10)
+
+### Fix
+
+- **ingest**: reclaim jobs stranded in `doing` under a live worker
+
+### Refactor
+
+- **ingest**: document backstop tradeoff + split reclaim log by sweep
+
+## v0.133.1 (2026-07-10)
+
+### Fix
+
+- **vector**: add payload index for index_mode (RAM-gauge 400)
+
+## v0.133.0 (2026-07-10)
+
+### Feat
+
+- **vector**: monitor dense-vector RAM cost during ingestion
+
+### Refactor
+
+- **vector**: address round-1 review on RAM-cost monitoring
+
+## v0.132.0 (2026-07-10)
+
+### BREAKING CHANGE
+
+- the env var VECTOR_SYNC_PDF_TAG is renamed to VECTOR_SYNC_TAG.
+Deployments that set VECTOR_SYNC_PDF_TAG must switch to VECTOR_SYNC_TAG; the old
+name is no longer read (no alias). Confirmed no tenant currently overrides it, so
+the default "vector-index" tag is unaffected.
+
+### Refactor
+
+- **config**: rename VECTOR_SYNC_PDF_TAG -> VECTOR_SYNC_TAG
+
+## v0.131.1 (2026-07-10)
+
+### Fix
+
+- **ingest**: accept and thread index_mode through worker task
+
+## v0.131.0 (2026-07-10)
+
+### Feat
+
+- **vector**: default vector_sync_keyword_tag to "keyword-index"
+
+## v0.130.1 (2026-07-10)
+
+### Fix
+
+- **ci**: exclude login_flow_ldap marker from the single-user lane
+
+## v0.130.0 (2026-07-08)
+
+### Feat
+
+- **vector**: per-document keyword vs hybrid index mode (keyword-index tag)
+
+### Refactor
+
+- **vector**: clear two SonarCloud new-code nits
+
+## v0.129.8 (2026-07-06)
+
+### Fix
+
+- reduce pdf preview request log noise
+
+## v0.129.7 (2026-07-06)
+
+### Fix
+
+- harden pdf preview path validation
+
+## v0.129.6 (2026-07-05)
+
+### Fix
+
+- **deps**: update dependency icalendar to >=7.2.0,<7.3.0
+
+## v0.129.5 (2026-07-05)
+
+### Refactor
+
+- **config**: drop redundant local `import re` in mask_db_password
+- **db**: pass DATABASE_URL through to psycopg verbatim; drop asyncpg
+
+## v0.129.4 (2026-07-05)
+
+### Fix
+
+- **ingest**: disable psycopg prepared statements behind the pgbouncer pooler
+
+## v0.129.3 (2026-07-05)
+
+### Fix
+
+- **ocr**: cap batch-poll Retry-After + test floor/cap/submit-path (#1027 review r2)
+- **ocr**: poll batch jobs forever + honour gateway Retry-After (Deck #523)
+
+## v0.129.2 (2026-07-04)
+
+### Fix
+
+- **ingest**: cache the poll batch-client + narrow gate + integration tests (Deck #518 review)
+- **ingest**: skip WebDAV re-download on batch-OCR poll retries (Deck #516/#518)
+
+## v0.129.1 (2026-07-03)
+
+### Refactor
+
+- **search**: consolidate the keyword-mode query-path gate (ADR-030)
+
+## v0.129.0 (2026-07-03)
+
+### Feat
+
+- **api**: reject explicit unsupported search algorithm with 422 (ADR-030)
+
+## v0.128.4 (2026-07-03)
+
+### Fix
+
+- **ocr**: re-submit batch OCR job on gateway 404 instead of polling a dead id forever
+
+## v0.128.3 (2026-07-03)
+
+### Fix
+
+- **logging**: keep traceback for the unexpected search catch-all too
+- **logging**: clear Sonar gate + retry transient 5xx on qdrant init
+- **logging**: keep traceback for the truly-unexpected sampling catch-all
+- **logging**: no tracebacks for handled/expected errors
+
+## v0.128.2 (2026-07-03)
+
+### Fix
+
+- **vector**: keyword-mode content dedup (embedding-identity writer/reader agree)
+
+## v0.128.1 (2026-07-02)
+
+### Fix
+
+- **vector**: keyword mode must size placeholder/dead-letter dense vector from SIMPLE_EMBEDDING_DIMENSION
+
+## v0.128.0 (2026-07-02)
+
+### Feat
+
+- **documents**: add docling (docling-serve) parsing backend
+
+### Fix
+
+- **ci**: register docling on the read_file path + fix isError assertion
+- **documents**: harden docling client + address review findings
+
+## v0.127.6 (2026-07-02)
+
+### Fix
+
+- **calendar**: resolve calendar-home-set against origin, not subpath base URL
+
+## v0.127.5 (2026-07-02)
+
+### Fix
+
+- **ingest**: make stalled-job reclaim resilient to queueing_lock collisions
+
+### Refactor
+
+- **ingest**: guard reclaim discard on queueing_lock constraint; test isolation
+
+## v0.127.4 (2026-07-01)
+
+### Fix
+
+- **client**: resolve DAV paths via principal discovery
+
+## v0.127.3 (2026-07-01)
+
+### Fix
+
+- **app**: preserve hybrid path's 30s discovery timeout via optional kwarg
+- **app**: extend discovery retry to hybrid mode; broaden catch; clear Sonar smells
+- **app**: retry malformed-200 discovery responses; fix Sonar float-eq bugs
+- **app**: clamp discovery backoff and document new retry knobs
+- **app**: retry OIDC discovery at startup with backoff instead of crashlooping
+
+## v0.127.2 (2026-07-01)
+
+### Fix
+
+- **login-flow**: use nextcloud_browser_url for userinfo app links
+- **login-flow**: resolve Login Flow v2 login_url to Nextcloud in external-IdP mode
+
+## v0.127.1 (2026-07-01)
+
+### Fix
+
+- **mail**: download attachments via direct route, not OCS (#989)
+
+### Refactor
+
+- **mail**: drop Accept:json on binary download; clarify cap comment
+
+## v0.127.0 (2026-06-30)
+
+### Feat
+
+- **api**: advertise supported_search_types on /api/v1/status
+- **search**: add SEARCH_MODE=keyword for airgapped, embedding-free search
+
+### Fix
+
+- mode-accurate search logs + skip PCA embed in keyword mode (round-6)
+- **api**: drop score_threshold upper bound on /api/v1/search (ADR-030)
+- **search**: address round-3 review (mode-aware algorithm gate, log casing)
+- **search**: address round-1 review on SEARCH_MODE keyword mode
+
+### Refactor
+
+- address round-5 review nits (DRY, coercion log, typing, ADR)
+- **search**: address round-2 review (dedup, complexity, log, docs)
+
+## v0.126.5 (2026-06-28)
+
+### Refactor
+
+- **config**: drive ALL config through dynaconf; remove os.environ reads
+
+## v0.126.4 (2026-06-28)
+
+### Fix
+
+- **api**: reject unauthenticated requests before the rate limiter
+- **api**: rate-limit + clearer errors on authenticated management routes
+- **api**: validate credentials on user-management endpoints (GHSA-x88r-fhx7-52h6)
+
+### Refactor
+
+- **api**: route provision through the shared auth helper; fix Sonar gate
+
+## v0.126.3 (2026-06-26)
+
+### Fix
+
+- **mail**: raise on outbox-create failure so the tool can't fake success
+- **mail**: drop the dropped `from_email` param; refresh stale docstrings
+
+### Refactor
+
+- **mail**: drop dead isinstance branch on required `to` arg (round-6)
+- **mail**: merge identical header dicts; guard outbox 204 (round-3)
+
+## v0.126.2 (2026-06-25)
+
+### Fix
+
+- address round-1 review on #968 (logging, startup warn, guards)
+- detect truncated WebDAV downloads and add NEXTCLOUD_HTTP_KEEPALIVE knob
+
+## v0.126.1 (2026-06-25)
+
+### Fix
+
+- send email via Mail 5.x outbox API (two-step create+send)
+- **mail**: use correct Mail 5.x API routes
+
+## v0.126.0 (2026-06-25)
+
+### Feat
+
+- **ingest**: add INGEST_LISTEN_NOTIFY toggle for poll-only worker
+
+## v0.125.1 (2026-06-25)
+
+### Fix
+
+- **auth**: use Nextcloud loginName for WebDAV path in Login Flow v2
+
+## v0.125.0 (2026-06-23)
+
+### Feat
+
+- **sharing**: add short-lived public download link tool (#829)
+
+### Fix
+
+- **sharing**: parameterize _build_link_response dict annotation (#952)
+- **sharing**: address review round 2 — fail hard on missing url, extract response builder (#952)
+- **sharing**: harden public-link tool per review round 1 (#952)
+
+## v0.124.4 (2026-06-23)
+
+### Fix
+
+- **documents**: recover full text layer when pymupdf4llm under-extracts
+
+## v0.124.3 (2026-06-23)
+
+### Fix
+
+- **webdav**: XML-escape find_by_name pattern + find_by_tag tag literal
+- address PR #950 review (metric comment, dead test assertion, hoist import)
+- **webdav**: XML-escape SEARCH scope + surface server error on failure
+- **ingest**: record batch-OCR-pending polls as status="pending", not "error"
+
+## v0.124.2 (2026-06-22)
+
+### Fix
+
+- **search**: word-level pymupdf chunk bboxes (coverage + per-line geometry)
+
+### Refactor
+
+- **search**: fix chunks_by_page type annotation + loop var name (#945 r4)
+- **search**: address #945 round-3 review (docstring + boundary lookup)
+- **search**: address #945 round-2 review (stale docstring, dead params)
+- **search**: address #945 review nits (dead params, clamp, docs)
+
+## v0.124.1 (2026-06-22)
+
+### Fix
+
+- **vector**: attribute OCR bboxes whitespace-insensitively + page guard
+
+## v0.124.0 (2026-06-22)
+
+### Feat
+
+- **vector**: meter bytes_ingested / bytes_stored at indexing
+
+## v0.123.2 (2026-06-22)
+
+### Fix
+
+- **vector**: escalate hard parse failures up the tier ladder (#399)
+
+## v0.123.1 (2026-06-21)
+
+### Fix
+
+- **vector**: index dead_letter payload field to stop ingest loop
+
+## v0.123.0 (2026-06-21)
+
+### Feat
+
+- **ocr**: store + expose gateway-provided OCR bounding boxes
+
+### Refactor
+
+- **ocr**: address PR #940 round-4 review (no blockers)
+- **ocr**: address PR #940 round-3 review
+- **ocr**: address PR #940 round-2 review
+- **ocr**: address PR #940 round-1 review
+
+## v0.122.2 (2026-06-21)
+
+### Fix
+
+- **vector**: key _potentially_deleted by doc_type to avoid cross-type collisions
+
+## v0.122.1 (2026-06-21)
+
+### Refactor
+
+- **ocr**: fix stale batch comment, single-source legacy OCR queues (PR #938 round-2)
+- **ocr**: consolidate the two OCR tiers into one configurable tier
+
+## v0.122.0 (2026-06-20)
+
+### Feat
+
+- **mail**: read and index Nextcloud Mail via the Mail OCS API
+
+### Fix
+
+- **mail**: guard empty message payload in processor (PR #935 round-6)
+- **mail**: address PR #935 round-2 review
+
+### Refactor
+
+- **mail**: address PR #935 round-1 review
+
+### Perf
+
+- **mail**: batch verify-on-read; test build_mail_content; addr-recall
+
+## v0.121.3 (2026-06-19)
+
+### Fix
+
+- **vector**: offload embedded Qdrant ops to a worker thread (#926)
+
+## v0.121.2 (2026-06-18)
+
+### Fix
+
+- **docker**: enable PYTHONFAULTHANDLER for native-crash diagnostics
+
+## v0.121.1 (2026-06-18)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.28,<1.29
+
+## v0.121.0 (2026-06-18)
+
+### Feat
+
+- **ingest**: split OCR into tier2 in-cluster (GPU, gateway-only) + tier3 upstream
+
+### Fix
+
+- **ingest**: warn when provider=none disables in-cluster; precise model fallback
+- **ingest**: suppress misleading batch-fallback warn for in-cluster rung
+
+### Refactor
+
+- **ingest**: doc legacy ocr queue; fix docstrings + getattr guard
+
+## v0.120.5 (2026-06-17)
+
+### Fix
+
+- **auth**: clarify empty-allowlist startup warning when userinfo is configured
+- **auth**: quiet per-validation userinfo TTL log; test introspection-timeout fall-through
+- **auth**: document introspection-error fall-through, drop misleading userinfo metric
+- **auth**: quiet cache-hit userinfo log, test real-exp userinfo path
+- **auth**: harden userinfo fallback (anti-forgery, SSRF guard, unconfigured-introspection)
+- **auth**: tighten userinfo-token cache TTL and metric labelling
+- **auth**: validate opaque access tokens via userinfo fallback
+
+## v0.120.4 (2026-06-17)
+
+### Fix
+
+- **vector**: guard dead-letter on etag, harden marker filter
+- **vector**: clear dead-letter marker on delete, treat oversize as terminal
+- **vector**: dead-letter terminally-failed documents to stop multi-user re-queue loop
+
+## v0.120.3 (2026-06-16)
+
+### Fix
+
+- **document-processors**: make glyph-corruption ratio of 0 disable the signal
+- **document-processors**: inline/external parity when structured tier is absent
+- **document-processors**: correct cascade escalation metric + review nits
+- **document-processors**: escalate glyph-corrupt PDFs to the structured tier
+
+## v0.120.2 (2026-06-16)
+
+### Refactor
+
+- **auth**: drop built-in well-known MCP client list
+
+## v0.120.1 (2026-06-16)
+
+### Fix
+
+- **vector**: propagate cancel in cleanup task; cover 403 + sweep-failure
+- **vector**: self-heal stale app passwords on auth failure
+
+## v0.120.0 (2026-06-16)
+
+### Feat
+
+- **vector-sync**: honor Astrolabe admin consent for searchable sources
+
+### Fix
+
+- **vector-sync**: address round-7 — only log purge endpoint when enabled
+- **vector-sync**: address round-6 review — rename shadowed var, add test
+- **vector-sync**: address round-5 review — partial-failure signal, markers
+- **vector-sync**: address round-4 review — processor test, partial eviction
+- **vector-sync**: address round-3 review — gate purge route, bound set, nits
+- **vector-sync**: address round-2 review — one-shot backstop, helper, caps
+- **vector-sync**: address PR review — dict guard, symmetric backstop, metrics
+
+### Refactor
+
+- **scanner**: _should_scan helper to cut scan_user_documents complexity
+- **scanner**: cut backstop cognitive complexity (SonarQube S3776)
+- **vector-sync**: dedupe "Bad request" 400s via a helper (SonarCloud S1192)
+
+## v0.119.0 (2026-06-15)
+
+### Feat
+
+- **ocr**: opt-in batch OCR mode via the gateway's async batch routes
+
+### Fix
+
+- **ocr**: round-5 review nits — empty-pages failure, comments, test cleanup
+- **ocr**: round-4 review — defensive poll + drop dead tracking columns
+- **ocr**: round-3 review — guard unexpected batch status + tests/comments
+- **ocr**: round-2 review — lazy store lock, mode enum normalization, type hints
+- **ocr**: wire batch settings into _field_map + review nits
+
+## v0.118.0 (2026-06-15)
+
+### Feat
+
+- **calendar**: list external read-only (subscribed) calendars
+
+## v0.117.2 (2026-06-14)
+
+### Fix
+
+- **security**: enforce WEBHOOK_SECRET min length + address round-2 review
+- **security**: require WEBHOOK_SECRET for the Nextcloud webhook receiver
+
+## v0.117.1 (2026-06-14)
+
+### Refactor
+
+- **auth**: drop remaining stale token-exchange references
+- **auth**: remove vestigial token-exchange code path
+
+## v0.117.0 (2026-06-13)
+
+### Feat
+
+- **ingest**: record suppressed OCR escalations (what-if-OCR signal)
+
+### Fix
+
+- **ingest**: address review round 2 (Literal reason + exhaustive branch + test)
+- **ingest**: address review round 1 (Literal kind + log tidy)
+
+### Refactor
+
+- **ingest**: rename ignore_enabled→ignore_ocr_enabled + empty/structured test
+
+## v0.116.0 (2026-06-13)
+
+### Feat
+
+- **ingest**: per-tier escalation via procrastinate queue-hop
+
+### Fix
+
+- **ingest**: stagger stalled-job reclaim to avoid thundering herd (round 5)
+- **ingest**: zero queue-depth gauge on all-queues-drained (review round 4)
+- **ingest**: address review round 3 + SonarCloud reliability gate
+- **ingest**: address review round 2 (stale gauge + hygiene)
+- **ingest**: address review round 1 (reclaim queue + tests)
+
+## v0.115.1 (2026-06-13)
+
+### Fix
+
+- **classifier**: make image coverage diagnostic-only, not an OCR routing trigger
+
+### Refactor
+
+- **classifier**: rename IMAGE_COVERAGE_SCANNED → IMAGE_HEAVY_THRESHOLD
+
+## v0.115.0 (2026-06-12)
+
+### Feat
+
+- **vector-sync**: scan provisioned users immediately
+
+### Refactor
+
+- **vector-sync**: clear SonarCloud gate + round-2 nits
+- **vector-sync**: address round-1 review nits
+
+## v0.114.0 (2026-06-11)
+
+### Feat
+
+- **auth**: advertise offline_access in discovered OAuth scopes
+
+## v0.113.1 (2026-06-11)
+
+### Fix
+
+- **vector**: don't inflate qdrant-error metric on embed drops (#893 r3)
+- **vector**: nested-group drop classification + review/Sonar fixes (#893)
+- **vector**: retry transient embed errors so a pod rollover drops 0 docs
+
+## v0.113.0 (2026-06-11)
+
+### Feat
+
+- **document**: configurable OCR timeout and fail-fast PDF size guard
+
+### Fix
+
+- **document**: catch httpx timeout from gateway OCR backend (#892 r3)
+- **document**: timeout reason bucket + Sonar https hotspot (#892 round 2)
+- **document**: apply OCR timeout to Mistral backend + review/Sonar fixes (#892)
+- **vector**: guard unbound doc_task + address review nits (#891)
+- **vector**: URL-encode DAV paths and unwrap TaskGroup exceptions
+
+## v0.112.0 (2026-06-11)
+
+### Feat
+
+- **worker**: structured logs + metrics + traces for ingest worker
+
+### Fix
+
+- **worker**: clear Sonar S5332 hotspot + address review nits
+
+### Refactor
+
+- **worker**: trim observability helper docstring; clarify test fake
+
+## v0.111.0 (2026-06-10)
+
+### Feat
+
+- **deck**: surface remapped labels in move-card response
+- **deck**: add deck_move_card_to_board tool for cross-board moves
+
+### Fix
+
+- **deck**: make done-restore best-effort on move; cover combined states
+- **deck**: preserve done/archived and validate target board on move
+
+## v0.110.2 (2026-06-10)
+
+### Fix
+
+- convert astrolabe int provisioned_at to ISO before ProvisioningStatus
+- **ci**: gate can-i-deploy broker steps individually, not at job level
+
+## v0.110.1 (2026-06-10)
+
+### Fix
+
+- **app**: port-aware MCP URL fallback + clear readiness cache per lifespan (round 4)
+- **app**: cancel readiness loop on lifespan shutdown (review round 2)
+- **config**: correct OIDC token-type/scopes env keys; address review round 1
+- **health**: non-gating readiness probe; shared-task-group lifespan; settings migration
+
+### Refactor
+
+- **app**: cancel only the readiness loop at shutdown (review round 3)
+
+## v0.110.0 (2026-06-08)
+
+### Feat
+
+- **metering**: pages_embedded = real parsed page count
+
+### Refactor
+
+- **metering**: harden page_count guard per review
+
+## v0.109.1 (2026-06-08)
+
+### Fix
+
+- **documents**: guard Unix-only resource import for Windows (#877)
+
+### Refactor
+
+- **documents**: fully decouple document stack from server startup; Windows-safe tests
+
+## v0.109.0 (2026-06-08)
+
+### Feat
+
+- **usage**: rename metrics → tokens_embedded/pages_embedded + export token cost to Prometheus
+- **usage**: meter embedding tokens as embeddings_queries on both paths
+
+### Fix
+
+- **usage**: drop redundant GatewayProvider.embed_batch override (round 3)
+- **usage**: embed query once across doc_types; address review round 1
+
+### Refactor
+
+- **search**: structural per-instance query side-channel; doc search billing gap
+- **usage**: extract indexing metering helper; address review round 2
+
+## v0.108.3 (2026-06-08)
+
+### Fix
+
+- **contacts**: address PR #876 round-2 nits
+- **contacts**: address PR #876 round-1 review
+- **contacts**: resolve real CardDAV object path for delete/update (fixes #874)
+
+## v0.108.2 (2026-06-07)
+
+### Fix
+
+- **vector**: address PR #873 round-2 review
+- **vector**: gate scanner app polls on per-user enabled apps
+
+## v0.108.1 (2026-06-07)
+
+### Fix
+
+- **deck**: include archived cards in list tools for status=all/archived
+
+### Refactor
+
+- **deck**: address PR #872 round-1 review
+
+## v0.108.0 (2026-06-07)
+
+### Feat
+
+- **usage**: record per-tenant usage events into the app DB
+
+### Refactor
+
+- **usage**: final round-6 nits on PR #871
+- **usage**: close out round-5 nits on PR #871
+- **usage**: address round-4 review on PR #871
+- **usage**: address round-3 review on PR #871
+- **usage**: address round-2 review on PR #871
+- **usage**: address round-1 review on PR #871
+
+## v0.107.0 (2026-06-06)
+
+### BREAKING CHANGE
+
+- PDFs are re-chunked page-aware by default. Existing
+deployments will re-index PDF content on the next vector sync (different
+chunk counts and page_number labels). Set DOCUMENT_CHUNK_PAGE_AWARE=false
+to retain the previous char-based behaviour.
+
+### Feat
+
+- **vector**: page-aware PDF chunking for predictable per-page retrieval
+
+### Fix
+
+- **vector**: skip page-assignment span/warning on empty boundaries
+- **vector**: route empty page_boundaries to char-based path; test ws offsets
+
+## v0.106.0 (2026-06-06)
+
+### Feat
+
+- **vector**: index files in real time on vector-index tag changes
+
+## v0.105.0 (2026-06-05)
+
+### Feat
+
+- quality + scan OCR escalation trigger (junk-text-layer scans)
+
+### Fix
+
+- **review**: unify "scanned" flag name + log image_coverage length drift
+- **review**: align classify_pdf routing with the hot path + scan-tail test
+- **review**: align quality threshold, cap + DRY scan coverage, warn on failure
+
+## v0.104.1 (2026-06-05)
+
+### Fix
+
+- close pypdfium2 page handle on error + cover classifier/OCR edge cases
+
+## v0.104.0 (2026-06-05)
+
+### Feat
+
+- tier-3 OCR processor (gateway or direct Mistral)
+- tiered PDF processor with pypdfium2 fast path (deprecate pymupdf4llm)
+
+### Fix
+
+- **review**: _enum_fields validation, gate classify_from_text flags, OCR warnings
+- **review**: lock OCR backend init, warn on rollback fallthrough, zero-page metric
+- **review**: cache OCR backend, drop asserts, real pipeline_tier, guard zero-page
+- OCR escalation falls back to tier-1 result when OCR can't run
+
+## v0.103.0 (2026-06-04)
+
+### Feat
+
+- use Nextcloud filename for indexed file title + reconcile on rename
+
+### Fix
+
+- **review**: guard placeholder in scanner reconcile + test dual-write path
+
+## v0.102.0 (2026-06-04)
+
+### Feat
+
+- tier-0 document classifier in shadow mode
+
+### Fix
+
+- **review**: warn (not debug) on shadow-classify failure; tidy pymupdf usage
+- **review**: sample last page, document flags-vs-routing, add flag-path tests
+
+## v0.101.4 (2026-06-04)
+
+### Fix
+
+- lower DOCUMENT_PDF_GRAPHICS_LIMIT default 5000 -> 1000
+
+## v0.101.3 (2026-06-04)
+
+### Fix
+
+- **tests**: moderate re-scan interval to stop multi-user index churn
+- **tests**: fast vector-sync cadence for multi-user-basic CI service
+- **tests**: repair multi-user-basic Astrolabe integration suite
+
+## v0.101.2 (2026-06-04)
+
+### Fix
+
+- **review**: type timeout as float; document worker reuse + identity check
+- **review**: require graphics_limit>=1, type _index_document, cover rlimit branch
+- **review**: close doc via try/finally; don't count parse failures as indexed
+- isolate PDF parse in a subprocess so a bad file can't OOM the pod
+
+## v0.101.1 (2026-06-04)
+
+### Fix
+
+- resolve startup NameError in vector-sync metrics task
+
+## v0.101.0 (2026-06-04)
+
+### BREAKING CHANGE
+
+- /api/v1/vector-sync/status field `indexed_documents` now holds
+the distinct-document count (was the chunk count); the chunk count moved to the
+new `indexed_chunks` field. The Astrolabe UI + the nc_get_vector_sync_status MCP
+tool / userinfo page are harmonized in a follow-up (Deck #195).
+
+### Feat
+
+- harmonize MCP tool + userinfo page to documents/chunks model
+- backend-agnostic vector-sync gauges (pending/documents/chunks)
+
+### Fix
+
+- add metrics-interval validator + type/test gaps (review #850)
+
+## v0.100.0 (2026-06-04)
+
+### Feat
+
+- add IngestTransport port for local/distributed ingest backends
+
+### Refactor
+
+- address PR #851 review round 5 (ingest transport)
+- address PR #851 review round 4 (ingest transport)
+- address PR #851 review round 3 (ingest transport)
+- address PR #851 review round 2 (ingest transport)
+- address PR #851 review round 1 (ingest transport)
+
+## v0.99.0 (2026-06-04)
+
+### Feat
+
+- dedup shared-file parsing/embedding across users in vector sync
+
+### Fix
+
+- only merge prior acl_principals for files (review #848)
+- **webdav**: harden offset/key truthiness and escape SEARCH mime type
+- **webdav**: await fallback, guard dedup key, split paging for complexity
+- paginate tagged-folder SEARCH so the scanner discovers all files
+
+## v0.98.1 (2026-06-04)
+
+### Fix
+
+- make procrastinate ingest queue opt-in (default to in-process anyio)
+
+## v0.98.0 (2026-06-03)
+
+### BREAKING CHANGE
+
+- the external-NATS-ingest env vars are removed
+(INGEST_MODE, STATUS_BACKEND, INGEST_BUS_URL, INGEST_BUS_NUM_REPLICAS,
+FACT_EVENT_EMITTER). Use INGEST_QUEUE (memory|postgres) and the `worker`
+command instead. TENANT_ID is retained (no longer NATS-subject-charset-validated).
+
+### Feat
+
+- replace NATS ingest with procrastinate Postgres queue (#183)
+
+### Fix
+
+- initialize document processors in the ingest worker (PR #836 round-5)
+- address PR #836 round-3 review (lock-key invariant, single open)
+- address PR #836 round-2 review (connect/timeout/observability)
+- address PR #836 review — forward task_producer to MCP contexts + cleanups
+- **ci**: install procrastinate in the dev group so ty + unit tests resolve it
+
+## v0.97.0 (2026-06-03)
+
+### Feat
+
+- **search**: support multiple folders in the semantic-search path filter
+
+### Fix
+
+- **search**: cap path_prefixes server-side; unify Iterable typing
+- **search**: cap path_prefixes at the MCP tool; widen path filter tests
+- **search**: address review feedback on multi-folder path filter
+
+## v0.96.0 (2026-06-03)
+
+### Feat
+
+- **observability**: astrolabe_* metrics + traces for the document pipeline
+
+### Fix
+
+- **observability**: address third review round
+- **observability**: address second review round
+- **observability**: address PR review + SonarCloud findings
+
+## v0.95.0 (2026-06-03)
+
+### Feat
+
+- add Claude Desktop extension (.mcpb) for single-user stdio mode
+
+### Fix
+
+- **mcpb**: add Windows support via platform_overrides and run.cmd
+- **mcpb**: address review feedback on manifest and run.sh
+
+## v0.94.1 (2026-06-03)
+
+### Fix
+
+- **search**: address PR #834 re-review (403/404 coverage + docs)
+- **search**: address PR #834 review findings
+- **search**: gate verify-on-read file results on vector-index tag membership
+
+### Perf
+
+- **search**: skip exclusion lookup on empty tag set; fix semaphore comment
+
+## v0.94.0 (2026-06-02)
+
+### Feat
+
+- **search**: ADR-027 Phase 2 — file-path filter
+- **search**: ADR-027 Phase 1 — modified-date range filter
+
+## v0.93.0 (2026-06-01)
+
+### BREAKING CHANGE
+
+- deck list tools now default to detail="summary" and
+status="open". The include_archived_cards parameter is replaced by status
+(use status="all" to include archived cards); pass detail="full" to restore
+the previous per-card shape.
+
+### Feat
+
+- **deck**: compact card/comment retrieval (summaries, filters, board overview)
+
+### Refactor
+
+- **deck**: address PR #826 review feedback
+
+## v0.92.1 (2026-06-01)
+
+### Fix
+
+- **embedding**: normalize gateway base_url to the /v1 base path
+
+## v0.92.0 (2026-06-01)
+
+### Feat
+
+- **embedding**: gateway provider discovers dimension via GET /v1/models
+
+## v0.91.3 (2026-06-01)
+
+### Fix
+
+- **api**: distinguish Nextcloud 5xx from auth failure; tighten body parse (#824)
+- **api**: block cross-user delete and address review feedback (#824)
+- **api**: return 401 not 500 on failed app-password OCS validation (#824)
+
+## v0.91.2 (2026-05-31)
+
+### Fix
+
+- **auth**: authenticate stored app passwords with loginName, not UID
+
+## v0.91.1 (2026-05-31)
+
+### Fix
+
+- **vector**: make NATS status subscriber resilient at startup
+
+## v0.91.0 (2026-05-31)
+
+### Feat
+
+- add opt-in MCP decomposition hook points (design §10)
+
+### Fix
+
+- stop S7632 flagging NOSONAR mentioned in prose comments
+- well-form NOSONAR suppressions (SonarCloud S7632/S7503)
+- address PR #814 reviewer follow-ups
+- address PR #814 review + SonarCloud gate
+
+## v0.90.2 (2026-05-30)
+
+### Fix
+
+- **vector-sync**: isolate per-app scans so a disabled Notes app can't abort sync
+
+## v0.90.1 (2026-05-30)
+
+### Fix
+
+- **api**: validate app password against Nextcloud using loginName, not UID
+
+## v0.90.0 (2026-05-29)
+
+### Feat
+
+- **search**: ACL-aware vector filter via Nextcloud Shares lookup
+
+### Fix
+
+- PR #813 review — cap unified_search multi-type pool; document deck self-only
+- cache app-password storage to avoid per-request Alembic upgrade race
+- PR #813 review — shared-file context in MCP tool path + viz over-fetch cap
+- address PR #813 review round 4 (log leak, cross-user chunk ctx, algo, overlap)
+- address PR #813 latest review (ACL-aware doc-type discovery, robustness)
+- address PR #813 review (owner_id index, cache bound, explicit param)
+- **search**: address PR #813 review (viz verify-on-read, owners cache, docs)
+- **auth**: make provision/revoke consistent with the app-password store
+- **auth**: login-flow provisioning — public login_url + session app passwords
+- **search**: verify shared files by global file id (ACL-aware)
+
+## v0.89.0 (2026-05-24)
+
+### Feat
+
+- **api**: log inbound User-Agent on management API and webhook receiver
+- **webhooks**: add Deck card sync preset with vector indexing
+
+## v0.88.3 (2026-05-22)
+
+### Fix
+
+- **vector-sync**: use resolved collection name in orphan sweep
+- **vector-sync**: sweep placeholder orphans at Pod startup (#101)
+
+## v0.88.2 (2026-05-21)
+
+### Fix
+
+- **contacts**: surface ORG/TITLE/NOTE/URL/CATEGORIES/PHOTO on read (refs #716)
+
+## v0.88.1 (2026-05-20)
+
+### Fix
+
+- **contacts**: warn on unsupported dict/list email/tel update inputs
+- **contacts**: two PR #719 review bugs
+- **contacts**: close PR #719 second-pass review gaps
+- **contacts**: persist all documented fields on create (fixes #716)
+
+### Refactor
+
+- **contacts**: address PR #719 follow-up review
+
+## v0.88.0 (2026-05-20)
+
+### Feat
+
+- **ci**: build arm64 Docker images natively on ubuntu-24.04-arm
+
+## v0.87.2 (2026-05-17)
+
+### Fix
+
+- **embedding**: instantiate BM25 singleton off the event loop
+
+## v0.87.1 (2026-05-17)
+
+### Fix
+
+- **storage**: address review on PR #799 (stale comments, docs deprecation, unit test)
+- **storage**: use NullPool for Postgres engine (cross-loop crashes under anyio TaskGroup)
+
+## v0.87.0 (2026-05-17)
+
+### Feat
+
+- **storage**: pluggable database backend via DATABASE_URL (ADR-026)
+
+### Fix
+
+- **storage**: address PR #798 round-4 review (NOSONAR syntax + pg_advisory_lock + engine dispose + nits)
+- **storage**: address PR #798 round-3 review (SonarQube + pool sizing + RETURNING test)
+- **storage**: address PR #798 review feedback (credentials, asyncpg extra, TLS, pool)
+
+## v0.86.4 (2026-05-16)
+
+### Fix
+
+- **config**: emit background-ops advisory logs once per process
+
+## v0.86.3 (2026-05-12)
+
+### Refactor
+
+- convert f-string logging to lazy %-style format (G004)
+
+## v0.86.2 (2026-05-12)
+
+### Refactor
+
+- drop OAuth-refresh background-sync path from oauth_sync.py
+
+## v0.86.1 (2026-05-12)
+
+### Refactor
+
+- prune dead pre-LOGIN_FLOW config/runtime branches
+
+## v0.86.0 (2026-05-12)
+
+### BREAKING CHANGE
+
+- ENABLE_MULTI_USER_BASIC_AUTH is no longer read from
+the environment, and setting it now raises a startup ValueError with
+a migration message. Replace `ENABLE_MULTI_USER_BASIC_AUTH=true` with
+`MCP_DEPLOYMENT_MODE=multi_user_basic`. The same loud-deprecation
+check is also applied to the recently-removed ENABLE_LOGIN_FLOW —
+replace with `MCP_DEPLOYMENT_MODE=login_flow` (or drop both;
+`login_flow` is the auto-detect default when no other auth env vars
+are set).
+- `ENABLE_LOGIN_FLOW` is no longer read from the
+environment. Anyone who relied on `ENABLE_LOGIN_FLOW=true` to activate
+Login Flow v2 should set `MCP_DEPLOYMENT_MODE=login_flow` instead (or
+rely on it being the default when no other auth env vars are set).
+- MCP_DEPLOYMENT_MODE=oauth_single_audience is no longer
+accepted. Set MCP_DEPLOYMENT_MODE=login_flow (and keep
+ENABLE_LOGIN_FLOW=true) for the same deployment. The un-augmented
+OAuth path is no longer supported; if you previously ran the broken
+path, you can either configure Login Flow v2 (recommended) or switch
+to multi_user_basic / single_user_basic.
+
+### Fix
+
+- **config**: derive mode flags in Settings.__post_init__; address review round 2
+
+### Refactor
+
+- **config**: drop ENABLE_MULTI_USER_BASIC_AUTH env var, fail loud on legacy aliases
+- **config**: derive enable_login_flow from mode, remove ENABLE_LOGIN_FLOW env var
+- **config**: rename OAUTH_SINGLE_AUDIENCE to LOGIN_FLOW, gate on ENABLE_LOGIN_FLOW
+
+## v0.85.1 (2026-05-11)
+
+### Fix
+
+- **calendar**: preserve floating/TZID semantics across CalDAV roundtrip (#782)
+
+## v0.85.0 (2026-05-10)
+
+### Feat
+
+- **deck**: add file/note attachment MCP tools
+
+### Fix
+
+- **deck**: address review — notesPath key, scopes, modernize types
+
+## v0.84.2 (2026-05-10)
+
+### Fix
+
+- **health**: forward api-key to Qdrant /readyz so Cloud probes work
+
+## v0.84.1 (2026-05-10)
+
+### Fix
+
+- **vector**: address PR review round 17 + local-mode collection-creation regression
+- **vector**: address PR review round 16 — type-aware index check, comments
+- **vector**: address PR review round 15 — concurrency, pagination, stale coercion
+- **vector**: address PR review round 14 — accurate offset-skip comment + news_item doc_id guard
+- **vector**: address PR review round 13 — index offset fields + tighten test
+- **vector**: address PR review round 12 — bool guard + strict doc_id validation
+- **vector**: address PR review round 11 — broaden offset-skip gate, clarify ordering
+- **vector**: address PR review round 10 — index chunk_index, harden index loop, lazy-init lock
+- **api**: validate doc_id at chunk-context handler boundary
+- **vector**: address PR review round 9 — drop redundant guard, add init lock, test float doc_id path
+- **vector**: guard _group_int_doc_ids against non-int doc_id values
+- **vector**: tighten get_chunk_bbox_and_page_from_qdrant doc_id to str
+- **login-flow**: allow Astrolabe's OAuth client on the management API
+- **vector**: address PR review round 8 — anyio convention + cosine-safe sentinel + dedup get_collection
+- **vector**: add BOOL index for is_placeholder + correct wait=True docstring
+- **vector**: address PR review round 6 + SonarCloud findings
+- **vector**: address PR review round 5 — progress logging, summary visibility, sentinel split
+- **vector**: address PR review round 4 — backfill resilience + degraded-mode docs
+- **vector**: address PR review round 3 — sentinel guard, skip indexed fields, narrow types
+- **vector**: address PR review round 2 — status branching, doc_id guard, doc restore
+- **vector**: address PR review — wait=True backfill, batched writes, search helper
+- **vector**: normalize doc_id to str + add Qdrant keyword payload indexes
+
+## v0.84.0 (2026-05-10)
+
+### Feat
+
+- **contacts**: add nc_contacts_search_contacts free-text search tool
+
+## v0.83.4 (2026-05-10)
+
+### Fix
+
+- **qdrant**: use get_collection for startup probe (multi-tenant safe, take 2)
+
+## v0.83.3 (2026-05-10)
+
+### Fix
+
+- **qdrant**: use collection_exists for startup probe (multi-tenant safe)
+
+## v0.83.2 (2026-05-09)
+
+### Fix
+
+- **chunk-context**: address PR #767 review — extract bbox helper, fix page_number overwrite
+- **chunk-context**: address PR #767 review — drop dead PDF branch, redundant alias, add boundary tests
+- **chunk-context**: address PR #767 round-3 review — gate readability + legacy-fallback comment
+- **chunk-context**: propagate chunk_index=None through ChunkContext
+- **chunk-context**: address PR #767 round-2 review — gate, parity, doc
+- **chunk-context**: address PR #767 review — doc_type filter parity + tests
+- **viz_routes**: address PR #767 review — param parity + always-on page_number
+- **viz_routes**: validate chunk_index/total_chunks bounds in OAuth route
+- **chunk-context**: use indexed chunk_index lookup, fix close-after-use bug
+
+## v0.83.1 (2026-05-09)
+
+### Fix
+
+- **webdav**: decode percent-encoded names in PROPFIND/SEARCH responses
+
+## v0.83.0 (2026-05-08)
+
+### Feat
+
+- **vector**: replace inline page-image payloads with chunk_bbox (Deck #76)
+
+### Refactor
+
+- **vector**: address PR #775 review round 3 — fix unused var, harden boundary lookup, rename trace span
+- **vector**: address PR #775 review round 2 — drop dead page field, add omission tests
+- **vector**: address PR #775 review — drop unused payload key, fix resource leaks
+
+## v0.82.0 (2026-05-08)
+
+### Feat
+
+- **providers**: add Mistral embedding provider, route registry through dynaconf
+
+### Refactor
+
+- **providers**: address PR #772 review round 3 — hermetic test, lazy logging, defensive-guard tests
+- **providers**: address PR #772 review round 2 — guard, naming, docs, tests
+- **providers**: address PR #772 review — shared retry, cleaner imports, no-op close
+
+## v0.81.0 (2026-05-07)
+
+### Feat
+
+- **vector**: expand tagged directories for include + apply EXCLUDED_TAGS in scanner
+
+### Fix
+
+- **webdav**: include fileid in find_by_type SEARCH + address PR #765 review
+
+## v0.80.0 (2026-05-06)
+
+### Feat
+
+- **webdav**: add tag-based file exclusion (#710)
+
+### Fix
+
+- **webdav**: finish lazy-logging conversion in get_tag_by_name
+- **webdav**: address PR #764 review round 4
+- **webdav**: address PR #764 review round 3
+- **webdav**: drop anyio.Lock and add integration tests for tag exclusion
+- **webdav**: address PR #764 review round 2
+- **webdav**: address PR #764 review
+
+## v0.79.3 (2026-05-03)
+
+### Fix
+
+- **webhooks**: use HTTP 428 instead of 412 for unprovisioned users
+- **webhooks**: use app-password basic auth for NC API calls
+
+## v0.79.2 (2026-05-03)
+
+### Fix
+
+- **test**: retry consent handling in login_flow_static_client_token
+- **webhooks**: use OCS v2 capabilities for /api/v1/apps
+
+## v0.79.1 (2026-05-03)
+
+### Fix
+
+- **auth**: address PR #758 round-7 medium/minor review
+- **auth**: address PR #758 round-7 important review
+- **auth**: address PR #758 round-6 medium/low review
+- **auth**: address PR #758 round-5 medium/low review
+- **auth**: address PR #758 round-4 review
+- **auth**: address PR #758 round-3 final review
+- **auth**: address PR #758 round-3 review
+- **auth**: address PR #758 round-2 review
+- **auth**: address PR #758 auto-review (id-token verify, nonce, CI key)
+- **auth**: fail closed on missing sub claim, delete Flow 2 callback session
+- **auth**: address PR #758 follow-up review
+- **auth**: use Settings for OIDC env vars in token revocation helper
+- **auth**: address PR #758 review — XSS, CSRF, open redirect, JWKS cache
+- **auth**: harden OAuth/session for hosted multi-tenant deployment (#626)
+
+## v0.79.0 (2026-05-02)
+
+### Feat
+
+- **deck**: add response filters and archived stacks tool
+
+### Fix
+
+- **deck**: address PR #759 round-3 review feedback
+- **deck**: address PR #759 round-2 review feedback
+- **deck**: address PR #759 review feedback
+
+## v0.78.0 (2026-05-02)
+
+### Feat
+
+- **auth**: elicit Astrolabe URL on missing app password
+
+### Fix
+
+- **auth**: address PR #757 round-3 review feedback
+- **auth**: invalidate scope cache on web/REST provisioning paths
+- **auth**: address PR #757 round-2 review feedback
+- **auth**: address PR #757 review feedback
+
+### Refactor
+
+- **config**: consolidate NEXTCLOUD_PUBLIC_ISSUER_URL through Settings
+
+## v0.77.1 (2026-05-01)
+
+### Fix
+
+- **deps**: update dependency icalendar to >=7.1.0,<7.2.0
+
+## v0.77.0 (2026-05-01)
+
+### Feat
+
+- **search**: verify-on-read for semantic search results (ADR-019)
+
+### Refactor
+
+- **search**: address PR #750 round 12 review feedback
+- **search**: address PR #750 round 11 review feedback
+- **search**: address PR #750 round 10 review feedback
+- **search**: address PR #750 round 9 review feedback
+- **search**: pre-push review fixes for PR #750
+- **search**: address PR #750 round 8 review feedback
+- **search**: address PR #750 round 7 review feedback
+- **search**: address PR #750 round 6 review feedback
+- **search**: address PR #750 round 5 review feedback
+- **search**: address PR #750 round 4 review feedback
+- **search**: address PR #750 round 3 review feedback
+- **search**: address PR #750 round 2 review feedback
+- **search**: address PR #750 review feedback
+
+## v0.76.0 (2026-05-01)
+
+### Feat
+
+- **infra**: distribute terraform modules under infra/terraform
+
+### Fix
+
+- **infra**: address PR review feedback on tf modules
+
+## v0.75.2 (2026-04-30)
+
+### Fix
+
+- **webhooks**: escape webhook_uri, lazy logging, document 401 header omission
+- **webhooks**: escape HTML in error responses, compare bearer as bytes
+- **webhooks**: authenticate deliveries via WEBHOOK_SECRET; review nits
+- **webhooks**: wire receiver to vector sync queue and fix registered URI
+
+### Refactor
+
+- **webhooks**: bound queue waits, route URLs through dynaconf
+- **webhooks**: address PR review on auth-pass
+
+## v0.75.1 (2026-04-30)
+
+### Fix
+
+- **vector-sync**: wire document streams into OAuthAppContext
+
+## v0.75.0 (2026-04-29)
+
+### Feat
+
+- **talk**: add MCP integration for Nextcloud Talk (spreed)
+
+### Fix
+
+- **talk**: address remaining PR #741 reviewer feedback
+- **talk**: address PR #741 reviewer feedback
+
+## v0.74.0 (2026-04-29)
+
+### Feat
+
+- **auth**: drop test-client defaults, add ALLOWED_MGMT_CLIENT allowlist
+
+## v0.73.2 (2026-04-29)
+
+### Fix
+
+- **oauth**: follow redirects when fetching OIDC discovery
+
+## v0.73.1 (2026-04-29)
+
+### Fix
+
+- **calendar**: thread raw credentials to caldav AsyncDAVClient
+
+## v0.73.0 (2026-04-29)
+
+### Feat
+
+- **deck**: add card comment tools
+
+### Fix
+
+- **deck**: address review feedback on card comment tools
+
+## v0.72.7 (2026-04-27)
+
+### Fix
+
+- **client**: route /apps/* through /index.php for non-pretty-URL installs
+- **notes**: defensively unwrap list-shaped Notes responses (refs #730)
+
+## v0.72.6 (2026-04-26)
+
+### Fix
+
+- **models**: coerce Contact.birthday + relax Table.owner_display_name
+
+## v0.72.5 (2026-04-23)
+
+### Fix
+
+- **api**: use stored app password for chunk-context and pdf-preview
+
+## v0.72.4 (2026-04-16)
+
+### Fix
+
+- **tests**: convert create_mcp_client_session to asynccontextmanager
+
+## v0.72.3 (2026-04-15)
+
+### Fix
+
+- coerce numeric nutrition values to strings in Cookbook model (fixes #708)
+
+## v0.72.2 (2026-04-14)
+
+### Fix
+
+- enable uvx/PyPI deployments without Docker assumptions
+
+## v0.72.1 (2026-04-07)
+
+### Fix
+
+- strip resource server prefix from JWT scopes for tool filtering
+
+## v0.72.0 (2026-04-07)
+
+### Feat
+
+- add --version option to CLI
+
+## v0.71.0 (2026-04-07)
+
+### Feat
+
+- add stdio transport support for local MCP usage
+
+### Fix
+
+- address third round of review feedback
+- address second round of review feedback
+- address PR review feedback and fix CI test failures
+
+## v0.70.4 (2026-04-07)
+
+### Fix
+
+- conditionally include offline_access based on IdP discovery
+
+## v0.70.3 (2026-04-07)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.27,<1.28
+
+## v0.70.2 (2026-04-07)
+
+### Fix
+
+- conditionally include offline_access in Flow 2 scope request
+
+## v0.70.1 (2026-04-07)
+
+### Fix
+
+- fall back to client_id when aud claim is absent (Cognito compat)
+
+## v0.70.0 (2026-04-07)
+
+### Feat
+
+- add OIDC resource server scope prefix for Cognito compatibility
+
+### Fix
+
+- address second round of PR review for scope prefix
+- address PR review for OIDC scope prefix feature
+
+## v0.69.0 (2026-04-07)
+
+### Feat
+
+- implement dynaconf configuration management (ADR-024 phases 1-3)
+
+### Fix
+
+- resolve dynaconf settings.toml not found in non-editable installs
+
+## v0.68.4 (2026-04-07)
+
+### Refactor
+
+- change OAuth scope separator from colon to dot for IDP compatibility
+
+## v0.68.3 (2026-04-05)
+
+### Fix
+
+- address PR review feedback for client registry and DCR proxy
+- support cloud OAuth clients and graceful DCR fallback
+
+### Refactor
+
+- remove ALLOWED_MCP_CLOUD_CLIENTS and add keycloak CI profile
+- consolidate ALLOWED_MCP_CLIENTS and add redirect URI validation
+
+## v0.68.2 (2026-04-04)
+
+### Fix
+
+- address PR review — remove token exchange tests, improve logging
+- address PR review — stale mcp-oauth refs, Playwright TimeoutError catch
+- update expected auth tools list for login-flow scope test
+
+### Refactor
+
+- remove RFC 8693 token exchange and Keycloak OAuth implementation
+- remove oauth profile, migrate MCP/OAuth tests to login-flow
+
+## v0.68.1 (2026-04-01)
+
+### Fix
+
+- convert BDAY datetime.date to string before Pydantic validation
+
+## v0.68.0 (2026-03-31)
+
+### Feat
+
+- add web-based Login Flow v2 provisioning endpoint
+
+### Fix
+
+- require bearer token on provision endpoints (open redirect mitigation)
+- address PR review round 3 — info disclosure, conditional routes, cleanup
+- address PR review round 2 — expiry checks, race guards, poll tests
+- address PR review — XSS escape, asyncio→anyio, URL rewrite dedup
+- use app password auth for background sync in Login Flow mode
+- discover Login Flow v2 users in OAuth mode user manager
+- rewrite Login Flow v2 poll endpoint URL to use configured host
+- handle internal hostname without port in Login Flow v2 URL rewriting
+
+### Refactor
+
+- use redirect-based Login Flow v2 provision instead of popup
+
+## v0.67.0 (2026-03-29)
+
+### Feat
+
+- add Tailscale Funnel config for Claude AI connector testing
+
+## v0.66.2 (2026-03-29)
+
+### Fix
+
+- allow HTTPS redirect URIs for non-localhost OAuth clients
+- move Astrolabe OAuth hook to before-starting for reliable OIDC client creation
+- resolve OAuth compatibility issues for login-flow deployment
+
+## v0.66.1 (2026-03-28)
+
+### Fix
+
+- pin Renovate Nextcloud updates to matching major version
+
+## v0.66.0 (2026-03-28)
+
+### Feat
+
+- add Nextcloud Collectives app support (#621)
+
+### Fix
+
+- address PR review feedback (round 9)
+- address PR review feedback (round 8)
+- address PR review feedback (round 7) and fix CI
+- address PR review feedback (round 6)
+- address PR review feedback (round 5)
+- add trash/delete collective tools and address review feedback (round 4)
+- address PR review feedback (round 3)
+- address PR review feedback (round 2)
+- correct tool annotations to match ADR-017 conventions
+- address PR review feedback for Collectives support
+
+## v0.65.4 (2026-03-27)
+
+### Fix
+
+- pin starlette<1.0 to prevent startup crash (#648)
+
+## v0.65.3 (2026-03-22)
+
+### Refactor
+
+- remove Smithery deployment mode
+
+## v0.65.2 (2026-03-22)
+
+### Fix
+
+- increase vector sync wait timeout to prevent sampling test timeouts in CI
+- reduce vector sync scan interval to 5s for single-user service
+- expose public status endpoints in all modes and enable vector sync (#637)
+
+## v0.65.1 (2026-03-21)
+
+### Fix
+
+- resolve OIDC consent flow 500 errors on NC 32
+- address PR #632 review comments
+- **ci**: build OIDC app for all test modes including single-user
+- patch OIDC consent flow regression and add CI build step
+- **caldav**: address PR #632 review feedback
+- **caldav**: migrate to upstream caldav v3.0.1 to fix href handling (#629)
+
+## v0.65.0 (2026-03-03)
+
+### Feat
+
+- **auth**: implement OAuth AS proxy to fix audience mismatch (ADR-023)
+- **ci**: add Nextcloud version matrix (NC 31, 32, 33)
+- **helm**: add login-flow auth mode to Helm chart (ADR-022)
+- add Docker Compose profiles and Login Flow v2 service
+
+### Fix
+
+- replace assert with proper guard and invalidate scope cache after provisioning
+- disable NC rate limiting in dev/CI and add token endpoint diagnostics
+- address review feedback — security, caching, CI 429 retry
+- skip keycloak hook when profile inactive and update stale PRM test
+- address remaining PR #589 review findings
+- address PR #589 review findings
+- address PR review issues for Login Flow v2
+- address PR #589 review feedback (round 2)
+- **ci**: remove dev OIDC mount to fix HTTP 500 in single-user/multi-user-basic
+- **ci**: fix health check timeout and per-profile MCP server URL routing
+- **ci**: fix PHP gating, add multi-user-basic matrix entry, upload debug artifacts
+- address PR #589 review feedback for Login Flow v2
+- **ci**: fix integration test collection and skip Playwright in CI
+- **test**: fix 17 pre-existing unit test failures and add astrolabe CI build
+- **ci**: keep third_party mount, always build submodules in CI
+- **ci**: revert accidental third_party mount, use compose override for OIDC
+- **ci**: don't block integration matrix on unit-test failures
+
+## v0.64.5 (2026-03-03)
+
+### Fix
+
+- handle pythonvCard4 dict-format fields and missing phone numbers (#601)
+
+## v0.64.4 (2026-02-26)
+
+### Fix
+
+- **deps**: update dependency icalendar to v7
+
+## v0.64.3 (2026-02-21)
+
+### Fix
+
+- address PR #574 fourth review round
+- address PR #574 third review round
+- address PR #574 second review round
+- address PR #574 review comments
+- wrap raw list returns in response models to produce single TextContent block
+
+## v0.64.2 (2026-02-20)
+
+### Fix
+
+- address PR #571 review comments
+- resolve stale credentials causing astrolabe background sync test failures
+
+### Refactor
+
+- enforce PLC0415 (import-outside-top-level) for source code
+
+## v0.64.1 (2026-02-18)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.26,<1.27
+
+## v0.64.0 (2026-02-16)
+
+### Feat
+
+- add self-signed SSL certificate support for Nextcloud connections
+
+### Fix
+
+- add type: ignore for caldav ssl_verify_cert parameter
+- convert CA bundle path to ssl.SSLContext to avoid httpx deprecation warning
+
+## v0.63.5 (2026-02-16)
+
+### Refactor
+
+- remove stale astrolabe references from commitizen config
+- extract Astrolabe to separate repository
+
+## v0.63.4 (2026-02-08)
+
+### Fix
+
+- strip whitespace from category names when splitting
+- handle categories, recurrence_rule, attendees, and reminder_minutes in update_event
+
+## v0.63.3 (2026-02-08)
+
+### Fix
+
+- expand recurring events in date-range queries
+
+## v0.63.2 (2026-02-07)
+
+### Fix
+
+- use CalDAV time-range filter for calendar date range queries
+
+## v0.63.1 (2026-02-03)
+
+### Fix
+
+- **helm**: add backward compatibility for legacy persistence configs
+
+## v0.63.0 (2026-01-28)
+
+### Feat
+
+- **astrolabe**: add background token refresh job
+
+### Fix
+
+- **astrolabe**: add pagination and psalm fixes for token refresh
+- **astrolabe**: add locking to prevent token refresh race condition
+- **astrolabe**: add issued_at to on-demand token refresh
+
+## v0.62.0 (2026-01-26)
+
+### Feat
+
+- **scripts**: add database query helpers for development
+
+### Fix
+
+- **astrolabe**: resolve Psalm type errors in PDF preview code
+- **astrolabe**: fix Psalm baseline and ESLint import order
+- **astrolabe**: load pdfjs-dist externally to fix PDF viewer
+- **astrolabe**: improve error messages for authorization issues
+- **astrolabe**: rename OAuthController and fix app password check
+- **tests**: improve Astrolabe integration test reliability
+- **astrolabe**: update Plotly title attributes for v3 compatibility
+- **deps**: update dependency plotly.js-dist-min to v3
+
+### Refactor
+
+- **api**: split management.py into domain-focused modules
+- **astrolabe**: replace client-side PDF.js with server-side PyMuPDF rendering
+
+## v0.61.5 (2026-01-17)
+
+### Fix
+
+- **astrolabe**: improve token refresh error handling and validation
+- **astrolabe**: delete stale tokens when refresh fails
+- **astrolabe**: resolve CI failures for code quality checks
+- **astrolabe**: use internal URL for OAuth token refresh
+
+### Refactor
+
+- **astrolabe**: add PHP property types to fix Psalm errors
+- **astrolabe**: upgrade to @nextcloud/vue 9.3.3 API
+
+## v0.61.4 (2026-01-16)
+
+### Fix
+
+- **astrolabe**: Address reviewer feedback for hybrid mode
+- **astrolabe**: Fix NcSelect options and CSS loading
+- **astrolabe**: fix OAuth flow and settings UI for hybrid mode
+- **api**: return OIDC config in hybrid mode for Astrolabe OAuth flow
+
+## v0.61.3 (2026-01-15)
+
+### Fix
+
+- **astrolabe**: address review feedback for Vue 3 bindings
+- **astrolabe**: update Vue component bindings for Vue 3 compatibility
+
+## v0.61.2 (2026-01-15)
+
+### Fix
+
+- **ci**: bump helm chart version when MCP appVersion changes
+
+## v0.61.1 (2026-01-15)
+
+### Fix
+
+- **astrolabe**: define appName and appVersion for @nextcloud/vue
+
+## v0.61.0 (2026-01-14)
+
+### Feat
+
+- Add rate limiting and extract helpers for app password endpoints
+
+### Fix
+
+- Add missing annotations for deck remove/unassign operations
+- **auth**: Store app passwords locally for multi-user BasicAuth background sync
+
+### Refactor
+
+- Use get_settings() for vector sync enabled check
+- Extract storage helper and improve PHP error handling
+
+## v0.60.4 (2026-01-12)
+
+### Fix
+
+- **deck**: use correct endpoint for reorder_card to fix cross-stack moves
+
+## v0.60.3 (2025-12-31)
+
+### Fix
+
+- **deck**: Always preserve fields in update_card for partial updates
+- **astrolabe**: Fix CSS loading for Nextcloud apps
+- **astrolabe**: Fix revoke access button HTTP method mismatch
+
+## v0.60.2 (2025-12-29)
+
+### Fix
+
+- **oauth**: Enable browser OAuth routes for Management API in hybrid mode
+
+## v0.60.1 (2025-12-26)
+
+### Fix
+
+- **mcp**: Move all imports to the top of modules
+
+## v0.60.0 (2025-12-26)
+
+### Feat
+
+- Remove URL rewriting in favor of proper nextcloud config
+- **helm**: migrate to new environment variable naming convention
+- Migrate to vue 3
+- **astrolabe**: upgrade to Vue 3 and @nextcloud/vue 9
+
+### Fix
+
+- **tests**: Add singleton reset fixture to prevent anyio.WouldBlock errors
+- **tests**: Fix integration test failures in qdrant, sampling, and rag tests
+- **auth**: Skip issuer validation for management API tokens
+- Use settings.enable_offline_access for env var consolidation
+- Add required config.py attributes
+- **docker**: remove overwritehost to fix container-to-container DCR
+- **deps**: update dependency @nextcloud/vue to v9
+- **deps**: update dependency vue to v3
+
+### Refactor
+
+- **auth**: Decouple BasicAuth and OAuth authentication strategies
+
+## v0.59.1 (2025-12-22)
+
+### Fix
+
+- **helm**: set OIDC client env vars when using existingSecret
+- **helm**: trigger chart release workflow on helm chart tags
+
+## v0.59.0 (2025-12-22)
+
+### Feat
+
+- **helm**: add support for multi-user BasicAuth mode
+
+### Fix
+
+- **helm**: address PR #447 reviewer feedback
+- **helm**: include MCP server version bumps in changelog pattern
+
+## v0.58.0 (2025-12-22)
+
+### Feat
+
+- **config**: enable DCR for multi-user BasicAuth with offline access
+- **astrolabe**: implement app password provisioning for multi-user background sync
+- **config**: consolidate configuration with smart dependency resolution (ADR-021)
+
+## v0.57.0 (2025-12-20)
+
+### Feat
+
+- **auth**: add multi-user BasicAuth pass-through mode
+- **astrolabe**: add dynamic MCP server configuration for testing
+
+### Fix
+
+- **config**: address reviewer feedback
+
+### Refactor
+
+- **config**: centralize configuration validation and simplify startup
+
+## v0.56.2 (2025-12-20)
+
+### Fix
+
+- **astrolabe**: screenshots in info.xml
+- **astrolabe**: screenshots in info.xml
+
+## v0.56.1 (2025-12-19)
+
+### Fix
+
+- **astrolabe**: Update screenshots
+- **ci**: skip existing Helm chart releases to prevent duplicate release errors
+
+## v0.56.0 (2025-12-19)
+
+### Feat
+
+- **ci**: add --increment flag to bump scripts for manual version control
+
+### Fix
+
+- **astrolabe**: add contents:write permission to appstore workflow
+- **astrolabe**: update commitizen pattern to properly update info.xml version
+- **astrolabe**: prevent workflow failure when only helm/astrolabe commits exist
+- **astrolabe**: info.xml
+
+## v0.55.1 (2025-12-19)
+
+### Fix
+
+- **ci**: push all tags explicitly in bump workflow
+
+## v0.55.0 (2025-12-19)
+
+### BREAKING CHANGE
+
+- MCP server now bumps for ANY conventional commit except
+those explicitly scoped to helm or astrolabe.
+
+### Feat
+
+- **ci**: implement monorepo-aware version bumping workflow
+
+### Fix
+
+- **ci**: make MCP server default bump target for all non-scoped commits
+- **ci**: restrict docker build to MCP server tags only
+- **ci**: correct appstore-push-action version to v1.0.4
+
+## v0.54.0 (2025-12-19)
+
+### Feat
+
+- **astrolabe**: add Nextcloud App Store deployment automation
+- configure commitizen monorepo with independent versioning
+
+### Fix
+
+- **ci**: improve versioning and error handling
+- **ci**: address critical workflow and validation issues
+- **astrolabe**: address code review feedback
+
+## v0.53.0 (2025-12-19)
+
+### Feat
+
+- add Alembic database migration system
+- make chunk modal title clickable link to documents
+- add native Plotly hover styling for clickable points
+- add click interactivity to Plotly 3D scatter chart
+- improve chunk viewer with fixed navigation and markdown rendering
+- **astrolabe**: enable multi-select for document types and refactor PDF viewer
+- **auth**: implement refresh token rotation for Nextcloud OIDC
+- **astrolabe**: enhance unified search and add webhook management
+- **astrolabe**: add webhook management UI to admin settings
+- **astrolabe**: add OAuth token refresh and webhook presets
+- **search**: add file_path metadata and chunk offsets to search results
+- **astrolabe**: use proper icons and thumbnails in unified search
+- **astrolabe**: add admin search settings and enhanced UI
+- **astrolabe**: add unified search provider with clickable file links
+- **astrolabe**: add 3D PCA visualization for semantic search
+- **astrolabe**: add Nextcloud PHP app for MCP server management
+- **vector-sync**: enable background sync in OAuth mode
+
+### Fix
+
+- **security**: address critical security issues from PR #401 code review
+- **oauth**: enable PKCE for all clients and add token_broker to oauth_context
+- **astrolabe**: revert invalid files_pdfviewer URL for file links
+- resolve type checking warnings for CI
+- move Alembic to package submodule for Docker compatibility
+- update unified search results to match chunk viz display
+- **astrolabe**: handle OAuth refresh token rotation
+- address critical code review issues (4 fixes)
+- resolve CI linting issues for Astroglobe
+
+### Refactor
+
+- **astrolabe**: extract PDF viewer to dedicated component
+- **astrolabe**: reframe UI as semantic search service
+
+## v0.52.1 (2025-12-13)
+
+### Perf
+
+- **deck**: optimize card lookup by storing board_id/stack_id in metadata
+
+## v0.52.0 (2025-12-13)
+
+### Feat
+
+- **vector**: add Deck card vector search with visualization support
+
+## v0.51.0 (2025-12-13)
+
+### Feat
+
+- **vector-viz**: add news_item support for links and chunk expansion
+
+## v0.50.2 (2025-12-13)
+
+### Fix
+
+- **news**: revert get_item() to use get_items() + filter
+
+## v0.50.1 (2025-12-12)
+
+### Fix
+
+- Disable DNS rebinding protection for containerized deployments
+- **deps**: update dependency mcp to >=1.23,<1.24
+
+## v0.50.0 (2025-12-11)
+
+### Feat
+
+- add MCP tool annotations for enhanced UX
+
+### Fix
+
+- address PR review feedback
+
+## v0.49.2 (2025-12-09)
+
+### Fix
+
+- Update lockfile
+
+## v0.49.1 (2025-12-09)
+
+### Fix
+
+- Revert mcp version <1.23
+
+## v0.49.0 (2025-12-08)
+
+### Feat
+
+- **news**: add Nextcloud News app integration
+
+### Fix
+
+- resolve all type checking errors (8 errors fixed)
+
+### Refactor
+
+- **news**: simplify vector sync to fetch all items
+
+### Perf
+
+- **news**: use direct API endpoint for get_item()
+
+## v0.48.6 (2025-12-03)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.23,<1.24
+
+## v0.48.5 (2025-11-28)
+
+### Fix
+
+- **deps**: update dependency pillow to v12
+
+## v0.48.4 (2025-11-23)
+
+### Fix
+
+- Add rate limit retry logic to OpenAI provider
+
+## v0.48.3 (2025-11-23)
+
+### Fix
+
+- Increase MCP sampling timeout to 5 minutes for slower LLMs
+
+## v0.48.2 (2025-11-23)
+
+### Fix
+
+- Share vector sync state with FastMCP session lifespan via module singleton
+- Share vector sync state with FastMCP session lifespan via module singleton
+
+## v0.48.1 (2025-11-23)
+
+### Fix
+
+- Use WebDAV for tag creation and add LLM-as-a-judge for RAG tests
+
+### Refactor
+
+- Move background tasks to server lifespan and deprecate SSE transport
+
+## v0.48.0 (2025-11-23)
+
+### Feat
+
+- Add tag management methods to WebDAV client
+
+## v0.47.0 (2025-11-23)
+
+### Feat
+
+- Add OpenAI provider support for embeddings and generation
+
+## v0.46.2 (2025-11-22)
+
+### Fix
+
+- **smithery**: Enable JSON response format for scanner compatibility
+
+## v0.46.1 (2025-11-22)
+
+### Perf
+
+- Optimize vector viz search performance
+
+## v0.46.0 (2025-11-22)
+
+### Feat
+
+- Add Smithery CLI deployment support
+- Implement ADR-016 Smithery stateless deployment mode
+
+### Fix
+
+- **smithery**: Add JSON Schema metadata to mcp-config endpoint
+- **smithery**: Use container runtime pattern for config discovery
+- Add Smithery lifespan and auth mode detection
+
+## v0.45.0 (2025-11-22)
+
+### Feat
+
+- Add context expansion to semantic search with chunk overlap removal
+- Use Ollama native batch API in embed_batch()
+- Implement Qdrant placeholder state management
+- Switch files to use numeric IDs with file_path resolution
+- Implement per-chunk vector visualization with context expansion
+
+### Fix
+
+- Use alpha_composite for proper RGBA highlight blending
+- Remove pymupdf.layout.activate() to fix page_chunks behavior
+- Centralize PDF processing and generate separate images per chunk
+- Set is_placeholder=False in processor to fix search filtering
+- Increase placeholder staleness threshold to 5x scan interval
+- Add placeholder staleness check to prevent duplicate processing
+- Use empty SparseVector instead of None for placeholders
+- Return empty array instead of null for query_coords when no results
+- Align PDF text extraction between indexing and context expansion
+- Update models and viz to use int-only doc_id
+- Reconstruct full content for notes to match indexed offsets
+- Add async/await, PDF metadata, and type safety fixes
+
+### Refactor
+
+- Simplify PDF text extraction with single to_markdown call
+
+### Perf
+
+- Optimize PDF processing with parallel extraction and single-render highlights
+
+## v0.44.1 (2025-11-21)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.22,<1.23
+
+## v0.44.0 (2025-11-19)
+
+### Feat
+
+- Improve vector visualization with static assets and fixes
+- Redesign UI to match Nextcloud ecosystem aesthetic
+
+### Fix
+
+- Improve 3D plot rendering with explicit dimensions and window resize support
+- Preserve 3D plot camera and improve documentation
+- Preserve 3D plot camera position and fix CSS loading
+
+## v0.43.0 (2025-11-18)
+
+### Feat
+
+- Replace custom document chunker with LangChain MarkdownTextSplitter
+
+## v0.42.0 (2025-11-17)
+
+### Feat
+
+- **viz**: Add dual-score display and improve UI controls
+
+## v0.41.0 (2025-11-17)
+
+### Feat
+
+- add configurable fusion algorithms for BM25 hybrid search
+- add chunk position tracking to vector indexing and search
+- add vector viz template and chunk context endpoint
+
+### Fix
+
+- prevent infinite loop in DocumentChunker with position tracking
+- Relax SearchResult validation to support DBSF fusion scores > 1.0
+
+## v0.40.0 (2025-11-16)
+
+### Feat
+
+- add unified provider architecture with Amazon Bedrock support
+
+### Fix
+
+- suppress Starlette middleware type warnings in ty checker
+
+## v0.39.0 (2025-11-16)
+
+### Feat
+
+- Implement BM25 hybrid search with native Qdrant RRF fusion
+
+### Fix
+
+- Handle named vectors in visualization and semantic search
+- Update vizApp to use bm25_hybrid algorithm and remove deprecated weights
+- Update viz routes to use BM25 hybrid search after refactor
+
+## v0.38.0 (2025-11-16)
+
+### Feat
+
+- add concurrent uploads and --force flag to upload command
+- implement RAG evaluation framework with CLI tooling
+
+### Fix
+
+- download qrels from BEIR ZIP instead of HuggingFace
+
+### Refactor
+
+- migrate asyncio to anyio for consistent structured concurrency
+- replace httpx client with NextcloudClient in upload command
+
+### Perf
+
+- Eliminate double-fetching in semantic search sampling
+- fix vector viz search performance and visual encoding
+- make note deletion concurrent in upload --force
+
+## v0.37.0 (2025-11-16)
+
+### Feat
+
+- Add OpenTelemetry tracing to @instrument_tool decorator
+
+## v0.36.0 (2025-11-15)
+
+### BREAKING CHANGE
+
+- Search algorithms now require Qdrant to be populated.
+Vector sync must be enabled and documents indexed for search to work.
+
+### Feat
+
+- Normalize hybrid search RRF scores to 0-1 range
+- Enhance vector visualization UI and parallelize search verification
+- Add Vector Viz tab to app home page
+- Add vector visualization pane with multi-select document types
+- Implement custom PCA to remove sklearn dependency
+- Add multi-document Protocol with cross-app search support
+- Update nc_semantic_search tool with algorithm selection
+- Implement unified search algorithm module
+
+### Fix
+
+- Reorder tabs and fix viz pane session access
+
+### Refactor
+
+- Optimize Nextcloud access verification with centralized filtering
+- Make all search algorithms query Qdrant payload, not Nextcloud
+
+### Perf
+
+- Exclude vector-sync status polling from distributed tracing
+
+## v0.35.0 (2025-11-15)
+
+### Feat
+
+- Enable SSE transport for mcp service and update test fixtures
+
+## v0.34.2 (2025-11-13)
+
+### Fix
+
+- Use NEXTCLOUD_OIDC_CLIENT_ID/SECRET env vars consistently
+
+## v0.34.1 (2025-11-13)
+
+### Fix
+
+- return all notes when search query is empty
+
+## v0.34.0 (2025-11-13)
+
+### Feat
+
+- Complete Phase 5 - Instrument all 93 MCP tools
+- Add instrumentation decorator and apply to notes tools (Phase 5)
+- Add OAuth token and database metrics (Phases 3-4)
+- Add metrics instrumentation for queue, health, and database operations
+
+## v0.33.1 (2025-11-13)
+
+### Fix
+
+- Move grafana_folder from labels to annotations
+
+## v0.33.0 (2025-11-13)
+
+### Feat
+
+- Add Grafana dashboard and vector sync metric instrumentation
+
+## v0.32.1 (2025-11-12)
+
+### Fix
+
+- add dynamic dimension detection for Ollama embedding models
+
+## v0.32.0 (2025-11-11)
+
+### Feat
+
+- **ollama**: Pull model on startup if not available in ollama
+- add dynamic vector sync status updates with htmx polling
+- add webhook management UI and BeforeNodeDeletedEvent support
+- validate Nextcloud webhook schemas and document findings
+
+### Fix
+
+- improve webapp tab UI with CSS Grid and viewport-filling container
+
+### Refactor
+
+- move webapp from /user/page to /app
+- consolidate database storage for webhooks and OAuth tokens
+
+## v0.31.1 (2025-11-10)
+
+### Refactor
+
+- simplify OpenTelemetry tracing configuration
+
+## v0.31.0 (2025-11-10)
+
+### Feat
+
+- skip tracing for health and metrics endpoints
+
+### Fix
+
+- add retry logic for ETag conflicts in category change test
+- optimize Notes API pagination with pruneBefore parameter
+
+## v0.30.0 (2025-11-10)
+
+### Feat
+
+- **helm**: Add document chunking configuration
+- **vector**: Add configurable chunk size and overlap for document embedding
+- **vector**: Support multiple embedding models with auto-generated collection names
+
+### Fix
+
+- Support in-memory Qdrant for CI testing
+
+## v0.29.2 (2025-11-09)
+
+### Fix
+
+- **helm**: Set default strategy to Recreate
+
+## v0.29.1 (2025-11-09)
+
+### Fix
+
+- **observability**: isolate metrics endpoint to dedicated port
+
+## v0.29.0 (2025-11-09)
+
+### Feat
+
+- **helm**: Add observability support with ServiceMonitor and Grafana dashboard
+
+### Fix
+
+- **readiness**: Only check external Qdrant in network mode
+
+## v0.28.0 (2025-11-09)
+
+### Feat
+
+- **observability**: Add comprehensive monitoring with Prometheus and OpenTelemetry
+
+### Fix
+
+- **vector**: Handle missing 'modified' field in notes gracefully
+
+## v0.27.3 (2025-11-09)
+
+### Fix
+
+- **ci**: Use helm dependency build instead of update to use Chart.lock
+
+## v0.27.2 (2025-11-09)
+
+### Fix
+
+- **helm**: update Qdrant dependency condition to match new mode structure
+
+## v0.27.1 (2025-11-09)
+
+### Fix
+
+- **ci**: add Helm repository setup to chart release workflow
+
+## v0.27.0 (2025-11-09)
+
+### Feat
+
+- **helm**: add Qdrant local mode support with three deployment options [skip ci]
+- add Qdrant local mode support with in-memory and persistent storage
+- implement ADR-009 - refactor semantic search to use generic semantic:read scope
+- implement MCP sampling for semantic search RAG (ADR-008)
+- add optional vector database and semantic search to helm chart
+- add vector sync processing status to /app endpoint
+- implement semantic search tool and fix vector sync issues (ADR-007 Phase 3)
+- implement vector sync scanner and processor (ADR-007 Phase 2)
+
+### Fix
+
+- implement deletion grace period and vector sync status tool
+- remove unnecessary urllib3<2.0 constraint
+- integrate vector sync tasks with Starlette lifespan for streamable-http
+
+### Refactor
+
+- migrate vector sync from asyncio.Queue to anyio memory object streams
+- update to Qdrant query_points API and fix Playwright Keycloak login
+
+## v0.26.1 (2025-11-08)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.21,<1.22
+
+## v0.26.0 (2025-11-08)
+
+### Feat
+
+- add real elicitation integration test with python-sdk MCP client
+- unify session architecture and enhance login status visibility
+
+### Fix
+
+- Consolidate OAuth callbacks and implement PKCE for all flows
+
+## v0.25.0 (2025-11-05)
+
+### BREAKING CHANGE
+
+- All OAuth deployments must be reconfigured to specify
+resource URIs (NEXTCLOUD_MCP_SERVER_URL and NEXTCLOUD_RESOURCE_URI) and
+choose between multi-audience or token exchange mode.
+
+### Feat
+
+- Implement ADR-005 unified token verifier to eliminate token passthrough vulnerability
+
+### Fix
+
+- Implement proper OAuth resource parameters and PRM-based discovery
+- Simplify token verifier to be RFC 7519 compliant
+- Use Keycloak client ID for NEXTCLOUD_RESOURCE_URI in token exchange
+- Correct OAuth token audience validation for multi-audience mode
+
+### Refactor
+
+- Eliminate duplicate validation logic in UnifiedTokenVerifier
+
+## v0.24.1 (2025-11-04)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.20,<1.21
+
+## v0.24.0 (2025-11-04)
+
+### Feat
+
+- add scope protection to OAuth provisioning tools
+- enable authorization services for token exchange in Keycloak
+- implement scope-based audience mapping and RFC 9728 support
+- integrate token exchange into MCP server application
+- implement RFC 8693 Standard Token Exchange for Keycloak
+- Add userinfo route/page
+- add browser-based user info page with separate OAuth flow
+- Implement ADR-004 Progressive Consent foundation (partial)
+- Complete ADR-004 Progressive Consent OAuth flows implementation
+- Implement ADR-004 Progressive Consent foundation components
+- Implement ADR-004 Hybrid Flow with comprehensive integration tests
+
+### Fix
+
+- add missing await for get_nextcloud_client in capabilities resource
+- use valid Fernet encryption keys in token exchange tests
+- accept resource URL in token audience for Nextcloud JWT tokens
+- remove token-exchange-nextcloud scope and accept tokens without audience
+- move audience mapper from scope to nextcloud-mcp-server client
+- move token-exchange-nextcloud from default to optional scopes
+- restructure routes to prevent SessionAuthBackend from interfering with FastMCP OAuth
+- allow OAuth Bearer tokens on /mcp endpoint by excluding from session auth
+- correct OAuth token audience validation using RFC 8707 resource parameter
+- remove remaining references to deleted oauth_callback and oauth_token
+- remove Hybrid Flow, make Progressive Consent default (ADR-004)
+- browser OAuth userinfo endpoint and refresh token rotation
+- make ENABLE_PROGRESSIVE_CONSENT consistently opt-in (default false)
+- make provisioning checks opt-in (default false)
+- Disable Progressive Consent for mcp-oauth to enable Hybrid Flow tests
+
+### Refactor
+
+- integrate token exchange into unified get_client() pattern
+
+## v0.23.0 (2025-11-03)
+
+### Feat
+
+- Auto-configure impersonation role in Keycloak realm import
+- Implement dual-tier token exchange (Standard V2 + Legacy V1 impersonation)
+- Add Keycloak external IdP integration with custom scopes
+- Implement RFC 8693 token exchange for Keycloak (ADR-002 Tier 2)
+- Add Keycloak OAuth provider support with refresh token storage
+
+### Fix
+
+- Complete Keycloak external IdP integration with all tests passing
+- Complete Keycloak external IdP integration with all tests passing
+- Update DCR token_type tests for OIDC app changes
+
+### Refactor
+
+- Remove NEXTCLOUD_OIDC_CLIENT_STORAGE environment variable
+- Remove unnecessary user_oidc patch - CORSMiddleware patch is sufficient
+- Unify OAuth configuration to be provider-agnostic
+
+## v0.22.7 (2025-10-29)
+
+### Fix
+
+- **helm**: Remove image tag overide
+
+## v0.22.6 (2025-10-29)
+
+### Fix
+
+- **helm**: Update helm chart with extraArgs
+
+## v0.22.5 (2025-10-29)
+
+### Fix
+
+- Update helm chart variables
+
+## v0.22.4 (2025-10-29)
+
+### Fix
+
+- **helm**: Update helm version with release
+- **helm**: Update helm version with release
+
+## v0.22.3 (2025-10-29)
+
+### Fix
+
+- **helm**: Update helm version with release
+
+## v0.22.2 (2025-10-29)
+
+### Fix
+
+- **helm**: Update helm version with release
+
+## v0.22.1 (2025-10-29)
+
+### Fix
+
+- Trigger release
+
+## v0.22.0 (2025-10-29)
+
+### Feat
+
+- **server**: Add /live & /health endpoints
+- Initialize helm chart
+
+## v0.21.0 (2025-10-25)
+
+### Feat
+
+- Add text processing background worker for telling client about progress
+
+### Refactor
+
+- Transform document parsing into pluggable processor architecture
+
+## v0.20.0 (2025-10-24)
+
+### Feat
+
+- **auth**: Add support for client registration deletion
+- Split read/write scopes into app:read/write scopes
+
+### Fix
+
+- Add support for RFC 7592 client registration and deletion
+- Update webdav models for proper serialization
+
+## v0.19.1 (2025-10-24)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.19,<1.20
+
+## v0.19.0 (2025-10-23)
+
+### Feat
+
+- Enable token introspection for opaque tokens
+
+### Fix
+
+- Add CORS middleware to allow browser-based clients like MCP Inspector
+
+## v0.18.0 (2025-10-23)
+
+### Feat
+
+- **server**: Add support for custom OIDC scopes and permissions via JWTs
+- Initialize JWT-scoped tools
+
+### Fix
+
+- Use occ-created OAuth clients with allowed_scopes for all tests
+- Separate OAuth fixtures for opaque vs JWT tokens
+
+### Refactor
+
+- Update JWT client to use DCR, re-enable tool filtering
+
+## v0.17.1 (2025-10-20)
+
+### Fix
+
+- **caldav**: Fix caldav search() due to missing todos
+
+## v0.17.0 (2025-10-19)
+
+### Feat
+
+- **caldav**: Add support for tasks
+
+### Fix
+
+- **caldav**: Check that calendar exists after creation to avoid race condition
+- **caldav**: Properly parse datetimes as vDDDTypes
+
+### Refactor
+
+- Migrate from internal CalendarClient to caldav library
+
+## v0.16.0 (2025-10-19)
+
+### Feat
+
+- **webdav**: Add search and list favorite response tools
+
+### Perf
+
+- **notes**: Improve notes search performance using async iterators
+
+## v0.15.2 (2025-10-17)
+
+### Refactor
+
+- Unify logging & remove factory deployment
+
+## v0.15.1 (2025-10-17)
+
+### Fix
+
+- Increase HTTP client timeout to 30s
+- Handle RequestError in mcp tools
+
+## v0.15.0 (2025-10-17)
+
+### Feat
+
+- **cookbook**: Add full Cookbook app support with 13 tools and 2 resources
+
+## v0.14.3 (2025-10-17)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.18,<1.19
+
+## v0.14.2 (2025-10-16)
+
+### Fix
+
+- **deps**: update dependency pillow to v12
+
+## v0.14.1 (2025-10-15)
+
+### Fix
+
+- **oauth**: Remove the option to force_register new clients
+
+## v0.14.0 (2025-10-15)
+
+### Feat
+
+- Add Groups API client
+- add sharing API client and server tools
+- **users**: Initialize user API client
+
+### Fix
+
+- Update user/groups API to OCS v2
+
+## v0.13.0 (2025-10-13)
+
+### Feat
+
+- **server**: Experimental support for OAuth2/OIDC authentication
+
+## v0.12.6 (2025-10-11)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.17,<1.18
+
+## v0.12.5 (2025-10-03)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.16,<1.17
+
+## v0.12.4 (2025-09-25)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.15,<1.16
+
+## v0.12.3 (2025-09-23)
+
+### Refactor
+
+- Add tools for all resources to enable tool-only workflows
+
+## v0.12.2 (2025-09-20)
+
+### Refactor
+
+- Add `http` to --transport option
+
+## v0.12.1 (2025-09-11)
+
+### Fix
+
+- **docker**: Provide --host 0.0.0.0 in default docker image
+
+## v0.12.0 (2025-09-11)
+
+### Feat
+
+- **server**: Add support for `streamable-http` transport type
+
+## v0.11.1 (2025-09-11)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.13,<1.14
+
+## v0.11.0 (2025-09-11)
+
+### Feat
+
+- **deck**: Add support for stack, cards, labels
+- **deck**: Initialize Deck app client/server
+
+## v0.10.0 (2025-09-10)
+
+### Feat
+
+- Add WebDAV resource copy functionality
+- Add WebDAV resource move/rename functionality
+
+## v0.9.0 (2025-09-10)
+
+### BREAKING CHANGE
+
+- FASTMCP_-prefixed env vars have been replaced by CLI
+arguments. Refer to the README for updated usage.
+
+### Feat
+
+- **cli**: Replace `mcp run` with click CLI and runtime options
+
+## v0.8.3 (2025-08-31)
+
+### Fix
+
+- **server**: Replace ErrorResponses with standard McpErrors
+- **notes**: Include ETags in responses to avoid accidently updates
+
+## v0.8.2 (2025-08-31)
+
+### Fix
+
+- **notes**: Remove note contents from responses to reduce token usage
+
+## v0.8.1 (2025-08-30)
+
+### Fix
+
+- **model**: Serialize timestamps in RFC3339 format
+
+## v0.8.0 (2025-08-30)
+
+### Feat
+
+- **client**: Preserve fields when modifying contacts/calendar resources
+- **server**: Add structured output to all tool/resource output
+
+### Refactor
+
+- Use _make_request where available
+
+## v0.7.2 (2025-08-30)
+
+### Fix
+
+- **client**: Use paging to fetch all notes
+
+## v0.7.1 (2025-08-08)
+
+### Fix
+
+- **client**: Strip cookies from responses to avoid falsely raising CSRF errors
+
+## v0.7.0 (2025-08-03)
+
+### Feat
+
+- **contacts**: Initialize Contacts App
+
+## v0.6.1 (2025-08-01)
+
+### Fix
+
+- **calendar**: Fix iCalendar date vs datetime format
+- **calendar**: Remove try/except in calendar API
+
+## v0.6.0 (2025-07-29)
+
+### Feat
+
+- **calendar**: add comprehensive Calendar app support via CalDAV protocol
+
+### Fix
+
+- apply ruff formatting to pass CI checks
+- **calendar**: address PR feedback from maintainer
+
+### Refactor
+
+- **calendar**: optimize logging for production readiness
+
+## v0.5.0 (2025-07-26)
+
+### Feat
+
+- Update webdav client create_directory method to handle recursive directories
+- **webdav**: add complete file system support
+
+### Fix
+
+- apply ruff formatting to test_webdav_operations.py
+
+## v0.4.1 (2025-07-10)
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.10,<1.11
+
+## v0.4.0 (2025-07-06)
+
+### Feat
+
+- Add TablesClient and associated tools
+
+### Fix
+
+- update tests
+
+### Refactor
+
+- Modularize NC and Notes app client
+
+## v0.3.0 (2025-06-06)
+
+### Feat
+
+- Switch to using async client
+
+## v0.2.5 (2025-05-25)
+
+### Fix
+
+- Commitizen release process
+
+## v0.2.4 (2025-05-25)
+
+### Fix
+
+- Do not update dependencies when running in Dockerfile
+- Configure logging
+
+## v0.2.3 (2025-05-25)
+
+### Fix
+
+- Limit search results to notes with score > 0.5
+
+## v0.2.2 (2025-05-24)
+
+### Fix
+
+- Install deps before checking service
+
+## v0.2.1 (2025-05-24)
+
+### Fix
+
+- Install deps before checking service
+
+## v0.2.1 (2025-05-24)
+
+## v0.2.0 (2025-05-24)
+
+### Feat
+
+- **notes**: Add append to note functionality
+
+### Fix
+
+- **deps**: update dependency mcp to >=1.9,<1.10
+
+## v0.1.3 (2025-05-16)
+
+## v0.1.2 (2025-05-05)
+
+## v0.1.1 (2025-05-05)
+
+## v0.1.0 (2025-05-05)

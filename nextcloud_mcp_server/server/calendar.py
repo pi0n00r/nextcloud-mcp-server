@@ -1,0 +1,1637 @@
+"""MCP tools for Nextcloud calendar and VTODO operations."""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+import datetime as dt
+import logging
+from typing import Any, Optional
+
+import httpx
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+
+from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.calendar import (
+    CalendarEtagConflictError,
+    CalendarEtagUnavailableError,
+)
+from nextcloud_mcp_server.client.dav_errors import DavPreconditionFailed
+from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.models.calendar import (
+    AvailabilitySlot,
+    Calendar,
+    CalendarEventSummary,
+    CalendarReadError,
+    CompleteTodoResponse,
+    DeleteEventResponse,
+    DeleteTodoResponse,
+    FindAvailabilityResponse,
+    ListCalendarsResponse,
+    ListEventsResponse,
+    ListTodosResponse,
+    Reminder,
+    Todo,
+    UpcomingEventsResponse,
+    UpdateTodoResponse,
+)
+from nextcloud_mcp_server.observability.metrics import instrument_tool
+
+logger = logging.getLogger(__name__)
+
+
+def _stale_etag_error(uid: str, e: DavPreconditionFailed) -> ToolError:
+    """Turn a 412 into something the caller can act on.
+
+    ``DavPreconditionFailed`` reaches an MCP client as an httpx status error
+    naming a CalDAV URL -- accurate, and useless for deciding what to do. The
+    only recovery is to re-read, re-apply and retry, so the message says that
+    and names the tool that actually returns a current ETag.
+    """
+    detail = e.dav_message or "it was modified after that ETag was read"
+    # debug, not warning: a caller losing a write race is the guard working,
+    # not a fault. It is logged at all because the refusal is otherwise
+    # invisible server-side -- and concurrent-write contention is exactly the
+    # kind of thing you end up reconstructing from logs after the fact.
+    logger.debug("Stale ETag on todo %s: %s", uid, detail)
+    return ToolError(
+        f"Todo {uid} was not updated: {detail}. Another client changed it "
+        "since you read it. Re-read the todo with nc_calendar_list_todos to "
+        "get its current etag, re-apply your changes on top of that copy, and "
+        "retry."
+    )
+
+
+def _reminders_to_dicts(reminders: list[Reminder]) -> list[dict[str, Any]]:
+    """Flatten validated reminders for the dict-based client layer.
+
+    ``exclude_none`` matters: the client distinguishes an absent trigger field
+    from one explicitly set, so leaving ``None``s in would make every reminder
+    look like it carried all three.
+    """
+    return [reminder.model_dump(exclude_none=True) for reminder in reminders]
+
+
+def _completion_payload(completed: str | None = None) -> dict[str, Any]:
+    """Assemble the three properties a VTODO needs to actually read as complete.
+
+    RFC 5545 treats STATUS, PERCENT-COMPLETE and COMPLETED as independent
+    properties, and ``_merge_ical_todo_properties`` gates each on its own key —
+    so setting ``status="COMPLETED"`` alone leaves PERCENT-COMPLETE at its old
+    value and writes no COMPLETED timestamp. Clients that surface progress or
+    completion dates then disagree about whether the task is done.
+
+    ``completed`` defaults to now in UTC.
+    """
+    return {
+        "status": "COMPLETED",
+        "percent_complete": 100,
+        "completed": completed
+        or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+    }
+
+
+async def _verify_todo_completed(
+    client: Any, calendar_name: str, todo_uid: str
+) -> tuple[bool, str | None]:
+    """Read back completion without masking a successful conditional write."""
+    try:
+        stored = await client.calendar.get_todo(calendar_name, todo_uid)
+    except Exception as exc:  # noqa: BLE001 - verification must not mask the write
+        logger.warning("Could not verify completed todo %s: %s", todo_uid, exc)
+        return False, f"read-back failed: {exc}"
+
+    if str(stored.get("status", "")).upper() == "COMPLETED" or bool(
+        stored.get("completed")
+    ):
+        return True, None
+    return False, "server read-back is not completed"
+
+
+def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
+    """Convert a raw event dict from the calendar client to a CalendarEventSummary."""
+    raw_categories = event.get("categories", [])
+    if isinstance(raw_categories, str):
+        categories = [c.strip() for c in raw_categories.split(",") if c.strip()]
+    else:
+        categories = raw_categories
+
+    start = event.get("start_datetime", "")
+    if not start:
+        logger.debug("Event %s has no start_datetime", event.get("uid", "unknown"))
+
+    return CalendarEventSummary(
+        uid=event.get("uid", ""),
+        summary=event.get("title", ""),
+        start=start,
+        end=event.get("end_datetime"),
+        start_tz=event.get("start_tz"),
+        end_tz=event.get("end_tz"),
+        all_day=event.get("all_day", False),
+        location=event.get("location") or None,
+        description=event.get("description") or None,
+        categories=categories,
+        status=event.get("status"),
+        transp=event.get("transp"),
+        calendar_name=event.get("calendar_name"),
+        calendar_display_name=event.get("calendar_display_name")
+        or event.get("calendar_name"),
+        reminders=event.get("reminders", []),
+        etag=event.get("etag"),
+    )
+
+
+def configure_calendar_tools(mcp: MCPServer):
+    # Calendar tools
+    @mcp.tool(
+        title="List Calendars",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("calendar.read")
+    @instrument_tool
+    async def nc_calendar_list_calendars(ctx: Context) -> ListCalendarsResponse:
+        """List all available calendars for the user"""
+        client = await get_client(ctx)
+        calendars_data = await client.calendar.list_calendars()
+
+        calendars = [Calendar(**cal_data) for cal_data in calendars_data]
+        return ListCalendarsResponse(calendars=calendars, total_count=len(calendars))
+
+    @mcp.tool(
+        title="Create Calendar Event",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_create_event(
+        calendar_name: str,
+        title: str,
+        start_datetime: str,
+        ctx: Context,
+        end_datetime: str = "",
+        all_day: bool = False,
+        description: str = "",
+        location: str = "",
+        categories: str = "",
+        recurring: bool | None = None,
+        recurrence_rule: str = "",
+        recurrence_end_date: str = "",
+        reminder_minutes: int = 15,
+        reminder_email: bool = False,
+        status: str = "CONFIRMED",
+        priority: int = 5,
+        privacy: str = "PUBLIC",
+        attendees: str = "",
+        url: str = "",
+        color: str = "",
+        timezone: str = "",
+        reminders: list[Reminder] | None = None,
+    ):
+        """Create a comprehensive calendar event with full feature support.
+
+        Args:
+            calendar_name: Name of the calendar to create the event in
+            title: Event title
+            start_datetime: ISO format. Three modes:
+                - ``"2025-01-15T14:00:00Z"`` or ``"2025-01-15T14:00:00+00:00"``
+                  → stored as UTC.
+                - ``"2025-01-15T14:00:00"`` with ``timezone="America/New_York"``
+                  → stored as TZID-bound (server emits ``DTSTART;TZID=...:...``
+                  plus a VTIMEZONE component).
+                - ``"2025-01-15T14:00:00"`` alone → stored as RFC 5545 floating
+                  local time (interpreted by viewers in their own zone). A
+                  warning is logged so the choice is visible.
+                - ``"2025-01-15"`` for all-day events.
+            ctx: MCP context
+            end_datetime: ISO format end time, empty for all-day events
+            all_day: Whether this is an all-day event
+            description: Event description/details
+            location: Event location
+            categories: Comma-separated categories (e.g., "work,meeting")
+            recurring: Whether this is a recurring event. A non-empty
+                ``recurrence_rule`` already implies recurrence, so leave this
+                unset unless you want to suppress it with ``False``.
+            recurrence_rule: RFC5545 RRULE (e.g., "FREQ=WEEKLY;BYDAY=MO,WE,FR")
+            recurrence_end_date: Date (or ISO datetime) the series stops
+                recurring, written as the rule's ``UNTIL``. Inclusive: a
+                date-only value keeps that day's occurrence. Rejected if
+                ``recurrence_rule`` already carries ``UNTIL`` or ``COUNT``.
+            reminder_minutes: Minutes before event to send reminder
+            reminder_email: Also send an email reminder, as a second VALARM with
+                ``ACTION:EMAIL``. Nextcloud addresses it to the event's
+                attendees and the calendar's sharees.
+            status: Event status: CONFIRMED, TENTATIVE, or CANCELLED
+            priority: Priority level 1-9 (1=highest, 9=lowest, 5=normal)
+            privacy: Privacy level: PUBLIC, PRIVATE, or CONFIDENTIAL
+            attendees: Comma-separated email addresses
+            url: Related URL for the event
+            color: Event colour as a CSS3 colour name (e.g. ``"tomato"``).
+                Nextcloud's Calendar UI resolves COLOR through a CSS3 name
+                lookup, so a hex value is stored but never rendered.
+            timezone: Optional IANA timezone name (e.g. ``"America/New_York"``).
+                Applied only when ``start_datetime``/``end_datetime`` are naive
+                (no offset, no ``Z``). Ignored — with a warning — when the
+                inputs already carry an explicit offset.
+            reminders: Ordered list of alarms, replacing ``reminder_minutes`` /
+                ``reminder_email`` when given. Each needs exactly one of
+                ``minutes_before``, ``trigger`` (RFC 5545 duration) or
+                ``trigger_at`` (absolute), plus an optional ``action``
+                (DISPLAY/EMAIL/AUDIO), ``description``, ``summary`` (EMAIL
+                subject) and ``related`` (START/END).
+
+        Returns:
+            Dict with event creation result
+        """
+        client = await get_client(ctx)
+
+        event_data = {
+            "title": title,
+            "start_datetime": start_datetime,
+            "end_datetime": end_datetime,
+            "all_day": all_day,
+            "description": description,
+            "location": location,
+            "categories": categories,
+            "recurrence_rule": recurrence_rule,
+            "recurrence_end_date": recurrence_end_date,
+            "reminder_minutes": reminder_minutes,
+            "reminder_email": reminder_email,
+            "status": status,
+            "priority": priority,
+            "privacy": privacy,
+            "attendees": attendees,
+            "url": url,
+            "color": color,
+            "timezone": timezone,
+        }
+        # Only forward ``recurring`` when the caller actually set it. Sending the
+        # default would pin it to False on every call, which is what made
+        # recurrence_rule a no-op here — the client reads a present-but-False
+        # flag as an explicit opt-out.
+        if recurring is not None:
+            event_data["recurring"] = recurring
+        if reminders is not None:
+            event_data["reminders"] = _reminders_to_dicts(reminders)
+
+        return await client.calendar.create_event(calendar_name, event_data)
+
+    @mcp.tool(
+        title="List Calendar Events",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("calendar.read")
+    @instrument_tool
+    async def nc_calendar_list_events(
+        ctx: Context,
+        calendar_name: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = 50,
+        min_attendees: Optional[int] = None,
+        min_duration_minutes: Optional[int] = None,
+        categories: Optional[str] = None,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        location_contains: Optional[str] = None,
+        search_all_calendars: bool = False,
+    ):
+        """List events in a calendar (or all calendars) within date range with advanced filtering.
+
+        Args:
+            ctx: MCP context
+            calendar_name: Name of the calendar to search. Required unless
+                search_all_calendars=True, in which case it is ignored.
+            start_date: Start date for search (YYYY-MM-DD format, e.g., "2025-01-01")
+            end_date: End date for search (YYYY-MM-DD format, e.g., "2025-01-31")
+            limit: Maximum number of events to return
+            min_attendees: Filter events with at least this many attendees
+            min_duration_minutes: Filter events with at least this duration
+            categories: Filter events containing any of these categories (comma-separated, e.g., "work,meeting")
+            status: Filter events by status (CONFIRMED, TENTATIVE, or CANCELLED)
+            title_contains: Filter events where title contains this text
+            location_contains: Filter events where location contains this text
+            search_all_calendars: If True, search across all calendars instead of just one
+
+        Returns:
+            List of events matching the filters
+        """
+        # ``calendar_name`` is genuinely unused when searching every calendar
+        # (the response even reports it as None), so requiring it forced callers
+        # to invent a throwaway value. It stays required otherwise — falling back
+        # to a default calendar would silently search the wrong one.
+        if not search_all_calendars and not calendar_name.strip():
+            raise ValueError(
+                "calendar_name is required when search_all_calendars is false"
+            )
+
+        client = await get_client(ctx)
+
+        # Convert YYYY-MM-DD format dates to datetime objects
+        start_datetime = None
+        end_datetime = None
+
+        if start_date:
+            try:
+                start_datetime = dt.datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                # If parsing fails, try to parse as ISO format
+                try:
+                    start_datetime = dt.datetime.fromisoformat(start_date)
+                except ValueError:
+                    logger.warning("Invalid start_date format: %s", start_date)
+
+        if end_date:
+            try:
+                # For end date, set to end of day (23:59:59)
+                end_datetime = dt.datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
+            except ValueError:
+                # If parsing fails, try to parse as ISO format
+                try:
+                    end_datetime = dt.datetime.fromisoformat(end_date)
+                except ValueError:
+                    logger.warning("Invalid end_date format: %s", end_date)
+
+        # Build filters dictionary
+        filters = {}
+        if min_attendees is not None:
+            filters["min_attendees"] = min_attendees
+        if min_duration_minutes is not None:
+            filters["min_duration_minutes"] = min_duration_minutes
+        if categories is not None:
+            filters["categories"] = [cat.strip() for cat in categories.split(",")]
+        if status is not None:
+            filters["status"] = status
+        if title_contains is not None:
+            filters["title_contains"] = title_contains
+        if location_contains is not None:
+            filters["location_contains"] = location_contains
+
+        failures: list[dict[str, str]] = []
+        if search_all_calendars:
+            # Search across all calendars with filters
+            events = await client.calendar.search_events_across_calendars(
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                filters=filters if filters else None,
+                failures=failures,
+            )
+            events = events[:limit]
+        else:
+            # Search in specific calendar
+            events = await client.calendar.get_calendar_events(
+                calendar_name=calendar_name,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                limit=limit,
+            )
+
+            # Enrich events with calendar context for per-event mapping.
+            # Note: calendar_display_name is not available here without an
+            # extra list_calendars() call; the response-level calendar_name
+            # already identifies the calendar for single-calendar queries.
+            for event in events:
+                event["calendar_name"] = calendar_name
+
+            # Apply filters if provided
+            if filters:
+                events = client.calendar._apply_event_filters(events, filters)
+
+        summaries = [_event_dict_to_summary(e) for e in events]
+        return ListEventsResponse(
+            events=summaries,
+            calendar_name=None if search_all_calendars else calendar_name,
+            start_date=start_date or None,
+            end_date=end_date or None,
+            total_found=len(summaries),
+            errors=[CalendarReadError(**f) for f in failures],
+        )
+
+    @mcp.tool(
+        title="Get Calendar Event",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("calendar.read")
+    @instrument_tool
+    async def nc_calendar_get_event(
+        calendar_name: str,
+        event_uid: str,
+        ctx: Context,
+    ):
+        """Get detailed information about a specific event"""
+        client = await get_client(ctx)
+        event_data, etag = await client.calendar.get_event(calendar_name, event_uid)
+        return event_data
+
+    @mcp.tool(
+        title="Update Calendar Event",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_update_event(
+        calendar_name: str,
+        event_uid: str,
+        ctx: Context,
+        etag: str,
+        # All the same parameters as create_event but optional
+        title: str | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        all_day: bool | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        categories: str | None = None,
+        # Recurrence updates
+        recurring: bool | None = None,
+        recurrence_rule: str | None = None,
+        recurrence_end_date: str | None = None,
+        # Notification updates
+        reminder_minutes: int | None = None,
+        reminder_email: bool | None = None,
+        # Event property updates
+        status: str | None = None,
+        priority: int | None = None,
+        privacy: str | None = None,
+        attendees: str | None = None,
+        url: str | None = None,
+        color: str | None = None,
+        timezone: str | None = None,
+        reminders: list[Reminder] | None = None,
+    ):
+        """Update any aspect of an existing event.
+
+        Only the arguments you pass are touched. Everything else on the stored
+        event is preserved. See ``nc_calendar_create_event`` for the shared
+        parameter semantics, including the datetime encoding rules that
+        ``timezone`` selects between.
+
+        Recurrence, specifically:
+
+        * ``recurrence_rule=""`` or ``recurring=False`` removes the series.
+        * ``recurrence_end_date`` alone re-bounds the *stored* rule, replacing
+          any ``UNTIL``/``COUNT`` it carries. Combined with an explicit
+          ``recurrence_rule`` that already bounds itself, it raises instead —
+          that combination contradicts itself within one request.
+
+        Reminders, likewise. Omit them all and the stored alarms survive. Pass
+        ``reminders=[]`` to clear them, or a list to replace them wholesale.
+        """
+        client = await get_client(ctx)
+
+        # Build update data with only non-None values
+        event_data = {}
+        if title is not None:
+            event_data["title"] = title
+        if start_datetime is not None:
+            event_data["start_datetime"] = start_datetime
+        if end_datetime is not None:
+            event_data["end_datetime"] = end_datetime
+        if all_day is not None:
+            event_data["all_day"] = all_day
+        if description is not None:
+            event_data["description"] = description
+        if location is not None:
+            event_data["location"] = location
+        if categories is not None:
+            event_data["categories"] = categories
+        if recurring is not None:
+            event_data["recurring"] = recurring
+        if recurrence_rule is not None:
+            event_data["recurrence_rule"] = recurrence_rule
+        if recurrence_end_date is not None:
+            event_data["recurrence_end_date"] = recurrence_end_date
+        if reminder_minutes is not None:
+            event_data["reminder_minutes"] = reminder_minutes
+        if reminder_email is not None:
+            event_data["reminder_email"] = reminder_email
+        if status is not None:
+            event_data["status"] = status
+        if priority is not None:
+            event_data["priority"] = priority
+        if privacy is not None:
+            event_data["privacy"] = privacy
+        if attendees is not None:
+            event_data["attendees"] = attendees
+        if url is not None:
+            event_data["url"] = url
+        if color is not None:
+            event_data["color"] = color
+        if timezone is not None:
+            event_data["timezone"] = timezone
+        if reminders is not None:
+            event_data["reminders"] = _reminders_to_dicts(reminders)
+
+        try:
+            return await client.calendar.update_event(
+                calendar_name, event_uid, event_data, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar event {event_uid} was modified since it was read."
+                f"{current} Read the event again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the event again before retrying."
+            ) from exc
+
+    @mcp.tool(
+        title="Delete Calendar Event",
+        annotations=ToolAnnotations(
+            destructive_hint=True, idempotent_hint=True, open_world_hint=True
+        ),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_delete_event(
+        calendar_name: str,
+        event_uid: str,
+        ctx: Context,
+    ) -> DeleteEventResponse:
+        """Delete a calendar event.
+
+        A missing event is reported as success (status 404) so retries are safe.
+        A server *refusal* — a scheduled/iMIP object, or a stale entry in the
+        calendar trashbin holding the UID — comes back with ``success=False`` and
+        a message explaining the likely cause, rather than raising.
+        """
+        client = await get_client(ctx)
+        result = await client.calendar.delete_event(calendar_name, event_uid)
+        return DeleteEventResponse(
+            success=result.get("success", True),
+            status_code=result.get("status_code"),
+            message=result.get("message"),
+            deleted_uid=event_uid,
+            calendar_name=calendar_name,
+        )
+
+    @mcp.tool(
+        title="Create Meeting",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_create_meeting(
+        title: str,
+        date: str,
+        time: str,
+        ctx: Context,
+        duration_minutes: int = 60,
+        calendar_name: str = "personal",
+        attendees: str = "",
+        location: str = "",
+        description: str = "",
+        reminder_minutes: int = 15,
+        timezone: str = "",
+    ):
+        """Quick meeting creation with smart defaults
+
+        This is a convenience function for creating events with common meeting defaults.
+        It automatically:
+        - Calculates end time based on duration
+        - Sets status to CONFIRMED
+        - Adds a reminder
+        - Uses simpler date/time inputs instead of full ISO format
+
+        For full control over all event properties, use nc_calendar_create_event instead.
+
+        Args:
+            title: Meeting title
+            date: Meeting date (YYYY-MM-DD format, e.g., "2025-01-15")
+            time: Meeting start time (HH:MM format, e.g., "14:00")
+            ctx: MCP context
+            duration_minutes: Meeting duration in minutes (default: 60)
+            calendar_name: Calendar to create the meeting in (default: "personal")
+            attendees: Comma-separated email addresses of attendees
+            location: Meeting location
+            description: Meeting description/agenda
+            reminder_minutes: Minutes before meeting to send reminder (default: 15)
+            timezone: IANA timezone ``date``/``time`` are expressed in (e.g.
+                ``"Europe/Amsterdam"``). Defaults to the user's Nextcloud
+                timezone setting. Only if that is unset or unreadable is the
+                meeting stored as floating local time.
+
+        Returns:
+            Dict with meeting creation result
+        """
+        client = await get_client(ctx)
+
+        if not timezone:
+            try:
+                timezone = await client.users.get_current_user_timezone()
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                # Fail open: a floating meeting beats no meeting.
+                logger.warning("Could not read the user's timezone: %s", e)
+
+        # Combine date and time for start_datetime
+        start_datetime = f"{date}T{time}:00"
+
+        # Calculate end_datetime
+        start_dt = dt.datetime.fromisoformat(start_datetime)
+        end_dt = start_dt + dt.timedelta(minutes=duration_minutes)
+        end_datetime = end_dt.isoformat()
+
+        event_data = {
+            "title": title,
+            "start_datetime": start_datetime,
+            "end_datetime": end_datetime,
+            "all_day": False,
+            "description": description,
+            "location": location,
+            "attendees": attendees,
+            "reminder_minutes": reminder_minutes,
+            "status": "CONFIRMED",
+            "priority": 5,
+            "privacy": "PUBLIC",
+            "timezone": timezone,
+        }
+
+        return await client.calendar.create_event(calendar_name, event_data)
+
+    @mcp.tool(
+        title="Get Upcoming Events",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("calendar.read")
+    @instrument_tool
+    async def nc_calendar_get_upcoming_events(
+        ctx: Context,
+        calendar_name: str = "",  # Empty = all calendars
+        days_ahead: int = 7,
+        limit: int = 10,
+    ):
+        """Get upcoming events in next N days"""
+        client = await get_client(ctx)
+
+        now = dt.datetime.now()
+        end_datetime = now + dt.timedelta(days=days_ahead)
+
+        failures: list[dict[str, str]] = []
+        if calendar_name:
+            # Get events from specific calendar
+            events = await client.calendar.get_calendar_events(
+                calendar_name=calendar_name,
+                start_datetime=now,
+                end_datetime=end_datetime,
+                limit=limit,
+            )
+            # calendar_display_name not available without extra API call
+            for event in events:
+                event["calendar_name"] = calendar_name
+        else:
+            all_events = await client.calendar.search_events_across_calendars(
+                start_datetime=now,
+                end_datetime=end_datetime,
+                limit=limit,
+                failures=failures,
+            )
+            # Sort by start time and limit
+            all_events.sort(key=lambda x: x.get("start_datetime", ""))
+            events = all_events[:limit]
+
+        summaries = [_event_dict_to_summary(e) for e in events]
+        return UpcomingEventsResponse(
+            events=summaries,
+            days_ahead=days_ahead,
+            calendar_name=calendar_name or None,
+            errors=[CalendarReadError(**f) for f in failures],
+        )
+
+    @mcp.tool(
+        title="Find Availability",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("calendar.read")
+    @instrument_tool
+    async def nc_calendar_find_availability(
+        duration_minutes: int,
+        ctx: Context,
+        attendees: str = "",  # Comma-separated email list
+        date_range_start: str = "",  # "2025-07-28"
+        date_range_end: str = "",  # "2025-08-04"
+        business_hours_only: bool = True,
+        exclude_weekends: bool = True,
+        preferred_times: str = "",  # Comma-separated time ranges like "09:00-12:00,14:00-17:00"
+        include_all_day: bool = True,
+        timezone: str = "",  # IANA name, e.g. "Europe/Amsterdam"
+    ) -> FindAvailabilityResponse:
+        """Find available time slots for scheduling meetings.
+
+        Analyses the events in your calendars (and, for any attendees given,
+        their free/busy as reported by the server) and returns the gaps that
+        are long enough. Slots are *maximal* free windows: a free morning comes
+        back once as a single long slot, not as a grid of candidate start
+        times, so pick any sub-range of at least duration_minutes from one.
+
+        Not everything on a calendar consumes time. Events marked free
+        (TRANSP:TRANSPARENT), cancelled events, and calendars set to "never
+        show me as busy" are ignored. Opaque all-day events block time by
+        default because they may represent leave or travel. Callers may
+        explicitly opt out with include_all_day=False.
+
+        Args:
+            duration_minutes: Required duration for the meeting in minutes
+            attendees: Comma-separated attendee email addresses whose free/busy
+                should also be checked (RFC 6638, which requires a server that
+                answers scheduling requests for them)
+            date_range_start: Start date for availability search (YYYY-MM-DD),
+                defaulting to now. Never searches into the past.
+            date_range_end: End date for availability search (YYYY-MM-DD),
+                defaulting to a week after the start
+            business_hours_only: Only suggest slots between 09:00 and 17:00
+            exclude_weekends: Skip Saturdays and Sundays
+            preferred_times: Preferred time ranges as "HH:MM-HH:MM"
+                (comma-separated). When given, these replace business hours
+                rather than narrowing them. Overlapping ranges are merged.
+                malformed entries are skipped only when a valid range remains.
+            include_all_day: Treat all-day events as busy (default true)
+            timezone: IANA timezone the business hours and preferred times are
+                expressed in, e.g. "Europe/Amsterdam". Defaults to the server's
+                UTC. An unknown name is an error, not a fallback.
+
+        Returns:
+            The available slots, plus the window that was actually searched
+        """
+        client = await get_client(ctx)
+
+        attendee_list = [
+            email.strip() for email in attendees.split(",") if email.strip()
+        ]
+
+        # Convert date strings to datetime objects
+        start_datetime = None
+        end_datetime = None
+
+        if date_range_start:
+            try:
+                start_datetime = dt.datetime.strptime(date_range_start, "%Y-%m-%d")
+            except ValueError as e:
+                raise ToolError(
+                    f"Invalid date_range_start {date_range_start!r}; expected YYYY-MM-DD"
+                ) from e
+
+        if date_range_end:
+            try:
+                end_datetime = dt.datetime.strptime(date_range_end, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
+            except ValueError as e:
+                raise ToolError(
+                    f"Invalid date_range_end {date_range_end!r}; expected YYYY-MM-DD"
+                ) from e
+
+        constraints = {
+            "business_hours_only": business_hours_only,
+            "exclude_weekends": exclude_weekends,
+            "preferred_times": preferred_times,
+            "include_all_day": include_all_day,
+            "timezone": timezone,
+        }
+
+        try:
+            result = await client.calendar.find_availability(
+                duration_minutes=duration_minutes,
+                attendees=attendee_list,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                constraints=constraints,
+            )
+        except ValueError as e:
+            # Bad range, or an attendee the server would not report on. Either
+            # way the caller must see it: an empty slot list would read as
+            # "fully booked" (issue #1394).
+            raise ToolError(str(e)) from e
+
+        return FindAvailabilityResponse(
+            available_slots=[AvailabilitySlot(**slot) for slot in result["slots"]],
+            duration_requested=duration_minutes,
+            date_range_start=result["range_start"],
+            date_range_end=result["range_end"],
+            attendees_checked=result["attendees_checked"],
+            business_hours_only=business_hours_only,
+        )
+
+    @mcp.tool(
+        title="Bulk Calendar Operations",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_bulk_operations(
+        operation: str,  # "update", "delete", "move"
+        ctx: Context,
+        title_contains: Optional[str] = None,
+        categories: Optional[str] = None,  # Comma-separated
+        calendar_name: Optional[str] = None,
+        start_date: str = "",  # "2025-07-01"
+        end_date: str = "",  # "2025-07-31"
+        status: Optional[str] = None,
+        location_contains: Optional[str] = None,
+        # Update operation parameters
+        new_title: Optional[str] = None,
+        new_description: Optional[str] = None,
+        new_location: Optional[str] = None,
+        new_categories: Optional[str] = None,
+        new_priority: Optional[int] = None,
+        new_reminder_minutes: Optional[int] = None,
+        # Move operation parameters
+        target_calendar: Optional[str] = None,
+        apply_to_series: bool = False,
+    ):
+        """Perform bulk operations (update/delete) on events matching filter criteria.
+
+        This tool allows you to efficiently modify or delete multiple events at once
+        by applying filters to find matching events and then performing the specified operation.
+
+        Args:
+            operation: Type of operation - "update" or "delete"
+            title_contains: Filter events where title contains this text
+            categories: Filter events containing any of these categories (comma-separated)
+            calendar_name: Filter events from this specific calendar
+            start_date: Filter events starting from this date (YYYY-MM-DD)
+            end_date: Filter events ending before this date (YYYY-MM-DD)
+            status: Filter events by status (CONFIRMED, TENTATIVE, CANCELLED)
+            location_contains: Filter events where location contains this text
+
+            # For update operations:
+            new_title: New title for matching events
+            new_description: New description for matching events
+            new_location: New location for matching events
+            new_categories: New categories for matching events (comma-separated)
+            new_priority: New priority for matching events (1-9, 5=normal)
+            new_reminder_minutes: New reminder time in minutes before event
+
+            # For move operations:
+            target_calendar: Calendar to move events to (requires operation="move")
+
+            apply_to_series: A matched occurrence of a recurring event stands for
+                the whole stored series: update/delete act on every occurrence,
+                not only those inside the date filter. Such matches are skipped
+                (status "skipped") unless this is true. Move never takes a
+                recurring series.
+
+        Returns:
+            Summary of operation results including counts and details
+        """
+        client = await get_client(ctx)
+
+        if operation not in ["update", "delete", "move"]:
+            raise ValueError("Operation must be 'update', 'delete', or 'move'")
+
+        # Convert date strings to datetime objects
+        start_datetime = None
+        end_datetime = None
+
+        if start_date:
+            try:
+                start_datetime = dt.datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                logger.warning("Invalid start_date format: %s", start_date)
+
+        if end_date:
+            try:
+                end_datetime = dt.datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
+            except ValueError:
+                logger.warning("Invalid end_date format: %s", end_date)
+
+        # Build filter criteria
+        filter_criteria = {}
+        if title_contains is not None:
+            filter_criteria["title_contains"] = title_contains
+        if categories is not None:
+            filter_criteria["categories"] = [
+                cat.strip() for cat in categories.split(",")
+            ]
+        if status is not None:
+            filter_criteria["status"] = status
+        if location_contains is not None:
+            filter_criteria["location_contains"] = location_contains
+        # Add datetime strings for client compatibility
+        if start_date:
+            filter_criteria["start_date"] = start_date
+        if end_date:
+            filter_criteria["end_date"] = end_date
+
+        if operation == "delete":
+            # Find matching events and delete them
+            if calendar_name:
+                events = await client.calendar.get_calendar_events(
+                    calendar_name=calendar_name,
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                )
+                if filter_criteria:
+                    events = client.calendar._apply_event_filters(
+                        events, filter_criteria
+                    )
+            else:
+                events = await client.calendar.search_events_across_calendars(
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                    filters=filter_criteria,
+                )
+
+            targets, skipped = client.calendar._bulk_targets(
+                events, apply_to_series, "delete"
+            )
+            deleted_count = 0
+            failed_count = 0
+            results = list(skipped)
+
+            for event in targets:
+                try:
+                    outcome = await client.calendar.delete_event(
+                        event.get("calendar_name", calendar_name), event["uid"]
+                    )
+                    # A server refusal is now a structured result rather than an
+                    # exception, so it has to be counted explicitly — otherwise it
+                    # would be tallied as a successful delete.
+                    if not outcome.get("success", True):
+                        failed_count += 1
+                        results.append(
+                            {
+                                "uid": event["uid"],
+                                "status": "failed",
+                                "error": outcome.get("message", "delete refused"),
+                                "title": event.get("title", ""),
+                            }
+                        )
+                        continue
+                    deleted_count += 1
+                    results.append(
+                        {
+                            "uid": event["uid"],
+                            "status": "deleted",
+                            "title": event.get("title", ""),
+                        }
+                    )
+                except Exception as e:
+                    failed_count += 1
+                    results.append(
+                        {
+                            "uid": event["uid"],
+                            "status": "failed",
+                            "error": str(e),
+                            "title": event.get("title", ""),
+                        }
+                    )
+
+            return {
+                "operation": "delete",
+                "total_found": len(targets) + len(skipped),
+                "deleted_count": deleted_count,
+                "failed_count": failed_count,
+                "skipped_count": len(skipped),
+                "results": results,
+            }
+
+        elif operation == "update":
+            # Build update data
+            update_data = {}
+            if new_title is not None:
+                update_data["title"] = new_title
+            if new_description is not None:
+                update_data["description"] = new_description
+            if new_location is not None:
+                update_data["location"] = new_location
+            if new_categories is not None:
+                update_data["categories"] = new_categories
+            if new_priority is not None:
+                update_data["priority"] = new_priority
+            if new_reminder_minutes is not None:
+                update_data["reminder_minutes"] = new_reminder_minutes
+
+            if not update_data:
+                raise ValueError("No update data provided for update operation")
+
+            return await client.calendar.bulk_update_events(
+                filter_criteria, update_data, apply_to_series=apply_to_series
+            )
+
+        elif operation == "move":
+            if not target_calendar:
+                raise ValueError("target_calendar is required for move operation")
+
+            # Find matching events
+            if calendar_name:
+                events = await client.calendar.get_calendar_events(
+                    calendar_name=calendar_name,
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                )
+                if filter_criteria:
+                    events = client.calendar._apply_event_filters(
+                        events, filter_criteria
+                    )
+            else:
+                events = await client.calendar.search_events_across_calendars(
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                    filters=filter_criteria,
+                )
+
+            targets, skipped = client.calendar._bulk_targets(
+                events, apply_to_series, "move"
+            )
+            moved_count = 0
+            failed_count = 0
+            results = list(skipped)
+
+            for event in targets:
+                try:
+                    # Create event in target calendar
+                    event_data = {
+                        k: v
+                        for k, v in event.items()
+                        if k
+                        not in [
+                            "uid",
+                            "href",
+                            "etag",
+                            "calendar_name",
+                            "calendar_display_name",
+                        ]
+                    }
+
+                    await client.calendar.create_event(target_calendar, event_data)
+
+                    # Delete from source calendar
+                    outcome = await client.calendar.delete_event(
+                        event.get("calendar_name", calendar_name), event["uid"]
+                    )
+                    # The copy has already landed in the target. If the source
+                    # delete is refused, the event now exists in *both* calendars,
+                    # so this must be reported as a failure with the duplicate
+                    # named — counting it as "moved" would hide it.
+                    if not outcome.get("success", True):
+                        failed_count += 1
+                        results.append(
+                            {
+                                "uid": event["uid"],
+                                "status": "failed",
+                                "error": (
+                                    "copied to "
+                                    f"{target_calendar} but the source copy could "
+                                    "not be deleted, so the event now exists in "
+                                    "both calendars: "
+                                    f"{outcome.get('message', 'delete refused')}"
+                                ),
+                                "title": event.get("title", ""),
+                            }
+                        )
+                        continue
+
+                    moved_count += 1
+                    results.append(
+                        {
+                            "uid": event["uid"],
+                            "status": "moved",
+                            "title": event.get("title", ""),
+                            "from_calendar": event.get("calendar_name", calendar_name),
+                            "to_calendar": target_calendar,
+                        }
+                    )
+                except Exception as e:
+                    failed_count += 1
+                    results.append(
+                        {
+                            "uid": event["uid"],
+                            "status": "failed",
+                            "error": str(e),
+                            "title": event.get("title", ""),
+                        }
+                    )
+
+            return {
+                "operation": "move",
+                "total_found": len(targets) + len(skipped),
+                "moved_count": moved_count,
+                "failed_count": failed_count,
+                "skipped_count": len(skipped),
+                "target_calendar": target_calendar,
+                "results": results,
+            }
+
+    @mcp.tool(
+        title="Manage Calendar",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("calendar.write")
+    @instrument_tool
+    async def nc_calendar_manage_calendar(
+        action: str,  # "create", "delete", "update", "list"
+        ctx: Context,
+        calendar_name: str = "",
+        display_name: str = "",
+        description: str = "",
+        color: str = "#1976D2",  # Default blue color
+    ):
+        """Manage calendar creation, deletion, and properties.
+
+        This tool provides comprehensive calendar management functionality including
+        creating new calendars, deleting existing ones, and updating calendar properties.
+
+        Args:
+            action: Action to perform - "create", "delete", "update", or "list"
+            calendar_name: Internal name for the calendar (required for create/delete/update)
+            display_name: Human-readable name for the calendar (used for create/update)
+            description: Description for the calendar (used for create/update)
+            color: Hex color code for the calendar (e.g., "#1976D2" for blue)
+
+        Returns:
+            Result of the calendar management operation
+        """
+        client = await get_client(ctx)
+
+        if action == "list":
+            # Wrap in ListCalendarsResponse so the result is one content block,
+            # not one per calendar (GH #568). Mirrors nc_calendar_list_calendars.
+            calendars_data = await client.calendar.list_calendars()
+            calendars = [Calendar(**cal_data) for cal_data in calendars_data]
+            return ListCalendarsResponse(
+                calendars=calendars, total_count=len(calendars)
+            )
+
+        elif action == "create":
+            if not calendar_name:
+                raise ValueError("calendar_name is required for create action")
+
+            return await client.calendar.create_calendar(
+                calendar_name=calendar_name,
+                display_name=display_name or calendar_name,
+                description=description,
+                color=color,
+            )
+
+        elif action == "delete":
+            if not calendar_name:
+                raise ValueError("calendar_name is required for delete action")
+
+            return await client.calendar.delete_calendar(calendar_name)
+
+        elif action == "update":
+            if not calendar_name:
+                raise ValueError("calendar_name is required for update action")
+
+            # Note: Calendar property updates require additional CalDAV PROPPATCH implementation
+            # For now, return an informative message
+            return {
+                "status": "not_implemented",
+                "message": "Calendar property updates require PROPPATCH implementation",
+                "calendar_name": calendar_name,
+                "requested_changes": {
+                    "display_name": display_name,
+                    "description": description,
+                    "color": color,
+                },
+            }
+
+        else:
+            raise ValueError("Action must be 'create', 'delete', 'update', or 'list'")
+
+    # ============= Todo/Task Tools =============
+
+    @mcp.tool(
+        title="List Todo Tasks",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("todo.read", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_list_todos(
+        calendar_name: str,
+        ctx: Context,
+        status: Optional[str] = None,
+        min_priority: Optional[int] = None,
+        categories: Optional[str] = None,
+        summary_contains: Optional[str] = None,
+        include_completed: bool = True,
+    ) -> ListTodosResponse:
+        """List todos/tasks in a calendar with optional filtering.
+
+        Args:
+            calendar_name: Name of the calendar to list todos from
+            ctx: MCP context
+            status: Filter by status (NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED)
+            min_priority: Filter by minimum priority (1=highest, 9=lowest)
+            categories: Filter by categories (comma-separated, e.g., "work,urgent")
+            summary_contains: Filter todos where summary contains this text
+
+        Returns:
+            List of todos matching the filters
+        """
+        client = await get_client(ctx)
+
+        # Build filters dictionary
+        filters = {}
+        if status is not None:
+            filters["status"] = status
+        if min_priority is not None:
+            filters["min_priority"] = min_priority
+        if categories is not None:
+            filters["categories"] = [cat.strip() for cat in categories.split(",")]
+        if summary_contains is not None:
+            filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
+
+        todos_data = await client.calendar.list_todos(
+            calendar_name, filters if filters else None
+        )
+
+        todos = [Todo(**todo_data) for todo_data in todos_data]
+        return ListTodosResponse(
+            todos=todos, calendar_name=calendar_name, total_count=len(todos)
+        )
+
+    @mcp.tool(
+        title="Get Todo Task",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("todo.read", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_get_todo(
+        calendar_name: str, todo_uid: str, ctx: Context
+    ) -> Todo:
+        """Read one todo by UID with its exact REPORT-coupled ETag."""
+        client = await get_client(ctx)
+        return Todo(**(await client.calendar.get_todo(calendar_name, todo_uid)))
+
+    @mcp.tool(
+        title="Create Todo Task",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("todo.write", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_create_todo(
+        calendar_name: str,
+        summary: str,
+        ctx: Context,
+        description: str = "",
+        status: str = "NEEDS-ACTION",
+        priority: int = 0,
+        due: str = "",
+        dtstart: str = "",
+        categories: str = "",
+        reminders: list[Reminder] | None = None,
+    ):
+        """Create a new todo/task in a calendar.
+
+        Args:
+            calendar_name: Name of the calendar to create the todo in
+            summary: Todo title/summary
+            ctx: MCP context
+            description: Detailed description of the todo
+            status: Todo status (NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED)
+            priority: Priority (0=undefined, 1=highest, 9=lowest)
+            due: Due date/time (ISO format, e.g., "2025-01-15T14:00:00"). A
+                date-only value ("2025-01-15") makes it a whole-day task.
+            dtstart: Start date/time (ISO format). Date-only means whole-day.
+                RFC 5545 requires both to be the same kind, so a time on
+                either side makes both date-times.
+            categories: Comma-separated categories (e.g., "work,urgent")
+            reminders: Ordered list of alarms. See ``nc_calendar_create_event``
+                for the shape.
+
+        Returns:
+            Dict with todo creation result
+        """
+        client = await get_client(ctx)
+
+        todo_data = {
+            "summary": summary,
+            "description": description,
+            "status": status,
+            "priority": priority,
+            "due": due,
+            "dtstart": dtstart,
+            "categories": categories,
+        }
+        if reminders is not None:
+            todo_data["reminders"] = _reminders_to_dicts(reminders)
+
+        return await client.calendar.create_todo(calendar_name, todo_data)
+
+    @mcp.tool(
+        title="Update Todo Task",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("todo.write", "calendar.read")
+    @instrument_tool
+    # The suppression on the signature below silences python:S107 -- 14
+    # parameters, one over Sonar's limit. On an MCP tool the parameter list IS
+    # the published input schema: the rule's usual remedy, bundling them into
+    # one object, would nest every optional field a level deeper for every
+    # caller and every generated client. The sibling nc_calendar_update_event
+    # carries ~22 for the same reason and only escapes the rule by being older
+    # than the new-code period.
+    #
+    # Two things had to be got right, both established by re-listing the PR's
+    # issues rather than by reasoning:
+    #
+    # 1. Bare, not parenthesised. A rule id in parentheses is not a scoped
+    #    filter -- Sonar rejects the whole comment as malformed (python:S7632)
+    #    and then suppresses nothing, which is what the first attempt did.
+    # 2. On the first PARAMETER line, not the `def` line. Sonar anchors S107 at
+    #    the start of the parameter list, so a marker on the signature line sits
+    #    one line above the issue and does nothing. Nothing else on that line
+    #    trips a rule, so suppressing it wholesale is safe.
+    async def nc_calendar_update_todo(
+        calendar_name: str,  # NOSONAR
+        todo_uid: str,
+        ctx: Context,
+        etag: str,
+        summary: Optional[str] = None,
+        description: Optional[str] = None,
+        status: Optional[str] = None,
+        priority: Optional[int] = None,
+        percent_complete: Optional[int] = None,
+        due: Optional[str] = None,
+        dtstart: Optional[str] = None,
+        completed: Optional[str] = None,
+        categories: Optional[str] = None,
+        reminders: list[Reminder] | None = None,
+    ) -> UpdateTodoResponse:
+        """Update an existing todo/task.
+
+        Args:
+            calendar_name: Name of the calendar containing the todo
+            todo_uid: UID of the todo to update
+            ctx: MCP context
+            summary: New summary/title
+            description: New description
+            status: New status (NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED)
+            priority: New priority (0-9)
+            percent_complete: New completion percentage (0-100)
+            due: New due date/time (ISO format). Date-only means whole-day.
+                Omit it or pass null to preserve the stored DUE property. Pass
+                an empty string to remove DUE.
+            dtstart: New start date/time (ISO format). Date-only means whole-day.
+                A side left unchanged keeps the stored kind, so a bare date
+                still becomes a date-time on an existing timed todo.
+            completed: Completion timestamp (ISO format)
+            categories: New categories (comma-separated)
+            reminders: Replacement alarm list. Omit to keep the stored alarms,
+                or pass ``[]`` to clear them.
+            etag: The ETag you read this todo with (from nc_calendar_list_todos
+                or a previous update). The write is refused if the todo changed
+                since, so your read-modify-write cycle cannot silently discard
+                someone else's edit. A strong ETag is required. The update is
+                not sent when it is missing, weak, or stale.
+
+        Returns:
+            UpdateTodoResponse carrying the identifiers and the new ETag.
+
+        Raises:
+            ToolError: If the todo changed since ``etag`` was read.
+        """
+        client = await get_client(ctx)
+
+        # Build update data with only non-None values
+        todo_data = {}
+        if summary is not None:
+            todo_data["summary"] = summary
+        if description is not None:
+            todo_data["description"] = description
+        if status is not None:
+            todo_data["status"] = status
+        if priority is not None:
+            todo_data["priority"] = priority
+        if percent_complete is not None:
+            todo_data["percent_complete"] = percent_complete
+        if due is not None:
+            todo_data["due"] = due
+        if dtstart is not None:
+            todo_data["dtstart"] = dtstart
+        if completed is not None:
+            todo_data["completed"] = completed
+        if categories is not None:
+            todo_data["categories"] = categories
+        if reminders is not None:
+            todo_data["reminders"] = _reminders_to_dicts(reminders)
+
+        try:
+            result = await client.calendar.update_todo(
+                calendar_name, todo_uid, todo_data, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar todo {todo_uid} was modified since it was read."
+                f"{current} Read the todo again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the todo again before retrying."
+            ) from exc
+        except DavPreconditionFailed as e:
+            raise _stale_etag_error(todo_uid, e) from e
+
+        return UpdateTodoResponse(
+            uid=todo_uid,
+            calendar_name=calendar_name,
+            href=result.get("href", ""),
+            etag=result.get("etag", ""),
+        )
+
+    @mcp.tool(
+        title="Complete Todo Task",
+        annotations=ToolAnnotations(
+            # Not idempotent: a second call with completed=None restamps COMPLETED
+            # with a fresh timestamp, so the same inputs produce a different card.
+            idempotent_hint=False,
+            open_world_hint=True,
+        ),
+    )
+    @require_scopes("todo.write", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_complete_todo(
+        calendar_name: str,
+        todo_uid: str,
+        ctx: Context,
+        etag: str,
+        completed: Optional[str] = None,
+        completed_at: Optional[str] = None,
+    ) -> CompleteTodoResponse:
+        """Mark a todo/task complete.
+
+        Sets STATUS, PERCENT-COMPLETE and COMPLETED together. Doing this through
+        nc_calendar_update_todo requires knowing that all three are needed and
+        setting each explicitly — passing status="COMPLETED" alone leaves
+        PERCENT-COMPLETE stale and writes no completion timestamp.
+
+        Args:
+            calendar_name: Name of the calendar containing the todo
+            todo_uid: UID of the todo to complete
+            ctx: MCP context
+            etag: Exact strong ETag returned by a todo read or list operation.
+            completed: Completion timestamp (ISO format). Defaults to now (UTC).
+            completed_at: Backward-compatible alias for ``completed``.
+
+        Returns:
+            CompleteTodoResponse carrying the three values actually written.
+
+        Raises:
+            ToolError: If the todo changed since ``etag`` was read.
+        """
+        client = await get_client(ctx)
+        if (
+            completed is not None
+            and completed_at is not None
+            and completed != completed_at
+        ):
+            raise ValueError(
+                "completed and completed_at must match when both are provided"
+            )
+        if completed is None:
+            completed = completed_at
+        payload = _completion_payload(completed)
+        try:
+            result = await client.calendar.update_todo(
+                calendar_name, todo_uid, payload, etag
+            )
+        except CalendarEtagConflictError as exc:
+            current = (
+                f" Current ETag: {exc.current_etag}."
+                if exc.current_etag is not None
+                else ""
+            )
+            raise ToolError(
+                f"Calendar todo {todo_uid} was modified since it was read."
+                f"{current} Read the todo again, apply the change to the latest "
+                "version, and retry with its ETag."
+            ) from exc
+        except CalendarEtagUnavailableError as exc:
+            raise ToolError(
+                f"{exc} The update was not sent; read the todo again before retrying."
+            ) from exc
+        except DavPreconditionFailed as e:
+            raise _stale_etag_error(todo_uid, e) from e
+        verified, verification_error = await _verify_todo_completed(
+            client, calendar_name, todo_uid
+        )
+        return CompleteTodoResponse(
+            uid=todo_uid,
+            calendar_name=calendar_name,
+            status=payload["status"],
+            percent_complete=payload["percent_complete"],
+            completed=payload["completed"],
+            href=result.get("href", ""),
+            etag=result.get("etag"),
+            verified=verified,
+            verification_error=verification_error,
+        )
+
+    @mcp.tool(
+        title="Delete Todo Task",
+        annotations=ToolAnnotations(
+            destructive_hint=True, idempotent_hint=True, open_world_hint=True
+        ),
+    )
+    @require_scopes("todo.write", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_delete_todo(
+        calendar_name: str,
+        todo_uid: str,
+        ctx: Context,
+    ) -> DeleteTodoResponse:
+        """Delete a todo/task from a calendar.
+
+        A missing todo is reported as success (status 404) so retries are safe.
+        A server *refusal* — a scheduled/iMIP object, or a stale entry in the
+        calendar trashbin holding the UID — comes back with ``success=False`` and
+        a message explaining the likely cause, rather than raising.
+
+        Args:
+            calendar_name: Name of the calendar containing the todo
+            todo_uid: UID of the todo to delete
+            ctx: MCP context
+
+        Returns:
+            DeleteTodoResponse carrying the status and, on refusal, why.
+        """
+        client = await get_client(ctx)
+        result = await client.calendar.delete_todo(calendar_name, todo_uid)
+        return DeleteTodoResponse(
+            success=result.get("success", True),
+            status_code=result.get("status_code"),
+            message=result.get("message"),
+            deleted_uid=todo_uid,
+            calendar_name=calendar_name,
+        )
+
+    @mcp.tool(
+        title="Search Todo Tasks",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("todo.read", "calendar.read")
+    @instrument_tool
+    async def nc_calendar_search_todos(
+        ctx: Context,
+        status: Optional[str] = None,
+        min_priority: Optional[int] = None,
+        categories: Optional[str] = None,
+        summary_contains: Optional[str] = None,
+        include_completed: bool = True,
+    ):
+        """Search todos across all calendars with optional filtering.
+
+        Args:
+            ctx: MCP context
+            status: Filter by status (NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED)
+            min_priority: Filter by minimum priority (1=highest, 9=lowest)
+            categories: Filter by categories (comma-separated, e.g., "work,urgent")
+            summary_contains: Filter todos where summary contains this text
+
+        Returns:
+            List of todos matching the filters from all calendars
+        """
+        client = await get_client(ctx)
+
+        # Build filters dictionary
+        filters = {}
+        if status is not None:
+            filters["status"] = status
+        if min_priority is not None:
+            filters["min_priority"] = min_priority
+        if categories is not None:
+            filters["categories"] = [cat.strip() for cat in categories.split(",")]
+        if summary_contains is not None:
+            filters["summary_contains"] = summary_contains
+        if not include_completed:
+            filters["include_completed"] = False
+
+        failures: list[dict[str, str]] = []
+        todos_data = await client.calendar.search_todos_across_calendars(
+            filters if filters else None, failures=failures
+        )
+
+        todos = [Todo(**todo_data) for todo_data in todos_data]
+        return ListTodosResponse(
+            todos=todos,
+            total_count=len(todos),
+            errors=[CalendarReadError(**f) for f in failures],
+        )

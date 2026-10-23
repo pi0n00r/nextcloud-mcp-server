@@ -1,0 +1,679 @@
+"""MCP tool surface for Nextcloud Contacts (CardDAV).
+
+Unified ``nc_contacts_*`` namespace, 11 ops total. Byte-preserving vCard
+substrate underneath every write — no JSON↔vCard round-trip on properties
+not being modified.
+
+Ops:
+  1. nc_contacts_list_addressbooks
+  2. nc_contacts_list_contacts        (gains include_vcard / include_etag)
+  3. nc_contacts_get_contact          NEW  (vcard_text + etag + JSON)
+  4. nc_contacts_create_contact       (accepts vcard_text or JSON)
+  5. nc_contacts_patch_contact        NEW  (surgical edit, If-Match)
+  6. nc_contacts_put_contact          NEW  (full vCard replace, If-Match)
+  7. nc_contacts_delete_contact       (gains If-Match)
+  8. nc_contacts_search_contacts
+  9. nc_contacts_create_addressbook
+ 10. nc_contacts_delete_addressbook
+ 11. nc_contacts_update_contact       compatibility shim
+
+New integrations should use ``nc_contacts_patch_contact`` or
+``nc_contacts_put_contact`` so preservation and concurrency semantics are
+explicit.
+"""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+import logging
+from datetime import date
+from typing import Any, Optional
+
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+
+from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.contacts import (
+    EtagConflictError,
+    EtagPreconditionError,
+)
+from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.models.contacts import (
+    AddressBook,
+    Contact,
+    ContactField,
+    GetContactResponse,
+    ListAddressBooksResponse,
+    ListContactsResponse,
+    PatchContactResponse,
+    PutContactResponse,
+)
+from nextcloud_mcp_server.observability.metrics import instrument_tool
+
+logger = logging.getLogger(__name__)
+
+
+def _contact_write_tool_error(
+    exc: EtagConflictError | EtagPreconditionError, *, uid: str
+) -> ToolError:
+    """Map typed CardDAV concurrency failures to actionable MCP tool errors."""
+    if isinstance(exc, EtagConflictError):
+        current = (
+            f" Current ETag: {exc.current_etag}."
+            if exc.current_etag is not None
+            else ""
+        )
+        return ToolError(
+            f"Contact {uid} was modified since it was read.{current} "
+            "Read the contact again and retry with its strong ETag."
+        )
+    return ToolError(f"{exc}. Read the contact and retry with its strong ETag.")
+
+
+def _parse_vcard_fields(
+    raw_values: str | dict | list | None, field_type: str
+) -> list[ContactField]:
+    if raw_values is None:
+        return []
+    items: list[str | dict] = (
+        raw_values if isinstance(raw_values, list) else [raw_values]
+    )
+    fields: list[ContactField] = []
+    for item in items:
+        if isinstance(item, dict):
+            value = str(item.get("value", ""))
+            if not value:
+                continue
+            raw_types: list[str] = item.get("type") or []
+            preferred = any(t.upper() == "PREF" for t in raw_types)
+            labels = [t.lower() for t in raw_types if t.upper() != "PREF"]
+            fields.append(
+                ContactField(
+                    type=field_type,
+                    value=value,
+                    label=", ".join(labels) if labels else None,
+                    preferred=preferred,
+                )
+            )
+        elif isinstance(item, str) and item:
+            fields.append(ContactField(type=field_type, value=item))
+    return fields
+
+
+def _parse_address_fields(raw_values: dict | list | None) -> list[ContactField]:
+    """Project ADR into a stable seven-component RFC 6350 shape."""
+    if not raw_values:
+        return []
+    items = [raw_values] if isinstance(raw_values, dict) else raw_values
+    fields: list[ContactField] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        components = item.get("value") or []
+        if isinstance(components, str):
+            components = components.split(";")
+        components = ([str(value) for value in components] + [""] * 7)[:7]
+        if not any(value.strip() for value in components):
+            continue
+        raw_types = item.get("type") or []
+        preferred = any(str(value).upper() == "PREF" for value in raw_types)
+        labels = [
+            str(value).lower() for value in raw_types if str(value).upper() != "PREF"
+        ]
+        fields.append(
+            ContactField(
+                type="address",
+                value=";".join(components),
+                label=", ".join(labels) if labels else None,
+                preferred=preferred,
+                components=components,
+            )
+        )
+    return fields
+
+
+def _parse_url_fields(raw_urls: str | list | None) -> list[ContactField]:
+    if isinstance(raw_urls, str):
+        raw_urls = [raw_urls] if raw_urls else []
+    return [
+        ContactField(type="url", value=url)
+        for url in (raw_urls or [])
+        if isinstance(url, str) and url
+    ]
+
+
+def _parse_categories(raw_categories: str | list | None) -> list[str]:
+    raw_categories = raw_categories or []
+    if isinstance(raw_categories, str):
+        return [item.strip() for item in raw_categories.split(",") if item.strip()]
+    return [item for item in raw_categories if isinstance(item, str) and item]
+
+
+def _build_custom_fields(contact_info: dict) -> dict[str, Any]:
+    custom_fields: dict[str, Any] = dict(contact_info.get("custom_fields") or {})
+    nickname = contact_info.get("nickname")
+    if nickname:
+        custom_fields["nickname"] = nickname
+    custom_fields.update(contact_info.get("custom") or {})
+    return custom_fields
+
+
+def _split_name_parts(raw_n: list | None) -> tuple[str | None, str | None]:
+    """Return ``(family_name, given_name)`` from the N component list.
+
+    N is ``[family, given, additional, prefix, suffix]``; index-guarded since a
+    malformed card can carry fewer components. Empty strings become ``None``.
+    """
+    name_parts = raw_n or []
+    family = name_parts[0] if len(name_parts) > 0 else None
+    given = name_parts[1] if len(name_parts) > 1 else None
+    return (family or None), (given or None)
+
+
+def _page(items: list, limit: int | None, offset: int) -> list:
+    """Slice one page out of a contact list.
+
+    Both bounds are defensive: a negative offset starts at the beginning, a
+    negative limit yields nothing rather than slicing from the end.
+    """
+    start = max(0, offset)
+    if limit is None:
+        return items[start:]
+    return items[start : start + max(0, limit)]
+
+
+def _raw_contact_to_model(raw: dict, *, include_photo: bool = True) -> Contact:
+    """Convert a raw contact dict from the contacts client to a Contact model.
+
+    Maps fullname, name parts, nickname, birthday, email, tel, address, org,
+    title, note, url, categories, photo and X-* extension fields. Email/tel
+    values may be plain strings, dicts with ``value``/``type`` keys, or lists of
+    either – see :func:`_parse_vcard_fields`.
+
+    ``include_photo`` controls whether the inline PHOTO payload is carried
+    over. It defaults to True so single-contact mappings keep their previous
+    shape; only the list and search tools opt out, because vCards embed photos
+    as base64 and that dwarfs every other field when many contacts are
+    returned at once. ``has_photo`` is reported either way.
+    """
+    contact_info = raw.get("contact")
+    if contact_info is None:
+        contact_info = raw.get("json", {})
+
+    emails = _parse_vcard_fields(contact_info.get("email"), "email")
+    phones = _parse_vcard_fields(contact_info.get("tel"), "phone")
+    urls = _parse_url_fields(contact_info.get("url"))
+    categories = _parse_categories(contact_info.get("categories"))
+    custom_fields = _build_custom_fields(contact_info)
+    family_name, given_name = _split_name_parts(contact_info.get("n"))
+    # An empty PHOTO is no photo: normalising here keeps photo and has_photo
+    # consistent instead of reporting "" alongside has_photo=False.
+    raw_photo = contact_info.get("photo") or None
+
+    return Contact(
+        uid=raw.get("vcard_id") or raw.get("uid"),
+        resource_path=raw.get("object_path"),
+        fn=contact_info.get("fullname", ""),
+        etag=raw.get("getetag") if "getetag" in raw else raw.get("etag"),
+        vcard_text=raw.get("vcard_text"),
+        given_name=given_name,
+        family_name=family_name,
+        organization=contact_info.get("org"),
+        title=contact_info.get("title"),
+        note=contact_info.get("note"),
+        photo=raw_photo if include_photo else None,
+        has_photo=bool(raw_photo),
+        birthday=contact_info["birthday"].isoformat()
+        if isinstance(contact_info.get("birthday"), date)
+        else contact_info.get("birthday"),
+        emails=emails,
+        phones=phones,
+        addresses=_parse_address_fields(contact_info.get("adr")),
+        urls=urls,
+        categories=categories,
+        custom_fields=custom_fields,
+    )
+
+
+def configure_contacts_tools(mcp: MCPServer):
+    # ------------------------------------------------------------------
+    # 1. list_addressbooks
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="List Address Books",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("contacts.read")
+    @instrument_tool
+    async def nc_contacts_list_addressbooks(ctx: Context) -> ListAddressBooksResponse:
+        """List all addressbooks for the user."""
+        client = await get_client(ctx)
+        addressbooks_data = await client.contacts.list_addressbooks()
+        addressbooks = [
+            AddressBook(
+                uri=ab["name"],
+                displayname=ab.get("display_name", ab["name"]),
+                ctag=ab.get("getctag"),
+            )
+            for ab in addressbooks_data
+        ]
+        return ListAddressBooksResponse(
+            addressbooks=addressbooks, total_count=len(addressbooks)
+        )
+
+    # ------------------------------------------------------------------
+    # 2. list_contacts (gains include_vcard / include_etag)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="List Contacts",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("contacts.read")
+    @instrument_tool
+    async def nc_contacts_list_contacts(
+        ctx: Context,
+        *,
+        addressbook: str,
+        include_vcard: bool = False,
+        include_etag: bool = True,
+        include_photos: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> ListContactsResponse:
+        """List all contacts in the specified addressbook.
+
+        Args:
+            addressbook: URI slug of the addressbook (e.g. "contacts"), not
+                the display name.
+            include_vcard: include the raw vcard_text per contact (byte-truth,
+                useful for byte-preserving subsequent writes).
+            include_etag: include the per-contact ETag (default True so
+                callers can chain into patch_contact without an extra GET).
+            include_photos: Include the inline base64 PHOTO payload. Off by
+                default: embedded photos dominate vCard size and can push the
+                response past what the transport delivers. ``has_photo`` still
+                says which contacts have one.
+            limit: Maximum number of contacts to return. None returns all.
+            offset: Number of contacts to skip, for paging through a large
+                addressbook together with ``limit``.
+        """
+        client = await get_client(ctx)
+        contacts_data = await client.contacts.list_contacts(
+            addressbook=addressbook,
+            include_vcard=include_vcard,
+            include_etag=include_etag,
+        )
+        total = len(contacts_data)
+
+        page = _page(contacts_data, limit, offset)
+        contacts = [
+            _raw_contact_to_model(c, include_photo=include_photos) for c in page
+        ]
+        # total_count reports the addressbook size, not the page size, so a
+        # caller can tell whether more contacts remain.
+        return ListContactsResponse(
+            contacts=contacts, addressbook=addressbook, total_count=total
+        )
+
+    # ------------------------------------------------------------------
+    # 3. get_contact (NEW)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Get Contact",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("contacts.read")
+    @instrument_tool
+    async def nc_contacts_get_contact(
+        ctx: Context, *, addressbook: str, uid: str
+    ) -> GetContactResponse:
+        """Fetch a single contact by UID — returns raw vcard_text + etag + JSON.
+
+        Use the returned ``etag`` as the If-Match precondition for any
+        subsequent ``patch_contact`` / ``put_contact`` / ``delete_contact``.
+
+        Args:
+            addressbook: URI slug of the addressbook.
+            uid: Contact UID.
+        """
+        client = await get_client(ctx)
+        raw = await client.contacts.get_contact(addressbook=addressbook, uid=uid)
+        contact = _raw_contact_to_model(raw)
+        return GetContactResponse(contact=contact)
+
+    # ------------------------------------------------------------------
+    # 4. create_contact (accepts vcard_text or JSON)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Create Contact",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_create_contact(
+        ctx: Context,
+        *,
+        addressbook: str,
+        uid: str,
+        vcard_text: Optional[str] = None,
+        contact_data: Optional[dict] = None,
+    ):
+        """Create a new contact.
+
+        Pass ``vcard_text`` (preferred — full fidelity, all properties round-trip)
+        OR ``contact_data`` (JSON projection — convenience). At least one is
+        required.
+
+        Args:
+            addressbook: URI slug.
+            uid: UID for the new contact.
+            vcard_text: full vCard text per RFC 6350.
+            contact_data: convenience JSON, e.g.
+                ``{"fn": "John Doe", "email": "john@example.com"}``.
+        """
+        client = await get_client(ctx)
+        return await client.contacts.create_contact(
+            addressbook=addressbook,
+            uid=uid,
+            vcard_text=vcard_text,
+            contact_data=contact_data,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. patch_contact (NEW — surgical edit with If-Match)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Patch Contact (byte-preserving)",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_patch_contact(
+        ctx: Context,
+        *,
+        addressbook: str,
+        uid: str,
+        etag: str,
+        set_props: Optional[dict] = None,
+        add_props: Optional[list] = None,
+        remove_props: Optional[list] = None,
+        verify: bool = False,
+        retry_on_conflict: bool = False,
+    ) -> PatchContactResponse:
+        """Surgical edit. GET-with-ETag → byte-preserve patch → PUT-with-If-Match.
+
+        Untouched properties (PHOTO, X-extensions, line-folded NOTEs, vendor
+        fields) round-trip byte-equal. Only the touched lines regenerate.
+        This replaces the deprecated ``update_contact`` for byte-faithful work.
+
+        Args:
+            addressbook: URI slug.
+            uid: Contact UID.
+            etag: If-Match precondition. Get from prior ``get_contact`` /
+                ``list_contacts(include_etag=true)``.
+            set_props: ``{selector: new_value}`` — replace single matching line.
+                Selectors: ``"FN"``, ``"NOTE"``, ``"TEL;TYPE=CELL"``, etc.
+                If property absent, it is added (DAVx5 ergonomic).
+            add_props: list of ``[name, value, params]`` — append a new line
+                without disturbing existing instances. ``params`` is a list of
+                ``[key, value]`` pairs. Use this for adding a TEL alongside
+                existing TELs.
+            remove_props: list of selectors to remove (all matches).
+            verify: post-write GET to confirm the change reflects (catches
+                structural-loss bugs in the substrate).
+            retry_on_conflict: on 412, refetch and re-apply once before failing.
+
+        Returns:
+            ``{uid, addressbook, old_etag, new_etag, applied, verified}``.
+            On 412 raises EtagConflictError → MCP error response.
+        """
+        client = await get_client(ctx)
+        try:
+            result = await client.contacts.patch_contact(
+                addressbook=addressbook,
+                uid=uid,
+                etag=etag,
+                set_props=set_props,
+                add_props=[
+                    (item[0], item[1], item[2] if len(item) > 2 else None)
+                    for item in (add_props or [])
+                ],
+                remove_props=remove_props,
+                verify=verify,
+                retry_on_conflict=retry_on_conflict,
+            )
+        except (EtagConflictError, EtagPreconditionError) as exc:
+            raise _contact_write_tool_error(exc, uid=uid) from exc
+        return PatchContactResponse(**result)
+
+    # ------------------------------------------------------------------
+    # 6. put_contact (NEW — full vCard replace)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Put Contact (full vCard replace)",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_put_contact(
+        ctx: Context, *, addressbook: str, uid: str, vcard_text: str, etag: str
+    ) -> PutContactResponse:
+        """Full vCard replace. Caller is responsible for byte-correctness.
+
+        Use for recovery import or corrective rewrite — most callers want
+        ``patch_contact`` (surgical, byte-preserving) instead. Same If-Match
+        discipline. A 412 response surfaces to the caller.
+
+        Args:
+            addressbook: URI slug.
+            uid: Contact UID.
+            vcard_text: complete vCard per RFC 6350.
+            etag: If-Match precondition.
+        """
+        client = await get_client(ctx)
+        try:
+            result = await client.contacts.put_contact(
+                addressbook=addressbook, uid=uid, vcard_text=vcard_text, etag=etag
+            )
+        except (EtagConflictError, EtagPreconditionError) as exc:
+            raise _contact_write_tool_error(exc, uid=uid) from exc
+        return PutContactResponse(**result)
+
+    # ------------------------------------------------------------------
+    # 7. delete_contact (gains If-Match)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Delete Contact",
+        annotations=ToolAnnotations(
+            destructive_hint=True, idempotent_hint=True, open_world_hint=True
+        ),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_delete_contact(
+        ctx: Context, *, addressbook: str, uid: str, etag: str = ""
+    ):
+        """Delete a contact. Pass ``etag`` for If-Match (recommended).
+
+        Args:
+            addressbook: URI slug.
+            uid: Contact UID.
+            etag: optional If-Match precondition. Without it, the delete is
+                unconditional (allows a concurrent edit to be lost).
+        """
+        client = await get_client(ctx)
+        return await client.contacts.delete_contact(
+            addressbook=addressbook, uid=uid, etag=etag
+        )
+
+    # ------------------------------------------------------------------
+    # 8a. create_addressbook (unchanged)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Search Contacts",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("contacts.read")
+    @instrument_tool
+    async def nc_contacts_search_contacts(
+        ctx: Context,
+        *,
+        query: str,
+        addressbook: str | None = None,
+        include_photos: bool = False,
+    ) -> ListContactsResponse:
+        """Search contacts by free-text query across name, nickname, email, and phone.
+
+        The query is matched case-insensitively as a substring against:
+        - the contact's full name (FN)
+        - any nickname
+        - every email address
+        - every phone number (digits only — formatting is stripped before
+          comparison so '+1 234 567 890' matches '2345678' and '234.567.890')
+
+        Args:
+            query: Free-text search string (case-insensitive substring match).
+                An empty query returns no results — use list_contacts for that.
+            addressbook: Optional URI slug of a specific addressbook to search.
+                When omitted, every addressbook for the user is searched.
+            include_photos: Include the inline base64 PHOTO payload. Off by
+                default -- see nc_contacts_list_contacts.
+
+        Returns:
+            ListContactsResponse with matching contacts. The ``addressbook``
+            field is set to the searched addressbook, or ``"*"`` when all
+            addressbooks were searched.
+        """
+        client = await get_client(ctx)
+        needle = (query or "").strip().lower()
+        if not needle:
+            return ListContactsResponse(
+                contacts=[], addressbook=addressbook or "*", total_count=0
+            )
+
+        # Phone numbers are normalised to digits-only for comparison so that
+        # users can search for "2345678" and find "+1 234-567-8" etc.
+        digits_needle = "".join(ch for ch in needle if ch.isdigit())
+
+        if addressbook:
+            address_books = [addressbook]
+        else:
+            address_books = [
+                ab["name"] for ab in await client.contacts.list_addressbooks()
+            ]
+
+        matches: list[Contact] = []
+        for ab_slug in address_books:
+            raw_contacts = await client.contacts.list_contacts(addressbook=ab_slug)
+            for raw in raw_contacts:
+                contact = _raw_contact_to_model(raw, include_photo=include_photos)
+                hay_parts: list[str] = []
+                if contact.fn:
+                    hay_parts.append(contact.fn.lower())
+                nickname = (
+                    contact.custom_fields.get("nickname")
+                    if contact.custom_fields
+                    else None
+                )
+                if nickname:
+                    hay_parts.append(str(nickname).lower())
+                for e in contact.emails:
+                    hay_parts.append(e.value.lower())
+                hay = " ".join(hay_parts)
+
+                phone_digits = "".join(
+                    "".join(ch for ch in p.value if ch.isdigit())
+                    for p in contact.phones
+                )
+
+                if needle in hay:
+                    matches.append(contact)
+                elif digits_needle and digits_needle in phone_digits:
+                    matches.append(contact)
+
+        return ListContactsResponse(
+            contacts=matches,
+            addressbook=addressbook or "*",
+            total_count=len(matches),
+        )
+
+    @mcp.tool(
+        title="Create Address Book",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_create_addressbook(
+        ctx: Context, *, name: str, display_name: str
+    ):
+        """Create a new addressbook."""
+        client = await get_client(ctx)
+        return await client.contacts.create_addressbook(
+            name=name, display_name=display_name
+        )
+
+    # ------------------------------------------------------------------
+    # 8b. delete_addressbook (unchanged)
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Delete Address Book",
+        annotations=ToolAnnotations(
+            destructive_hint=True, idempotent_hint=True, open_world_hint=True
+        ),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_delete_addressbook(ctx: Context, *, name: str):
+        """Delete an addressbook."""
+        client = await get_client(ctx)
+        return await client.contacts.delete_addressbook(name=name)
+
+    # ------------------------------------------------------------------
+    # DEPRECATED — update_contact shim
+    # ------------------------------------------------------------------
+    @mcp.tool(
+        title="Update Contact (DEPRECATED — use patch_contact)",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("contacts.write")
+    @instrument_tool
+    async def nc_contacts_update_contact(
+        ctx: Context, *, addressbook: str, uid: str, contact_data: dict, etag: str = ""
+    ):
+        """DEPRECATED. Use ``nc_contacts_patch_contact`` directly.
+
+        This shim translates the legacy JSON shape to a ``patch_contact``
+        invocation underneath. It inherits the byte-preserving substrate so
+        PHOTO blobs and X-properties are no longer dropped, but the JSON
+        translation is still lossy for fields not in the legacy schema.
+        Callers should migrate to ``patch_contact`` for full fidelity.
+
+        Args:
+            addressbook: URI slug, not the address-book display name.
+            uid: Contact UID.
+            contact_data: Legacy JSON fields. Plain strings are supported for
+                ``fn``, ``email``, ``tel``/``phone``, ``title`` and ``note``.
+                ``org``/``organization``, ``nickname``, ``categories`` and
+                ``url`` also accept the compatibility shapes handled by the
+                byte-preserving client. Unknown fields are ignored.
+            etag: Optional ETag for optimistic concurrency control.
+        """
+        logger.warning(
+            "nc_contacts_update_contact is DEPRECATED for uid=%s in %s; "
+            "migrate caller to nc_contacts_patch_contact",
+            uid,
+            addressbook,
+        )
+        client = await get_client(ctx)
+        return await client.contacts.update_contact(
+            addressbook=addressbook, uid=uid, contact_data=contact_data, etag=etag
+        )

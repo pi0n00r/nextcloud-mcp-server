@@ -1,0 +1,3498 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import importlib
+import json
+import logging
+import os
+import time
+import traceback
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import quote, urlparse
+
+import anyio
+import click
+import httpx
+from anyio.abc import TaskGroup
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from pydantic import AnyHttpUrl
+from starlette.applications import Starlette
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import BaseRoute, Mount, Route
+from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Send
+from starlette.types import Scope as StarletteScope
+
+from nextcloud_mcp_server.api import (
+    delete_app_password,
+    get_app_password_status,
+    get_installed_apps,
+    get_server_status,
+    get_user_access,
+    get_user_session,
+    get_vector_sync_status,
+    list_supported_scopes,
+    provision_app_password,
+    revoke_user_access,
+    update_user_scopes,
+)
+from nextcloud_mcp_server.api.passwords import _validate_nextcloud_credentials
+from nextcloud_mcp_server.auth import (
+    InsufficientScopeError,
+    discover_all_scopes,
+    get_access_token_scopes,
+    has_required_scopes,
+    is_jwt_token,
+)
+from nextcloud_mcp_server.auth.browser_oauth_routes import (
+    oauth_login,
+    oauth_login_callback,
+    oauth_logout,
+)
+from nextcloud_mcp_server.auth.client_registration import ensure_oauth_client
+from nextcloud_mcp_server.auth.oauth_routes import (
+    oauth_as_metadata,
+    oauth_authorize,
+    oauth_authorize_nextcloud,
+    oauth_callback,
+    oauth_callback_nextcloud,
+    oauth_register_proxy,
+    oauth_token_endpoint,
+)
+from nextcloud_mcp_server.auth.provision_routes import (
+    provision_page,
+    provision_status,
+)
+from nextcloud_mcp_server.auth.session_backend import SessionAuthBackend
+from nextcloud_mcp_server.auth.storage import RefreshTokenStorage, get_shared_storage
+from nextcloud_mcp_server.auth.token_broker import TokenBrokerService
+from nextcloud_mcp_server.auth.unified_verifier import UnifiedTokenVerifier
+from nextcloud_mcp_server.auth.userinfo_routes import (
+    revoke_session,
+    user_info_html,
+    vector_sync_status_fragment,
+)
+from nextcloud_mcp_server.client import NextcloudClient
+from nextcloud_mcp_server.config import (
+    Settings,
+    get_document_processor_config,
+    get_settings,
+)
+from nextcloud_mcp_server.config_validators import (
+    AuthMode,
+    get_mode_summary,
+    validate_configuration,
+)
+from nextcloud_mcp_server.context import get_client as get_nextcloud_client
+from nextcloud_mcp_server.errors import NextcloudMCPServer
+from nextcloud_mcp_server.features import semantic_installed
+from nextcloud_mcp_server.http import nextcloud_httpx_client
+from nextcloud_mcp_server.models.auth import ALL_SUPPORTED_SCOPES
+from nextcloud_mcp_server.observability import (
+    ObservabilityMiddleware,
+    setup_metrics,
+    setup_profiling,
+    setup_tracing,
+)
+from nextcloud_mcp_server.observability.metrics import (
+    instrument_call_tool_outcomes,
+    record_dependency_check,
+    set_dependency_health,
+)
+from nextcloud_mcp_server.observability.readiness import ReadinessCache
+from nextcloud_mcp_server.plugins import (
+    load_plugins,
+    plugin_routes,
+    register_plugin_tools,
+)
+from nextcloud_mcp_server.request_context import current_context
+from nextcloud_mcp_server.retry import retry_on_transient
+from nextcloud_mcp_server.server import AVAILABLE_APPS, configure_app_tools
+from nextcloud_mcp_server.server.auth_tools import register_auth_tools
+from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
+
+# The vector/semantic-search stack (vector/, search/, document_processors/,
+# admin/payload_backfill, api/{visualization,vector_sync,sar}, server/{semantic,
+# sar}) is NEVER imported at module level here. It pulls in optional heavy
+# dependencies (qdrant-client, fastembed, pymupdf, provider SDKs), and the core
+# server must start without them. Each use imports it inside the branch that is
+# already gated on VECTOR_SYNC_ENABLED / a plugin being available, or via _lazy_endpoint
+# for routes that are mounted unconditionally.
+# tests/unit/test_core_import_boundary.py enforces this.
+
+if TYPE_CHECKING:
+    # Annotation-only in this module (the file uses `from __future__ import
+    # annotations`, so these are never evaluated at runtime).
+    from nextcloud_mcp_server.vector.oauth_sync import ProvisionSignal
+    from nextcloud_mcp_server.vector.queue import IngestTransport, TaskProducer
+
+logger = logging.getLogger(__name__)
+HTTPXClientInstrumentor().instrument()
+
+
+# Pre-shared-secret gate paths exempt from MCP_GATEWAY_SECRET. Health probes and
+# OAuth discovery metadata must remain reachable without transport credentials.
+_GATEWAY_GATE_OPEN_PREFIXES = (
+    "/health",
+    "/.well-known",
+)
+
+
+class GatewaySecretMiddleware:
+    """Optional pre-shared-secret gate for exposed MCP deployments."""
+
+    def __init__(self, app: ASGIApp, secret: str) -> None:
+        assert secret, "GatewaySecretMiddleware requires a non-empty secret"
+        self.app = app
+        self._secret = secret
+
+    def _present_secret(self, headers: list[tuple[bytes, bytes]]) -> str | None:
+        for name, value in headers:
+            if name == b"x-mcp-gateway-secret":
+                return value.decode("latin-1")
+            if name == b"authorization":
+                raw = value.decode("latin-1")
+                if raw[:7].lower() == "bearer ":
+                    return raw[7:].strip()
+        return None
+
+    async def __call__(
+        self, scope: StarletteScope, receive: Receive, send: Send
+    ) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path.startswith(_GATEWAY_GATE_OPEN_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        presented = self._present_secret(scope.get("headers", []))
+        ok = presented is not None and hmac.compare_digest(presented, self._secret)
+        if not ok:
+            response = JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mcp-gateway"'},
+                content={
+                    "error": "unauthorized",
+                    "error_description": (
+                        "MCP gateway secret required "
+                        "(X-MCP-Gateway-Secret or Authorization: Bearer)."
+                    ),
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def build_dcr_scopes(
+    *,
+    vector_sync_enabled: bool,
+    offline_access_enabled: bool,
+    plugin_scopes: Iterable[tuple[frozenset[str], bool]] = (),
+) -> str:
+    """Build the space-separated scope list this server registers via DCR.
+
+    When we register as a resource server (with resource_url) the allowed
+    scopes describe what is AVAILABLE for this resource, not what the server
+    itself needs — external clients then request tokens limited to this list.
+    Every scope any tool requires must appear, and since a token scope is
+    required for every tool call, an omission here makes those tools
+    permanently uncallable.
+
+    Derived from ALL_SUPPORTED_SCOPES rather than hand-maintained: the two were
+    a duplicated pair that silently drifted, leaving mail.send (and every mail
+    scope) ungrantable in OAuth mode despite being in use. semantic.read is
+    subtracted and re-added conditionally so it is advertised only when
+    semantic search is enabled — subtracting is what keeps it from being
+    emitted twice now that it is a member of the vocabulary. Each plugin's
+    scopes are handled the same way: ``plugin_scopes`` holds one
+    ``(scopes, available)`` pair per installed plugin, and a plugin's scopes are
+    advertised only while it is available.
+    """
+    per_plugin = list(plugin_scopes)
+    withheld = frozenset().union(*(s for s, _ in per_plugin))
+    scopes = ["openid", "profile", "email"]
+    scopes += sorted(ALL_SUPPORTED_SCOPES - {"semantic.read"} - withheld)
+    if vector_sync_enabled:
+        scopes.append("semantic.read")
+    for plugin_scope_set, available in per_plugin:
+        if available:
+            scopes += sorted(plugin_scope_set)
+    if offline_access_enabled:
+        scopes.append("offline_access")
+    return " ".join(scopes)
+
+
+def initialize_document_processors():
+    """Initialize and register document processors based on configuration.
+
+    This function reads the environment configuration and registers the available
+    OPTIONAL processors (Unstructured, Tesseract, Custom HTTP, Docling) with the
+    global registry, each gated by its own ``ENABLE_*`` flag. The built-in PDF
+    tiers (pypdfium2 / pymupdf / OCR) self-register on first import of
+    ``document_processors`` and need nothing here.
+    """
+    config = get_document_processor_config()
+
+    if not config["processors"]:
+        logger.info("No optional document processors configured")
+        return
+
+    # Imported lazily so the API startup path never loads the ingest document
+    # stack (document_processors -> pymupdf -> _isolation) unless an optional
+    # processor actually has to be registered -- see #877 / the API-vs-ingest
+    # split. Nothing to register means nothing to import.
+    from nextcloud_mcp_server.document_processors import get_registry  # noqa: PLC0415
+
+    registry = get_registry()
+    registered_count = 0
+
+    # Register Unstructured processor
+    if "unstructured" in config["processors"]:
+        unst_config = config["processors"]["unstructured"]
+        try:
+            from nextcloud_mcp_server.document_processors.unstructured import (  # noqa: PLC0415
+                UnstructuredProcessor,
+            )
+
+            processor = UnstructuredProcessor(
+                api_url=unst_config["api_url"],
+                timeout=unst_config["timeout"],
+                default_strategy=unst_config["strategy"],
+                default_languages=unst_config["languages"],
+                progress_interval=unst_config.get("progress_interval", 10),
+            )
+            registry.register(processor, priority=10)
+            logger.info("Registered Unstructured processor: %s", unst_config["api_url"])
+            registered_count += 1
+        except Exception as e:
+            logger.warning("Failed to register Unstructured processor: %s", e)
+
+    # Register Tesseract processor
+    if "tesseract" in config["processors"]:
+        tess_config = config["processors"]["tesseract"]
+        try:
+            from nextcloud_mcp_server.document_processors.tesseract import (  # noqa: PLC0415
+                TesseractProcessor,
+            )
+
+            processor = TesseractProcessor(
+                tesseract_cmd=tess_config.get("tesseract_cmd"),
+                default_lang=tess_config["lang"],
+            )
+            registry.register(processor, priority=5)
+            logger.info("Registered Tesseract processor: lang=%s", tess_config["lang"])
+            registered_count += 1
+        except Exception as e:
+            logger.warning("Failed to register Tesseract processor: %s", e)
+
+    # PyMuPDF is NOT registered here: it is the built-in ``structured`` tier and
+    # registers itself (from Settings.pymupdf_*) when document_processors is
+    # first imported, which is on the first parse rather than at startup (#877).
+
+    # Register custom processor
+    if "custom" in config["processors"]:
+        custom_config = config["processors"]["custom"]
+        try:
+            from nextcloud_mcp_server.document_processors.custom_http import (  # noqa: PLC0415
+                CustomHTTPProcessor,
+            )
+
+            processor = CustomHTTPProcessor(
+                name=custom_config["name"],
+                api_url=custom_config["api_url"],
+                api_key=custom_config.get("api_key"),
+                timeout=custom_config["timeout"],
+                supported_types=custom_config["supported_types"],
+            )
+            registry.register(processor, priority=1)
+            logger.info(
+                "Registered Custom processor '%s': %s",
+                custom_config["name"],
+                custom_config["api_url"],
+            )
+            registered_count += 1
+        except Exception as e:
+            logger.warning("Failed to register Custom processor: %s", e)
+
+    # Register Docling processor (docling-serve HTTP). High priority so images
+    # always route to docling when enabled; images-only for auto-selection, but
+    # force-selectable by name (e.g. to re-parse a text-layer PDF with tables).
+    if "docling" in config["processors"]:
+        docling_config = config["processors"]["docling"]
+        try:
+            from nextcloud_mcp_server.document_processors.docling_serve import (  # noqa: PLC0415
+                DoclingProcessor,
+            )
+
+            processor = DoclingProcessor(
+                api_url=docling_config["api_url"],
+                timeout=docling_config["timeout"],
+                ocr_lang=docling_config["ocr_lang"],
+                do_ocr=docling_config["do_ocr"],
+                pipeline=docling_config.get("pipeline", "standard"),
+                vlm_preset=docling_config.get("vlm_preset"),
+                progress_interval=docling_config.get("progress_interval", 10),
+            )
+            registry.register(processor, priority=20)  # Above unstructured (10)
+            logger.info("Registered Docling processor: %s", docling_config["api_url"])
+            registered_count += 1
+        except Exception as e:
+            logger.warning("Failed to register Docling processor: %s", e)
+
+    if registered_count > 0:
+        logger.info(
+            "Document processing initialized with %s optional processor(s); "
+            "registry now holds: %s",
+            registered_count,
+            ", ".join(registry.list_processors()),
+        )
+    else:
+        logger.warning(
+            "Optional document processors were configured but none could be "
+            "registered; only the built-in tiers are available"
+        )
+
+
+def validate_pkce_support(discovery: dict, discovery_url: str) -> None:
+    """
+    Validate that the OIDC provider properly advertises PKCE support.
+
+    According to RFC 8414, if code_challenge_methods_supported is absent,
+    it means the authorization server does not support PKCE.
+
+    MCP clients require PKCE with S256 and will refuse to connect if this
+    field is missing or doesn't include S256.
+    """
+
+    code_challenge_methods = discovery.get("code_challenge_methods_supported")
+
+    if code_challenge_methods is None:
+        click.echo("=" * 80, err=True)
+        click.echo(
+            "ERROR: OIDC CONFIGURATION ERROR - Missing PKCE Support Advertisement",
+            err=True,
+        )
+        click.echo("=" * 80, err=True)
+        click.echo(f"Discovery URL: {discovery_url}", err=True)
+        click.echo("", err=True)
+        click.echo(
+            "The OIDC discovery document is missing 'code_challenge_methods_supported'.",
+            err=True,
+        )
+        click.echo(
+            "According to RFC 8414, this means the server does NOT support PKCE.",
+            err=True,
+        )
+        click.echo("", err=True)
+        click.echo("⚠️  MCP clients (like Claude Code) WILL REJECT this provider!")
+        click.echo("", err=True)
+        click.echo("How to fix:", err=True)
+        click.echo(
+            "  1. Ensure PKCE is enabled in Nextcloud OIDC app settings", err=True
+        )
+        click.echo(
+            "  2. Update the OIDC app to advertise PKCE support in discovery", err=True
+        )
+        click.echo("  3. See: RFC 8414 Section 2 (Authorization Server Metadata)")
+        click.echo("=" * 80, err=True)
+        click.echo("", err=True)
+        return
+
+    if "S256" not in code_challenge_methods:
+        click.echo("=" * 80, err=True)
+        click.echo(
+            "WARNING: OIDC CONFIGURATION WARNING - S256 Challenge Method Not Advertised",
+            err=True,
+        )
+        click.echo("=" * 80, err=True)
+        click.echo(f"Discovery URL: {discovery_url}", err=True)
+        click.echo(f"Advertised methods: {code_challenge_methods}", err=True)
+        click.echo("", err=True)
+        click.echo("MCP specification requires S256 code challenge method.", err=True)
+        click.echo("Some clients may reject this provider.", err=True)
+        click.echo("=" * 80, err=True)
+        click.echo("", err=True)
+        return
+
+    click.echo(f"✓ PKCE support validated: {code_challenge_methods}")
+
+
+@dataclass
+class VectorSyncState:
+    """
+    Module-level state for vector sync background tasks.
+
+    This singleton bridges the Starlette server lifespan (where background tasks run)
+    and MCPServer session lifespans (where MCP tools need access to the streams).
+    """
+
+    document_send_stream: MemoryObjectSendStream | None = None
+    document_receive_stream: MemoryObjectReceiveStream | None = None
+    # Ingest producer the scanner/webhook send to: the in-memory send stream
+    # (INGEST_QUEUE=memory) or the procrastinate producer (INGEST_QUEUE=postgres,
+    # Deck #183). The webhook reads this; in memory mode it is the same object as
+    # document_send_stream.
+    task_producer: "TaskProducer | None" = None
+    shutdown_event: anyio.Event | None = None
+    scanner_wake_event: anyio.Event | None = None
+    # Rung by a provisioning request to wake ``user_manager_task`` immediately so
+    # a just-provisioned user's scanner is spawned without waiting out the
+    # ``VECTOR_SYNC_USER_POLL_INTERVAL`` poll. ``None`` when no user manager is
+    # running (single-user mode or vector sync disabled), in which case
+    # ``notify_user_provisioned`` is a no-op.
+    provision_signal: "ProvisionSignal | None" = None
+    # Long-lived task group used for fire-and-forget background work spawned
+    # from the request path (e.g. ADR-019 verify-on-read eviction). Set by the
+    # starlette lifespan after entering its task group; cleared on shutdown.
+    eviction_task_group: TaskGroup | None = None
+
+
+# Module-level singleton for vector sync state
+_vector_sync_state = VectorSyncState()
+
+
+def notify_user_provisioned() -> None:
+    """Wake the user manager to discover a just-provisioned user immediately.
+
+    Provisioning call sites invoke this after a successful app-password store so
+    ``user_manager_task`` re-polls at once instead of waiting out
+    ``VECTOR_SYNC_USER_POLL_INTERVAL``. The 60s poll remains the backstop, so a
+    missed signal (e.g. provisioning handled on a different replica than the
+    manager) only delays the scan, never skips it.
+
+    No-op when ``provision_signal`` is ``None`` — single-user mode or vector
+    sync disabled, where no user manager is running.
+    """
+    signal = _vector_sync_state.provision_signal
+    if signal is not None:
+        signal.ring()
+
+
+def background_task_group() -> TaskGroup | None:
+    """The lifespan's long-lived task group, for background work started from a
+    request (e.g. SAR export, ADR-040). ``None`` outside the lifespan."""
+    return _vector_sync_state.eviction_task_group
+
+
+def _wire_vector_sync_state(
+    app: Starlette,
+    transport: IngestTransport,
+    shutdown_event: anyio.Event,
+    scanner_wake_event: anyio.Event,
+) -> None:
+    """Publish the ingest transport + sync events to every state surface.
+
+    Both lifespan paths (single-user and multi-user) previously duplicated these
+    writes three times each: ``app.state``, the module singleton
+    ``_vector_sync_state`` (read by MCPServer session lifespans), and the mounted
+    ``/app`` browser sub-app. ``document_send_stream``/``document_receive_stream``
+    come from the transport — ``None`` in postgres mode (no in-process stream) —
+    and ``task_producer`` is the transport's producer in both modes (Deck #183,
+    ADR-028).
+
+    ``eviction_task_group`` is deliberately not set here: it only exists once the
+    lifespan has entered its ``anyio.create_task_group()`` (after this call), so
+    the lifespan assigns it on the singleton directly at that point.
+    ``provision_signal`` is likewise excluded on purpose — only ``user_manager_task``
+    consumes it (request handlers reach it via ``notify_user_provisioned``), so the
+    multi-user lifespan sets it on the singleton directly rather than fanning it out
+    to ``app.state``/the browser sub-app.
+    """
+    send_stream = transport.send_stream
+    receive_stream = transport.receive_stream
+    task_producer = transport.producer
+
+    def _apply(state: Any) -> None:
+        state.document_send_stream = send_stream
+        state.document_receive_stream = receive_stream
+        state.task_producer = task_producer
+        state.shutdown_event = shutdown_event
+        state.scanner_wake_event = scanner_wake_event
+
+    # app.state (Starlette) + the module singleton share the same attribute names.
+    _apply(app.state)
+    _apply(_vector_sync_state)
+    logger.info("Vector sync state published (app.state + module singleton)")
+
+    # Also share with the mounted /app browser sub-app, if present.
+    for route in app.routes:
+        if isinstance(route, Mount) and route.path == "/app":
+            browser_app = cast(Starlette, route.app)
+            _apply(browser_app.state)
+            logger.info("Vector sync state shared with browser_app for /app")
+            break
+
+
+def _clear_vector_sync_state() -> None:
+    """Drop the module-singleton ingest references on lifespan shutdown.
+
+    Mirrors the ``eviction_task_group = None`` cleanup so that any code reaching
+    the singleton in the narrow window between transport teardown and process
+    exit (e.g. a late webhook) sees ``None`` rather than a producer/stream backed
+    by an already-closed resource. The per-request ``shutdown_event`` gate is the
+    primary guard; this is defense-in-depth. Integration tests with module-level
+    singletons also benefit (no stale closed producer leaks between runs).
+    """
+    _vector_sync_state.task_producer = None
+    _vector_sync_state.document_send_stream = None
+    _vector_sync_state.document_receive_stream = None
+    # Symmetric with the fields above: the just-fired events belong to the
+    # closed lifespan; the next startup's _wire_vector_sync_state rebinds them.
+    _vector_sync_state.shutdown_event = None
+    _vector_sync_state.scanner_wake_event = None
+    _vector_sync_state.provision_signal = None
+
+
+# =============================================================================
+# Readiness dependency health (Deck #302)
+# =============================================================================
+#
+# Readiness must reflect "this process is up and configured to serve", NOT the
+# live reachability of shared external dependencies. The MCP server typically
+# runs as a single replica per tenant; failing readiness when Nextcloud or
+# Qdrant blips would pull the only Pod out of its Service, leaving the gateway
+# with no upstream and turning a degraded dependency into a total outage plus
+# an MCP reconnect storm. So external dependency health is refreshed by a
+# background loop, cached, and *reported but non-gating* — and the probe path
+# never performs external I/O.
+
+
+def _default_mcp_server_url() -> str:
+    """Fallback MCP server URL (OAuth audience) when NEXTCLOUD_MCP_SERVER_URL is
+    unset — derived from the configured PORT so a custom port is honoured."""
+    return f"http://localhost:{get_settings().port}"
+
+
+# Pre-loop default; _readiness_refresh_loop overrides ttl_seconds at startup to
+# 2x the configured refresh interval, so bumping this value alone has no effect.
+_readiness_cache = ReadinessCache(ttl_seconds=30.0)
+
+
+async def _check_nextcloud_health() -> None:
+    """Probe Nextcloud ``status.php`` and record the result in the cache.
+
+    Catches everything: the refresh loop must never crash on a dependency
+    error, and a failed check is just an unhealthy status, not an exception.
+    """
+    host = get_settings().nextcloud_host
+    if not host:
+        return
+    start = time.time()
+    try:
+        async with nextcloud_httpx_client(timeout=2.0) as client:
+            response = await client.get(f"{host}/status.php")
+        healthy = response.status_code == 200
+        detail = "ok" if healthy else f"error: status {response.status_code}"
+    except Exception as e:  # noqa: BLE001 - any failure is "unhealthy"
+        healthy = False
+        detail = f"error: {e}"
+    _readiness_cache.update("nextcloud_reachable", healthy, detail)
+    set_dependency_health("nextcloud", healthy)
+    record_dependency_check("nextcloud", time.time() - start)
+
+
+async def _check_qdrant_health() -> None:
+    """Probe Qdrant (network mode) and record the result in the readiness cache.
+
+    Qdrant Cloud's auth gateway 403s unauthenticated requests, so forward the
+    same api-key the configured client uses (see vector/qdrant_client.py).
+
+    Probes the tenant's **collection** (``GET /collections/{name}``) rather than
+    the cluster's ``/readyz``. That matters because the deployed api-key is a
+    *collection-scoped* JWT: a token that is expired, revoked, or scoped to the
+    wrong collection still sails past ``/readyz`` (which only proves the cluster
+    is up), so a cluster-level probe reports "ok" while every real query fails.
+    Probing the collection exercises the credential we actually depend on, and
+    additionally catches the collection having been deleted out from under us.
+
+    PRECONDITION: the caller (:func:`_refresh_dependency_health`) only schedules
+    this when ``vector_sync_enabled`` **and** ``qdrant_url`` are both set — the
+    no-``qdrant_url`` case is reported as ``"embedded"`` there, and with vector
+    sync off nothing populates ``checks.qdrant`` at all. So there is deliberately
+    no ``/readyz`` fallback here: with vector sync on there is always a collection
+    to probe, and a branch for the other case would be unreachable code that a
+    unit test could only "cover" by calling this function directly and bypassing
+    the gate — proving nothing about the running server. If that gate ever
+    changes, revisit this function rather than adding a branch here.
+
+    Deliberately still NON-gating for Kubernetes readiness (see the
+    ``/health/ready`` handler): this only populates the reported snapshot, so a
+    Qdrant blip never pulls a single-replica Pod out of its Service (Deck #302).
+    The control plane reads ``checks.qdrant`` from that body to decide whether a
+    JWT rotation actually reached this Pod — before this change there was no
+    signal anywhere that could distinguish a working token from a dead one
+    (astrolabe-cloud-website board 6 #723).
+    """
+    settings = get_settings()
+    qdrant_url = settings.qdrant_url
+    if not qdrant_url:
+        return
+    headers = {"api-key": settings.qdrant_api_key} if settings.qdrant_api_key else {}
+
+    start = time.time()
+    probe_desc = "qdrant"
+    try:
+        # Resolving the collection name is INSIDE the guard: get_collection_name()
+        # can raise (it derives from the embedding provider / hostname), and an
+        # escaping exception would propagate out of this task. Because the caller
+        # runs it via tg.start_soon, that also cancels the sibling Nextcloud probe
+        # for the cycle — and, worse, leaves checks.qdrant simply not updated
+        # rather than reporting unhealthy, which is the silent-skip this probe
+        # exists to eliminate. A config error is an unhealthy dependency, and is
+        # reported through the same channel as a dead JWT.
+        collection = settings.get_collection_name()
+        # quote() because this is the one place the collection name is spliced
+        # into a URL path rather than handed to the qdrant-client SDK (which
+        # encodes internally). The explicit-override branch of
+        # get_collection_name() does no sanitisation, so an operator-set
+        # QDRANT_COLLECTION containing "/" would otherwise silently probe a
+        # different path.
+        probe_url = f"{qdrant_url}/collections/{quote(collection, safe='')}"
+        probe_desc = f"collection {collection}"
+
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(probe_url, headers=headers)
+        healthy = response.status_code == 200
+        # Keep the healthy detail exactly "ok" — the control plane's rotate-verify
+        # gates on that literal. Failures name what was probed, so an operator can
+        # tell a dead JWT (401/403) from a missing collection (404) at a glance.
+        detail = (
+            "ok" if healthy else f"error: status {response.status_code} ({probe_desc})"
+        )
+    except Exception as e:  # noqa: BLE001 - any failure is "unhealthy"
+        healthy = False
+        detail = f"error: {e} ({probe_desc})"
+    _readiness_cache.update("qdrant", healthy, detail)
+    set_dependency_health("qdrant", healthy)
+    record_dependency_check("qdrant", time.time() - start)
+
+
+def _qdrant_init_error_is_transient(exc: BaseException) -> bool:
+    """True if a Qdrant startup-init failure is a transient connection blip.
+
+    Qdrant can be briefly unreachable during a rolling deploy (pod ordering,
+    network-policy convergence), which is worth retrying. A genuine
+    misconfiguration (bad URL/API key surfacing as a 4xx) is not transient and
+    should fail fast. Transient signals, mirroring the OIDC-discovery split:
+    connection-level failures — ``httpx.TransportError`` (raw) or qdrant's
+    ``ResponseHandlingException`` (wrapper) — and a ``5xx`` from a reachable but
+    overloaded/starting Qdrant (qdrant's ``UnexpectedResponse.status_code``). A
+    ``4xx`` (auth/URL) is not transient. Walks the ``__cause__``/``__context__``
+    chain since the real cause is nested under the qdrant wrapper.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "ResponseHandlingException" or isinstance(
+            current, httpx.TransportError
+        ):
+            return True
+        # qdrant's UnexpectedResponse carries the HTTP status: 5xx is a transient
+        # server-side blip (overloaded/starting), 4xx is a genuine misconfig.
+        status = getattr(current, "status_code", None)
+        if (
+            type(current).__name__ == "UnexpectedResponse"
+            and isinstance(status, int)
+            and 500 <= status < 600
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _init_qdrant_collection_with_retry() -> None:
+    """Initialize the Qdrant collection at startup, retrying transient failures.
+
+    Mirrors the OIDC-discovery startup retry: rather than crashloop the pod with
+    a full traceback every time Qdrant is briefly unreachable during a deploy,
+    ride out the window with capped exponential backoff + full jitter. Genuine
+    (non-transient) errors fail fast, and the budget still fails clearly if
+    Qdrant stays down. ``get_qdrant_client`` only publishes its singleton after
+    migrations succeed, so re-entering it on retry is safe. Set
+    ``QDRANT_INIT_MAX_ATTEMPTS=1`` to restore the original fail-fast behavior.
+    """
+    settings = get_settings()
+
+    @retry_on_transient(
+        Exception,
+        should_retry=_qdrant_init_error_is_transient,
+        provider_name="Qdrant collection init",
+        label="transient error",
+        max_retries=settings.qdrant_init_max_attempts,
+        initial_delay=max(0.0, settings.qdrant_init_backoff_base),
+        max_delay=max(0.0, settings.qdrant_init_backoff_max),
+        jitter=True,
+    )
+    async def _attempt() -> None:
+        from nextcloud_mcp_server.vector.qdrant_client import (  # noqa: PLC0415
+            get_qdrant_client,
+        )
+
+        await get_qdrant_client()  # Triggers collection creation if needed
+
+    try:
+        await _attempt()
+    except Exception as exc:
+        # Both the non-transient fail-fast and the exhausted-budget cases land
+        # here; the operator wants the same "cannot start" framing either way.
+        logger.error("Failed to initialize Qdrant collection: %s", exc)
+        raise RuntimeError(
+            f"Cannot start vector sync - Qdrant initialization failed: {exc}"
+        ) from exc
+
+    logger.info("Qdrant collection ready")
+
+
+async def _refresh_dependency_health() -> None:
+    """Refresh all external dependency statuses concurrently (one pass)."""
+    settings = get_settings()
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_check_nextcloud_health)
+        if settings.vector_sync_enabled and settings.qdrant_url:
+            tg.start_soon(_check_qdrant_health)
+        elif settings.vector_sync_enabled:
+            # Embedded Qdrant (memory/persistent mode) — no external service.
+            _readiness_cache.update("qdrant", True, "embedded")
+            set_dependency_health("qdrant", True)
+
+
+async def _readiness_refresh_loop(*, task_status=anyio.TASK_STATUS_IGNORED) -> None:
+    """Background loop that keeps ``_readiness_cache`` warm off the probe path.
+
+    Reports its own ``CancelScope`` via ``task_status`` so the lifespan can stop
+    just this infinite loop at shutdown while the sync tasks drain naturally on
+    their ``shutdown_event``.
+    """
+    interval = get_settings().health_ready_refresh_interval
+    # Keep the staleness window in step with the configured cadence so
+    # is_stale() stays meaningful when the interval is tuned off its default.
+    _readiness_cache.ttl_seconds = interval * 2
+    # Drop entries from a prior lifespan run in the same process (the integration
+    # matrix restarts the server) so the snapshot reflects only this run's deps.
+    _readiness_cache.statuses.clear()
+    logger.info(
+        "Readiness dependency-health refresh loop started (every %ss)", interval
+    )
+    with anyio.CancelScope() as scope:
+        task_status.started(scope)
+        while True:
+            try:
+                await _refresh_dependency_health()
+            except Exception as exc:  # noqa: BLE001 - never let the loop die
+                logger.warning("Readiness dependency refresh iteration failed: %s", exc)
+            await anyio.sleep(interval)
+
+
+@dataclass
+class AppContext:
+    """Application context for BasicAuth mode."""
+
+    client: NextcloudClient
+    storage: "RefreshTokenStorage | None" = None
+    document_send_stream: MemoryObjectSendStream | None = None
+    document_receive_stream: MemoryObjectReceiveStream | None = None
+    shutdown_event: anyio.Event | None = None
+    scanner_wake_event: anyio.Event | None = None
+
+    @property
+    def task_producer(self) -> "TaskProducer | None":
+        # Read dynamically from the module-level singleton (like
+        # eviction_task_group) rather than snapshotting at yield time — that way
+        # a session can't observe a stale ``None`` and the per-session yields
+        # can't forget to forward it (the bug this property replaces). The
+        # vector-sync status tool reads this for postgres-backend job counts.
+        return _vector_sync_state.task_producer
+
+    @property
+    def eviction_task_group(self) -> TaskGroup | None:
+        # Read dynamically from the module-level singleton instead of
+        # snapshotting at lifespan-yield time. Snapshotting is order-sensitive:
+        # if the MCPServer server lifespan ever runs before the Starlette
+        # lifespan assigns the task group, every session for the life of the
+        # process would see ``None`` and fall back to inline eviction.
+        return _vector_sync_state.eviction_task_group
+
+
+@dataclass
+class OAuthAppContext:
+    """Application context for OAuth mode."""
+
+    nextcloud_host: str
+    token_verifier: object  # UnifiedTokenVerifier (ADR-005 compliant)
+    refresh_token_storage: "RefreshTokenStorage | None" = None
+    oauth_client: object | None = None
+    oauth_provider: str = "nextcloud"  # "nextcloud" or "keycloak"
+    server_client_id: str | None = None  # MCP server's OAuth client ID (static or DCR)
+    document_send_stream: MemoryObjectSendStream | None = None
+    document_receive_stream: MemoryObjectReceiveStream | None = None
+    shutdown_event: anyio.Event | None = None
+    scanner_wake_event: anyio.Event | None = None
+
+    @property
+    def task_producer(self) -> "TaskProducer | None":
+        # See AppContext.task_producer for rationale.
+        return _vector_sync_state.task_producer
+
+    @property
+    def eviction_task_group(self) -> TaskGroup | None:
+        # See AppContext.eviction_task_group for rationale.
+        return _vector_sync_state.eviction_task_group
+
+
+def _auth_scheme(auth_header: str) -> str:
+    """The Authorization scheme, safe to log; never any credential material.
+
+    Only known schemes are echoed: a header without one may be a bare token, and
+    its first word would then be the secret itself.
+    """
+    scheme = auth_header.split(" ", 1)[0]
+    return scheme if scheme.lower() in ("basic", "bearer") else "<other>"
+
+
+class BasicAuthMiddleware:
+    """Middleware to extract and verify BasicAuth credentials.
+
+    For multi-user BasicAuth pass-through mode, this middleware extracts
+    username/password from the Authorization: Basic header, verifies them
+    against Nextcloud, and stores them in the request state for use by the
+    context layer.
+
+    Verification happens here, once, before any handler runs: some handlers
+    serve server-side state keyed by the username without themselves calling
+    Nextcloud, so they cannot be relied on to reject a bad credential. A
+    failed check is rejected with 401 (or 502 when Nextcloud is unreachable) —
+    fail closed.
+
+    The credentials are NOT stored persistently. A successful check is
+    remembered for ``_VALID_TTL`` seconds, keyed by a hash of the header, so
+    each request doesn't cost a Nextcloud round-trip. Failures are not cached:
+    a negative cache only dedupes an identical bad header, not varied guesses,
+    and before this check every bad tool call already reached Nextcloud, whose
+    brute-force protection remains the throttle.
+    """
+
+    # ponytail: a revoked password stays accepted for up to this long; lower it
+    # if revocation latency matters more than one OCS call per request.
+    _VALID_TTL = 60.0
+    _PRUNE_AT = 256
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+        self._validated: dict[bytes, float] = {}
+
+    async def _verify(
+        self, auth_header: bytes, username: str, password: str
+    ) -> JSONResponse | None:
+        """Return ``None`` if the credential is valid, else the error response."""
+        key = hashlib.sha256(auth_header).digest()
+        now = time.monotonic()
+        if self._validated.get(key, 0.0) > now:
+            return None
+
+        _, error = await _validate_nextcloud_credentials(
+            get_settings().nextcloud_host or "",
+            username,
+            password,
+            invalid_credential_error="Invalid credentials",
+        )
+        if error is not None:
+            return error
+
+        # Drop expired entries so the map is bounded by recently-active users.
+        if len(self._validated) >= self._PRUNE_AT:
+            self._validated = {k: t for k, t in self._validated.items() if t > now}
+        self._validated[key] = now + self._VALID_TTL
+        return None
+
+    async def __call__(
+        self, scope: StarletteScope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] == "http":
+            # Extract Authorization header
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"")
+
+            if auth_header.startswith(b"Basic "):
+                try:
+                    # Decode base64(username:password)
+                    encoded = auth_header[6:]  # Skip "Basic "
+                    decoded = base64.b64decode(encoded).decode("utf-8")
+                    username, password = decoded.split(":", 1)
+                except Exception as e:
+                    logger.warning("Failed to extract BasicAuth credentials: %s", e)
+                    error = JSONResponse(
+                        {"success": False, "error": "Malformed credentials"},
+                        status_code=401,
+                    )
+                else:
+                    error = await self._verify(auth_header, username, password)
+
+                if error is not None:
+                    error.headers["WWW-Authenticate"] = 'Basic realm="nextcloud"'
+                    await error(scope, receive, send)
+                    return
+
+                # Store in request state
+                scope.setdefault("state", {})
+                scope["state"]["basic_auth"] = {
+                    "username": username,
+                    "password": password,
+                }
+                logger.debug("BasicAuth credentials extracted for user: %s", username)
+
+        await self.app(scope, receive, send)
+
+
+async def load_oauth_client_credentials(
+    nextcloud_host: str, registration_endpoint: str | None
+) -> tuple[str, str]:
+    """
+    Load OAuth client credentials from environment, storage file, or dynamic registration.
+
+    This consolidates the client loading logic that was duplicated across multiple functions.
+
+    Args:
+        nextcloud_host: Nextcloud instance URL
+        registration_endpoint: Dynamic registration endpoint URL (or None if not available)
+
+    Returns:
+        Tuple of (client_id, client_secret)
+
+    Raises:
+        ValueError: If credentials cannot be obtained
+    """
+    # Try environment variables first
+    client_id = get_settings().oidc_client_id
+    client_secret = get_settings().oidc_client_secret
+
+    if client_id and client_secret:
+        logger.info("Using pre-configured OAuth client credentials from environment")
+        return (client_id, client_secret)
+
+    # Try loading from SQLite storage
+    try:
+        storage = RefreshTokenStorage.from_env()
+        await storage.initialize()
+
+        client_data = await storage.get_oauth_client()
+        if client_data:
+            logger.info(
+                "Loaded OAuth client from SQLite: %s...", client_data["client_id"][:16]
+            )
+            return (client_data["client_id"], client_data["client_secret"])
+    except ValueError:
+        # TOKEN_ENCRYPTION_KEY not set, skip SQLite storage check
+        logger.debug("SQLite storage not available (TOKEN_ENCRYPTION_KEY not set)")
+
+    # Try dynamic registration if available
+    if registration_endpoint:
+        logger.info("Dynamic client registration available")
+        mcp_server_url = (
+            get_settings().nextcloud_mcp_server_url or _default_mcp_server_url()
+        )
+        redirect_uris = [
+            f"{mcp_server_url}/oauth/callback",  # Unified callback (flow determined by query param)
+        ]
+
+        # Add conditional scopes based on server configuration
+        dcr_settings = get_settings()
+        enable_offline_access = dcr_settings.enable_offline_access
+
+        dcr_scopes = build_dcr_scopes(
+            vector_sync_enabled=dcr_settings.vector_sync_enabled,
+            offline_access_enabled=enable_offline_access,
+            plugin_scopes=[
+                (p.scopes, p.available(dcr_settings)) for p in load_plugins()
+            ],
+        )
+        if dcr_settings.vector_sync_enabled:
+            logger.info("✓ semantic.read scope enabled for semantic search tools")
+        if enable_offline_access:
+            logger.info("✓ offline_access scope enabled for refresh tokens")
+
+        logger.info("MCP server DCR scopes (resource server): %s", dcr_scopes)
+
+        # Get token type from environment (Bearer or jwt)
+        # Note: Must be lowercase "jwt" to match OIDC app's check
+        token_type = get_settings().oidc_token_type.lower()
+        # Special case: "bearer" should remain capitalized for compatibility
+        if token_type != "jwt":
+            token_type = "Bearer"
+        logger.info("Requesting token type: %s", token_type)
+
+        # Ensure OAuth client in SQLite storage
+        storage = RefreshTokenStorage.from_env()
+        await storage.initialize()
+
+        # RFC 9728: resource_url must be a URL for the protected resource
+        # This URL is used by token introspection to match tokens to this client
+        resource_url = f"{mcp_server_url}/mcp"
+
+        client_info = await ensure_oauth_client(
+            nextcloud_url=nextcloud_host,
+            registration_endpoint=registration_endpoint,
+            storage=storage,
+            client_name=f"Nextcloud MCP Server ({token_type})",
+            redirect_uris=redirect_uris,
+            scopes=dcr_scopes,  # Use DCR-specific scopes (basic OIDC only)
+            token_type=token_type,
+            resource_url=resource_url,  # RFC 9728 Protected Resource URL
+        )
+
+        logger.info("OAuth client ready: %s...", client_info.client_id[:16])
+        return (client_info.client_id, client_info.client_secret)
+
+    # No credentials available
+    raise ValueError(
+        "OAuth mode requires either:\n"
+        "1. NEXTCLOUD_OIDC_CLIENT_ID and NEXTCLOUD_OIDC_CLIENT_SECRET environment variables, OR\n"
+        "2. Pre-existing client credentials in SQLite storage (TOKEN_STORAGE_DB), OR\n"
+        "3. Dynamic client registration enabled on Nextcloud OIDC app\n\n"
+        "Note: TOKEN_ENCRYPTION_KEY is required for SQLite storage"
+    )
+
+
+@asynccontextmanager
+async def app_lifespan_basic(server: MCPServer) -> AsyncGenerator[AppContext]:
+    """
+    Manage application lifecycle for BasicAuth mode (MCPServer session lifespan).
+
+    For single-user mode: Creates a single Nextcloud client with basic authentication
+    that is shared across all requests within a session.
+
+    For multi-user mode: No shared client - clients created per-request by BasicAuthMiddleware.
+
+    Note: Background tasks (scanner, processor) are started at server level
+    in starlette_lifespan, not here. mcp 2.x enters this lifespan once, when the
+    Streamable HTTP session manager starts, and shares the result across every
+    session and request (1.x entered it per session).
+    """
+    settings = get_settings()
+    is_multi_user = settings.enable_multi_user_basic_auth
+
+    logger.info(
+        "Starting MCP session in %s BasicAuth mode",
+        "multi-user" if is_multi_user else "single-user",
+    )
+
+    # Only create shared client for single-user mode
+    client = None
+    if not is_multi_user:
+        logger.info("Creating shared Nextcloud client with BasicAuth")
+        client = NextcloudClient.from_env()
+        logger.info("Client initialization complete")
+    else:
+        logger.info(
+            "Multi-user mode - clients created per-request from BasicAuth headers"
+        )
+
+    # Initialize persistent storage (tokens, sessions, app passwords)
+    storage = RefreshTokenStorage.from_env()
+    await storage.initialize()
+    logger.info("Persistent storage initialized")
+
+    # Initialize document processors
+    initialize_document_processors()
+
+    # Yield client context - scanner runs at server level (starlette_lifespan)
+    # Include vector sync state from module singleton (set by starlette_lifespan)
+    try:
+        yield AppContext(
+            client=client,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # None in multi-user mode
+            storage=storage,
+            document_send_stream=_vector_sync_state.document_send_stream,
+            document_receive_stream=_vector_sync_state.document_receive_stream,
+            shutdown_event=_vector_sync_state.shutdown_event,
+            scanner_wake_event=_vector_sync_state.scanner_wake_event,
+            # task_producer and eviction_task_group are exposed via @property
+            # (read _vector_sync_state at access time, not snapshot).
+        )
+    finally:
+        logger.info("Shutting down BasicAuth session")
+        if client is not None:
+            await client.close()
+        # Dispose the storage engine so pooled psycopg connections drain
+        # cleanly on SIGTERM (ADR-026, PR #798 round-4).
+        try:
+            await storage.close()
+        except Exception as e:
+            logger.warning("Error disposing storage: %s", e)
+
+
+def _oidc_discovery_error_is_transient(exc: BaseException) -> bool:
+    """Whether an OIDC-discovery failure is worth retrying.
+
+    ``httpx.RequestError`` is the broad network-layer base (transport
+    timeouts/connection errors plus TooManyRedirects, DecodingError, …), and a
+    malformed 200 body — e.g. a proxy/gateway "warming up" HTML placeholder
+    served during cold start — raises ``JSONDecodeError``. Both are transient
+    like a 5xx; treating them as fatal reintroduces the very crashloop the
+    retry exists to prevent.
+
+    A 4xx is a misconfiguration (wrong URL, no OIDC app), so it fails fast and
+    the operator sees the real error instead of a retry storm.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    return True
+
+
+async def _perform_oidc_discovery(
+    discovery_url: str, settings: Settings, timeout: float | None = None
+) -> dict[str, Any]:
+    """Fetch the OIDC discovery document, retrying transient failures.
+
+    OIDC discovery runs synchronously at startup and is fatal on failure. On a
+    freshly-scheduled pod the network egress path (e.g. Cilium ``toFQDNs`` allow
+    + egress-gateway SNAT programming) can take a few seconds to converge, during
+    which the request is silently dropped and times out. Without retries a
+    cold-start race crashloops the backend on the very first attempt; retrying
+    with capped exponential backoff + full jitter lets startup ride out that
+    window instead.
+
+    Transport errors (connect/read timeouts, connection resets) and 5xx
+    responses are treated as transient and retried. A 4xx response is a
+    configuration error, not a transient condition, so it is raised immediately.
+
+    ``timeout`` overrides the per-attempt httpx timeout (seconds); ``None`` keeps
+    httpx's default. The hybrid multi-user-basic path passes an explicit,
+    longer budget here so it keeps its original per-attempt timeout while also
+    gaining the retries.
+    """
+    # Pass timeout through only when set — httpx treats an explicit
+    # timeout=None as "disable timeout" rather than "use the default".
+    client_kwargs: dict[str, Any] = {"follow_redirects": True}
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
+
+    # Backoff bounds are clamped by the helper (max_retries) and below (the
+    # delays): Settings can be constructed directly in tests, bypassing the
+    # gte=1/gte=0 dynaconf validators, and a negative backoff would otherwise
+    # flip random.uniform(0, delay) into a reversed range.
+    @retry_on_transient(
+        (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError),
+        should_retry=_oidc_discovery_error_is_transient,
+        provider_name="OIDC discovery",
+        label="transient error",
+        max_retries=settings.oidc_discovery_max_attempts,
+        initial_delay=max(0.0, settings.oidc_discovery_backoff_base),
+        max_delay=max(0.0, settings.oidc_discovery_backoff_max),
+        jitter=True,
+    )
+    async def _attempt() -> dict:
+        async with nextcloud_httpx_client(**client_kwargs) as client:
+            response = await client.get(discovery_url)
+            response.raise_for_status()
+            return response.json()
+
+    return await _attempt()
+
+
+async def setup_oauth_config():
+    """
+    Setup OAuth configuration by performing OIDC discovery and client registration.
+
+    Auto-detects OAuth provider mode:
+    - Integrated mode: OIDC_DISCOVERY_URL points to NEXTCLOUD_HOST (or not set)
+      → Nextcloud OIDC app provides both OAuth and API access
+    - External IdP mode: OIDC_DISCOVERY_URL points to external provider
+      → External IdP for OAuth, Nextcloud user_oidc validates tokens and provides API access
+
+    Uses OIDC environment variables:
+    - OIDC_DISCOVERY_URL: OIDC discovery endpoint (optional, defaults to NEXTCLOUD_HOST)
+    - NEXTCLOUD_OIDC_CLIENT_ID / NEXTCLOUD_OIDC_CLIENT_SECRET: Static credentials (optional, uses DCR if not provided)
+    - NEXTCLOUD_OIDC_SCOPES: Requested OAuth scopes
+
+    This is done synchronously before MCPServer initialization because MCPServer
+    requires token_verifier at construction time.
+
+    Returns:
+        Tuple of (nextcloud_host, token_verifier, auth_settings, refresh_token_storage, oauth_client, oauth_provider, client_id, client_secret)
+    """
+    # Get settings for enable_offline_access check (handles both ENABLE_BACKGROUND_OPERATIONS
+    # and ENABLE_OFFLINE_ACCESS environment variables)
+    settings = get_settings()
+
+    nextcloud_host = settings.nextcloud_host
+    if not nextcloud_host:
+        raise ValueError(
+            "NEXTCLOUD_HOST environment variable is required for OAuth mode"
+        )
+
+    nextcloud_host = nextcloud_host.rstrip("/")
+
+    # Get OIDC discovery URL (defaults to Nextcloud integrated mode)
+    discovery_url = (
+        settings.oidc_discovery_url
+        or f"{nextcloud_host}/.well-known/openid-configuration"
+    )
+    logger.info("Performing OIDC discovery: %s", discovery_url)
+
+    # Perform OIDC discovery (retries transient failures — see helper docstring)
+    discovery = await _perform_oidc_discovery(discovery_url, settings)
+
+    logger.info("✓ OIDC discovery successful")
+
+    # Validate PKCE support
+    validate_pkce_support(discovery, discovery_url)
+
+    # Extract OIDC endpoints
+    issuer = discovery["issuer"]
+    userinfo_uri = discovery["userinfo_endpoint"]
+    jwks_uri = discovery.get("jwks_uri")
+    introspection_uri = discovery.get("introspection_endpoint")
+    registration_endpoint = discovery.get("registration_endpoint")
+
+    logger.info("OIDC endpoints discovered:")
+    logger.info("  Issuer: %s", issuer)
+    logger.info("  Userinfo: %s", userinfo_uri)
+    if jwks_uri:
+        logger.info("  JWKS: %s", jwks_uri)
+    if introspection_uri:
+        logger.info("  Introspection: %s", introspection_uri)
+
+    # Auto-detect provider mode based on issuer
+    # External IdP mode: issuer doesn't match Nextcloud host
+    # Normalize URLs for comparison (handle port differences like :80 for HTTP)
+    def normalize_url(url: str) -> str:
+        """Normalize URL by removing default ports (80 for HTTP, 443 for HTTPS)."""
+        parsed = urlparse(url)
+        # Remove default ports
+        if (parsed.scheme == "http" and parsed.port == 80) or (
+            parsed.scheme == "https" and parsed.port == 443
+        ):
+            # Remove explicit default port
+            hostname = parsed.hostname or parsed.netloc.split(":")[0]
+            return f"{parsed.scheme}://{hostname}"
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    issuer_normalized = normalize_url(issuer)
+    nextcloud_normalized = normalize_url(nextcloud_host)
+
+    # Determine if this is an external IdP by comparing discovered issuer with Nextcloud host
+    is_external_idp = not issuer_normalized.startswith(nextcloud_normalized)
+
+    if is_external_idp:
+        oauth_provider = "external"  # Could be Keycloak, Auth0, Okta, etc.
+        logger.info(
+            "✓ Detected external IdP mode (issuer: %s != Nextcloud: %s)",
+            issuer,
+            nextcloud_host,
+        )
+        logger.info("  Tokens will be validated via Nextcloud user_oidc app")
+    else:
+        oauth_provider = "nextcloud"
+        logger.info("✓ Detected integrated mode (Nextcloud OIDC app)")
+
+    # Check if offline access (refresh tokens) is enabled
+    # Use settings.enable_offline_access which handles both ENABLE_BACKGROUND_OPERATIONS (new)
+    # and ENABLE_OFFLINE_ACCESS (deprecated) environment variables
+    enable_offline_access = settings.enable_offline_access
+
+    # Initialize refresh token storage if enabled
+    refresh_token_storage = None
+    if enable_offline_access:
+        try:
+            # Validate encryption key before initializing
+            encryption_key = settings.token_encryption_key
+            if not encryption_key:
+                logger.warning(
+                    "ENABLE_OFFLINE_ACCESS=true but TOKEN_ENCRYPTION_KEY not set. "
+                    "Refresh tokens will NOT be stored. Generate a key with:\n"
+                    '  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+                )
+            else:
+                refresh_token_storage = RefreshTokenStorage.from_env()
+                await refresh_token_storage.initialize()
+                logger.info(
+                    "✓ Refresh token storage initialized (offline_access enabled)"
+                )
+        except Exception as e:
+            logger.error("Failed to initialize refresh token storage: %s", e)
+            logger.warning(
+                "Continuing without refresh token storage - users will need to re-authenticate after token expiration"
+            )
+
+    # Load client credentials (static or dynamic registration)
+    client_id = settings.oidc_client_id
+    client_secret = settings.oidc_client_secret
+
+    if client_id and client_secret:
+        logger.info("Using static OIDC client credentials: %s", client_id)
+    elif registration_endpoint:
+        logger.info(
+            "NEXTCLOUD_OIDC_CLIENT_ID not set, attempting Dynamic Client Registration"
+        )
+        client_id, client_secret = await load_oauth_client_credentials(
+            nextcloud_host=nextcloud_host, registration_endpoint=registration_endpoint
+        )
+    else:
+        raise ValueError(
+            "NEXTCLOUD_OIDC_CLIENT_ID and NEXTCLOUD_OIDC_CLIENT_SECRET environment variables are required "
+            "when the OIDC provider does not support Dynamic Client Registration. "
+            f"Discovery URL: {discovery_url}"
+        )
+
+    # ADR-005: Unified Token Verifier with proper audience validation
+    # Use public issuer URL for JWT validation if set (handles Docker internal/external URL mismatch)
+    # Tokens are issued with the public URL, but OIDC discovery returns internal URL
+    public_issuer_url = settings.nextcloud_public_issuer_url
+    client_issuer = public_issuer_url if public_issuer_url else issuer
+    # Get MCP server URL for audience validation
+    mcp_server_url = settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+    nextcloud_resource_uri = settings.nextcloud_resource_uri or nextcloud_host
+
+    # Warn if resource URIs are not configured (required for ADR-005 compliance)
+    if not settings.nextcloud_mcp_server_url:
+        logger.warning(
+            "NEXTCLOUD_MCP_SERVER_URL not set, defaulting to: %s. This should be set explicitly for proper audience validation.",
+            mcp_server_url,
+        )
+    if not settings.nextcloud_resource_uri:
+        logger.warning(
+            "NEXTCLOUD_RESOURCE_URI not set, defaulting to: %s. This should be set explicitly for proper audience validation.",
+            nextcloud_resource_uri,
+        )
+
+    # Create settings for UnifiedTokenVerifier (use same settings instance from start of function)
+    # settings is already set at the start of setup_oauth_config()
+    # Override with discovered values if not set in environment
+    if not settings.oidc_client_id:
+        settings.oidc_client_id = client_id
+    if not settings.oidc_client_secret:
+        settings.oidc_client_secret = client_secret
+    if not settings.jwks_uri:
+        settings.jwks_uri = jwks_uri
+    if not settings.introspection_uri:
+        settings.introspection_uri = introspection_uri
+    if not settings.userinfo_uri:
+        settings.userinfo_uri = userinfo_uri
+    if not settings.oidc_issuer:
+        # Use client_issuer which handles public URL override
+        settings.oidc_issuer = client_issuer
+    if not settings.nextcloud_mcp_server_url:
+        settings.nextcloud_mcp_server_url = mcp_server_url
+    if not settings.nextcloud_resource_uri:
+        settings.nextcloud_resource_uri = nextcloud_resource_uri
+
+    # Create Unified Token Verifier (ADR-005 compliant)
+    token_verifier = UnifiedTokenVerifier(settings)
+
+    # Log the mode
+    logger.info(
+        "✓ Multi-audience mode enabled (ADR-005) - tokens must contain both MCP and Nextcloud audiences"
+    )
+    logger.info("  Required MCP audience: %s or %s", client_id, mcp_server_url)
+    logger.info("  Required Nextcloud audience: %s", nextcloud_resource_uri)
+
+    if introspection_uri:
+        logger.info("✓ Opaque token introspection enabled (RFC 7662)")
+    if jwks_uri:
+        logger.info("✓ JWT signature verification enabled (JWKS)")
+
+    # Progressive Consent mode (for offline access / background jobs)
+    encryption_key = settings.token_encryption_key
+    if enable_offline_access and encryption_key and refresh_token_storage:
+        logger.info("✓ Progressive Consent mode enabled - offline access available")
+
+        # Note: Token Broker service would be initialized here for background job support
+        # Currently not used in ADR-005 implementation as it's specific to offline access patterns
+        # that are separate from the real-time token exchange flow
+        logger.debug("Token broker available for future offline access features")
+
+    oauth_client = None
+
+    # Create auth settings
+    mcp_server_url = settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+
+    # Note: We don't set required_scopes here anymore.
+    # Scopes are now advertised via PRM endpoint and enforced per-tool.
+    # This allows dynamic tool filtering based on user's actual token scopes.
+    auth_settings = AuthSettings(
+        issuer_url=AnyHttpUrl(
+            client_issuer
+        ),  # Use client issuer (may be public override)
+        resource_server_url=AnyHttpUrl(mcp_server_url),
+    )
+
+    logger.info("OAuth configuration complete")
+
+    return (
+        nextcloud_host,
+        token_verifier,
+        auth_settings,
+        refresh_token_storage,
+        oauth_client,
+        oauth_provider,
+        client_id,
+        client_secret,
+    )
+
+
+async def setup_oauth_config_for_multi_user_basic(
+    settings: Settings,
+    client_id: str,
+    client_secret: str,
+) -> tuple[UnifiedTokenVerifier, RefreshTokenStorage | None, str, str]:
+    """
+    Setup minimal OAuth configuration for multi-user BasicAuth mode.
+
+    This is a lightweight version of setup_oauth_config() that:
+    - Performs OIDC discovery to get endpoints
+    - Creates UnifiedTokenVerifier for management API token validation
+    - Creates RefreshTokenStorage for webhook token storage
+    - Skips OAuth client creation (not needed for BasicAuth background sync)
+    - Skips AuthSettings creation (not needed for BasicAuth MCP operations)
+
+    This enables hybrid authentication mode where:
+    - MCP operations use BasicAuth (stateless, simple)
+    - Management APIs use OAuth bearer tokens (secure, per-user)
+    - Background operations use OAuth refresh tokens (webhook sync)
+
+    Args:
+        settings: Application settings
+        client_id: OAuth client ID (from DCR or static config)
+        client_secret: OAuth client secret
+
+    Returns:
+        Tuple of (token_verifier, refresh_token_storage, client_id, client_secret)
+
+    Raises:
+        ValueError: If NEXTCLOUD_HOST is not set
+        httpx.HTTPError: If OIDC discovery fails
+    """
+    nextcloud_host = settings.nextcloud_host
+    if not nextcloud_host:
+        raise ValueError("NEXTCLOUD_HOST is required for OAuth infrastructure setup")
+
+    nextcloud_host = nextcloud_host.rstrip("/")
+
+    # Get OIDC discovery URL (always Nextcloud integrated mode for multi-user BasicAuth)
+    discovery_url = (
+        settings.oidc_discovery_url
+        or f"{nextcloud_host}/.well-known/openid-configuration"
+    )
+    logger.info(
+        "Performing OIDC discovery for multi-user BasicAuth hybrid mode: %s",
+        discovery_url,
+    )
+
+    # Perform OIDC discovery with the same cold-start retry/backoff as the
+    # LOGIN_FLOW path (see _perform_oidc_discovery). This call degrades
+    # gracefully at the caller rather than crashlooping, but without retry the
+    # cold-start egress race would still disable hybrid-mode management APIs on
+    # every pod restart until the next scan. The helper's exhaustion exceptions
+    # (HTTPStatusError / RequestError / JSONDecodeError — the last a ValueError
+    # subclass) all fall through to the handlers below.
+    try:
+        discovery = await _perform_oidc_discovery(discovery_url, settings, timeout=30.0)
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "OIDC discovery failed: HTTP %s from %s",
+            e.response.status_code,
+            discovery_url,
+        )
+        raise ValueError(
+            f"OIDC discovery failed: HTTP {e.response.status_code} from {discovery_url}. "
+            "Ensure Nextcloud OIDC (user_oidc app) is installed and configured."
+        ) from e
+    except httpx.RequestError as e:
+        logger.error("OIDC discovery failed: %s", e)
+        raise ValueError(
+            f"OIDC discovery failed: Cannot connect to {discovery_url}. Error: {e}"
+        ) from e
+    except (KeyError, ValueError) as e:
+        logger.error(
+            "OIDC discovery failed: Invalid response from %s: %s", discovery_url, e
+        )
+        raise ValueError(
+            f"OIDC discovery failed: Invalid response from {discovery_url}. "
+            "The endpoint did not return valid OIDC configuration."
+        ) from e
+
+    logger.info("✓ OIDC discovery successful (multi-user BasicAuth)")
+
+    # Extract OIDC endpoints from discovery
+    issuer = discovery["issuer"]
+    userinfo_uri = discovery["userinfo_endpoint"]
+    jwks_uri = discovery.get("jwks_uri")
+    introspection_uri = discovery.get("introspection_endpoint")
+
+    logger.info("OIDC endpoints configured for management API:")
+    logger.info("  Issuer: %s", issuer)
+    logger.info("  Userinfo: %s", userinfo_uri)
+    logger.info("  JWKS: %s", jwks_uri)
+    logger.info("  Introspection: %s", introspection_uri)
+
+    # Get MCP server URL for audience validation
+    mcp_server_url = settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+    nextcloud_resource_uri = settings.nextcloud_resource_uri or nextcloud_host
+
+    # Use public issuer URL for JWT validation if set (handles Docker internal/external URL mismatch)
+    # Tokens are issued with the public URL, but OIDC discovery returns internal URL
+    public_issuer_url = settings.nextcloud_public_issuer_url
+    client_issuer = public_issuer_url if public_issuer_url else issuer
+
+    # Update settings with discovered values for UnifiedTokenVerifier
+    if not settings.oidc_client_id:
+        settings.oidc_client_id = client_id
+    if not settings.oidc_client_secret:
+        settings.oidc_client_secret = client_secret
+    if not settings.jwks_uri:
+        settings.jwks_uri = jwks_uri
+    if not settings.introspection_uri:
+        settings.introspection_uri = introspection_uri
+    if not settings.userinfo_uri:
+        settings.userinfo_uri = userinfo_uri
+    if not settings.oidc_issuer:
+        settings.oidc_issuer = client_issuer
+    if not settings.nextcloud_mcp_server_url:
+        settings.nextcloud_mcp_server_url = mcp_server_url
+    if not settings.nextcloud_resource_uri:
+        settings.nextcloud_resource_uri = nextcloud_resource_uri
+
+    # Create Unified Token Verifier for management API authentication
+    token_verifier = UnifiedTokenVerifier(settings)
+    logger.info("✓ Token verifier created for management API (hybrid mode)")
+
+    if introspection_uri:
+        logger.info("  Opaque token introspection enabled (RFC 7662)")
+    if jwks_uri:
+        logger.info("  JWT signature verification enabled (JWKS)")
+
+    # Initialize refresh token storage for background operations
+    refresh_token_storage = None
+    if settings.enable_offline_access:
+        try:
+            encryption_key = settings.token_encryption_key
+            if not encryption_key:
+                logger.warning(
+                    "ENABLE_OFFLINE_ACCESS=true but TOKEN_ENCRYPTION_KEY not set. "
+                    "Refresh tokens will NOT be stored. Generate a key with:\n"
+                    '  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+                )
+            else:
+                refresh_token_storage = RefreshTokenStorage.from_env()
+                await refresh_token_storage.initialize()
+                logger.info(
+                    "✓ Refresh token storage initialized for background operations (hybrid mode)"
+                )
+        except Exception as e:
+            logger.error("Failed to initialize refresh token storage: %s", e)
+            logger.debug("Full traceback:\\n%s", traceback.format_exc())
+            logger.warning(
+                "Continuing without refresh token storage - management APIs may be limited"
+            )
+
+    logger.info(
+        "OAuth infrastructure setup complete for multi-user BasicAuth hybrid mode"
+    )
+
+    return (token_verifier, refresh_token_storage, client_id, client_secret)
+
+
+def _split_csv(raw: str | None) -> list[str]:
+    """Split a comma-separated setting into a clean list of entries."""
+    if not raw:
+        return []
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+#: Room for the JSON-RPC envelope around a maximum-size `nc_webdav_write_file`
+#: argument: method, id, path, content_type, and the quoting of the base64 blob.
+_REQUEST_ENVELOPE_SLACK = 1024 * 1024
+
+
+def _max_request_body_size() -> int:
+    """The Streamable HTTP POST body limit, derived from ``WEBDAV_WRITE_MAX_MB``.
+
+    mcp 2.x caps POST bodies at 4 MiB and answers 413 *before* parsing the JSON,
+    so the default would reject a `nc_webdav_write_file` call well below the
+    ``WEBDAV_WRITE_MAX_MB`` (50 MB) this server advertises -- with a transport
+    error instead of that tool's explanatory ``ToolError``. Sizing the transport
+    limit off the same setting keeps the one number operators tune in charge,
+    and keeps the size refusal where it can explain itself.
+
+    base64 inflates by 4/3, and the tool decodes the argument rather than
+    streaming it, so the wire form is what has to fit.
+    """
+    max_mb = get_settings().webdav_write_max_mb or 0.0
+    return max(
+        4 * 1024 * 1024,  # never below the SDK default
+        int(max_mb * 1024 * 1024 * 4 / 3) + _REQUEST_ENVELOPE_SLACK,
+    )
+
+
+def build_transport_security(settings: Settings) -> TransportSecuritySettings:
+    """Build the MCP transport-security settings from configuration.
+
+    DNS rebinding protection is off unless MCP_DNS_REBINDING_PROTECTION is set.
+    That default is deliberate and preserves this fork's historical behavior:
+    FastMCP auto-enables Host validation for loopback binds with a
+    localhost-only allowlist, which rejects the service DNS names that
+    containerized deployments (Docker Compose, k8s) legitimately present.
+
+    Because this server always passes an explicit TransportSecuritySettings,
+    FastMCP's auto-enablement never applies — protection was previously off for
+    *every* bind address, including 0.0.0.0. Operators exposing the server
+    beyond a trusted network can now turn it back on and enumerate the
+    Host/Origin values their clients present.
+    """
+    allowed_hosts = _split_csv(settings.mcp_allowed_hosts)
+    allowed_origins = _split_csv(settings.mcp_allowed_origins)
+    legacy_hosts = _split_csv(settings.mcp_dns_rebinding_allowed_hosts)
+    legacy_origins = _split_csv(settings.mcp_dns_rebinding_allowed_origins)
+
+    if not allowed_hosts and legacy_hosts:
+        allowed_hosts = legacy_hosts
+        logger.warning(
+            "MCP_DNS_REBINDING_ALLOWED_HOSTS is deprecated; use "
+            "MCP_ALLOWED_HOSTS instead."
+        )
+    elif allowed_hosts and legacy_hosts and allowed_hosts != legacy_hosts:
+        logger.warning(
+            "Both MCP_ALLOWED_HOSTS and deprecated "
+            "MCP_DNS_REBINDING_ALLOWED_HOSTS are set; using MCP_ALLOWED_HOSTS."
+        )
+
+    if not allowed_origins and legacy_origins:
+        allowed_origins = legacy_origins
+        logger.warning(
+            "MCP_DNS_REBINDING_ALLOWED_ORIGINS is deprecated; use "
+            "MCP_ALLOWED_ORIGINS instead."
+        )
+    elif allowed_origins and legacy_origins and allowed_origins != legacy_origins:
+        logger.warning(
+            "Both MCP_ALLOWED_ORIGINS and deprecated "
+            "MCP_DNS_REBINDING_ALLOWED_ORIGINS are set; using "
+            "MCP_ALLOWED_ORIGINS."
+        )
+
+    if not settings.mcp_dns_rebinding_protection:
+        if allowed_hosts or allowed_origins:
+            logger.warning(
+                "MCP DNS-rebinding allowlists are set but "
+                "MCP_DNS_REBINDING_PROTECTION is false, so they have no effect."
+            )
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    if not allowed_hosts:
+        raise ValueError(
+            "MCP_DNS_REBINDING_PROTECTION is enabled but MCP_ALLOWED_HOSTS is "
+            "empty. Set the hosts your clients present, e.g. "
+            "'nextcloud-mcp:*,127.0.0.1:*,localhost:*'."
+        )
+    logger.info(
+        "MCP DNS rebinding protection enabled (%d allowed host(s), %d allowed origin(s))",
+        len(allowed_hosts),
+        len(allowed_origins),
+    )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+def build_cors_origins(settings: Settings) -> list[str]:
+    """Build the configured CORS origin list without changing legacy defaults."""
+    origins = _split_csv(settings.cors_allow_origins) or ["*"]
+    if "*" in origins:
+        logger.warning(
+            "CORS allows any origin with credentials (CORS_ALLOW_ORIGINS='*'). "
+            "Set CORS_ALLOW_ORIGINS to an explicit comma-separated list if this "
+            "server is reachable from a browser."
+        )
+    return origins
+
+
+def _lazy_endpoint(module: str, name: str) -> Callable[[Request], Awaitable[Response]]:
+    """A route endpoint that imports its real handler on first request.
+
+    For routes mounted regardless of VECTOR_SYNC_ENABLED whose handler lives in
+    the optional vector stack: the route table stays the same, but the stack is
+    only imported once such a route is actually hit. Without the ``semantic``
+    extra installed the route answers 404, as a removed endpoint would.
+    """
+
+    async def endpoint(request: Request) -> Response:
+        if not semantic_installed():
+            return JSONResponse(
+                {"error": "Semantic search is not installed on this server"},
+                status_code=404,
+            )
+        handler = getattr(importlib.import_module(module), name)
+        return await handler(request)
+
+    endpoint.__name__ = name
+    return endpoint
+
+
+def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None = None):
+    # Initialize observability (logging will be configured by uvicorn)
+    settings = get_settings()
+
+    # Validate configuration and detect deployment mode
+    mode, config_errors = validate_configuration(settings)
+
+    if config_errors:
+        error_msg = (
+            f"Configuration validation failed for {mode.value} mode:\n"
+            + "\n".join(f"  - {err}" for err in config_errors)
+            + "\n\n"
+            + get_mode_summary(mode)
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    logger.info("✅ Configuration validated successfully for %s mode", mode.value)
+
+    # Load plugins now so a broken one fails startup, not every later call
+    # (e.g. /api/v1/status) -- load_plugins() caches only a success.
+    for plugin in load_plugins():
+        logger.info("Plugin installed: %s", plugin.name)
+    logger.debug("Mode details:\\n%s", get_mode_summary(mode))
+
+    # Derive helper variables for backward compatibility with existing code.
+    # `oauth_enabled` is True for the LOGIN_FLOW (formerly OAUTH_SINGLE_AUDIENCE)
+    # multi-user OAuth mode — in this mode the MCP server is an OIDC relying
+    # party and Login Flow v2 acquires per-user Nextcloud app passwords.
+    oauth_enabled = mode == AuthMode.LOGIN_FLOW
+    # Log hybrid authentication status for multi-user BasicAuth with offline access
+    if mode == AuthMode.MULTI_USER_BASIC and settings.enable_offline_access:
+        logger.info(
+            "🔄 Hybrid authentication mode will be enabled:\n"
+            "  - MCP operations: BasicAuth (stateless, credentials per-request)\n"
+            "  - Management APIs: OAuth bearer tokens (secure, per-user)\n"
+            "  - Background operations: OAuth refresh tokens (webhook sync)"
+        )
+
+    # Setup Prometheus metrics (always enabled by default)
+    if settings.metrics_enabled:
+        setup_metrics(port=settings.metrics_port)
+        logger.info(
+            "Prometheus metrics enabled on dedicated port %s", settings.metrics_port
+        )
+
+    # Setup OpenTelemetry tracing (optional)
+    if settings.otel_exporter_otlp_endpoint:
+        setup_tracing(
+            service_name=settings.otel_service_name,
+            otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+            otlp_verify_ssl=settings.otel_exporter_verify_ssl,
+        )
+        logger.info(
+            "OpenTelemetry tracing enabled (endpoint: %s)",
+            settings.otel_exporter_otlp_endpoint,
+        )
+    else:
+        logger.info(
+            "OpenTelemetry tracing disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)"
+        )
+
+    # Setup continuous profiling (optional; push to Alloy → homelab Pyroscope)
+    setup_profiling(
+        application_name=f"{settings.otel_service_name}-api",
+        server_address=settings.pyroscope_server_address,
+        enabled=settings.pyroscope_enabled,
+    )
+
+    # Initialize OAuth credentials for multi-user modes that need background operations
+    # This must happen BEFORE uvicorn starts (same lifecycle point as OAuth modes)
+    # to avoid async context issues
+    multi_user_basic_oauth_creds: tuple[str, str] | None = None
+    multi_user_token_verifier: UnifiedTokenVerifier | None = None
+    multi_user_refresh_storage: RefreshTokenStorage | None = None
+
+    if (
+        mode == AuthMode.MULTI_USER_BASIC
+        and settings.vector_sync_enabled
+        and settings.enable_background_operations
+    ):
+        logger.info(
+            "Multi-user BasicAuth with vector sync - checking for OAuth/app password credentials"
+        )
+
+        # Check for static credentials first
+        static_client_id = settings.oidc_client_id
+        static_client_secret = settings.oidc_client_secret
+
+        if static_client_id and static_client_secret:
+            logger.info("Using static OAuth credentials for background operations")
+            multi_user_basic_oauth_creds = (static_client_id, static_client_secret)
+        else:
+            # Perform DCR before uvicorn starts (same lifecycle as OAuth modes)
+            logger.info(
+                "OAuth credentials not configured - attempting Dynamic Client Registration..."
+            )
+
+            async def setup_multi_user_basic_dcr():
+                """Setup DCR for multi-user BasicAuth background operations."""
+                # Required for multi-user mode. Checked before the try below
+                # rather than asserted inside it, where the AssertionError
+                # would be caught and logged as a DCR failure — and where the
+                # f-string below had already built a "None/apps/oidc/register"
+                # endpoint out of it (python:S5779).
+                if settings.nextcloud_host is None:
+                    logger.error(
+                        "NEXTCLOUD_HOST is required for multi-user BasicAuth mode; "
+                        "skipping Dynamic Client Registration."
+                    )
+                    logger.warning("Background vector sync will be disabled.")
+                    return None
+
+                # Construct registration endpoint directly from nextcloud_host
+                # Standard RFC 7591 endpoint pattern for Nextcloud OIDC
+                # This avoids relying on discovery doc which may use public URLs unreachable from containers
+                registration_endpoint = f"{settings.nextcloud_host}/apps/oidc/register"
+                logger.info(
+                    "Attempting Dynamic Client Registration at: %s",
+                    registration_endpoint,
+                )
+
+                # Perform DCR
+                try:
+                    client_id, client_secret = await load_oauth_client_credentials(
+                        nextcloud_host=settings.nextcloud_host,
+                        registration_endpoint=registration_endpoint,
+                    )
+                    logger.info(
+                        "✓ Dynamic Client Registration successful for background operations (client_id: %s...)",
+                        client_id[:16],
+                    )
+                    return (client_id, client_secret)
+                except Exception as e:
+                    logger.error("Dynamic Client Registration failed: %s", e)
+                    logger.debug("Full traceback:\\n%s", traceback.format_exc())
+                    logger.warning("Background vector sync will be disabled.")
+                    return None
+
+            # Run DCR synchronously before uvicorn starts
+            multi_user_basic_oauth_creds = anyio.run(setup_multi_user_basic_dcr)
+
+        # Setup OAuth infrastructure for management APIs and background operations
+        # This creates the UnifiedTokenVerifier needed by management.py and
+        # RefreshTokenStorage for webhook token persistence
+        if multi_user_basic_oauth_creds:
+            sync_client_id, sync_client_secret = multi_user_basic_oauth_creds
+
+            logger.info(
+                "Setting up OAuth infrastructure for management APIs (hybrid mode)..."
+            )
+
+            try:
+                (
+                    multi_user_token_verifier,
+                    multi_user_refresh_storage,
+                    _,
+                    _,
+                ) = anyio.run(
+                    setup_oauth_config_for_multi_user_basic,
+                    settings,
+                    sync_client_id,
+                    sync_client_secret,
+                )
+                logger.info(
+                    "✓ OAuth infrastructure setup complete for multi-user BasicAuth hybrid mode"
+                )
+            except (httpx.HTTPError, ValueError, KeyError) as e:
+                # Expected errors during OAuth infrastructure setup:
+                # - httpx.HTTPError: Network issues, OIDC discovery failures
+                # - ValueError: Missing required configuration (NEXTCLOUD_HOST)
+                # - KeyError: Missing required fields in OIDC discovery response
+                logger.error("Failed to setup OAuth infrastructure: %s", e)
+                logger.debug("Full traceback:\\n%s", traceback.format_exc())
+                logger.warning(
+                    "Management API will be unavailable. "
+                    "The Astrolabe admin UI will not be able to reach it."
+                )
+                # Set to None to indicate failure
+                multi_user_token_verifier = None
+                multi_user_refresh_storage = None
+            except Exception as e:
+                # Unexpected error - this is a programming error, re-raise it
+                logger.error(
+                    "Unexpected error during OAuth infrastructure setup: %s. This is likely a programming error that should be fixed.",
+                    e,
+                )
+                raise
+
+    # Create MCP server based on detected mode
+    if mode == AuthMode.LOGIN_FLOW:
+        logger.info("Configuring MCP server for %s mode", mode.value)
+        # Asynchronously get the OAuth configuration
+
+        (
+            nextcloud_host,
+            token_verifier,
+            auth_settings,
+            refresh_token_storage,
+            oauth_client,
+            oauth_provider,
+            client_id,
+            client_secret,
+        ) = anyio.run(setup_oauth_config)
+
+        # Create lifespan function with captured OAuth context (closure)
+        @asynccontextmanager
+        async def oauth_lifespan(server: MCPServer) -> AsyncGenerator[OAuthAppContext]:
+            """
+            Lifespan context for OAuth mode - captures OAuth configuration from outer scope.
+            """
+            logger.info("Starting MCP server in OAuth mode")
+            logger.info("Using OAuth provider: %s", oauth_provider)
+            if refresh_token_storage:
+                logger.info("Refresh token storage is available")
+            if oauth_client:
+                logger.info("OAuth client is available for token refresh")
+
+            # Initialize document processors
+            initialize_document_processors()
+
+            try:
+                yield OAuthAppContext(
+                    nextcloud_host=nextcloud_host,
+                    token_verifier=token_verifier,
+                    refresh_token_storage=refresh_token_storage,
+                    oauth_client=oauth_client,
+                    oauth_provider=oauth_provider,
+                    server_client_id=client_id,
+                    document_send_stream=_vector_sync_state.document_send_stream,
+                    document_receive_stream=_vector_sync_state.document_receive_stream,
+                    shutdown_event=_vector_sync_state.shutdown_event,
+                    scanner_wake_event=_vector_sync_state.scanner_wake_event,
+                    # task_producer and eviction_task_group are exposed via
+                    # @property (read _vector_sync_state at access time).
+                )
+            finally:
+                logger.info("Shutting down MCP server")
+                # NOTE: refresh_token_storage is deliberately NOT closed here.
+                # mcp 2.x enters this lifespan once, at session-manager startup,
+                # rather than per MCP session -- but the reasoning below is what
+                # keeps that safe either way, so it stays: the storage was built
+                # once at startup (setup_oauth_config) and is handed to the
+                # process-lifetime background tasks — user_manager_task and
+                # credential_cleanup_task both hold this very object
+                # (see the token_storage wiring in starlette_lifespan). Closing
+                # it nulls the shared engine, so the first client session to end
+                # killed new-user discovery for the rest of the pod's life:
+                # every later poll raised
+                # AssertionError('RefreshTokenStorage.initialize() not called')
+                # and a newly provisioned user got no scanner until a restart.
+                # Nothing is leaked by leaving it open: under NullPool
+                # (ADR-026) there is no idle pool to drain and _db() closes each
+                # connection in its own finally. Whoever creates the storage
+                # closes it — app_lifespan_basic still closes the instance it
+                # builds itself.
+                # OAuth client cleanup (if it has a close method)
+                if oauth_client and hasattr(oauth_client, "close"):
+                    try:
+                        await oauth_client.close()
+                    except Exception as e:
+                        logger.warning("Error closing OAuth client: %s", e)
+                logger.info("MCP server shutdown complete")
+
+        mcp = NextcloudMCPServer(
+            "Nextcloud MCP",
+            lifespan=oauth_lifespan,
+            token_verifier=token_verifier,
+            auth=auth_settings,
+        )
+    else:
+        # BasicAuth modes (single-user or multi-user)
+        logger.info("Configuring MCP server for %s mode", mode.value)
+        mcp = NextcloudMCPServer(
+            "Nextcloud MCP",
+            lifespan=app_lifespan_basic,
+        )
+
+    @mcp.resource("nc://capabilities")
+    async def nc_get_capabilities():
+        """Get the Nextcloud Host capabilities"""
+        ctx = current_context(mcp)
+        client = await get_nextcloud_client(ctx)
+        return await client.capabilities()
+
+    # If no specific apps are specified, enable all
+    if enabled_apps is None:
+        enabled_apps = list(AVAILABLE_APPS.keys())
+
+    # Configure only the enabled apps
+    for app_name in enabled_apps:
+        if app_name in AVAILABLE_APPS:
+            logger.info("Configuring %s tools", app_name)
+            configure_app_tools(mcp, app_name)
+        else:
+            logger.warning(
+                "Unknown app: %s. Available apps: %s",
+                app_name,
+                list(AVAILABLE_APPS.keys()),
+            )
+
+    # Register semantic search tools (cross-app feature)
+    if settings.vector_sync_enabled:
+        from nextcloud_mcp_server.server.semantic import (  # noqa: PLC0415
+            configure_semantic_tools,
+        )
+
+        logger.info("Configuring search tools (vector sync enabled, hybrid search)")
+        configure_semantic_tools(mcp)
+    else:
+        logger.info("Skipping semantic search tools (VECTOR_SYNC_ENABLED not set)")
+
+    register_plugin_tools(mcp, settings)
+
+    # Register OAuth provisioning tools (only when offline access is enabled)
+    enable_offline_access_for_tools = settings.enable_offline_access
+    if oauth_enabled and enable_offline_access_for_tools:
+        logger.info("Registering OAuth provisioning tools for offline access")
+        register_oauth_tools(mcp)
+    elif oauth_enabled and not enable_offline_access_for_tools:
+        logger.info(
+            "Skipping provisioning tools registration (offline access not enabled)"
+        )
+
+    # Register Login Flow v2 auth tools (ADR-022)
+    if settings.enable_login_flow:
+        logger.info("Registering Login Flow v2 auth tools")
+        register_auth_tools(mcp)
+
+    # Override list_tools to filter based on user's token scopes (OAuth mode only)
+    if oauth_enabled:
+        original_list_tools = mcp._tool_manager.list_tools
+
+        def list_tools_filtered():
+            """List tools filtered by user's token scopes (JWT and Bearer tokens)."""
+            # Get user's scopes from token using MCP SDK's contextvar
+            # This works for all request types including list_tools
+            user_scopes = get_access_token_scopes()
+            is_jwt = is_jwt_token()
+            logger.info(
+                "🔍 list_tools called - Token type: %s, User scopes: %s",
+                "JWT" if is_jwt else "opaque/none",
+                user_scopes,
+            )
+
+            # Get all tools
+            all_tools = original_list_tools()
+
+            # Filter tools based on user's token scopes (both JWT and opaque tokens)
+            # JWT tokens have scopes embedded in payload
+            # Opaque tokens get scopes via introspection endpoint
+            # Claude Code now properly respects PRM endpoint for scope discovery
+            if user_scopes:
+                allowed_tools = [
+                    tool
+                    for tool in all_tools
+                    if has_required_scopes(tool.fn, user_scopes)
+                ]
+                token_type = "JWT" if is_jwt else "Bearer"
+                logger.info(
+                    "✂️ %s scope filtering: %s/%s tools available for scopes: %s",
+                    token_type,
+                    len(allowed_tools),
+                    len(all_tools),
+                    user_scopes,
+                )
+            else:
+                # BasicAuth mode or no token - show all tools
+                allowed_tools = all_tools
+                logger.info(
+                    "📋 Showing all %s tools (no token/BasicAuth)", len(all_tools)
+                )
+
+            # Return the Tool objects directly (they're already in the correct format)
+            return allowed_tools
+
+        # Replace the tool manager's list_tools method
+        mcp._tool_manager.list_tools = list_tools_filtered  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+        logger.info(
+            "Dynamic tool filtering enabled for OAuth mode (JWT and Bearer tokens)"
+        )
+
+    # Client-fleet observability: records the calling client's identity,
+    # capabilities and negotiated protocol version, plus whether the SDK
+    # delivered each tool call as CallToolResult(is_error=True) or as a JSON-RPC
+    # error. Deliberately outside the `if oauth_enabled` block above — unlike
+    # the tool filter, this must work in every deployment mode.
+    instrument_call_tool_outcomes(mcp)
+
+    # mcp 2.x moved transport configuration off the MCPServer constructor onto
+    # the app factory. Passing transport_security explicitly also suppresses the
+    # SDK's host="127.0.0.1" auto-enable, which would break k8s/Docker service
+    # DNS names (docs/MCP-1.23-DNS-REBINDING-FIX.md).
+    mcp_app = mcp.streamable_http_app(
+        transport_security=build_transport_security(settings),
+        max_request_body_size=_max_request_body_size(),
+    )
+
+    async def _login_flow_cleanup_loop() -> None:
+        """Periodically clean up expired Login Flow v2 sessions and proxy codes."""
+        from nextcloud_mcp_server.auth.oauth_routes import (  # noqa: PLC0415
+            _cleanup_expired_proxy_codes,
+        )
+        from nextcloud_mcp_server.auth.provision_routes import (  # noqa: PLC0415
+            _cleanup_expired_sessions as _cleanup_expired_provision_sessions,
+        )
+
+        while True:
+            try:
+                storage = await get_shared_storage()
+                count = await storage.delete_expired_login_flow_sessions()
+                if count:
+                    logger.info("Cleaned up %s expired login flow sessions", count)
+                # Browser session rows are otherwise only cleaned up lazily
+                # when a user revisits — PR #758 finding 6.
+                await storage.cleanup_expired_browser_sessions()
+                # Also clean up expired AS proxy codes/sessions
+                _cleanup_expired_proxy_codes()
+                # Clean up expired web provision sessions
+                _cleanup_expired_provision_sessions()
+            except Exception as e:
+                logger.warning("Login flow cleanup error: %s", e)
+            await anyio.sleep(3600)  # Every hour
+
+    @asynccontextmanager
+    async def _maybe_login_flow_cleanup(app: Starlette):
+        """Start Login Flow cleanup task and provision poll task group.
+
+        The task group is always created (even when Login Flow cleanup is
+        disabled) because provision routes use it to spawn background poll
+        tasks via ``browser_app.state.poll_task_group``.
+        """
+        async with anyio.create_task_group() as tg:
+            if settings.enable_login_flow:
+                tg.start_soon(_login_flow_cleanup_loop)
+            # Share task group with provision routes for background polling
+            browser_app = next(
+                (
+                    cast(Starlette, route.app)
+                    for route in app.routes
+                    if isinstance(route, Mount) and route.path == "/app"
+                ),
+                None,
+            )
+            if browser_app is None:
+                logger.warning(
+                    "Could not find /app mount to share poll task group; "
+                    "web provisioning will return 500"
+                )
+            else:
+                browser_app.state.poll_task_group = tg
+            yield
+            tg.cancel_scope.cancel()
+
+    @asynccontextmanager
+    async def _mcp_session_with_login_flow(app: Starlette):
+        """Start MCP session manager with optional Login Flow cleanup."""
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(mcp.session_manager.run())
+            await stack.enter_async_context(_maybe_login_flow_cleanup(app))
+            yield
+
+    async def _sweep_orphan_placeholders_if_enabled() -> None:
+        """One-shot Pod-startup sweep of cross-restart placeholder orphans.
+
+        See ``vector.placeholder.sweep_orphan_placeholders`` and Deck
+        card #101. Both lifespan branches (single-user BasicAuth and
+        OAuth / multi-user BasicAuth) call this after the qdrant
+        client is initialised and before the scanner / user-manager
+        tasks spawn. Failures are non-fatal — the existing staleness
+        gate will eventually re-queue orphans on the slow ~5h path.
+        """
+        if not settings.vector_sync_orphan_sweep_enabled:
+            return
+        from nextcloud_mcp_server.vector.placeholder import (  # noqa: PLC0415
+            sweep_orphan_placeholders,
+        )
+        from nextcloud_mcp_server.vector.qdrant_client import (  # noqa: PLC0415
+            get_qdrant_client,
+        )
+
+        try:
+            qdrant_client = await get_qdrant_client()
+            collection = settings.get_collection_name()
+            swept, kept = await sweep_orphan_placeholders(qdrant_client, collection)
+            logger.info(
+                "vector_sync.orphan_sweep",
+                extra={
+                    "swept": swept,
+                    "kept": kept,
+                    "collection": collection,
+                },
+            )
+        except Exception as exc:
+            logger.error("vector_sync.orphan_sweep_failed: %s", exc)
+
+    @asynccontextmanager
+    async def starlette_lifespan(app: Starlette):
+        # Set OAuth context for OAuth login routes (ADR-004)
+        if oauth_enabled:
+            # Prepare OAuth config from setup_oauth_config closure variables
+            # Get nextcloud_host from settings (it was validated as required)
+            nextcloud_host_for_context = settings.nextcloud_host
+            if not nextcloud_host_for_context:
+                raise ValueError("NEXTCLOUD_HOST is required for OAuth mode")
+
+            mcp_server_url = (
+                settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+            )
+            nextcloud_resource_uri = (
+                settings.nextcloud_resource_uri or nextcloud_host_for_context
+            )
+            discovery_url = (
+                settings.oidc_discovery_url
+                or f"{nextcloud_host_for_context}/.well-known/openid-configuration"
+            )
+            scopes = settings.oidc_scopes
+
+            oauth_context_dict = {
+                # login_flow needs storage for browser sessions + app passwords
+                # regardless of offline access. refresh_token_storage is only
+                # created when offline access is enabled (default off), so fall
+                # back to the always-initialized process-wide singleton — the
+                # same instance the MCP tools use — so browser/provisioning
+                # routes never dereference None (GH #1068).
+                "storage": refresh_token_storage or await get_shared_storage(),
+                "oauth_client": oauth_client,
+                "token_verifier": token_verifier,  # For querying IdP userinfo endpoint
+                "config": {
+                    "mcp_server_url": mcp_server_url,
+                    "discovery_url": discovery_url,
+                    "client_id": client_id,  # From setup_oauth_config (DCR or static)
+                    "client_secret": client_secret,  # From setup_oauth_config (DCR or static)
+                    "scopes": scopes,
+                    "nextcloud_host": nextcloud_host_for_context,
+                    "nextcloud_resource_uri": nextcloud_resource_uri,
+                    "oauth_provider": oauth_provider,
+                },
+            }
+            app.state.oauth_context = oauth_context_dict
+
+            # Also set oauth_context on browser_app for session authentication
+            # browser_app is in the same function scope (defined later in create_app)
+            # We need to find it in the mounted routes
+            for route in app.routes:
+                if isinstance(route, Mount) and route.path == "/app":
+                    browser_app = cast(Starlette, route.app)
+                    browser_app.state.oauth_context = oauth_context_dict
+                    logger.info(
+                        "OAuth context shared with browser_app for session auth"
+                    )
+                    break
+
+            logger.info(
+                "OAuth context initialized for login routes (client_id=%s...)",
+                client_id[:16],
+            )
+        else:
+            # BasicAuth mode - initialize storage for the management APIs
+            basic_auth_storage = RefreshTokenStorage.from_env()
+            await basic_auth_storage.initialize()
+            logger.info("Initialized refresh token storage for management APIs")
+
+            app.state.storage = basic_auth_storage
+
+            # For multi-user BasicAuth with offline access, create oauth_context for management APIs
+            # This allows Astrolabe to use management APIs with OAuth bearer tokens
+            if settings.enable_multi_user_basic_auth and settings.enable_offline_access:
+                # Check if we have OAuth credentials AND infrastructure from setup
+                if (
+                    multi_user_basic_oauth_creds
+                    and multi_user_token_verifier is not None
+                ):
+                    sync_client_id, sync_client_secret = multi_user_basic_oauth_creds
+
+                    # Create oauth_context for management API authentication
+                    nextcloud_host_for_context = settings.nextcloud_host
+                    mcp_server_url = (
+                        settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+                    )
+                    discovery_url = (
+                        settings.oidc_discovery_url
+                        or f"{nextcloud_host_for_context}/.well-known/openid-configuration"
+                    )
+
+                    oauth_context_dict = {
+                        # Use OAuth refresh token storage if available, fallback to basic_auth_storage
+                        "storage": multi_user_refresh_storage or basic_auth_storage,
+                        "oauth_client": None,  # Not needed for management APIs
+                        "token_verifier": multi_user_token_verifier,  # FIXED: Now has real verifier!
+                        "config": {
+                            "mcp_server_url": mcp_server_url,
+                            "discovery_url": discovery_url,
+                            "client_id": sync_client_id,
+                            "client_secret": sync_client_secret,
+                            "scopes": "",  # Background sync only
+                            "nextcloud_host": nextcloud_host_for_context,
+                            "nextcloud_resource_uri": nextcloud_host_for_context,
+                            "oauth_provider": "nextcloud",  # Always Nextcloud for multi-user BasicAuth
+                        },
+                    }
+                    app.state.oauth_context = oauth_context_dict
+                    logger.info(
+                        "✓ OAuth context initialized for management APIs (hybrid mode, client_id=%s...)",
+                        sync_client_id[:16],
+                    )
+                elif multi_user_basic_oauth_creds and multi_user_token_verifier is None:
+                    logger.warning(
+                        "OAuth infrastructure setup failed - management API will be unavailable. "
+                        "This is expected if OIDC discovery failed or token verifier creation failed. "
+                        "The Astrolabe admin UI will not be able to reach them."
+                    )
+                else:
+                    logger.warning(
+                        "OAuth credentials not available - management API will be unavailable. "
+                        "This is expected if DCR failed or static credentials were not provided. "
+                        "The Astrolabe admin UI will not be able to reach it."
+                    )
+
+            # Also share with browser_app for its session-authenticated routes
+            for route in app.routes:
+                if isinstance(route, Mount) and route.path == "/app":
+                    browser_app = cast(Starlette, route.app)
+                    browser_app.state.storage = basic_auth_storage
+                    if (
+                        settings.enable_multi_user_basic_auth
+                        and settings.enable_offline_access
+                        and hasattr(app.state, "oauth_context")
+                    ):
+                        browser_app.state.oauth_context = app.state.oauth_context
+                        logger.info(
+                            "OAuth context shared with browser_app for management APIs"
+                        )
+                    logger.info("Storage shared with browser_app")
+                    break
+
+        # Start background vector sync tasks (ADR-007)
+        # Scanner runs at server-level (once), not per-session
+
+        # Re-use settings from outer scope (already validated)
+        # Note: enable_offline_access_for_sync, encryption_key, and refresh_token_storage
+        # are already defined in outer scope before mode split
+
+        # Each deployment mode contributes its background-sync work as a
+        # (start, teardown) pair; the shared task group further below runs that
+        # work alongside the readiness health-refresh loop and yields once
+        # through the MCP session manager — collapsing four near-identical
+        # task-group + session + yield + teardown skeletons into one.
+        async def _noop_start(tg: TaskGroup) -> None:
+            """No background sync tasks for this mode."""
+
+        async def _noop_teardown() -> None:
+            """No mode-owned resources to release."""
+
+        start, teardown = _noop_start, _noop_teardown
+
+        # Multi-user BasicAuth uses OAuth-style background sync (with app
+        # passwords); single-user BasicAuth sync is skipped in multi-user mode.
+        if (
+            settings.vector_sync_enabled
+            and not oauth_enabled
+            and not settings.enable_multi_user_basic_auth
+        ):
+            # BasicAuth mode - single user sync
+            from nextcloud_mcp_server.vector.metrics_publisher import (  # noqa: PLC0415
+                usage_stock_task,
+                vector_density_snapshot_task,
+                vector_sync_metrics_task,
+            )
+            from nextcloud_mcp_server.vector.processor import (  # noqa: PLC0415
+                processor_task,
+            )
+            from nextcloud_mcp_server.vector.queue import (  # noqa: PLC0415
+                build_transport,
+            )
+            from nextcloud_mcp_server.vector.scanner import (  # noqa: PLC0415
+                scanner_task,
+            )
+
+            logger.info("Starting background vector sync tasks for BasicAuth mode")
+
+            # Get username from settings
+            username = settings.nextcloud_username
+            if not username:
+                raise ValueError(
+                    "NEXTCLOUD_USERNAME required for vector sync in BasicAuth mode"
+                )
+
+            # Create client for vector sync (server-level, not per-session)
+            client = NextcloudClient.from_env()
+
+            # Initialize Qdrant collection before starting background tasks
+            logger.info("Initializing Qdrant collection...")
+
+            await _init_qdrant_collection_with_retry()
+
+            # Orphan-sweep before scanner starts — card #101.
+            await _sweep_orphan_placeholders_if_enabled()
+
+            # Initialize the ingest transport. INGEST_QUEUE selects the backend
+            # (Deck #183, ADR-028): ``memory`` builds an in-process anyio stream
+            # drained by an in-process pool (SQLite/dev); ``postgres`` defers jobs
+            # to the per-tenant Postgres via procrastinate and runs no in-process
+            # consumer (the separate ``worker`` role drains the queue). The
+            # transport hides that choice — this path is now backend-agnostic.
+            shutdown_event = anyio.Event()
+            scanner_wake_event = anyio.Event()
+
+            # Named ingest_transport (not transport) to avoid shadowing the
+            # get_app(transport=...) HTTP-transport parameter.
+            ingest_transport = await build_transport(settings)
+
+            # Publish to app.state (ADR-007), the module singleton (MCPServer
+            # session lifespans), and the /app browser sub-app in one place.
+            _wire_vector_sync_state(
+                app, ingest_transport, shutdown_event, scanner_wake_event
+            )
+
+            # Background-sync work for this mode; the shared runner starts it.
+            async def _single_user_start(tg: TaskGroup) -> None:
+                # Scanner publishes to the transport's producer.
+                await tg.start(
+                    scanner_task,
+                    ingest_transport.producer,
+                    shutdown_event,
+                    scanner_wake_event,
+                    client,
+                    username,
+                )
+
+                # In-process consumer pool. ``run_consumers`` is a no-op for the
+                # distributed (postgres) backend — the out-of-process ``worker``
+                # role consumes there. The closure binds this mode's shared
+                # client+username and forwards anyio's injected ``task_status``.
+                # One shared receive stream + N workers ⇒ a single multiplexed
+                # queue processed with N-way parallelism (ADR-028).
+                async def spawn_worker(
+                    worker_id, receive_stream, *, task_status=anyio.TASK_STATUS_IGNORED
+                ):
+                    await processor_task(
+                        worker_id,
+                        receive_stream,
+                        shutdown_event,
+                        client,
+                        username,
+                        task_status=task_status,
+                    )
+
+                await ingest_transport.run_consumers(
+                    tg, spawn_worker, settings.vector_sync_processor_workers
+                )
+
+                # Outstanding-work + corpus gauges on a fixed cadence,
+                # independent of the consumer path and queue backend (fixes the
+                # gauge reading 0 on the multi-user path; see metrics_publisher).
+                # receive_stream is None in postgres mode — get_ingest_pending
+                # falls back to the procrastinate job counts there.
+                await tg.start(
+                    vector_sync_metrics_task,
+                    ingest_transport.producer,
+                    ingest_transport.receive_stream,
+                    shutdown_event,
+                )
+
+                # Current-corpus chunk-density snapshot on its own slower cadence
+                # (heavier collection scroll). Opt-out via
+                # VECTOR_DENSITY_SNAPSHOT_ENABLED.
+                if settings.vector_density_snapshot_enabled:
+                    await tg.start(vector_density_snapshot_task, shutdown_event)
+
+                # Billable retention snapshot (chunks_stored), once per UTC day.
+                # Gated on metering alone — the task no-ops otherwise, and it must
+                # run on BOTH consumer paths or multi-user tenants go un-metered.
+                if settings.usage_metering_enabled:
+                    await tg.start(usage_stock_task, shutdown_event)
+
+                logger.info(
+                    "Background sync tasks started: 1 scanner + %s processors (queue=%s)",
+                    ingest_transport.active_consumer_count,
+                    ingest_transport.backend_name,
+                )
+
+            async def _single_user_teardown() -> None:
+                shutdown_event.set()
+                # Tear down backend-owned resources (closes the procrastinate
+                # connector pool in postgres mode; no-op for the memory stream,
+                # which task-group cancellation closes).
+                await ingest_transport.aclose()
+                # Drop stale singleton refs to the now-closed transport.
+                _clear_vector_sync_state()
+                await client.close()
+
+            start, teardown = _single_user_start, _single_user_teardown
+
+        elif (
+            settings.vector_sync_enabled
+            and (oauth_enabled or settings.enable_multi_user_basic_auth)
+            and settings.enable_background_operations
+        ):
+            # OAuth mode with background operations - multi-user sync
+            # Also used for multi-user BasicAuth mode (client auth is BasicAuth, background sync uses app passwords or OAuth)
+            from nextcloud_mcp_server.vector.metrics_publisher import (  # noqa: PLC0415
+                usage_stock_task,
+                vector_density_snapshot_task,
+                vector_sync_metrics_task,
+            )
+            from nextcloud_mcp_server.vector.oauth_sync import (  # noqa: PLC0415
+                ProvisionSignal,
+                credential_cleanup_task,
+                oauth_processor_task,
+                user_manager_task,
+            )
+            from nextcloud_mcp_server.vector.queue import (  # noqa: PLC0415
+                build_transport,
+            )
+
+            mode_desc = "OAuth mode" if oauth_enabled else "Multi-user BasicAuth mode"
+            logger.info("Starting background vector sync tasks for %s", mode_desc)
+
+            # Get nextcloud_host (from settings - already validated)
+            nextcloud_host_for_sync = settings.nextcloud_host
+            if not nextcloud_host_for_sync:
+                raise ValueError("NEXTCLOUD_HOST required for vector sync")
+
+            # Get OIDC discovery URL (same as used for OAuth setup)
+            discovery_url = (
+                settings.oidc_discovery_url
+                or f"{nextcloud_host_for_sync}/.well-known/openid-configuration"
+            )
+
+            # Get client credentials - these were obtained before uvicorn started
+            # For OAuth modes: from setup_oauth_config()
+            # For multi-user BasicAuth: from setup_multi_user_basic_dcr()
+            oauth_ctx = getattr(app.state, "oauth_context", {})
+            oauth_config = oauth_ctx.get("config", {})
+            sync_client_id = oauth_config.get("client_id")
+            sync_client_secret = oauth_config.get("client_secret")
+
+            # For multi-user BasicAuth mode, use pre-obtained credentials from outer scope
+            if not sync_client_id or not sync_client_secret:
+                if multi_user_basic_oauth_creds:
+                    sync_client_id, sync_client_secret = multi_user_basic_oauth_creds
+                    logger.info(
+                        "Using pre-obtained OAuth credentials for background sync"
+                    )
+                else:
+                    # No credentials available - DCR was attempted before uvicorn started but failed
+                    sync_client_id = None
+                    sync_client_secret = None
+                    logger.warning(
+                        "OAuth credentials not available for background sync "
+                        "(DCR was attempted during startup but failed)"
+                    )
+
+            # Only start vector sync if credentials are available
+            if sync_client_id and sync_client_secret:
+                # Get storage - different for OAuth vs multi-user BasicAuth modes
+                # OAuth mode: refresh_token_storage (from setup_oauth_config)
+                # Multi-user BasicAuth: app.state.storage (basic_auth_storage)
+                token_storage = (
+                    refresh_token_storage if oauth_enabled else app.state.storage
+                )
+
+                # Create token broker for background operations
+                # Note: storage handles encryption internally, no key needed here
+                # Client credentials are needed for token refresh operations
+                token_broker = TokenBrokerService(
+                    storage=token_storage,
+                    oidc_discovery_url=discovery_url,
+                    nextcloud_host=nextcloud_host_for_sync,
+                    client_id=sync_client_id,
+                    client_secret=sync_client_secret,
+                )
+
+                # Store token broker in oauth_context for management API (revoke endpoint)
+                if hasattr(app.state, "oauth_context"):
+                    app.state.oauth_context["token_broker"] = token_broker  # ty: ignore[invalid-assignment]  # Starlette app.state bag is heterogeneous; the inferred value union is too narrow
+                    logger.info(
+                        "Token broker added to oauth_context for management API"
+                    )
+
+                # Initialize Qdrant collection before starting background tasks
+                logger.info("Initializing Qdrant collection...")
+
+                await _init_qdrant_collection_with_retry()
+
+                # Orphan-sweep before scanners spawn — card #101. Runs once
+                # across the shared (per-tenant) collection regardless of
+                # how many per-user scanners the user-manager later starts.
+                await _sweep_orphan_placeholders_if_enabled()
+
+                # Clean up stale app passwords at startup. All deployment modes
+                # now authenticate background sync via locally-stored app
+                # passwords (the OAuth refresh-token path was removed), so this
+                # must run regardless of oauth_enabled — login_flow tenants were
+                # previously skipped, letting deleted-user credentials linger and
+                # drive an endless scanner re-spawn/401 loop (Deck #198). The
+                # credential_cleanup_task started below repeats it on a cadence.
+                try:
+                    # Log the cohort first: the sweep makes one OCS validation
+                    # call per stored user before readiness, so the count is the
+                    # operability signal if startup latency ever climbs.
+                    stored = await token_storage.get_all_app_password_user_ids()
+                    if stored:
+                        logger.info(
+                            "Running startup credential sweep for %s stored user(s)",
+                            len(stored),
+                        )
+                    removed = await token_storage.cleanup_invalid_app_passwords(
+                        nextcloud_host=nextcloud_host_for_sync
+                    )
+                    if removed:
+                        logger.info(
+                            "Cleaned up %s stale app password(s): %s",
+                            len(removed),
+                            removed,
+                        )
+                except Exception as e:
+                    logger.warning("App password cleanup failed (non-fatal): %s", e)
+
+                # Initialize the ingest transport. INGEST_QUEUE selects the
+                # backend (Deck #183, ADR-028): ``memory`` builds an in-process
+                # anyio stream drained by an in-process pool; ``postgres`` defers
+                # jobs via procrastinate and runs no in-process consumer (the
+                # separate ``worker`` role drains the queue). The transport hides
+                # that choice — this path is now backend-agnostic.
+                shutdown_event = anyio.Event()
+                scanner_wake_event = anyio.Event()
+                # Doorbell the provisioning request path rings (via
+                # notify_user_provisioned) to wake the user manager immediately
+                # for a newly provisioned user. Held on the singleton only — both
+                # the manager and the signal helper reach it there.
+                provision_signal = ProvisionSignal()
+                _vector_sync_state.provision_signal = provision_signal
+
+                # User state tracking for user manager
+                user_states: dict = {}
+
+                # Named ingest_transport (not transport) to avoid shadowing the
+                # get_app(transport=...) HTTP-transport parameter.
+                ingest_transport = await build_transport(settings)
+
+                # Publish to app.state (ADR-007), the module singleton (MCPServer
+                # session lifespans), and the /app browser sub-app in one place.
+                _wire_vector_sync_state(
+                    app, ingest_transport, shutdown_event, scanner_wake_event
+                )
+
+                # Background sync authenticates as each provisioned user via
+                # locally-stored Nextcloud app passwords (Login Flow v2 /
+                # multi-user BasicAuth). The earlier OAuth refresh-token
+                # path in vector/oauth_sync.py was removed in the ADR-022
+                # cleanup — it relied on unmerged user_oidc patches and was
+                # never reachable from any supported deployment mode. The
+                # `token_broker` constructed above is still used by the
+                # management API revoke endpoint (via app.state.oauth_context).
+                async def _multi_user_start(tg: TaskGroup) -> None:
+                    # User manager supervises per-user scanners. Each per-user
+                    # scanner clones the producer; for the bus producer clone()
+                    # returns the shared connection.
+                    await tg.start(
+                        user_manager_task,
+                        ingest_transport.producer,
+                        shutdown_event,
+                        scanner_wake_event,
+                        token_storage,
+                        nextcloud_host_for_sync,
+                        user_states,
+                        tg,
+                        provision_signal,
+                    )
+
+                    # Periodic backstop sweep removing app passwords that no
+                    # longer authenticate (deleted/disabled users), complementing
+                    # the per-scanner self-heal in user_scanner_task (Deck #198).
+                    await tg.start(
+                        credential_cleanup_task,
+                        token_storage,
+                        shutdown_event,
+                        nextcloud_host_for_sync,
+                    )
+
+                    # In-process consumer pool. ``run_consumers`` is a no-op for
+                    # the distributed (postgres) backend — the out-of-process
+                    # ``worker`` role consumes there. The closure binds this
+                    # mode's nextcloud_host (per-document credential resolution)
+                    # and forwards anyio's injected ``task_status``. One shared
+                    # receive stream + N workers ⇒ a single multiplexed queue
+                    # draining every user's documents with N-way parallelism,
+                    # never one user at a time (ADR-028).
+                    async def spawn_worker(
+                        worker_id,
+                        receive_stream,
+                        *,
+                        task_status=anyio.TASK_STATUS_IGNORED,
+                    ):
+                        await oauth_processor_task(
+                            worker_id,
+                            receive_stream,
+                            shutdown_event,
+                            nextcloud_host_for_sync,
+                            task_status=task_status,
+                        )
+
+                    await ingest_transport.run_consumers(
+                        tg, spawn_worker, settings.vector_sync_processor_workers
+                    )
+
+                    # Outstanding-work + corpus gauges on a fixed cadence.
+                    # Critical on this multi-user path: the consumer is
+                    # oauth_processor_task, which never updated the queue gauge,
+                    # so without this the gauge read 0 while the buffer held
+                    # thousands of pending docs (see metrics_publisher).
+                    # receive_stream is None in postgres mode — get_ingest_pending
+                    # falls back to the procrastinate job counts there.
+                    await tg.start(
+                        vector_sync_metrics_task,
+                        ingest_transport.producer,
+                        ingest_transport.receive_stream,
+                        shutdown_event,
+                    )
+
+                    # Current-corpus chunk-density snapshot on its own slower
+                    # cadence (heavier collection scroll). Opt-out via
+                    # VECTOR_DENSITY_SNAPSHOT_ENABLED.
+                    if settings.vector_density_snapshot_enabled:
+                        await tg.start(vector_density_snapshot_task, shutdown_event)
+
+                    # Billable retention snapshot (chunks_stored), once per UTC
+                    # day. Must be spawned here too: this is the multi-user
+                    # consumer path, and omitting it would silently un-meter
+                    # every multi-user tenant's storage.
+                    if settings.usage_metering_enabled:
+                        await tg.start(usage_stock_task, shutdown_event)
+
+                    logger.info(
+                        "Background sync tasks started: 1 user manager + %s processors (queue=%s)",
+                        ingest_transport.active_consumer_count,
+                        ingest_transport.backend_name,
+                    )
+
+                async def _multi_user_teardown() -> None:
+                    shutdown_event.set()
+                    # Tear down backend-owned resources (closes the procrastinate
+                    # connector pool in postgres mode; no-op for the memory stream).
+                    await ingest_transport.aclose()
+                    # Drop stale singleton refs to the now-closed transport.
+                    _clear_vector_sync_state()
+                    # Close token broker HTTP client
+                    if token_broker._http_client:
+                        await token_broker._http_client.aclose()
+
+                start, teardown = _multi_user_start, _multi_user_teardown
+            else:
+                # No OAuth credentials available for background sync
+                logger.warning(
+                    "Skipping background vector sync - OAuth credentials not available. "
+                    "Multi-user BasicAuth mode will run without semantic search background operations. "
+                    "To enable, set NEXTCLOUD_OIDC_CLIENT_ID and NEXTCLOUD_OIDC_CLIENT_SECRET."
+                )
+                # start/teardown stay no-op; the shared runner yields below.
+
+        else:
+            # No vector sync - just run MCP session manager
+            if settings.vector_sync_enabled:
+                # Log why vector sync is not starting
+                if oauth_enabled and not settings.enable_offline_access:
+                    logger.warning(
+                        "Vector sync enabled but ENABLE_OFFLINE_ACCESS=false - "
+                        "vector sync requires offline access in OAuth mode"
+                    )
+                elif oauth_enabled and not refresh_token_storage:
+                    logger.warning(
+                        "Vector sync enabled but refresh token storage not available"
+                    )
+                elif oauth_enabled and not settings.token_encryption_key:
+                    logger.warning(
+                        "Vector sync enabled but TOKEN_ENCRYPTION_KEY not set"
+                    )
+            # start/teardown stay no-op; the shared runner yields below.
+
+        # One shared task group runs this mode's background tasks plus the
+        # readiness health-refresh loop, then yields through the MCP session
+        # manager. The group is exposed for request-path background work
+        # (ADR-019 verify-on-read eviction) and cancels every task on exit.
+        async with anyio.create_task_group() as tg:
+            await start(tg)
+            # Capture the loop's own CancelScope so shutdown stops just the loop.
+            readiness_scope = await tg.start(_readiness_refresh_loop)
+            _vector_sync_state.eviction_task_group = tg
+            async with _mcp_session_with_login_flow(app):
+                try:
+                    yield
+                finally:
+                    logger.info("Shutting down background tasks")
+                    # Request path must not spawn into a cancelling group.
+                    _vector_sync_state.eviction_task_group = None
+                    await teardown()
+            # The readiness loop runs forever with no shutdown_event to observe,
+            # and anyio waits for (not cancels) child tasks on normal exit — so
+            # without this the lifespan shutdown would hang until uvicorn's
+            # graceful timeout. Cancel only the loop; the task group's exit then
+            # waits for the sync tasks to drain via shutdown_event (set in
+            # teardown) rather than force-cancelling them mid-work.
+            readiness_scope.cancel()
+
+    # Health check endpoints for Kubernetes probes
+    def health_live(request):
+        """Liveness probe endpoint.
+
+        Returns 200 OK if the application process is running.
+        This is a simple check that doesn't verify external dependencies.
+        """
+        return JSONResponse(
+            {
+                "status": "alive",
+                "mode": "oauth" if oauth_enabled else "basic",
+            }
+        )
+
+    def health_ready(request):
+        """Readiness probe endpoint.
+
+        Gates **only** on local, cheap configuration checks (that the process is
+        up and configured to serve). External dependency reachability (Nextcloud,
+        Qdrant) is reported for observability but is intentionally *non-gating*
+        and served from a background-refreshed cache, so the probe performs no
+        external I/O and a shared-dependency blip cannot pull a single-replica
+        Pod out of its Service (Deck #302).
+        """
+        checks: dict[str, object] = {}
+        is_ready = True
+        settings = get_settings()
+
+        # --- Local, hard gates ------------------------------------------------
+        if settings.nextcloud_host:
+            checks["nextcloud_configured"] = "ok"
+        else:
+            checks["nextcloud_configured"] = "error: NEXTCLOUD_HOST not set"
+            is_ready = False
+
+        # Report the deployment mode (helps clients pick the auth flow).
+        if mode == AuthMode.LOGIN_FLOW:
+            checks["auth_mode"] = "oauth"
+            checks["auth_configured"] = "ok"
+        elif mode == AuthMode.MULTI_USER_BASIC:
+            checks["auth_mode"] = "multi_user_basic"
+            checks["auth_configured"] = "ok"
+            # Indicate if app passwords are supported (when offline_access enabled)
+            checks["supports_app_passwords"] = settings.enable_offline_access
+        elif mode == AuthMode.SINGLE_USER_BASIC:
+            checks["auth_mode"] = "basic"
+            if settings.nextcloud_username and settings.nextcloud_password:
+                checks["auth_configured"] = "ok"
+            else:
+                checks["auth_configured"] = "error: credentials not set"
+                is_ready = False
+
+        # --- External dependencies: reported, NON-gating ----------------------
+        # Read the background-refreshed snapshot; never do I/O on the probe path.
+        for name, status in _readiness_cache.snapshot().items():
+            checks[name] = status.detail
+
+        status_code = 200 if is_ready else 503
+        return JSONResponse(
+            {
+                "status": "ready" if is_ready else "not_ready",
+                "checks": checks,
+            },
+            status_code=status_code,
+        )
+
+    # Add Protected Resource Metadata (PRM) endpoint for OAuth mode
+    routes: list[BaseRoute] = []
+
+    # Add health check routes (available in both OAuth and BasicAuth modes)
+    routes.append(Route("/health/live", health_live, methods=["GET"]))
+    routes.append(Route("/health/ready", health_ready, methods=["GET"]))
+    logger.info("Health check endpoints enabled: /health/live, /health/ready")
+
+    # Add Nextcloud webhook receiver (queues DocumentTasks for vector sync).
+    # Implementation lives in vector/webhook_receiver.py; the handler reads
+    # the send-stream from request.app.state.document_send_stream.
+    #
+    # Security (GHSA-8vh3-g2qg-2h2c): the receiver trusts the attacker-supplied
+    # user.uid in the payload and feeds it to Qdrant, so an unauthenticated
+    # POST could delete/re-index any user's embeddings. The route is therefore
+    # only mounted when WEBHOOK_SECRET is configured; without it the webhook
+    # feature is off and vector sync still reconciles via the polling scanner.
+    if settings.webhook_secret:
+        routes.append(
+            Route(
+                "/webhooks/nextcloud",
+                _lazy_endpoint(
+                    "nextcloud_mcp_server.vector.webhook_receiver",
+                    "handle_nextcloud_webhook",
+                ),
+                methods=["POST"],
+            )
+        )
+        logger.info("Webhook endpoint enabled: /webhooks/nextcloud")
+    else:
+        logger.warning(
+            "Webhook endpoint disabled: WEBHOOK_SECRET is not set. "
+            "/webhooks/nextcloud will return 404; vector sync relies on the "
+            "polling scanner. Set WEBHOOK_SECRET to enable webhook-driven sync."
+        )
+
+    # Add management API endpoints for Nextcloud PHP app
+    # Tier 1: Public endpoints (no auth required)
+    # These let Astrolabe show basic server status even in single-user BasicAuth mode
+    routes.append(Route("/api/v1/status", get_server_status, methods=["GET"]))
+    routes.append(
+        Route(
+            "/api/v1/vector-sync/status",
+            get_vector_sync_status,
+            methods=["GET"],
+        )
+    )
+    logger.info(
+        "Public management API endpoints enabled: /api/v1/status, /api/v1/vector-sync/status"
+    )
+
+    # Tier 2+: Authenticated management endpoints (OAuth required)
+    # Available in: OAuth modes OR multi-user BasicAuth with offline access
+    enable_authenticated_management_apis = oauth_enabled or (
+        settings.enable_multi_user_basic_auth and settings.enable_offline_access
+    )
+    if enable_authenticated_management_apis:
+        # Admin: one-shot payload backfill (design §10.2). Requires the `admin`
+        # scope (enforced inside the handler via require_admin_scope).
+        routes.append(
+            Route(
+                "/api/v1/admin/payload-backfill",
+                _lazy_endpoint(
+                    "nextcloud_mcp_server.admin.payload_backfill",
+                    "handle_payload_backfill",
+                ),
+                methods=["POST"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/session",
+                get_user_session,
+                methods=["GET"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/revoke",
+                revoke_user_access,
+                methods=["POST"],
+            )
+        )
+        # App password endpoints for multi-user BasicAuth mode
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/app-password",
+                provision_app_password,
+                methods=["POST"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/app-password",
+                get_app_password_status,
+                methods=["GET"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/app-password",
+                delete_app_password,
+                methods=["DELETE"],
+            )
+        )
+        viz = "nextcloud_mcp_server.api.visualization"
+        routes.append(
+            Route(
+                "/api/v1/vector-viz/search",
+                _lazy_endpoint(viz, "vector_search"),
+                methods=["POST"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/chunk-context",
+                _lazy_endpoint(viz, "get_chunk_context"),
+                methods=["GET"],
+            )
+        )
+        # ADR-018: Unified search endpoint for Nextcloud PHP app integration
+        routes.append(
+            Route(
+                "/api/v1/search",
+                _lazy_endpoint(viz, "unified_search"),
+                methods=["POST"],
+            )
+        )
+        routes.append(Route("/api/v1/apps", get_installed_apps, methods=["GET"]))
+        # Vector-sync admin: purge indexed vectors by doc type (admin consent —
+        # called by Astrolabe when a source is disabled for semantic search).
+        # Gated on vector_sync_enabled: without it there is no Qdrant client, so
+        # the purge would 500 rather than no-op.
+        if settings.vector_sync_enabled:
+            from nextcloud_mcp_server.api.vector_sync import (  # noqa: PLC0415
+                purge_doc_types_route,
+            )
+
+            routes.append(
+                Route(
+                    "/api/v1/vector-sync/purge",
+                    purge_doc_types_route,
+                    methods=["POST"],
+                )
+            )
+            logger.info("Vector-sync admin endpoint enabled: /api/v1/vector-sync/purge")
+        # Plugin routes (e.g. SAR, ADR-040), advertised as <name>_available.
+        # Mounted only inside this authenticated-management block: keep it in
+        # step with the `served` gate of api.management._plugin_availability,
+        # or status would advertise routes that are not mounted.
+        routes += plugin_routes(settings)
+        # Access and scope management endpoints (ADR-022)
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/access",
+                get_user_access,
+                methods=["GET"],
+            )
+        )
+        routes.append(
+            Route(
+                "/api/v1/users/{user_id}/scopes",
+                update_user_scopes,
+                methods=["PATCH"],
+            )
+        )
+        routes.append(Route("/api/v1/scopes", list_supported_scopes, methods=["GET"]))
+        logger.info(
+            "Authenticated management API endpoints enabled: "
+            "/api/v1/users/{user_id}/session, /api/v1/users/{user_id}/revoke, "
+            "/api/v1/users/{user_id}/app-password, /api/v1/users/{user_id}/access, "
+            "/api/v1/users/{user_id}/scopes, /api/v1/scopes, "
+            "/api/v1/vector-viz/search, /api/v1/search, /api/v1/apps"
+        )
+
+    # Note: Metrics endpoint is NOT exposed on main HTTP port for security reasons.
+    # Metrics are served on dedicated port via setup_metrics() (default: 9090)
+
+    # Determine if OAuth provisioning is available
+    # This is true for:
+    # 1. OAuth modes (primary auth method for MCP operations)
+    # 2. Multi-user BasicAuth with offline access (hybrid mode)
+    oauth_provisioning_available = oauth_enabled or (
+        mode == AuthMode.MULTI_USER_BASIC
+        and settings.enable_offline_access
+        and multi_user_token_verifier is not None  # Ensure OAuth setup succeeded
+    )
+
+    if oauth_provisioning_available:
+        logger.info(
+            "OAuth provisioning routes enabled for mode: %s (oauth_enabled=%s, hybrid_mode=%s)",
+            mode.value,
+            oauth_enabled,
+            not oauth_enabled,
+        )
+
+        def oauth_protected_resource_metadata(request):
+            """RFC 9728 Protected Resource Metadata endpoint.
+
+            Dynamically discovers supported scopes from registered MCP tools.
+            This ensures the advertised scopes always match the actual tool requirements.
+
+            The 'resource' field is set to the MCP server's public URL (RFC 9728 requires a URL).
+            This is used as the audience in access tokens via the resource parameter (RFC 8707).
+            The introspection controller matches this URL to the MCP server's client via resource_url field.
+
+            ADR-023: authorization_servers points to the MCP server itself (AS proxy)
+            so that clients authenticate through the proxy and tokens have correct audience.
+            """
+            # RFC 9728 requires resource to be a URL (not a client ID)
+            # Use the MCP server's public URL
+            mcp_server_url = settings.nextcloud_mcp_server_url
+            if not mcp_server_url:
+                # Fallback derived from the configured port (see helper).
+                mcp_server_url = _default_mcp_server_url()
+
+            # Dynamically discover all scopes from registered tools
+            # This provides a single source of truth based on @require_scopes decorators
+            supported_scopes = discover_all_scopes(mcp)
+
+            # ADR-023: Point authorization_servers to the MCP server itself.
+            # The MCP server acts as an OAuth AS proxy, forwarding to Nextcloud
+            # with its own client_id so tokens have the correct audience.
+            return JSONResponse(
+                {
+                    "resource": f"{mcp_server_url}/mcp",  # RFC 9728: must be a URL
+                    "scopes_supported": supported_scopes,
+                    "authorization_servers": [mcp_server_url],
+                    "bearer_methods_supported": ["header"],
+                    "resource_signing_alg_values_supported": ["RS256"],
+                }
+            )
+
+        # Register PRM endpoint at both path-based and root locations per RFC 9728
+        # Path-based discovery: /.well-known/oauth-protected-resource{path}
+        routes.append(
+            Route(
+                "/.well-known/oauth-protected-resource/mcp",
+                oauth_protected_resource_metadata,
+                methods=["GET"],
+            )
+        )
+        # Root discovery (fallback): /.well-known/oauth-protected-resource
+        routes.append(
+            Route(
+                "/.well-known/oauth-protected-resource",
+                oauth_protected_resource_metadata,
+                methods=["GET"],
+            )
+        )
+        logger.info(
+            "Protected Resource Metadata (PRM) endpoints enabled (path-based + root)"
+        )
+
+        # Add unified OAuth callback endpoint supporting both flows
+        routes.append(Route("/oauth/callback", oauth_callback, methods=["GET"]))
+        logger.info(
+            "OAuth unified callback enabled: /oauth/callback?flow={browser|provisioning}"
+        )
+
+        # Add OAuth resource provisioning routes (ADR-004 Progressive Consent Flow 2)
+        routes.append(
+            Route(
+                "/oauth/authorize-nextcloud",
+                oauth_authorize_nextcloud,
+                methods=["GET"],
+            )
+        )
+        # Keep old callback endpoint as backwards-compatible alias
+        routes.append(
+            Route(
+                "/oauth/callback-nextcloud",
+                oauth_callback_nextcloud,
+                methods=["GET"],
+            )
+        )
+        logger.info(
+            "OAuth resource provisioning routes enabled: /oauth/authorize-nextcloud, /oauth/callback-nextcloud (Flow 2)"
+        )
+
+    # Add OAuth Flow 1 routes (MCP client login) - ONLY for OAuth modes
+    # Multi-user BasicAuth uses hybrid mode with only Flow 2 (resource provisioning)
+    if oauth_enabled:
+        routes.append(Route("/oauth/authorize", oauth_authorize, methods=["GET"]))
+
+        # ADR-023: AS proxy endpoints — MCP server acts as its own OAuth AS
+        routes.append(Route("/oauth/token", oauth_token_endpoint, methods=["POST"]))
+        routes.append(Route("/oauth/register", oauth_register_proxy, methods=["POST"]))
+        routes.append(
+            Route(
+                "/.well-known/oauth-authorization-server",
+                oauth_as_metadata,
+                methods=["GET"],
+            )
+        )
+        logger.info(
+            "OAuth AS proxy routes enabled: /oauth/authorize, /oauth/token, "
+            "/oauth/register, /.well-known/oauth-authorization-server (ADR-023)"
+        )
+
+    # Add browser OAuth login routes for Management API access
+    # Available in OAuth modes AND multi-user BasicAuth with offline access
+    # (hybrid mode). Separate from MCP tool auth - Management API uses OAuth
+    if oauth_provisioning_available:
+        routes.append(
+            Route("/oauth/login", oauth_login, methods=["GET"], name="oauth_login")
+        )
+        # Keep old callback endpoint as backwards-compatible alias
+        routes.append(
+            Route(
+                "/oauth/login-callback",
+                oauth_login_callback,
+                methods=["GET"],
+                name="oauth_login_callback",
+            )
+        )
+        # POST-only: defends against passive CSRF (e.g. <img src="…/logout">)
+        # — see PR #758 finding 5.
+        routes.append(
+            Route("/oauth/logout", oauth_logout, methods=["POST"], name="oauth_logout")
+        )
+        logger.info(
+            "Browser OAuth routes enabled: /oauth/login, /oauth/login-callback (legacy), /oauth/logout"
+        )
+
+    # Add user info routes (available in both BasicAuth and OAuth modes)
+    # Create a separate Starlette app for browser routes that need session auth
+    # This prevents SessionAuthBackend from interfering with MCPServer's OAuth
+    browser_routes = [
+        Route("/", user_info_html, methods=["GET"]),  # /app → user info with all tabs
+        Route(
+            "/revoke",
+            revoke_session,
+            methods=["POST"],
+            name="revoke_session_endpoint",
+        ),  # /app/revoke → revoke_session
+        # Vector sync status fragment (htmx polling)
+        Route(
+            "/vector-sync/status",
+            vector_sync_status_fragment,
+            methods=["GET"],
+        ),  # /app/vector-sync/status
+    ]
+
+    # Login Flow v2 web provisioning (only when Login Flow is enabled)
+    if settings.enable_login_flow:
+        browser_routes += [
+            Route("/provision", provision_page, methods=["GET"]),  # /app/provision
+            Route(
+                "/provision/status", provision_status, methods=["GET"]
+            ),  # /app/provision/status
+        ]
+
+    # Add static files mount if directory exists
+    static_dir = os.path.join(os.path.dirname(__file__), "auth", "static")
+    if os.path.isdir(static_dir):
+        browser_routes.append(
+            Mount("/static", StaticFiles(directory=static_dir), name="static")
+        )
+        logger.info("Mounted static files from %s", static_dir)
+
+    browser_app = Starlette(routes=browser_routes)
+    browser_app.add_middleware(
+        AuthenticationMiddleware,  # type: ignore[invalid-argument-type]
+        backend=SessionAuthBackend(oauth_enabled=oauth_enabled),
+    )
+
+    # Add redirect from /app to /app/ (Starlette requires trailing slash for mounted apps)
+    routes.append(
+        Route("/app", lambda request: RedirectResponse("/app/", status_code=307))
+    )
+
+    # Mount browser app at /app (webapp and admin routes)
+    routes.append(Mount("/app", app=browser_app))
+    logger.info("App routes with session auth: /app, /app/revoke")
+
+    # Favicon for connector directory discovery (Google favicon service)
+    favicon_path = os.path.join(
+        os.path.dirname(__file__), "auth", "static", "favicon.png"
+    )
+    if os.path.isfile(favicon_path):
+        routes.append(
+            Route(
+                "/favicon.ico",
+                lambda request: FileResponse(favicon_path, media_type="image/png"),
+            )
+        )
+
+    # Mount MCPServer at root last (catch-all, handles OAuth via token_verifier)
+    routes.append(Mount("/", app=mcp_app))
+
+    app = Starlette(routes=routes, lifespan=starlette_lifespan)
+    logger.info(
+        "Routes: /user/* with SessionAuth, /mcp with MCPServer OAuth Bearer tokens"
+    )
+
+    # Store supported scopes on app.state for AS metadata endpoint (ADR-023)
+    if oauth_enabled:
+        app.state.supported_scopes = discover_all_scopes(mcp)
+
+    # Add debugging middleware to log Authorization headers and client capabilities
+    @app.middleware("http")
+    async def log_auth_headers(request, call_next):
+        auth_header = request.headers.get("authorization")
+        if request.url.path.startswith("/mcp"):
+            if auth_header:
+                logger.debug(
+                    "🔑 /mcp request with Authorization scheme: %s",
+                    _auth_scheme(auth_header),
+                )
+            else:
+                # Only warn about missing Authorization in OAuth mode
+                # In BasicAuth mode, /mcp requests without Authorization are expected
+                if oauth_enabled:
+                    logger.warning(
+                        "⚠️  /mcp request WITHOUT Authorization header from %s",
+                        request.client,
+                    )
+
+            # Log client capabilities on initialize request
+            if request.method == "POST":
+                # Read body to check for initialize request
+                # Starlette caches the body internally, so it's safe to read here
+                body = await request.body()
+                try:
+                    data = json.loads(body)
+                    # Check if this is an initialize request
+                    if data.get("method") == "initialize":
+                        params = data.get("params", {})
+                        capabilities = params.get("capabilities", {})
+                        client_info = params.get("clientInfo", {})
+
+                        logger.info(
+                            "🔌 MCP client connected: %s v%s",
+                            client_info.get("name", "unknown"),
+                            client_info.get("version", "unknown"),
+                        )
+
+                        # Log capabilities in a structured way
+                        cap_summary = []
+                        # Check for presence using 'in' not truthiness (empty dict {} counts as having capability)
+                        if "roots" in capabilities:
+                            cap_summary.append("roots")
+                        if "sampling" in capabilities:
+                            cap_summary.append("sampling")
+                        if "experimental" in capabilities:
+                            cap_summary.append(
+                                f"experimental({len(capabilities['experimental'])} features)"
+                            )
+
+                        logger.info(
+                            "📋 Client capabilities: %s",
+                            ", ".join(cap_summary) if cap_summary else "none",
+                        )
+                        # Log full capabilities at INFO level to diagnose capability issues
+                        logger.info(
+                            "Full capabilities JSON: %s", json.dumps(capabilities)
+                        )
+                except Exception as e:
+                    # Don't fail the request if logging fails
+                    logger.debug(
+                        "Failed to parse MCP request for capability logging: %s", e
+                    )
+
+        response = await call_next(request)
+        return response
+
+    # Log the inbound User-Agent on management API and webhook receiver routes
+    # so we can tell which management client build is
+    # talking to the backend.
+    _UA_LOGGED_PATH_PREFIXES = ("/api/v1/", "/webhooks/nextcloud")
+
+    @app.middleware("http")
+    async def log_client_user_agent(request, call_next):
+        path = request.url.path
+        if path.startswith(_UA_LOGGED_PATH_PREFIXES):
+            ua = request.headers.get("user-agent") or "(none)"
+            logger.info(
+                "%s %s from %s",
+                request.method,
+                path,
+                ua,
+                extra={
+                    "user_agent": ua,
+                    "http_method": request.method,
+                    "http_path": path,
+                },
+            )
+        return await call_next(request)
+
+    # Add CORS middleware to allow browser-based clients like MCP Inspector.
+    #
+    # The default is still "*", so behaviour is unchanged — but it is now a
+    # setting rather than a literal, and the wildcard is called out at startup.
+    # "*" together with allow_credentials=True is not the permissive-but-inert
+    # combination it looks like: Starlette echoes the request's Origin back
+    # instead of "*" (a bare "*" is invalid with credentials per the CORS spec),
+    # so *any* origin may send credentialed requests. Fine behind a private
+    # network or for local Inspector use; not something to leave unexamined on a
+    # server reachable from a browser.
+    cors_origins = build_cors_origins(settings)
+    app.add_middleware(
+        CORSMiddleware,  # type: ignore[invalid-argument-type]
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+
+    # Add observability middleware (metrics + tracing)
+    if settings.metrics_enabled or settings.otel_exporter_otlp_endpoint:
+        app.add_middleware(ObservabilityMiddleware)  # type: ignore[invalid-argument-type]
+        logger.info("Observability middleware enabled (metrics and/or tracing)")
+
+    # Add exception handler for scope challenges (OAuth mode only)
+    if oauth_enabled:
+
+        @app.exception_handler(InsufficientScopeError)
+        async def handle_insufficient_scope(request, exc: InsufficientScopeError):
+            """Return 403 with WWW-Authenticate header for scope challenges."""
+            resource_url = (
+                settings.nextcloud_mcp_server_url or _default_mcp_server_url()
+            )
+            scope_str = " ".join(exc.missing_scopes)
+
+            return JSONResponse(
+                status_code=403,
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer error="insufficient_scope", '
+                        f'scope="{scope_str}", '
+                        f'resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp"'
+                    )
+                },
+                content={
+                    "error": "insufficient_scope",
+                    "scopes_required": exc.missing_scopes,
+                },
+            )
+
+        logger.info("WWW-Authenticate scope challenge handler enabled")
+
+    # Apply BasicAuthMiddleware for multi-user BasicAuth pass-through mode
+    if settings.enable_multi_user_basic_auth:
+        app = BasicAuthMiddleware(app)
+        logger.info(
+            "BasicAuthMiddleware enabled - multi-user BasicAuth pass-through mode active"
+        )
+
+    # Outermost gate: pre-shared-secret check. Wraps everything else so an
+    # unauthenticated transport request is rejected before reaching CORS,
+    # BasicAuth, or MCP routes. Fail-open when unset.
+    gateway_secret = os.getenv("MCP_GATEWAY_SECRET", "").strip()
+    if gateway_secret:
+        app = GatewaySecretMiddleware(app, gateway_secret)
+        logger.info(
+            "GatewaySecretMiddleware enabled - MCP transport gated behind "
+            "MCP_GATEWAY_SECRET (health + .well-known exempt)"
+        )
+
+    return app

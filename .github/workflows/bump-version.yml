@@ -1,0 +1,126 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+name: Bump version
+
+# Fork policy: do not auto-bump versions on master pushes. Version numbers
+# are release-governance signals, not a Commitizen side effect. Run manually
+# only when the operator intends to cut a release.
+on:
+  workflow_dispatch:
+
+# Ensure only one version bump runs at a time. Concurrent runs would race to
+# bump the version and push tags, which has caused release failures in the past.
+# Queue subsequent pushes instead of cancelling an in-flight bump/release.
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump-version:
+    if: "!startsWith(github.event.head_commit.message, 'bump:') && !startsWith(github.event.head_commit.message, 'chore(release):')"
+    runs-on: ubuntu-latest
+    name: "Bump version and create changelog"
+    permissions:
+      contents: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      # The pinned action replaces `curl https://astral.sh/uv/install.sh | sh`,
+      # which piped an unverified script straight into a shell
+      # (githubactions:S8482/S6506). Same action, same pin as pact.yml.
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect and bump version
+        id: bump
+        run: |
+          set -euo pipefail
+
+          echo "Checking for version bump..."
+
+          # Record the current version tag before attempting a bump. commitizen
+          # is the single source of truth for whether a release is warranted: it
+          # only bumps for feat/fix/breaking changes and emits
+          # [NO_COMMITS_TO_BUMP] (exit 0) for release-irrelevant commits such as
+          # ci:, docs:, chore:, etc. We therefore let it decide and detect a
+          # release by whether the latest tag actually changed.
+          tag_before=$(git tag --sort=-creatordate | grep -E '^v[0-9]' | head -n 1 || echo "")
+          echo "Latest tag before bump: ${tag_before:-<none>}"
+
+          # Run the bump. The script exits 0 both when it bumps and when there
+          # is nothing to bump, so we compare tags rather than trusting exit code.
+          ./scripts/bump-mcp.sh
+
+          tag_after=$(git tag --sort=-creatordate | grep -E '^v[0-9]' | head -n 1 || echo "")
+          echo "Latest tag after bump: ${tag_after:-<none>}"
+
+          if [ -n "$tag_after" ] && [ "$tag_after" != "$tag_before" ]; then
+            echo "Version bumped to $tag_after"
+            echo "bumped=true" >> $GITHUB_OUTPUT
+            echo "tag=$tag_after" >> $GITHUB_OUTPUT
+          else
+            echo "No version bump required (no release-relevant commits)"
+            echo "bumped=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push tags
+        if: steps.bump.outputs.bumped == 'true'
+        run: |
+          git push
+          git push --tags
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.bump.outputs.bumped }}" == "true" ]; then
+            tag=$(git tag --sort=-creatordate | grep -E '^v[0-9]' | head -n 1)
+            echo "## Version Bump Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **MCP Server**: \`$tag\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Tag has been pushed and release workflows will trigger automatically." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Version Bump Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No version bump required - no relevant commits found since last release." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  release:
+    needs: bump-version
+    if: needs.bump-version.outputs.bumped == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump-version.outputs.tag }}
+    secrets: inherit
+    permissions:
+      id-token: write
+      # write: the reusable workflow creates the GitHub Release for this tag.
+      contents: write
+
+  # Immutable container packages remain an explicit operator action through
+  # docker-build-publish.yml. A version bump is not deployment evidence and
+  # must not create a package or Pact deployment record automatically.

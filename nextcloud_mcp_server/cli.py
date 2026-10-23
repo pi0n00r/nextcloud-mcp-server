@@ -1,0 +1,928 @@
+import ipaddress
+import logging
+import logging.config
+from importlib.metadata import version
+from typing import TYPE_CHECKING
+
+import click
+import uvicorn
+
+if TYPE_CHECKING:  # heavy optional import; keep it out of CLI startup
+    import procrastinate
+
+from nextcloud_mcp_server.config import (
+    Settings,
+    cfg,
+    get_database_url,
+    get_settings,
+    is_ephemeral_token_db,
+    set_override,
+)
+from nextcloud_mcp_server.features import semantic_installed
+from nextcloud_mcp_server.migrations import (
+    create_migration,
+    downgrade_database,
+    get_current_revision,
+    show_migration_history,
+    upgrade_database,
+)
+from nextcloud_mcp_server.observability import (
+    get_uvicorn_logging_config,
+    setup_logging,
+    setup_metrics,
+    setup_profiling,
+    setup_tracing,
+    shutdown_profiling,
+)
+from nextcloud_mcp_server.server import AVAILABLE_APPS
+
+from .app import get_app
+
+logger = logging.getLogger(__name__)
+
+
+@click.command()
+@click.option(
+    "--host", "-h", default="127.0.0.1", show_default=True, help="Server host"
+)
+@click.option(
+    "--dual-stack",
+    is_flag=True,
+    default=False,
+    help="Allow an IPv6 listener to also accept IPv4 connections.",
+)
+@click.option(
+    "--port",
+    "-p",
+    type=int,
+    envvar="PORT",
+    default=8000,
+    show_default=True,
+    help="Server port",
+)
+@click.option(
+    "--log-level",
+    "-l",
+    default="info",
+    show_default=True,
+    type=click.Choice(["critical", "error", "warning", "info", "debug", "trace"]),
+    help="Logging level",
+)
+@click.option(
+    "--transport",
+    "-t",
+    default="streamable-http",
+    show_default=True,
+    type=click.Choice(["streamable-http", "http", "stdio"]),
+    help="MCP transport protocol",
+)
+@click.option(
+    "--enable-app",
+    "-e",
+    multiple=True,
+    type=click.Choice(sorted(AVAILABLE_APPS.keys())),
+    help="Enable specific Nextcloud app APIs. Can be specified multiple times. If not specified, all apps are enabled.",
+)
+@click.option(
+    "--oauth/--no-oauth",
+    default=None,
+    help="Force OAuth mode (if enabled) or BasicAuth mode (if disabled). By default, auto-detected based on environment variables.",
+)
+@click.option(
+    "--oauth-client-id",
+    envvar="NEXTCLOUD_OIDC_CLIENT_ID",
+    help="OAuth client ID (can also use NEXTCLOUD_OIDC_CLIENT_ID env var)",
+)
+@click.option(
+    "--oauth-client-secret",
+    envvar="NEXTCLOUD_OIDC_CLIENT_SECRET",
+    help="OAuth client secret (can also use NEXTCLOUD_OIDC_CLIENT_SECRET env var)",
+)
+@click.option(
+    "--mcp-server-url",
+    envvar="NEXTCLOUD_MCP_SERVER_URL",
+    default="http://localhost:8000",
+    show_default=True,
+    help="MCP server URL for OAuth callbacks (can also use NEXTCLOUD_MCP_SERVER_URL env var)",
+)
+@click.option(
+    "--nextcloud-host",
+    envvar="NEXTCLOUD_HOST",
+    help="Nextcloud instance URL (can also use NEXTCLOUD_HOST env var)",
+)
+@click.option(
+    "--nextcloud-username",
+    envvar="NEXTCLOUD_USERNAME",
+    help="Nextcloud username for BasicAuth (can also use NEXTCLOUD_USERNAME env var)",
+)
+@click.option(
+    "--nextcloud-password",
+    envvar="NEXTCLOUD_PASSWORD",
+    help="Nextcloud password for BasicAuth (can also use NEXTCLOUD_PASSWORD env var)",
+)
+@click.option(
+    "--oauth-scopes",
+    envvar="NEXTCLOUD_OIDC_SCOPES",
+    default="openid profile email notes.read notes.write calendar.read calendar.write todo.read todo.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write sharing.read sharing.write",
+    show_default=True,
+    help="OAuth scopes to request during client registration. These define the maximum allowed scopes for the client. Note: Actual supported scopes are discovered dynamically from MCP tools at runtime. (can also use NEXTCLOUD_OIDC_SCOPES env var)",
+)
+@click.option(
+    "--oauth-token-type",
+    envvar="NEXTCLOUD_OIDC_TOKEN_TYPE",
+    default="bearer",
+    show_default=True,
+    type=click.Choice(["bearer", "jwt"], case_sensitive=False),
+    help="OAuth token type (can also use NEXTCLOUD_OIDC_TOKEN_TYPE env var)",
+)
+@click.option(
+    "--public-issuer-url",
+    envvar="NEXTCLOUD_PUBLIC_ISSUER_URL",
+    help="Public issuer URL for OAuth (can also use NEXTCLOUD_PUBLIC_ISSUER_URL env var)",
+)
+def run(
+    host: str,
+    dual_stack: bool,
+    port: int,
+    log_level: str,
+    transport: str,
+    enable_app: tuple[str, ...],
+    oauth: bool | None,
+    oauth_client_id: str | None,
+    oauth_client_secret: str | None,
+    mcp_server_url: str,
+    nextcloud_host: str | None,
+    nextcloud_username: str | None,
+    nextcloud_password: str | None,
+    oauth_scopes: str,
+    oauth_token_type: str,
+    public_issuer_url: str | None,
+):
+    """
+    Run the Nextcloud MCP server.
+
+    \b
+    Authentication Modes:
+      - BasicAuth: Set NEXTCLOUD_USERNAME and NEXTCLOUD_PASSWORD
+      - OAuth: Leave USERNAME/PASSWORD unset (requires OIDC app enabled)
+
+    \b
+    Examples:
+      # BasicAuth mode with CLI options
+      $ nextcloud-mcp-server --nextcloud-host=https://cloud.example.com \\
+          --nextcloud-username=admin --nextcloud-password=secret
+
+      # BasicAuth mode with env vars (recommended for credentials)
+      $ export NEXTCLOUD_HOST=https://cloud.example.com
+      $ export NEXTCLOUD_USERNAME=admin
+      $ export NEXTCLOUD_PASSWORD=secret
+      $ nextcloud-mcp-server --host 0.0.0.0 --port 8000
+
+      # OAuth mode with auto-registration
+      $ nextcloud-mcp-server --nextcloud-host=https://cloud.example.com --oauth
+
+      # OAuth mode with pre-configured client
+      $ nextcloud-mcp-server --nextcloud-host=https://cloud.example.com --oauth \\
+          --oauth-client-id=xxx --oauth-client-secret=yyy
+
+      # OAuth mode with custom scopes and JWT tokens
+      $ nextcloud-mcp-server --nextcloud-host=https://cloud.example.com --oauth \\
+          --oauth-scopes="openid notes.read notes.write" --oauth-token-type=jwt
+
+      # OAuth with public issuer URL (for Docker/proxy setups)
+      $ nextcloud-mcp-server --nextcloud-host=http://app --oauth \\
+          --public-issuer-url=http://localhost:8080
+
+      # stdio transport for local use (e.g. Claude Code)
+      $ nextcloud-mcp-server run --transport stdio
+    """
+    # Feed CLI options into dynaconf as runtime overrides (the documented
+    # `.set` path) instead of mutating os.environ, so all config is
+    # dynaconf-driven (settings.toml + env + overrides).
+    for _key, _val in (
+        ("NEXTCLOUD_HOST", nextcloud_host),
+        ("NEXTCLOUD_USERNAME", nextcloud_username),
+        ("NEXTCLOUD_PASSWORD", nextcloud_password),
+        ("NEXTCLOUD_OIDC_CLIENT_ID", oauth_client_id),
+        ("NEXTCLOUD_OIDC_CLIENT_SECRET", oauth_client_secret),
+        ("NEXTCLOUD_OIDC_SCOPES", oauth_scopes),
+        ("NEXTCLOUD_OIDC_TOKEN_TYPE", oauth_token_type),
+        ("NEXTCLOUD_MCP_SERVER_URL", mcp_server_url),
+        ("NEXTCLOUD_PUBLIC_ISSUER_URL", public_issuer_url),
+    ):
+        if _val:
+            set_override(_key, _val)
+
+    # Force OAuth mode if explicitly requested
+    if oauth is True:
+        # Clear username/password to force OAuth mode
+        if cfg("NEXTCLOUD_USERNAME"):
+            click.echo(
+                "Warning: --oauth flag set, ignoring NEXTCLOUD_USERNAME", err=True
+            )
+            set_override("NEXTCLOUD_USERNAME", None)
+        if cfg("NEXTCLOUD_PASSWORD"):
+            click.echo(
+                "Warning: --oauth flag set, ignoring NEXTCLOUD_PASSWORD", err=True
+            )
+            set_override("NEXTCLOUD_PASSWORD", None)
+
+        # Validate OAuth configuration. Read via settings (dynaconf) — which is
+        # fed by the generated settings.toml AND env — not os.getenv directly, so
+        # a settings.toml-only NEXTCLOUD_HOST is honoured (helm chart >= 0.90.0).
+        nextcloud_host = get_settings().nextcloud_host
+        if not nextcloud_host:
+            raise click.ClickException(
+                "OAuth mode requires NEXTCLOUD_HOST to be set (env or settings.toml)"
+            )
+
+        # Check if we have client credentials OR if dynamic registration is possible
+        has_client_creds = cfg("NEXTCLOUD_OIDC_CLIENT_ID") and cfg(
+            "NEXTCLOUD_OIDC_CLIENT_SECRET"
+        )
+
+        if not has_client_creds:
+            # No client credentials - will attempt dynamic registration
+            # Show helpful message before server starts
+            click.echo("", err=True)
+            click.echo("OAuth Configuration:", err=True)
+            click.echo("  Mode: Dynamic Client Registration", err=True)
+            click.echo("  Host: " + nextcloud_host, err=True)
+            click.echo("  Storage: SQLite (TOKEN_STORAGE_DB)", err=True)
+            click.echo("", err=True)
+            click.echo(
+                "Note: Make sure 'Dynamic Client Registration' is enabled", err=True
+            )
+            click.echo("      in your Nextcloud OIDC app settings.", err=True)
+            click.echo("", err=True)
+        else:
+            click.echo("", err=True)
+            click.echo("OAuth Configuration:", err=True)
+            click.echo("  Mode: Pre-configured Client", err=True)
+            click.echo("  Host: " + nextcloud_host, err=True)
+            click.echo(
+                "  Client ID: " + (cfg("NEXTCLOUD_OIDC_CLIENT_ID") or "")[:16] + "...",
+                err=True,
+            )
+            click.echo("", err=True)
+
+    elif oauth is False:
+        # Force BasicAuth mode - verify credentials exist
+        if not cfg("NEXTCLOUD_USERNAME") or not cfg("NEXTCLOUD_PASSWORD"):
+            raise click.ClickException(
+                "--no-oauth flag set but NEXTCLOUD_USERNAME or NEXTCLOUD_PASSWORD not set"
+            )
+
+    enabled_apps = list(enable_app) if enable_app else None
+
+    if transport == "stdio":
+        if oauth is True:
+            raise click.ClickException(
+                "stdio transport does not support OAuth mode. "
+                "Use single-user BasicAuth with NEXTCLOUD_HOST, "
+                "NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD."
+            )
+        from .stdio import get_stdio_mcp  # noqa: PLC0415
+
+        try:
+            mcp = get_stdio_mcp(enabled_apps=enabled_apps)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        mcp.run(transport="stdio")
+        return
+
+    app = get_app(transport=transport, enabled_apps=enabled_apps)
+
+    # Get observability settings and create uvicorn logging config
+    settings = get_settings()
+    uvicorn_log_config = get_uvicorn_logging_config(
+        log_format=settings.log_format,
+        log_level=settings.log_level,
+        include_trace_context=settings.log_include_trace_context,
+    )
+
+    # Apply the config now rather than leaving it to uvicorn.run(). Anything we
+    # log before that call otherwise escapes this pipeline: the MCP SDK's
+    # configure_logging() has already run logging.basicConfig() with a rich
+    # handler, so a startup line would render as rich text even under
+    # LOG_FORMAT=json — and would vanish entirely if that side effect ever went
+    # away. dictConfig is idempotent (disable_existing_loggers is False), so
+    # uvicorn re-applying the same dict internally is a no-op.
+    logging.config.dictConfig(uvicorn_log_config)
+
+    _log_forwarded_allow_ips(settings.forwarded_allow_ips)
+
+    uvicorn.run(
+        app=app,
+        host=host,
+        dual_stack=dual_stack,
+        port=port,
+        log_level=log_level,
+        log_config=uvicorn_log_config,
+        # None reproduces uvicorn's own resolution (FORWARDED_ALLOW_IPS env,
+        # else 127.0.0.1), so passing it unconditionally only ever adds the
+        # settings.toml source on top. See GH #1284.
+        forwarded_allow_ips=settings.forwarded_allow_ips,
+    )
+
+
+def _is_ip_or_network(token: str) -> bool:
+    """Whether uvicorn will parse ``token`` as an IP address or network.
+
+    Mirrors the per-entry half of
+    ``uvicorn.middleware.proxy_headers._TrustedHosts.__init__``, including its
+    strict network parsing — anything it cannot parse is kept as a string
+    literal there, so "10.0.0.1/8" (host bits set) is a literal, not the /8 the
+    operator meant. The wildcard is deliberately not accepted here; it is not a
+    per-entry concern (see ``_log_forwarded_allow_ips``).
+    """
+    if "/" in token:
+        try:
+            ipaddress.ip_network(token)
+        except ValueError:
+            return False
+        return True
+    try:
+        ipaddress.ip_address(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _log_forwarded_allow_ips(value: str | None) -> None:
+    """Report the effective proxy trust list, warning about unusable entries.
+
+    uvicorn silently demotes an entry it cannot parse to a string literal,
+    which then matches no real client — its own source calls this out as
+    something that "may lead to unexpected / difficult to debug behaviour". A
+    typo therefore looks configured while leaving GH #1284's symptom (every
+    request logged as the proxy's IP) fully in place, so say so at startup.
+    """
+    if not value:
+        return
+
+    logger.info("Trusting X-Forwarded-* headers from: %s", value)
+
+    # uvicorn's trust-everything switch is an exact match on the whole raw
+    # value (``_TrustedHosts.always_trust``), so a "*" is only a wildcard when
+    # it is the entire setting. Anywhere else — even alone but padded, and
+    # notably in "10.0.0.0/8,*" — it parses as neither address nor network and
+    # becomes an inert literal, quietly narrowing the list rather than widening
+    # it. Verified against uvicorn 0.51.0. So it gets no special case below.
+    if value == "*":
+        return
+
+    tokens = [token.strip() for token in value.split(",")]
+    unparsed = [t for t in tokens if t and not _is_ip_or_network(t)]
+    if unparsed:
+        logger.warning(
+            "FORWARDED_ALLOW_IPS entries are not IP addresses or networks and "
+            "will only ever match a client address literally: %s",
+            ", ".join(unparsed),
+        )
+
+
+def _init_worker_observability(settings: Settings) -> None:
+    """Configure logging, metrics, and tracing for the standalone ingest worker."""
+    # Mirrors app.py's lifespan bootstrap; without it the worker's bridgette_*
+    # metrics and document_processor.parse spans are invisible in external mode.
+    # Structured logging first, so every subsequent startup line is JSON like
+    # the API's — the worker entrypoint never went through uvicorn's log_config.
+    setup_logging(
+        log_format=settings.log_format,
+        log_level=settings.log_level,
+        include_trace_context=settings.log_include_trace_context,
+    )
+
+    if settings.metrics_enabled:
+        setup_metrics(port=settings.metrics_port)
+        logger.info(
+            "Prometheus metrics enabled on dedicated port %s", settings.metrics_port
+        )
+
+    if settings.otel_exporter_otlp_endpoint:
+        setup_tracing(
+            service_name=settings.otel_service_name,
+            otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+            otlp_verify_ssl=settings.otel_exporter_verify_ssl,
+        )
+        logger.info(
+            "OpenTelemetry tracing enabled (endpoint: %s)",
+            settings.otel_exporter_otlp_endpoint,
+        )
+    else:
+        logger.info(
+            "OpenTelemetry tracing disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)"
+        )
+
+    # Continuous profiling is deliberately NOT started here. The worker is the
+    # highest-value profiling target (CPU-bound parse/chunk/embed), so it stays
+    # enabled — but starting the sampler before the database pool is open makes
+    # the worker CrashLoop indefinitely on psycopg pool-open timeouts, where a
+    # byte-identical worker with profiling off starts in <1s (Deck #908,
+    # observed on a dev tenant 2026-07-27: 127 PoolTimeouts, zero documents
+    # processed). _run_ingest_worker() starts it once the pool is up.
+
+
+async def _run_ingest_worker(
+    app: "procrastinate.App",
+    settings: Settings,
+    *,
+    queues: list[str],
+    workers: int,
+    tier: str | None,
+) -> None:
+    """Open the pool, start profiling, and run the ingest worker loop.
+
+    Extracted from ``worker()`` so the profiling-safety logic is readable and
+    testable on its own (and to keep ``worker()`` under the Sonar cognitive
+    complexity limit).
+
+    Profiling must NEVER be the reason this worker cannot start. Two guards:
+
+    1. The sampler starts only *after* ``app.open_async()`` succeeds. Started
+       before, every libpq connect in the pool's 30s init window times out and
+       the worker CrashLoops forever, while a byte-identical worker with
+       profiling off starts in <1s (Deck #908). The connect-time mechanism is
+       still unestablished; this orders around it rather than claiming a fix.
+    2. If startup fails anyway with the profiler running, shed it and retry
+       once — a pod with degraded telemetry beats one in CrashLoopBackOff
+       indexing nothing.
+    """
+    from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
+        apply_ingest_queue_schema,
+    )
+
+    # startup_complete: once the worker loop is entered, a failure is a real
+    # error and must propagate rather than silently restart the loop.
+    # profiling_shed: shutdown_profiling() clears setup_profiling()'s
+    # idempotence guard, so without this the retry would re-arm the very thing
+    # that just prevented startup.
+    state = {"startup_complete": False, "profiling_shed": False}
+
+    def _start_profiling() -> None:
+        if state["profiling_shed"]:
+            return
+        setup_profiling(
+            application_name=f"{settings.otel_service_name}-worker",
+            server_address=settings.pyroscope_server_address,
+            enabled=settings.pyroscope_enabled,
+        )
+
+    async def _loop() -> None:
+        # Open the connector pool once and reuse it for both the defensive
+        # schema apply (the always-on API pod is the authoritative applier) and
+        # the worker loop — manage_connection=False avoids a redundant
+        # open/close cycle on startup.
+        #
+        # Safe to re-enter on the retry below: procrastinate's AwaitableContext
+        # __aexit__ calls connector.close_async(), which sets _async_pool=None,
+        # so the second open_async() builds a fresh pool rather than handing
+        # back the dead one (open_async() early-returns while _async_pool is
+        # set). That holds because the retry can only follow a *successful*
+        # __aenter__ — a failure inside open_async() itself means the profiler
+        # never started, so shutdown_profiling() returns False and the guard
+        # re-raises instead of retrying. Which is just as well: __aexit__ does
+        # not run when __aenter__ raises, so _async_pool would still be set.
+        async with app.open_async():
+            _start_profiling()
+            await apply_ingest_queue_schema(app, manage_connection=False)
+            # Structured log (not click.echo) so it lands in the JSON / OTel
+            # pipeline like every other startup message.
+            logger.info(
+                "Ingest worker started: tier=%s queues=%s concurrency=%s "
+                "delete_succeeded=%s listen_notify=%s",
+                tier or "all",
+                queues,
+                workers,
+                settings.ingest_delete_succeeded_jobs,
+                settings.ingest_listen_notify,
+            )
+            state["startup_complete"] = True
+            await app.run_worker_async(
+                queues=queues,
+                concurrency=workers,
+                install_signal_handlers=True,
+                # Drop succeeded jobs (default) so the queue table stays lean and
+                # the KEDA queue-depth metric reflects only outstanding work; set
+                # INGEST_DELETE_SUCCEEDED_JOBS=false to retain them for audit.
+                delete_jobs="successful"
+                if settings.ingest_delete_succeeded_jobs
+                else "never",
+                # LISTEN/NOTIFY for near-instant job pickup. Set
+                # INGEST_LISTEN_NOTIFY=false to run poll-only when DATABASE_URL
+                # routes through a transaction-mode pooler (PgBouncer), which
+                # drops the LISTEN registration on backend checkin (Deck #424).
+                listen_notify=settings.ingest_listen_notify,
+            )
+
+    try:
+        await _loop()
+    except Exception:
+        if state["startup_complete"] or not shutdown_profiling():
+            raise
+        state["profiling_shed"] = True
+        logger.exception(
+            "Ingest worker startup failed with Pyroscope profiling running; "
+            "shed the profiler and retrying once (this worker will have no "
+            "profiles — see Deck #908)"
+        )
+        await _loop()
+
+
+def _sweep_spools_at_startup(settings) -> int:
+    """Clear ingest spool files left behind by a previous worker; returns count.
+
+    A SIGKILLed worker cannot run its own cleanup, and the spool directory is an
+    emptyDir that survives container restarts within the pod, so a crash-looping
+    worker would otherwise accumulate whole documents on disk until the volume
+    filled. Skipped when streaming is off, since nothing spools then.
+    """
+    if not settings.document_stream_download_enabled:
+        return 0
+
+    from nextcloud_mcp_server.document_source import (  # noqa: PLC0415
+        sweep_orphaned_spools,
+    )
+
+    swept = sweep_orphaned_spools(settings.document_spool_dir)
+    if swept:
+        logger.warning(
+            "Removed %d orphaned ingest spool file(s) at startup "
+            "(previous worker exited without cleaning up)",
+            swept,
+        )
+    return swept
+
+
+def _resolve_worker_concurrency(
+    cli_concurrency: int | None,
+    tier: str | None,
+    *,
+    fast: int | None,
+    structured: int | None,
+    default: int,
+) -> int:
+    """Resolve the procrastinate worker concurrency for a tier.
+
+    Precedence: an explicit ``--concurrency`` (the chart's per-tier arg) wins,
+    else the per-tier setting override (fast/structured), else the global
+    ``vector_sync_processor_workers``. ``or`` also treats a 0/None override as
+    "unset", so a bogus value can never yield ``concurrency=0``.
+    """
+    tier_override = {"fast": fast, "structured": structured}.get(tier)
+    return cli_concurrency or tier_override or default
+
+
+@click.command()
+@click.option(
+    "--concurrency",
+    "-c",
+    type=int,
+    default=None,
+    help="Max concurrent jobs. Defaults to VECTOR_SYNC_PROCESSOR_WORKERS.",
+)
+@click.option(
+    "--tier",
+    type=click.Choice(["fast", "structured", "ocr"]),
+    default=None,
+    help=(
+        "Run only this extraction tier's queue (Deck #323). Omit to drain ALL "
+        "tier queues in one process (single-Deployment / dev); set it to run one "
+        "tier per Deployment so the fleets scale independently."
+    ),
+)
+def worker(concurrency: int | None, tier: str | None):
+    """Run the ingest worker (Deck #183, per-tier fleets #323).
+
+    \b
+    Drains the per-tenant Postgres ingest queue (procrastinate): for each
+    deferred document it fetches the content as the owning user, parses, chunks,
+    embeds, and upserts into Qdrant. This is the scale-to-zero ``worker`` role of
+    the api/worker split; run it as a separate Deployment from the API pod.
+
+    \b
+    With --tier the worker drains only that tier's queue (``ingest-<tier>``), so
+    a CPU-bound ``fast`` fleet, an in-cluster ``structured`` fleet, and an ``ocr``
+    fleet scale independently. Without it, all tier queues are drained in
+    one process (handy for dev / a single Deployment). A low-quality parse hops
+    the job to the next tier's queue automatically (see TieredEscalationStrategy).
+
+    \b
+    Requires INGEST_QUEUE=postgres (a PostgreSQL DATABASE_URL); procrastinate is
+    Postgres-only.
+
+    \b
+    Example:
+      $ export DATABASE_URL=postgresql+psycopg://mcp:mcp@db/mcp
+      $ nextcloud-mcp-server worker -c 4 --tier fast
+    """
+    import anyio  # noqa: PLC0415
+
+    settings = get_settings()
+    if settings.ingest_queue != "postgres":
+        raise click.ClickException(
+            "worker requires INGEST_QUEUE=postgres (a PostgreSQL DATABASE_URL); "
+            f"resolved INGEST_QUEUE={settings.ingest_queue!r}"
+        )
+    if not semantic_installed():
+        raise click.ClickException(
+            "worker requires the semantic extra: "
+            "pip install 'nextcloud-mcp-server[semantic]'"
+        )
+
+    # Initialize observability here, not in a lifespan — the worker never runs
+    # uvicorn, so it skips app.py's bootstrap (the WHY lives in the helper's
+    # docstring). Done after the queue check so a misconfig fails fast.
+    _init_worker_observability(settings)
+
+    _sweep_spools_at_startup(settings)
+
+    from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
+        ALL_INGEST_QUEUES,
+        INGEST_QUEUE_MAINTENANCE,
+        LEGACY_INGEST_QUEUE,
+        LEGACY_OCR_QUEUES,
+        TIER_QUEUES,
+        get_procrastinate_app,
+    )
+
+    # Which queues this process drains. A single tier -> just its queue; no tier
+    # -> every tier queue PLUS the legacy queues, so a rolling upgrade never
+    # strands jobs deferred under the pre-#323 single queue or the pre-#353 split
+    # OCR queues (now consolidated into ``ingest-ocr``). The ``ocr`` worker also
+    # drains those two split OCR queues so in-flight OCR jobs from a pre-
+    # consolidation deploy still get processed. Every worker drains the maintenance
+    # queue so the periodic stalled-job reclaim fires regardless of which tier(s)
+    # are scaled up (procrastinate dedups the periodic, so multiple drainers don't
+    # multiply the reclaim).
+    if tier is not None:
+        queues = [TIER_QUEUES[tier], INGEST_QUEUE_MAINTENANCE]
+        if tier == "ocr":
+            queues[1:1] = sorted(LEGACY_OCR_QUEUES)
+    else:
+        queues = [
+            *ALL_INGEST_QUEUES,
+            LEGACY_INGEST_QUEUE,
+            *sorted(LEGACY_OCR_QUEUES),
+            INGEST_QUEUE_MAINTENANCE,
+        ]
+
+    # This is the consumer side of the distributed (postgres) ingest backend.
+    # Unlike the in-process anyio pool, the worker talks to procrastinate's App
+    # directly (run_worker_async), so it does NOT go through IngestTransport —
+    # DistributedTransport.run_consumers is a deliberate no-op precisely because
+    # this separate process is the consumer (see vector/queue/transport.py).
+    workers = _resolve_worker_concurrency(
+        concurrency,
+        tier,
+        fast=settings.vector_sync_fast_concurrency,
+        structured=settings.vector_sync_structured_concurrency,
+        default=settings.vector_sync_processor_workers,
+    )
+    app = get_procrastinate_app()
+
+    # Register the configured document processors (Unstructured / Tesseract /
+    # custom HTTP) in the worker process. The always-on API pod does this in its
+    # lifespan; the worker has its own startup path, so without this the worker
+    # would silently fall back to the import-time-registered PyMuPDF only.
+    from nextcloud_mcp_server.app import initialize_document_processors  # noqa: PLC0415
+
+    initialize_document_processors()
+
+    anyio.run(
+        lambda: _run_ingest_worker(
+            app, settings, queues=queues, workers=workers, tier=tier
+        )
+    )
+
+
+@click.group()
+def db():
+    """Database migration management commands."""
+    pass
+
+
+def _resolve_db_url(database_url: str | None, database_path: str | None) -> str:
+    """Pick the database URL for a CLI subcommand.
+
+    Priority: explicit ``--database-url`` > legacy ``--database-path``
+    (treated as a SQLite file) > :func:`get_database_url` (honors
+    ``DATABASE_URL`` env or falls back to the ephemeral SQLite tempfile).
+    """
+    if database_url:
+        return database_url
+    if database_path:
+        return f"sqlite+aiosqlite:///{database_path}"
+    return get_database_url()
+
+
+def _warn_if_ephemeral(database_url: str) -> None:
+    """Warn when the resolved URL is the per-process SQLite tempfile."""
+    if not database_url.startswith(
+        "sqlite+aiosqlite:///"
+    ) and not database_url.startswith("sqlite:///"):
+        return
+    path = database_url.split("///", 1)[1]
+    if is_ephemeral_token_db(path):
+        click.echo(
+            click.style(
+                f"⚠ Using ephemeral tempfile {path}; changes "
+                "will be lost on exit. Pass --database-url / --database-path "
+                "or set DATABASE_URL / TOKEN_STORAGE_DB to operate on a "
+                "persistent database.",
+                fg="yellow",
+            ),
+            err=True,
+        )
+
+
+def _db_target_options(fn):
+    """Attach the shared ``--database-url`` / ``--database-path`` options.
+
+    Using a decorator factory rather than ``**kwargs`` dict-expansion so
+    static type checkers (ty) see ``click.option`` called with literal
+    keyword arguments, which is the only form it's typed to accept.
+    """
+    fn = click.option(
+        "--database-path",
+        "-d",
+        envvar="TOKEN_STORAGE_DB",
+        default=None,
+        help="SQLite database file path. Equivalent to "
+        "--database-url sqlite+aiosqlite:///<path>.",
+    )(fn)
+    fn = click.option(
+        "--database-url",
+        "-u",
+        envvar="DATABASE_URL",
+        default=None,
+        help="SQLAlchemy URL (e.g. postgresql+psycopg://...). Wins over --database-path.",
+    )(fn)
+    return fn
+
+
+@db.command()
+@_db_target_options
+@click.option(
+    "--revision",
+    "-r",
+    default="head",
+    show_default=True,
+    help="Target revision (default: head for latest)",
+)
+def upgrade(database_url: str | None, database_path: str | None, revision: str):
+    """Upgrade database to a specific revision.
+
+    \b
+    Examples:
+      # Upgrade to latest version
+      $ nextcloud-mcp-server db upgrade
+
+      # Upgrade a Postgres backend
+      $ nextcloud-mcp-server db upgrade -u postgresql+psycopg://mcp:mcp@db/mcp
+
+      # Use custom SQLite path
+      $ nextcloud-mcp-server db upgrade -d /path/to/tokens.db
+    """
+    url = _resolve_db_url(database_url, database_path)
+    _warn_if_ephemeral(url)
+    try:
+        click.echo(f"Upgrading database to revision: {revision}")
+        upgrade_database(url, revision)
+        # Apply procrastinate's ingest-queue schema on Postgres so a one-shot
+        # migration/init job provisions everything the api + worker roles need
+        # (Deck #183). Idempotent + lazy import (Postgres-only extra).
+        from nextcloud_mcp_server.config import is_sqlite_url  # noqa: PLC0415
+
+        # The ingest queue only exists for semantic ingest, and its module
+        # imports the vector stack, so without the extra there is nothing to
+        # provision (Postgres can still back token storage alone).
+        postgres = not is_sqlite_url(url)
+        if postgres and not semantic_installed():
+            click.echo("Ingest queue schema skipped (semantic extra not installed)")
+        elif postgres:
+            import anyio  # noqa: PLC0415
+
+            from nextcloud_mcp_server.vector.queue.procrastinate import (  # noqa: PLC0415
+                apply_ingest_queue_schema,
+                build_app_for_url,
+            )
+
+            anyio.run(apply_ingest_queue_schema, build_app_for_url(url))
+            click.echo(click.style("✓ Ingest queue schema applied", fg="green"))
+        click.echo(click.style("✓ Database upgraded successfully", fg="green"))
+    except Exception as e:
+        click.echo(click.style(f"✗ Upgrade failed: {e}", fg="red"), err=True)
+        raise click.ClickException(str(e))
+
+
+@db.command()
+@_db_target_options
+@click.option(
+    "--revision",
+    "-r",
+    default="-1",
+    show_default=True,
+    help="Target revision (default: -1 for previous version)",
+)
+@click.confirmation_option(
+    prompt="Are you sure you want to downgrade the database? This may result in data loss."
+)
+def downgrade(database_url: str | None, database_path: str | None, revision: str):
+    """Downgrade database to a specific revision.
+
+    WARNING: This may result in data loss! Use with caution.
+    """
+    url = _resolve_db_url(database_url, database_path)
+    _warn_if_ephemeral(url)
+    try:
+        click.echo(f"Downgrading database to revision: {revision}")
+        downgrade_database(url, revision)
+        click.echo(click.style("✓ Database downgraded successfully", fg="green"))
+    except Exception as e:
+        click.echo(click.style(f"✗ Downgrade failed: {e}", fg="red"), err=True)
+        raise click.ClickException(str(e))
+
+
+@db.command()
+@_db_target_options
+def current(database_url: str | None, database_path: str | None):
+    """Show current database revision."""
+    url = _resolve_db_url(database_url, database_path)
+    _warn_if_ephemeral(url)
+    try:
+        revision = get_current_revision(url)
+        if revision:
+            click.echo(f"Current revision: {click.style(revision, fg='cyan')}")
+        else:
+            click.echo(
+                click.style(
+                    "Database is not versioned (no alembic_version table)", fg="yellow"
+                )
+            )
+    except Exception as e:
+        click.echo(
+            click.style(f"✗ Failed to get current revision: {e}", fg="red"), err=True
+        )
+        raise click.ClickException(str(e))
+
+
+@db.command()
+@_db_target_options
+def history(database_url: str | None, database_path: str | None):
+    """Show migration history."""
+    url = _resolve_db_url(database_url, database_path)
+    _warn_if_ephemeral(url)
+    try:
+        click.echo("Migration history:")
+        show_migration_history(url)
+    except Exception as e:
+        click.echo(click.style(f"✗ Failed to show history: {e}", fg="red"), err=True)
+        raise click.ClickException(str(e))
+
+
+@db.command()
+@click.argument("message")
+def migrate(message: str):
+    """Create a new migration script (developers only).
+
+    The MESSAGE argument describes the changes in this migration.
+
+    \b
+    Examples:
+      $ nextcloud-mcp-server db migrate "add user preferences table"
+      $ nextcloud-mcp-server db migrate "add index on refresh_tokens.user_id"
+
+    Note: You must manually edit the generated migration file to add SQL statements.
+    """
+    try:
+        click.echo(f"Creating new migration: {message}")
+        create_migration(message)
+        click.echo(click.style("✓ Migration created successfully", fg="green"))
+        click.echo(
+            "Edit the migration file in alembic/versions/ to add upgrade/downgrade SQL."
+        )
+    except Exception as e:
+        click.echo(
+            click.style(f"✗ Failed to create migration: {e}", fg="red"), err=True
+        )
+        raise click.ClickException(str(e))
+
+
+# Create CLI group with subcommands
+@click.group()
+@click.version_option(
+    version=version("nextcloud-mcp-server"), prog_name="nextcloud-mcp-server"
+)
+def cli():
+    pass
+
+
+cli.add_command(run)
+cli.add_command(worker)
+cli.add_command(db)
+
+
+if __name__ == "__main__":
+    cli()

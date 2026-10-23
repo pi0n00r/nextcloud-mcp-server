@@ -1,0 +1,288 @@
+"""Document parsing utilities using the pluggable processor registry.
+
+Two jobs live here:
+
+* :func:`parse_document_source` runs the tiered pipeline against a document that
+  is already on disk, and
+* :func:`summarize_parse` turns the resulting :class:`ProcessingResult` into the
+  handful of plain statements a caller needs to describe what it actually got.
+
+The second exists because a parse can degrade in half a dozen ways that all look
+identical from the outside -- a scanned PDF on a tenant without OCR, a
+600-page document past the markdown ceiling, an oversize file the guard
+rejected, a timeout -- and returning text without saying which of those happened
+is how a caller ends up presenting a partial extraction as the whole document.
+Every one of those statements is written here, once, so the wording cannot drift
+between call sites.
+"""
+
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from nextcloud_mcp_server.document_processors import (
+    ProcessingResult,
+    ProcessorError,
+    get_registry,
+)
+from nextcloud_mcp_server.document_processors.base import EMPTY_DOCUMENT_REASON
+from nextcloud_mcp_server.document_source import DocumentSource
+from nextcloud_mcp_server.models.webdav import ContentFormat, ParseStatus
+
+logger = logging.getLogger(__name__)
+
+
+def is_parseable_document(content_type: Optional[str]) -> bool:
+    """Whether any registered processor can extract text from this type.
+
+    There is no instance-wide "document processing" switch: whether to parse a
+    document on read is the caller's decision (``nc_webdav_read_file``'s
+    ``parse_document`` argument). This answers only "is there a processor for
+    this MIME type", which the caller cannot know.
+    """
+    if not content_type:
+        return False
+    # Text needs no extraction: the raw file already is the text. A processor
+    # claims text/* for indexing, not to change what reading a file returns.
+    if content_type.split(";")[0].strip().lower().startswith("text/"):
+        return False
+
+    registry = get_registry()
+    return registry.find_processor(content_type) is not None
+
+
+async def parse_document_source(
+    source: DocumentSource,
+    *,
+    prefer_markdown: bool = False,
+    progress_callback: Optional[
+        Callable[[float, Optional[float], Optional[str]], Awaitable[None]]
+    ] = None,
+) -> ProcessingResult:
+    """Run the tiered pipeline against a document that is already on disk.
+
+    Source-based on purpose: the interactive read path streams the document to a
+    spool file rather than buffering it, so peak memory stays at one chunk no
+    matter how large the document is. Handing the *source* down (rather than its
+    bytes) is what keeps that true through the parse -- both PDF engines open the
+    path natively.
+
+    ``prefer_markdown`` asks the pipeline for reconstructed structure rather than
+    a flat text layer; it is bounded by ``document_markdown_max_pages`` and is
+    recorded on the result when it could not be honoured.
+
+    Never raises for a processor-level failure: a failed parse comes back as a
+    ``ProcessingResult`` with ``success=False`` and a ``parse_failed_reason``, so
+    the caller can say what went wrong instead of guessing from an exception.
+
+    Always asks for a one-shot parse subprocess: this is the interactive path,
+    and a pooled worker would outlive the call holding its peak memory.
+    """
+    registry = get_registry()
+    options: dict[str, Any] = {"one_shot_parse": True}
+    if prefer_markdown:
+        options["prefer_markdown"] = True
+
+    logger.debug(
+        "Parsing document of type '%s'%s",
+        source.content_type,
+        " (markdown requested)" if prefer_markdown else "",
+    )
+
+    try:
+        result = await registry.process_source(
+            source, options=options, progress_callback=progress_callback
+        )
+    except ProcessorError as e:
+        logger.warning("Document processing failed: %s", e)
+        return ProcessingResult(
+            text="",
+            metadata={"parse_failed_reason": "error"},
+            processor="unknown",
+            success=False,
+            error=str(e),
+        )
+
+    logger.info(
+        "Parsed document with '%s' processor (success=%s)",
+        result.processor,
+        result.success,
+    )
+    return result
+
+
+@dataclass
+class ParseSummary:
+    """What a parse actually produced, in terms a caller can report verbatim."""
+
+    status: ParseStatus
+    tier: str | None = None
+    processor: str | None = None
+    content_format: ContentFormat = "text"
+    notes: list[str] = field(default_factory=list)
+
+
+def _failure_note(result: ProcessingResult, tier: str | None, settings: Any) -> str:
+    """Why a parse that did not succeed produced no text."""
+    reason = (result.metadata or {}).get("parse_failed_reason", "error")
+    if result.processor == "size_guard" or reason == "oversize":
+        return (
+            f"The document was not parsed: it exceeds the "
+            f"{settings.document_max_pdf_size_mb:g} MB parse cap "
+            f"(DOCUMENT_MAX_PDF_SIZE_MB)."
+        )
+    if reason == EMPTY_DOCUMENT_REASON:
+        return "The document was not parsed: it has no content (0 bytes)."
+    where = f" in the '{tier}' tier" if tier else ""
+    return f"Parsing failed ({reason}){where}; no text was extracted."
+
+
+def _markdown_note(
+    metadata: dict, settings: Any, *, markdown_requested: bool
+) -> str | None:
+    """Why the markdown the caller asked for is not in the content.
+
+    Only ever fires when the caller actually asked for markdown.
+    ``markdown_skipped_reason`` records a fact about the parse -- structure was
+    not reconstructed -- and the structured tier stamps it whenever it runs past
+    the page ceiling, INCLUDING when it was reached to recover a glyph-corrupt
+    text layer in ``auto`` mode. Surfacing it there would report a
+    non-degradation as one: a caller that asked for text got exactly the text it
+    asked for, and ``content_format`` already says it is not markdown.
+    """
+    if not markdown_requested:
+        return None
+    reason = metadata.get("markdown_skipped_reason")
+    if reason == "page_ceiling":
+        return (
+            f"Markdown structure was not reconstructed: this document has "
+            f"{metadata.get('page_count')} pages, above "
+            f"DOCUMENT_MARKDOWN_MAX_PAGES={settings.document_markdown_max_pages}. "
+            f"The raw per-page text layer is returned instead."
+        )
+    if reason == "disabled":
+        return (
+            "Markdown reconstruction is switched off on this server "
+            "(DOCUMENT_MARKDOWN_MAX_PAGES=0); the raw text layer is returned."
+        )
+    if reason == "not_registered":
+        return (
+            "No structured-parse engine is available on this server, so the raw "
+            "text layer is returned without markdown structure."
+        )
+    if reason == "parse_failed":
+        return (
+            "Markdown reconstruction was attempted and failed; the raw text layer "
+            "is returned instead."
+        )
+    return None
+
+
+def _ocr_note(metadata: dict) -> str | None:
+    """Why a document the classifier wanted OCR'd was not OCR'd (or failed)."""
+    skipped = metadata.get("ocr_escalation_skipped")
+    if skipped == "disabled":
+        return (
+            "This document has little or no usable text layer and OCR is not "
+            "enabled on this server (DOCUMENT_OCR_ENABLED), so the text below is "
+            "only what a text extractor could recover -- it may be incomplete or "
+            "empty."
+        )
+    if skipped == "not_registered":
+        return (
+            "This document needs OCR, but no OCR backend is configured on this "
+            "server (DOCUMENT_OCR_PROVIDER); the text below may be incomplete or "
+            "empty."
+        )
+    failed = metadata.get("ocr_escalation_failed")
+    if failed:
+        return (
+            f"OCR was attempted and did not succeed ({failed}); the text below is "
+            f"what a text extractor could recover."
+        )
+    return None
+
+
+def _picture_caption_note(metadata: dict) -> str | None:
+    """Why an OOXML document's pictures may be missing from the text below
+    (ADR-037).
+
+    ``pictures_found`` is stamped by the native OOXML readers regardless of
+    whether captioning is configured -- it is itself already a useful signal,
+    so this fires even with captioning off. ``pictures_captioned`` is only
+    present when captioning was actually attempted.
+    """
+    found = metadata.get("pictures_found")
+    if not found:
+        return None
+    captioned = metadata.get("pictures_captioned")
+    if captioned is None:
+        return (
+            f"This document contains {found} picture(s) whose content was "
+            f"not described (OFFICE_CAPTION_IMAGES is off, or DOCLING_API_URL "
+            f"is not configured); a diagram or screenshot pasted as an image "
+            f"may be missing from the text below."
+        )
+    if captioned < found:
+        missing = found - captioned
+        return (
+            f"{missing} of {found} picture(s) in this document could not be "
+            f"described (a docling-serve error/timeout, or the "
+            f"OFFICE_CAPTION_MAX_IMAGES cap was reached); the text below may "
+            f"be missing diagram/screenshot content."
+        )
+    return None
+
+
+def summarize_parse(
+    result: ProcessingResult, settings: Any, *, markdown_requested: bool = False
+) -> ParseSummary:
+    """Describe a :class:`ProcessingResult` honestly.
+
+    Pure: no I/O, no globals beyond the ``settings`` handed in, so every
+    degradation path is unit-testable without a running pipeline. The note
+    wording lives in the three ``_*_note`` helpers above -- one per thing that
+    can degrade -- so a caller never has to infer the difference between "OCR is
+    off here" and "OCR ran and failed".
+
+    ``markdown_requested`` is what the CALLER asked for, which the result alone
+    cannot tell you: the structured tier is also reached to recover a corrupt
+    text layer, and its "no markdown here" bookkeeping must not be reported as a
+    degradation to someone who only ever asked for text.
+    """
+    metadata = result.metadata or {}
+    tier = metadata.get("pipeline_tier")
+
+    if not result.success:
+        # A failed parse is never dressed up as content. The tier/processor are
+        # still reported so the caller can see what was attempted.
+        return ParseSummary(
+            status="failed",
+            tier=tier,
+            processor=result.processor,
+            content_format="text",
+            notes=[_failure_note(result, tier, settings)],
+        )
+
+    notes = [
+        note
+        for note in (
+            _markdown_note(metadata, settings, markdown_requested=markdown_requested),
+            _ocr_note(metadata),
+            _picture_caption_note(metadata),
+        )
+        if note is not None
+    ]
+    if not result.text:
+        notes.append("The parse succeeded but extracted 0 characters of text.")
+
+    return ParseSummary(
+        status="parsed",
+        tier=tier,
+        processor=result.processor,
+        content_format=(
+            "markdown" if metadata.get("parse_mode") == "markdown" else "text"
+        ),
+        notes=notes,
+    )

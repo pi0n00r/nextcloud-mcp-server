@@ -1,0 +1,145 @@
+name: Bug report
+description: Report a bug, crash, or unexpected behavior in nextcloud-mcp-server
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Before submitting**, please check that:
+        - You're running a recent version (`uvx nextcloud-mcp-server --version` or check the Docker tag).
+        - The issue isn't already reported in [open issues](https://github.com/cbcoutinho/nextcloud-mcp-server/issues).
+        - Security issues should **not** be filed here — use [private vulnerability reporting](https://github.com/cbcoutinho/nextcloud-mcp-server/security/advisories/new) or see [SECURITY.md](https://github.com/cbcoutinho/nextcloud-mcp-server/blob/master/SECURITY.md).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing what went wrong.
+      placeholder: "nc_contacts_create silently drops EMAIL/TEL/ORG fields — only the full name is saved."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the bug. Include the exact MCP tool call(s) and arguments where relevant.
+      placeholder: |
+        1. Call `nc_contacts_create` with `full_name`, `email`, `phone`
+        2. Inspect the contact in the Nextcloud web UI
+        3. Only the name is present
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behavior
+      placeholder: |
+        Expected: All provided fields are written to the vCard.
+        Actual: Only FN is saved; EMAIL, TEL, ORG are silently dropped.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and error output
+      description: |
+        Include the full error message / stack trace from the MCP server.
+        If running with Docker, also include any relevant entries from
+        `docker compose exec app cat /var/www/html/data/nextcloud.log | jq | tail`
+        (Nextcloud side). For other install methods, attach the equivalent
+        Nextcloud log excerpt if available.
+        Redact tokens, passwords, and personal data.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: mcp_server_version
+    attributes:
+      label: nextcloud-mcp-server version
+      description: e.g. `0.73.0`, Docker tag, or git SHA.
+      placeholder: "0.73.0"
+    validations:
+      required: true
+
+  - type: input
+    id: nextcloud_version
+    attributes:
+      label: Nextcloud server version
+      placeholder: "Nextcloud 30.0.2"
+    validations:
+      required: true
+
+  - type: input
+    id: nextcloud_app_versions
+    attributes:
+      label: Affected Nextcloud app version(s)
+      description: |
+        For bugs in a specific app integration, list the installed app version(s) — e.g. Notes 5.0.0, Deck 1.13.0,
+        Cookbook 0.11.2. Run `docker compose exec app php occ app:list` or check Apps in the Nextcloud UI.
+      placeholder: "Notes 5.0.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: deployment_mode
+    attributes:
+      label: Deployment mode
+      options:
+        - Single-user (BasicAuth)
+        - Multi-user BasicAuth (pass-through)
+        - Login Flow v2
+        - OAuth / OIDC (Nextcloud user_oidc)
+        - OAuth / OIDC (external IdP, e.g. Keycloak)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: MCP transport
+      options:
+        - stdio
+        - streamable-http
+        - sse (legacy)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: How are you running the server?
+      options:
+        - uvx
+        - Docker / docker compose
+        - Helm chart on Kubernetes
+        - Local checkout (`uv run`)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: mcp_client
+    attributes:
+      label: MCP client
+      description: e.g. Claude Desktop, Claude Code, an IDE extension, custom client + LLM.
+      placeholder: "Claude Code"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might help — workarounds you found, related issues, suspected root cause, etc.
+    validations:
+      required: false

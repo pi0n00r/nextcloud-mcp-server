@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a new Nextcloud app integration, MCP tool, or capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement! See the [Supported Apps table](https://github.com/cbcoutinho/nextcloud-mcp-server#supported-apps)
+        for what's already covered.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case from the user's perspective. What can't you do today?
+      placeholder: "I want to start Nextcloud Talk calls and post messages to rooms from an AI assistant."
+    validations:
+      required: true
+
+  - type: input
+    id: nextcloud_app
+    attributes:
+      label: Nextcloud app or feature involved
+      description: If this is about a specific Nextcloud app (Talk, Photos, Mail, etc.) or API, name it here.
+      placeholder: "Talk (spreed)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What would the MCP tool(s) look like? Include suggested tool names, inputs/outputs, and any relevant
+        Nextcloud API endpoints if you've researched them.
+      placeholder: |
+        - `nc_talk_list_rooms()` — returns rooms the user is a member of
+        - `nc_talk_send_message(room_token, message)`
+        - Backed by the OCS Talk API: /ocs/v2.php/apps/spreed/api/v4/...
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you've tried, or other tools/projects that solve a similar problem.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Screenshots, links to Nextcloud API docs, related issues, etc.
+    validations:
+      required: false

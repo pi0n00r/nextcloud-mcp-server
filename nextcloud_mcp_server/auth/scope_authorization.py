@@ -1,0 +1,674 @@
+"""Scope-based authorization for MCP tools."""
+
+import logging
+import time
+from functools import wraps
+from typing import Any, Callable
+
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.utilities.context_injection import find_context_parameter
+
+from nextcloud_mcp_server.auth.storage import get_shared_storage
+from nextcloud_mcp_server.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# Scopes that only assert identity (OIDC standard claims).
+# Tools requiring *only* these scopes (e.g. auth provisioning tools) must
+# bypass the Login Flow v2 "is the user provisioned?" check — otherwise the
+# very tools that *create* app passwords would be blocked for unprovisioned
+# users, creating a circular dependency.
+IDENTITY_ONLY_SCOPES: frozenset[str] = frozenset({"openid", "profile", "email"})
+
+
+class ScopeAuthorizationError(Exception):
+    """Raised when a request lacks required scopes."""
+
+    pass
+
+
+class InsufficientScopeError(ScopeAuthorizationError):
+    """Raised when request lacks required scopes (enables step-up auth).
+
+    This exception triggers a 403 response with WWW-Authenticate header
+    containing the missing scopes, allowing clients to perform step-up
+    authorization to obtain additional permissions.
+    """
+
+    def __init__(self, missing_scopes: list[str], message: str | None = None):
+        self.missing_scopes = missing_scopes
+        super().__init__(
+            message or f"Missing required scopes: {', '.join(missing_scopes)}"
+        )
+
+
+class ProvisioningRequiredError(ScopeAuthorizationError):
+    """Raised when Nextcloud resource access requires provisioning (Flow 2).
+
+    In Progressive Consent mode, users must explicitly provision Nextcloud
+    access using the provision_nextcloud_access MCP tool.
+    """
+
+    def __init__(self, message: str | None = None):
+        super().__init__(
+            message
+            or (
+                "Nextcloud resource access not provisioned. "
+                "Please run the 'provision_nextcloud_access' tool to grant access."
+            )
+        )
+
+
+def require_scopes(*required_scopes: str):
+    """
+    Decorator to require specific OAuth scopes for MCP tool execution.
+
+    This decorator:
+    1. Stores scope requirements as function metadata (_required_scopes attribute)
+    2. Checks that the access token contains all required scopes before execution
+    3. Raises ScopeAuthorizationError if any required scope is missing
+
+    The stored metadata enables dynamic tool filtering - tools can be hidden from
+    users who lack the necessary scopes.
+
+    Args:
+        *required_scopes: Variable number of scope strings required (e.g., "notes.read", "notes.write")
+
+    Returns:
+        Decorated function that checks scopes before execution
+
+    Example:
+        ```python
+        @mcp.tool()
+        @require_scopes("notes.read")
+        async def nc_notes_get_note(ctx: Context, note_id: int):
+            # This tool requires the notes.read scope
+            ...
+
+        @mcp.tool()
+        @require_scopes("notes.write")
+        async def nc_notes_create_note(ctx: Context, ...):
+            # This tool requires the notes.write scope
+            ...
+        ```
+
+    Raises:
+        ScopeAuthorizationError: If required scopes are not present in the access token
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Store scope requirements as function metadata for dynamic filtering
+        func._required_scopes = list(required_scopes)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+
+        # Get function name for logging (works for any callable)
+        func_name = getattr(func, "__name__", repr(func))
+
+        # Find which parameter receives the Context (MCPServer injects it by name)
+        context_param_name = find_context_parameter(func)
+
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Extract context from kwargs (where MCPServer injected it)
+            ctx: Context | None = (
+                kwargs.get(context_param_name) if context_param_name else None
+            )
+
+            if ctx is None:
+                # No context parameter found - likely BasicAuth mode
+                # In BasicAuth mode, all operations are allowed
+                logger.debug(
+                    "No context parameter for %s - allowing (BasicAuth mode)", func_name
+                )
+                return await func(*args, **kwargs)
+
+            # Resolve the verified token from the SDK auth contextvar. It is
+            # never an attribute of RequestContext — reading it from there
+            # always yielded None, which silently disabled every check below.
+            access_token: AccessToken | None = get_access_token()
+
+            if access_token is None:
+                # BasicAuth deployments carry no OAuth token: there are no token
+                # scopes to check, and Nextcloud enforces its own ACLs.
+                # Under OAuth a missing token means the auth middleware never
+                # populated one, so deny instead of granting every scope.
+                if get_settings().enable_login_flow:
+                    logger.warning(
+                        "Access denied to %s: OAuth mode but no verified access "
+                        "token on this request",
+                        func_name,
+                    )
+                    raise InsufficientScopeError(
+                        list(required_scopes),
+                        f"Access denied to {func_name}: no verified access token "
+                        f"on this request.",
+                    )
+                logger.debug(
+                    "No access token for %s - allowing (BasicAuth mode)", func_name
+                )
+                return await func(*args, **kwargs)
+
+            # ── Login Flow v2: Check stored app password scopes ──
+            # In Login Flow v2 multi-user mode, Nextcloud API access uses stored
+            # app passwords, so the user must be provisioned before any tool can
+            # run. The stored scope list is an *additional* restriction on top of
+            # the OAuth token, not a replacement for it: this block can deny, and
+            # can decline to restrict (NULL), but never grants. Whatever survives
+            # it still has to clear the token check below, so the effective
+            # permission is:
+            #
+            #     token(consent ∩ client allowed_scopes) ∩ stored (NULL = no restriction)
+            if get_settings().enable_login_flow and not set(required_scopes).issubset(
+                IDENTITY_ONLY_SCOPES
+            ):
+                from nextcloud_mcp_server.auth.token_utils import (  # noqa: PLC0415
+                    extract_user_id_from_token,
+                )
+
+                user_id = await extract_user_id_from_token(ctx)
+                if user_id and user_id != "default_user":
+                    stored_scopes = await _get_stored_scopes(user_id)
+
+                    if stored_scopes is None:
+                        # No stored app password → require provisioning. Try to
+                        # elicit a clickable Astrolabe / Login-Flow-v2 link so
+                        # the user has somewhere to click; the elicit helper
+                        # silently falls back when the client lacks support.
+                        from nextcloud_mcp_server.auth.elicitation import (  # noqa: PLC0415
+                            present_provisioning_required,
+                        )
+
+                        elicit_result = await present_provisioning_required(ctx)
+
+                        # Always raise — the decorator can't safely re-check
+                        # stored scopes mid-call (TTL cache, plus the LFv2
+                        # poller may still be running). Only the message
+                        # changes so an LLM that just acknowledged the
+                        # elicitation isn't told to call the auth tool
+                        # again (which would loop).
+                        if elicit_result == "accepted":
+                            # Note: stored-scope lookups are cached for
+                            # _SCOPE_CACHE_TTL (5 min). All three provisioning
+                            # paths invalidate the cache on completion: the
+                            # in-tool poller in nc_auth_check_status
+                            # (auth_tools.py), the Astrolabe web route
+                            # (provision_routes.py), and the BasicAuth REST
+                            # endpoint (api/passwords.py). However, if the
+                            # LFv2 poller is still in-flight at acknowledge-
+                            # time the next retry can still hit a not-yet-
+                            # populated entry — hence the "wait a moment"
+                            # qualifier below.
+                            logger.warning(
+                                "Access denied to %s: app password missing "
+                                "after user accepted elicitation; advising retry",
+                                func_name,
+                            )
+                            error_msg = (
+                                f"Access denied to {func_name}: Nextcloud "
+                                f"access was not provisioned at the time of "
+                                f"this call. If you just completed "
+                                f"provisioning, please retry the request — "
+                                f"if it still fails, provisioning may still be "
+                                f"completing; wait a moment and try again."
+                            )
+                        else:
+                            logger.warning(
+                                "Access denied to %s: app password missing; "
+                                "advising nc_auth_provision_access "
+                                "(elicit_result=%s)",
+                                func_name,
+                                elicit_result,
+                            )
+                            error_msg = (
+                                f"Access denied to {func_name}: "
+                                f"Nextcloud access not provisioned. "
+                                f"Please call 'nc_auth_provision_access' first."
+                            )
+                        raise ProvisioningRequiredError(error_msg)
+
+                    if stored_scopes == "all":
+                        # NULL scopes in DB = no *additional* restriction. This
+                        # deliberately does not grant everything: it falls
+                        # through to the token check below, so the OAuth token
+                        # remains the ceiling. Returning here instead was how a
+                        # NULL-scoped user could call tools their token never
+                        # carried — and it made list_tools (which filters on
+                        # token scopes) disagree with tools/call.
+                        logger.debug(
+                            "No stored scope restriction for %s - deferring to token scopes",
+                            func_name,
+                        )
+                    else:
+                        # Check stored scopes against required. This layer can
+                        # only narrow: passing it still requires the token to
+                        # carry the scope as well.
+                        stored_set = set(stored_scopes)
+                        missing = set(required_scopes) - stored_set
+                        if missing:
+                            error_msg = (
+                                f"Access denied to {func_name}: "
+                                f"Missing scopes: {', '.join(sorted(missing))}. "
+                                f"Call 'nc_auth_update_scopes' to add permissions."
+                            )
+                            logger.warning(error_msg)
+                            raise InsufficientScopeError(list(missing), error_msg)
+
+                        logger.debug(
+                            "Stored app password scope check passed for %s", func_name
+                        )
+
+            # Extract scopes from access token (strip resource prefix if configured)
+            token_scopes = _strip_resource_prefix(set(access_token.scopes or []))
+            required_scopes_set = set(required_scopes)
+
+            # Check if offline access is enabled
+            # Use settings.enable_offline_access which handles both ENABLE_BACKGROUND_OPERATIONS (new)
+            # and ENABLE_OFFLINE_ACCESS (deprecated) environment variables
+            settings = get_settings()
+            enable_offline_access = settings.enable_offline_access
+
+            # In offline access mode, check if Nextcloud scopes require provisioning.
+            # Skipped under Login Flow v2: the two provisioning models are
+            # mutually exclusive, and this branch would send a login-flow user to
+            # 'provision_nextcloud_access' (the Flow 2 tool, only registered when
+            # offline access is on) instead of raising InsufficientScopeError —
+            # which is also the only path that carries a WWW-Authenticate step-up
+            # challenge. Before NULL scopes fell through, login_flow never reached
+            # here.
+            if enable_offline_access and not settings.enable_login_flow:
+                # Check if any required scopes are Nextcloud-specific
+                nextcloud_scopes = [
+                    s
+                    for s in required_scopes
+                    if any(
+                        s.startswith(prefix)
+                        for prefix in [
+                            "notes.",
+                            "calendar.",
+                            "contacts.",
+                            "files.",
+                            "tables.",
+                            "deck.",
+                            "talk.",
+                        ]
+                    )
+                ]
+
+                if nextcloud_scopes:
+                    # Check if user has completed Flow 2 provisioning
+                    # This would be indicated by having a stored refresh token
+                    # In production, we'd check the token broker or storage
+                    # For now, we check if the token has the required scopes
+                    # (Flow 1 tokens won't have Nextcloud scopes)
+                    has_nextcloud_scopes = any(
+                        s.startswith(prefix)
+                        for s in token_scopes
+                        for prefix in [
+                            "notes.",
+                            "calendar.",
+                            "contacts.",
+                            "files.",
+                            "tables.",
+                            "deck.",
+                            "talk.",
+                        ]
+                    )
+
+                    if not has_nextcloud_scopes:
+                        error_msg = (
+                            f"Access denied to {func_name}: "
+                            f"Nextcloud resource access not provisioned. "
+                            f"Please run the 'provision_nextcloud_access' tool first."
+                        )
+                        logger.warning(error_msg)
+                        raise ProvisioningRequiredError(error_msg)
+
+            # Check if all required scopes are present
+            missing_scopes = required_scopes_set - token_scopes
+            if missing_scopes:
+                error_msg = (
+                    f"Access denied to {func_name}: "
+                    f"Missing required scopes: {', '.join(sorted(missing_scopes))}. "
+                    f"Token has scopes: {', '.join(sorted(token_scopes)) if token_scopes else 'none'}"
+                )
+                if settings.enable_login_flow:
+                    # Name the remedy *and* the non-remedy. These are OAuth
+                    # token scopes, so nc_auth_update_scopes can never grant
+                    # them — and an agent that has seen the stored-scope denial
+                    # will otherwise retry it forever against an "unchanged"
+                    # response. Either lever can be the cause: the admin's
+                    # allowed_scopes on the OIDC client, or the user's own
+                    # consent selection when the OIDC app permits user settings.
+                    error_msg += (
+                        ". These are OAuth token scopes, not stored app-password "
+                        "scopes: 'nc_auth_update_scopes' cannot grant them. The "
+                        "OIDC client must permit the scope (Nextcloud → "
+                        "Administration → OpenID Connect) and it must be included "
+                        "in your consent (Nextcloud → Personal settings, where "
+                        "user scope selection is enabled); then re-authorize to "
+                        "obtain a new token."
+                    )
+                logger.warning(error_msg)
+                raise InsufficientScopeError(list(missing_scopes), error_msg)
+
+            # All required scopes present - allow execution
+            logger.debug(
+                "Scope authorization passed for %s: %s", func_name, required_scopes
+            )
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def _strip_resource_prefix(scopes: set[str]) -> set[str]:
+    """Strip resource server URL prefix from scopes.
+
+    External IdPs like AWS Cognito return scopes prefixed with the resource
+    server identifier (e.g. ``https://mcp.example.com/notes.read``).  MCP
+    tools use bare scope names (``notes.read``), so we strip the prefix to
+    allow matching.
+
+    The prefix is read from ``OIDC_RESOURCE_SERVER_ID`` (set in settings).
+    Standard OIDC scopes (openid, profile, email, offline_access) are never
+    prefixed and are passed through unchanged.
+    """
+    settings = get_settings()
+    resource_server_id = getattr(settings, "oidc_resource_server_id", None)
+    if not resource_server_id:
+        return scopes
+
+    prefix = resource_server_id.rstrip("/") + "/"
+    stripped: set[str] = set()
+    for scope in scopes:
+        if scope.startswith(prefix):
+            stripped.add(scope[len(prefix) :])
+        else:
+            stripped.add(scope)
+    return stripped
+
+
+def get_access_token_scopes(ctx: Context | None = None) -> set[str]:
+    """
+    Extract scopes from the authenticated user's access token.
+
+    This function uses MCP SDK's contextvar to access the token, which works
+    across all request types including list_tools.
+
+    If ``OIDC_RESOURCE_SERVER_ID`` is configured, resource-prefixed scopes
+    (e.g. ``https://mcp.example.com/notes.read``) are stripped to bare names
+    (``notes.read``) so they match tool ``@require_scopes`` decorators.
+
+    Args:
+        ctx: MCPServer context object (unused, kept for compatibility)
+
+    Returns:
+        Set of scope strings, empty set if no token or no scopes
+    """
+    # Use MCP SDK's get_access_token() which uses contextvars
+    # This works for all request types, including list_tools
+    access_token: AccessToken | None = get_access_token()
+
+    if access_token is None:
+        logger.debug("No access token found in auth context (likely BasicAuth mode)")
+        return set()
+
+    scopes = set(access_token.scopes or [])
+    scopes = _strip_resource_prefix(scopes)
+    logger.info("✅ Extracted scopes from access token: %s", scopes)
+    return scopes
+
+
+def check_scopes(ctx: Context, *required_scopes: str) -> tuple[bool, set[str]]:
+    """
+    Check if the request context has all required scopes.
+
+    Utility function for manual scope checking without decorator.
+
+    Args:
+        ctx: MCPServer context object
+        *required_scopes: Variable number of required scope strings
+
+    Returns:
+        Tuple of (has_all_scopes: bool, missing_scopes: set[str])
+
+    Example:
+        ```python
+        async def my_tool(ctx: Context):
+            has_scopes, missing = check_scopes(ctx, "notes.read", "notes.write")
+            if not has_scopes:
+                # Handle missing scopes
+                ...
+        ```
+    """
+    token_scopes = get_access_token_scopes(ctx)
+    required_scopes_set = set(required_scopes)
+
+    # No verified token at all. Under BasicAuth that is expected — Nextcloud
+    # enforces its own ACLs — but under OAuth it means the auth middleware never
+    # populated one, so report nothing granted rather than everything. Same
+    # fail-closed rule as require_scopes: reporting "all granted" here would
+    # reintroduce, for any future caller, exactly the bug this module was fixed
+    # for. (A token that merely carries no scopes is a different case and is
+    # still checked against the requirement below.)
+    if get_access_token() is None:
+        if get_settings().enable_login_flow:
+            return False, required_scopes_set
+        return True, set()
+
+    missing_scopes = required_scopes_set - token_scopes
+
+    return len(missing_scopes) == 0, missing_scopes
+
+
+def get_required_scopes(func: Callable) -> list[str]:
+    """
+    Extract required scopes from a function decorated with @require_scopes.
+
+    Args:
+        func: Function to check (may be decorated)
+
+    Returns:
+        List of required scope strings, empty list if no scopes required
+
+    Example:
+        ```python
+        @require_scopes("notes.read", "notes.write")
+        async def my_tool():
+            pass
+
+        scopes = get_required_scopes(my_tool)  # ["notes.read", "notes.write"]
+        ```
+    """
+    return getattr(func, "_required_scopes", [])
+
+
+def is_jwt_token() -> bool:
+    """
+    Check if the current access token is in JWT format.
+
+    JWT tokens have 3 parts separated by dots (header.payload.signature).
+    Opaque tokens are random strings without this structure.
+
+    Returns:
+        True if current token is JWT format, False if opaque or no token
+    """
+    access_token: AccessToken | None = get_access_token()
+
+    if access_token is None:
+        logger.debug("No access token found - not JWT")
+        return False
+
+    # JWT tokens have exactly 2 dots (3 parts)
+    token_string = access_token.token
+    is_jwt = "." in token_string and token_string.count(".") == 2
+
+    logger.debug("Token format check: is_jwt=%s", is_jwt)
+    return is_jwt
+
+
+def has_required_scopes(func: Callable, user_scopes: set[str]) -> bool:
+    """
+    Check if a user has all scopes required by a function.
+
+    Used for dynamic tool filtering - determines if a tool should be visible
+    to a user based on their token scopes.
+
+    Args:
+        func: Function decorated with @require_scopes
+        user_scopes: Set of scopes the user possesses
+
+    Returns:
+        True if user has all required scopes (or no scopes required), False otherwise
+
+    Example:
+        ```python
+        @require_scopes("notes.write")
+        async def create_note():
+            pass
+
+        user_scopes = {"notes.read", "notes.write"}
+        can_see = has_required_scopes(create_note, user_scopes)  # True
+
+        limited_user_scopes = {"notes.read"}
+        can_see = has_required_scopes(create_note, limited_user_scopes)  # False
+        ```
+    """
+    required = get_required_scopes(func)
+
+    # No scopes required → always allow
+    if not required:
+        return True
+
+    # Empty user_scopes but scopes required → deny
+    if not user_scopes:
+        return False
+
+    # Check if user has all required scopes
+    return set(required).issubset(user_scopes)
+
+
+def discover_all_scopes(mcp) -> list[str]:
+    """
+    Dynamically discover all OAuth scopes required by registered MCP tools.
+
+    This function inspects all registered tools and extracts their required scopes
+    from the @require_scopes decorator metadata. It provides a single source of truth
+    for available scopes based on the actual tool implementations.
+
+    Args:
+        mcp: MCPServer instance with registered tools
+
+    Returns:
+        Sorted list of unique scope strings, including base OIDC scopes
+
+    Example:
+        ```python
+        from mcp.server.mcpserver import MCPServer
+
+        mcp = MCPServer("My Server")
+
+        @mcp.tool()
+        @require_scopes("notes.read")
+        async def get_notes():
+            pass
+
+        @mcp.tool()
+        @require_scopes("notes.write")
+        async def create_note():
+            pass
+
+        scopes = discover_all_scopes(mcp)
+        # Returns: ["notes.read", "notes.write", "offline_access", "openid", ...]
+        ```
+
+    Note:
+        - Base OIDC scopes (openid, profile, email) are always included
+        - offline_access is always included so clients can request a refresh token
+        - Scopes are deduplicated and sorted alphabetically
+        - Only scopes from decorated tools are included
+        - Must be called after tools are registered
+    """
+    # Start with base OIDC scopes that are always required
+    all_scopes = {"openid", "profile", "email"}
+
+    # Advertise offline_access so discovery-driven MCP clients can request a
+    # refresh token. The AS proxy forwards it upstream to Nextcloud, which
+    # issues a refresh token when the MCP server's OIDC client is permitted the
+    # scope. Optional for clients (unlike the base OIDC scopes) and never tied
+    # to a tool, so it is added here rather than discovered from @require_scopes.
+    #
+    # Advertised unconditionally — independent of settings.enable_offline_access
+    # (which gates the server's own Flow 2 background access). Per RFC 8414,
+    # scopes_supported lists what the AS *can* support, not what it will always
+    # grant; the actual refresh token is still gated upstream by Nextcloud.
+    all_scopes.add("offline_access")
+
+    # Get all registered tools
+    try:
+        tools = mcp._tool_manager.list_tools()
+    except AttributeError:
+        logger.warning("MCPServer instance does not have _tool_manager attribute")
+        return sorted(all_scopes)
+
+    # Extract scopes from each tool
+    for tool in tools:
+        # Get the original function (tools have a .fn attribute)
+        func = getattr(tool, "fn", None)
+        if func is None:
+            continue
+
+        # Extract scopes using existing helper
+        tool_scopes = get_required_scopes(func)
+        all_scopes.update(tool_scopes)
+
+    # Return sorted list of unique scopes
+    return sorted(all_scopes)
+
+
+# ── Login Flow v2 helpers ────────────────────────────────────────────────
+
+# Scope cache: user_id → (expires_at, scopes)
+_scope_cache: dict[str, tuple[float, list[str] | str | None]] = {}
+_SCOPE_CACHE_TTL = 300  # 5 minutes
+
+
+def invalidate_scope_cache(user_id: str) -> None:
+    """Remove cached scopes for a user (call when scopes are updated)."""
+    _scope_cache.pop(user_id, None)
+
+
+async def _get_stored_scopes(user_id: str) -> list[str] | str | None:
+    """Look up stored app password scopes for a user (with TTL cache).
+
+    Returns:
+        - list[str]: Specific scopes granted — an additional restriction on
+          top of the OAuth token
+        - "all": NULL scopes in DB = no additional restriction. Callers must
+          still apply the token check; this is not a grant.
+        - None: No stored app password (provisioning required)
+
+    Raises:
+        Storage/infrastructure exceptions propagate to the caller
+        (require_scopes decorator) for proper MCP error responses.
+    """
+    now = time.time()
+    if user_id in _scope_cache:
+        expires_at, cached = _scope_cache[user_id]
+        if now < expires_at:
+            return cached
+
+    storage = await get_shared_storage()
+
+    data = await storage.get_app_password_with_scopes(user_id)
+    if data is None:
+        result = None
+    elif data["scopes"] is None:
+        result = "all"
+    else:
+        result = data["scopes"]
+
+    _scope_cache[user_id] = (now + _SCOPE_CACHE_TTL, result)
+    return result

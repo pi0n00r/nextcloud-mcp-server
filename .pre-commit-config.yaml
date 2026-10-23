@@ -1,0 +1,26 @@
+repos:
+- repo: https://github.com/commitizen-tools/commitizen
+  rev: v4.16.5
+  hooks:
+  - id: commitizen
+  - id: commitizen-branch
+    stages:
+    - pre-push
+- repo: local
+  hooks:
+    - id: ruff-check
+      name: ruff-check
+      entry: uv run ruff check
+      language: system
+      types: [python]
+    - id: ruff-format
+      name: ruff-format
+      entry: uv run ruff format
+      language: system
+      types: [python]
+    - id: ty-check
+      name: ty-check
+      language: system
+      types: [python]
+      pass_filenames: false
+      entry: uv run ty check -- nextcloud_mcp_server

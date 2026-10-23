@@ -1,0 +1,498 @@
+"""HTTP client for the Nextcloud Talk (spreed) app.
+
+Talk exposes its REST API under ``/ocs/v2.php/apps/spreed/api/{v}/...``.
+The current versions used here are:
+
+- conversations & participants: ``api/v4`` (Nextcloud 22+)
+- chat:                          ``api/v1`` (Nextcloud 13+)
+
+All endpoints follow the OCS envelope ``{"ocs": {"meta": ..., "data": ...}}``,
+require ``OCS-APIRequest: true`` and respond as JSON when ``Accept:
+application/json`` is sent.
+"""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+import logging
+import re
+from typing import Any
+
+from httpx import HTTPStatusError, codes
+
+from nextcloud_mcp_server.client.base import BaseNextcloudClient
+from nextcloud_mcp_server.client.ocs import OCS_REQUEST_HEADERS
+from nextcloud_mcp_server.models.talk import (
+    TalkConversation,
+    TalkMessage,
+    TalkParticipant,
+    TalkParticipantSource,
+    TalkRoomType,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Spreed conversation tokens are short alphanumeric strings (e.g. "a1b2c3d4").
+# httpx does not normalise path traversal sequences, so a pathological token
+# like ``"../foo"`` would be sent verbatim. Validate up-front for clearer
+# errors and defence-in-depth.
+_TALK_TOKEN_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def _validate_token(token: str) -> None:
+    if not _TALK_TOKEN_RE.fullmatch(token):
+        raise ValueError(f"Invalid Talk conversation token: {token!r}")
+
+
+def _validate_message_id(message_id: int) -> None:
+    """Reject message ids that cannot address a message.
+
+    ``bool`` is excluded explicitly: it is an ``int`` subclass, so ``True``
+    would otherwise sail through as message id 1.
+    """
+    if isinstance(message_id, bool) or not isinstance(message_id, int):
+        raise ValueError(f"Message ID must be an integer: {message_id!r}")
+    if message_id <= 0:
+        raise ValueError(f"Message ID must be positive: {message_id}")
+
+
+def _validate_reaction(reaction: str) -> None:
+    """Reject an empty reaction before it reaches the wire.
+
+    spreed rejects these too, but with a bare 400 that says nothing about which
+    field was at fault.
+    """
+    if not reaction or not reaction.strip():
+        raise ValueError("Reaction must not be empty or whitespace-only")
+
+
+def _reaction_map(data: Any) -> dict[str, list[dict[str, Any]]]:
+    """Normalise spreed's reactions payload to a map.
+
+    An empty reaction set comes back as ``{}`` on Talk 22, but PHP serialises
+    empty maps as ``[]`` elsewhere in this API, and ``null`` shows up on some
+    error paths. All three mean "no reactions".
+    """
+    if not data:
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("Unexpected reactions payload of type %s", type(data).__name__)
+        return {}
+    return data
+
+
+class TalkClient(BaseNextcloudClient):
+    """Client for Nextcloud Talk (spreed) app operations."""
+
+    app_name = "talk"
+
+    _ROOM_BASE = "/ocs/v2.php/apps/spreed/api/v4/room"
+    _CHAT_BASE = "/ocs/v2.php/apps/spreed/api/v1/chat"
+    _REACTION_BASE = "/ocs/v2.php/apps/spreed/api/v1/reaction"
+
+    def _talk_headers(self) -> dict[str, str]:
+        """Standard OCS+JSON headers for spreed API calls.
+
+        ``Content-Type`` is intentionally omitted — httpx adds it
+        automatically (and correctly) on requests that pass ``json=``,
+        so setting it here would also leak it onto bodyless GETs and
+        DELETEs.
+        """
+        return dict(OCS_REQUEST_HEADERS)
+
+    # Conversations (rooms)
+
+    async def list_conversations(
+        self,
+        *,
+        modified_since: int | None = None,
+        include_status: bool = False,
+        no_status_update: bool = True,
+    ) -> list[TalkConversation]:
+        """Return the user's Talk conversations.
+
+        Args:
+            modified_since: If provided, only return conversations modified
+                after this Unix timestamp (server-side filter).
+            include_status: Include user-status info for one-to-one rooms.
+            no_status_update: When True (default), the call does not bump
+                the user's "online" status — appropriate for an MCP server
+                acting in the background.
+        """
+        params: dict[str, Any] = {}
+        if modified_since is not None:
+            params["modifiedSince"] = modified_since
+        if include_status:
+            params["includeStatus"] = 1
+        if no_status_update:
+            params["noStatusUpdate"] = 1
+        response = await self._make_request(
+            "GET", self._ROOM_BASE, params=params, headers=self._talk_headers()
+        )
+        data = response.json()["ocs"]["data"]
+        return [TalkConversation(**room) for room in data]
+
+    async def get_conversation(self, token: str) -> TalkConversation:
+        """Fetch a single Talk conversation by its room token."""
+        _validate_token(token)
+        response = await self._make_request(
+            "GET", f"{self._ROOM_BASE}/{token}", headers=self._talk_headers()
+        )
+        return TalkConversation(**response.json()["ocs"]["data"])
+
+    async def create_conversation(
+        self,
+        *,
+        room_type: TalkRoomType = 2,
+        room_name: str | None = None,
+        invite: str | None = None,
+    ) -> TalkConversation:
+        """Create a new conversation.
+
+        Args:
+            room_type: 1=one-to-one, 2=group, 3=public. Defaults to 2.
+            room_name: Display name. Required by spreed for group and public
+                rooms; a one-to-one room is identified by its other
+                participant, and is created without one.
+            invite: User/group ID to invite at creation time. For a one-to-one
+                room this is the other participant, and is what defines the
+                room.
+        """
+        body: dict[str, Any] = {"roomType": room_type}
+        # Omitted rather than sent empty for a one-to-one room: spreed names
+        # those after the other participant, and a blank roomName is not the
+        # same request as no roomName.
+        if room_name is not None:
+            body["roomName"] = room_name
+        if invite is not None:
+            body["invite"] = invite
+        response = await self._make_request(
+            "POST", self._ROOM_BASE, json=body, headers=self._talk_headers()
+        )
+        return TalkConversation(**response.json()["ocs"]["data"])
+
+    async def delete_conversation(self, token: str) -> None:
+        """Delete a conversation. Used by integration test cleanup.
+
+        Does not apply to one-to-one rooms: spreed answers those with 400
+        (observed on Nextcloud 32/33/34). A participant *leaves* a one-to-one
+        conversation instead, after which it becomes a "former one-to-one"
+        room -- the type 5 the conversation model documents.
+        """
+        _validate_token(token)
+        await self._make_request(
+            "DELETE", f"{self._ROOM_BASE}/{token}", headers=self._talk_headers()
+        )
+
+    # Chat
+
+    async def get_messages(
+        self,
+        token: str,
+        *,
+        limit: int = 50,
+        last_known_message_id: int | None = None,
+        look_into_future: bool = False,
+        set_read_marker: bool = False,
+        include_last_known: bool = False,
+        thread_id: int | None = None,
+    ) -> tuple[list[TalkMessage], int | None]:
+        """Fetch chat messages for a conversation.
+
+        Args:
+            token: Conversation token.
+            limit: Max messages to return. spreed caps this server-side
+                at 200; values outside ``[1, 200]`` are clamped here so
+                callers don't get a confusing mismatch between the
+                requested limit and the returned ``count``.
+            last_known_message_id: Pagination cursor — pass the value
+                from the previous response's ``X-Chat-Last-Given`` header.
+            look_into_future: When False (default), return *older*
+                messages relative to ``last_known_message_id`` — i.e.,
+                read history. When True, this becomes a long-poll for
+                new messages, which we don't expose via MCP.
+            set_read_marker: When False (default), the call does not move
+                the user's read marker — consumers can call
+                ``mark_as_read`` explicitly.
+            include_last_known: Include the message identified by
+                ``last_known_message_id`` itself in the page.
+            thread_id: Optional ID of a thread's root message. Limits the
+                page to that root and the messages posted inside the thread.
+                Not documented in docs/chat.md at the time of writing --
+                spreed's ``receiveMessages`` has accepted ``threadId`` since
+                Talk v22.0.0 (when the "threads" capability was introduced),
+                and responds 404 when the thread does not exist in the room.
+                spreed silently ignores it where threads are unsupported
+                (e.g. federated rooms), so the page is also filtered here.
+
+        Returns:
+            ``(messages, x_chat_last_given)`` where the integer is the
+            value of the ``X-Chat-Last-Given`` response header (or None
+            if the header was absent or unparseable), suitable for
+            pagination. ``([], None)`` once there is no older history.
+        """
+        _validate_token(token)
+        clamped_limit = min(max(1, limit), 200)
+        params: dict[str, Any] = {
+            "limit": clamped_limit,
+            "lookIntoFuture": 1 if look_into_future else 0,
+            "setReadMarker": 1 if set_read_marker else 0,
+            "includeLastKnown": 1 if include_last_known else 0,
+        }
+        if last_known_message_id is not None:
+            params["lastKnownMessageId"] = last_known_message_id
+        if thread_id is not None:
+            _validate_message_id(thread_id)
+            params["threadId"] = thread_id
+        try:
+            response = await self._make_request(
+                "GET",
+                f"{self._CHAT_BASE}/{token}",
+                params=params,
+                headers=self._talk_headers(),
+            )
+        except HTTPStatusError as e:
+            # spreed answers 304 Not Modified, with no body, once there is no
+            # older history before the cursor -- and _make_request's
+            # raise_for_status() raises on it. That is the end of the
+            # history, not an error.
+            if e.response.status_code == codes.NOT_MODIFIED:
+                return [], None
+            raise
+        last_given_header = response.headers.get("X-Chat-Last-Given")
+        last_given: int | None = None
+        if last_given_header:
+            try:
+                last_given = int(last_given_header)
+            except ValueError:
+                # Defensive: spreed always sends an int, but a misbehaving
+                # proxy could mangle the header. Don't crash the read flow.
+                logger.warning(
+                    "Invalid X-Chat-Last-Given header from spreed: %r",
+                    last_given_header,
+                )
+        data = response.json()["ocs"]["data"]
+        messages = [TalkMessage(**msg) for msg in data]
+        if thread_id is not None:
+            # The pagination cursor above still comes from the unfiltered
+            # page, so callers keep advancing even if this page empties out.
+            in_thread = [msg for msg in messages if msg.threadId == thread_id]
+            if len(in_thread) != len(messages):
+                logger.debug(
+                    "spreed ignored threadId=%s for %s; filtered %d of %d messages",
+                    thread_id,
+                    token,
+                    len(messages) - len(in_thread),
+                    len(messages),
+                )
+            messages = in_thread
+        return messages, last_given
+
+    async def send_message(
+        self,
+        token: str,
+        message: str,
+        *,
+        reply_to: int | None = None,
+        thread_id: int | None = None,
+        thread_title: str | None = None,
+        reference_id: str | None = None,
+        silent: bool = False,
+    ) -> TalkMessage:
+        """Post a chat message to a conversation.
+
+        Args:
+            token: Conversation token.
+            message: Message text (max 32000 chars per spreed docs/chat.md).
+            reply_to: Optional parent message ID to thread this reply.
+            thread_id: Optional ID of an existing thread's root message.
+                Posts this message inside that thread. Not documented in
+                docs/chat.md at the time of writing (only covered, and
+                incompletely, in the file-sharing section) -- confirmed
+                against a live Talk v24.0.5 instance with the "threads"
+                spreed capability enabled.
+            thread_title: Optional title. Sent alone (without reply_to),
+                starts a brand-new thread with this message as its root --
+                spreed then reports `isThread: true` and sets `threadId` on
+                the response to this message's own id. Same docs/chat.md
+                caveat as thread_id.
+            reference_id: Optional client-provided UUID for idempotency on
+                retry (spreed dedupes on this within the conversation).
+            silent: When True, the message is delivered without push
+                notifications.
+        """
+        _validate_token(token)
+        body: dict[str, Any] = {"message": message}
+        if reply_to is not None:
+            body["replyTo"] = reply_to
+        if thread_id is not None:
+            body["threadId"] = thread_id
+        if thread_title is not None:
+            body["threadTitle"] = thread_title
+        if reference_id is not None:
+            body["referenceId"] = reference_id
+        if silent:
+            body["silent"] = True
+        response = await self._make_request(
+            "POST",
+            f"{self._CHAT_BASE}/{token}",
+            json=body,
+            headers=self._talk_headers(),
+        )
+        return TalkMessage(**response.json()["ocs"]["data"])
+
+    async def mark_as_read(
+        self, token: str, *, last_read_message: int | None = None
+    ) -> None:
+        """Mark the conversation as read.
+
+        If ``last_read_message`` is provided it sets the read marker to
+        that message; otherwise spreed marks everything currently in the
+        room as read.
+        """
+        _validate_token(token)
+        body: dict[str, Any] = {}
+        if last_read_message is not None:
+            body["lastReadMessage"] = last_read_message
+        # ``json=None`` makes httpx skip both the body and the
+        # ``Content-Type: application/json`` header — semantically correct
+        # for the bodyless "mark everything as read" call.
+        await self._make_request(
+            "POST",
+            f"{self._CHAT_BASE}/{token}/read",
+            json=body or None,
+            headers=self._talk_headers(),
+        )
+
+    # Participants
+
+    async def list_participants(
+        self, token: str, *, include_status: bool = False
+    ) -> list[TalkParticipant]:
+        """List participants of a Talk conversation."""
+        _validate_token(token)
+        params: dict[str, Any] = {}
+        if include_status:
+            params["includeStatus"] = 1
+        response = await self._make_request(
+            "GET",
+            f"{self._ROOM_BASE}/{token}/participants",
+            params=params,
+            headers=self._talk_headers(),
+        )
+        data = response.json()["ocs"]["data"]
+        return [TalkParticipant(**p) for p in data]
+
+    async def add_participant(
+        self,
+        token: str,
+        participant: str,
+        *,
+        source: TalkParticipantSource = "users",
+    ) -> None:
+        """Add a participant to a group or public conversation.
+
+        Returns nothing: spreed answers a successful add with an empty ``data``
+        payload (verified against Talk 22.0.17), so there is no participant
+        object to hand back.
+
+        Adding someone who is already in the room succeeds as a no-op, which is
+        why the tool in front of this is marked idempotent.
+
+        Args:
+            token: Conversation token.
+            participant: Identifier to add, interpreted per ``source``.
+            source: Actor source -- ``users`` (default), ``groups``, ``emails``,
+                ``circles``, or ``federated_users``.
+
+        Raises:
+            HTTPStatusError: 404 when the participant does not exist
+                (``data.error == "new-participant"``), 400 for a one-to-one
+                room, which cannot take additional participants
+                (``data.error == "room-type"``).
+        """
+        _validate_token(token)
+        await self._make_request(
+            "POST",
+            f"{self._ROOM_BASE}/{token}/participants",
+            json={"newParticipant": participant, "source": source},
+            headers=self._talk_headers(),
+        )
+
+    # Reactions
+
+    async def list_reactions(
+        self, token: str, message_id: int, *, reaction: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """List reactions on a chat message, keyed by emoji.
+
+        Args:
+            token: Conversation token.
+            message_id: ID of the message.
+            reaction: Optional single emoji to filter to.
+
+        Returns:
+            ``{emoji: [actor, ...]}``. Empty when nothing has been reacted.
+        """
+        _validate_token(token)
+        _validate_message_id(message_id)
+        if reaction is not None:
+            _validate_reaction(reaction)
+        params = {"reaction": reaction} if reaction is not None else None
+        response = await self._make_request(
+            "GET",
+            f"{self._REACTION_BASE}/{token}/{message_id}",
+            params=params,
+            headers=self._talk_headers(),
+        )
+        return _reaction_map(response.json()["ocs"]["data"])
+
+    async def add_reaction(
+        self, token: str, message_id: int, reaction: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        """React to a chat message, returning the message's updated reactions.
+
+        spreed answers ``201`` for a new reaction and ``200`` when the actor had
+        already reacted with that emoji -- the end state is the same either way,
+        which is why the tool is marked idempotent.
+        """
+        _validate_token(token)
+        _validate_message_id(message_id)
+        _validate_reaction(reaction)
+        response = await self._make_request(
+            "POST",
+            f"{self._REACTION_BASE}/{token}/{message_id}",
+            json={"reaction": reaction},
+            headers=self._talk_headers(),
+        )
+        return _reaction_map(response.json()["ocs"]["data"])
+
+    async def remove_reaction(
+        self, token: str, message_id: int, reaction: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Remove the user's reaction, returning the updated reactions.
+
+        Raises:
+            HTTPStatusError: 404 if the user has no such reaction on the
+                message. The end state matches a successful removal, but spreed
+                reports it as an error rather than a no-op.
+        """
+        _validate_token(token)
+        _validate_message_id(message_id)
+        _validate_reaction(reaction)
+        response = await self._make_request(
+            "DELETE",
+            f"{self._REACTION_BASE}/{token}/{message_id}",
+            json={"reaction": reaction},
+            headers=self._talk_headers(),
+        )
+        return _reaction_map(response.json()["ocs"]["data"])

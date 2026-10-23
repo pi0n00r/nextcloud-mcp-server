@@ -1,0 +1,75 @@
+name: Pact record deployment
+
+# Records a production deployment of nextcloud-mcp-server in the Pact Broker
+# (ADR-029). This is the missing half of the can-i-deploy loop: can-i-deploy
+# checks the candidate against whatever is currently in `production`, and this
+# workflow tells the broker what `production` now contains.
+#
+# Trigger: called by bump-version.yml after it cuts a tag. It deliberately does
+# NOT trigger on `push: tags: v*` — the bump workflow pushes tags with
+# GITHUB_TOKEN, and tags pushed with GITHUB_TOKEN do not trigger workflows. This
+# workflow was originally wired that way and consequently never ran once.
+#
+# Version identity: as a called workflow, ${{ github.sha }} is the caller's
+# triggering commit — the master commit that prompted the bump. That is exactly
+# the SHA pact.yml used when it published this repo's consumer pacts and
+# provider verification results for that master push, so the deployment record
+# lines up with already-verified pacts. Recording the "bump: version ..." commit
+# or the tag string instead would NOT match and can-i-deploy would stay red.
+#
+# The broker is only reachable over Tailscale; the step no-ops when the broker
+# secrets are absent (e.g. forks).
+#
+# Required repo/org secrets:
+#   TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET  - Tailscale github-runner OAuth client
+#   PACT_BROKER / PACT_USERNAME / PACT_PASSWORD  - broker URL + basic auth
+
+on:
+  workflow_call:
+
+# Two bumps landing close together could overlap; don't cancel an in-flight
+# recording — let it complete.
+concurrency:
+  group: pact-record-deployment-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACT_BROKER: ${{ secrets.PACT_BROKER }}
+  PACT_USERNAME: ${{ secrets.PACT_USERNAME }}
+  PACT_PASSWORD: ${{ secrets.PACT_PASSWORD }}
+
+jobs:
+  record-deployment:
+    name: Record production deployment
+    runs-on: ubuntu-latest
+    # Least-privilege: scope the token at job level (GitHub Actions S8264).
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      # Needed for .github/scripts/install-pact-cli.sh; this job previously ran
+      # without a working copy.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Join tailnet
+        if: ${{ env.PACT_BROKER != '' }}
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-runner
+
+      - name: Install Pact CLI
+        if: ${{ env.PACT_BROKER != '' }}
+        run: .github/scripts/install-pact-cli.sh
+
+      - name: Record deployment to production
+        if: ${{ env.PACT_BROKER != '' }}
+        run: |
+          pact broker record-deployment \
+            --broker-base-url "$PACT_BROKER" \
+            --broker-username "$PACT_USERNAME" \
+            --broker-password "$PACT_PASSWORD" \
+            --pacticipant nextcloud-mcp-server \
+            --version "$GITHUB_SHA" \
+            --environment production

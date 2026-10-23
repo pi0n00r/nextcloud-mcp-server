@@ -1,0 +1,102 @@
+"""Pytest configuration for integration tests.
+
+This conftest.py provides hooks and fixtures specific to integration tests.
+"""
+
+import logging
+
+import pytest
+
+logger = logging.getLogger(__name__)
+
+# Canonical minimal valid PDF for integration tests. verify-on-read gates file
+# results on the vector-index tag via
+# find_files_by_tag(..., mime_type_filter="application/pdf"), so file fixtures
+# must be PDFs (matching what the scanner indexes), not .txt. Shared here so the
+# constant is defined once rather than drifting across test modules.
+PDF_BYTES = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n%%EOF\n"
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+async def reset_all_singletons():
+    """Reset ALL global singletons between test modules.
+
+    Prevents anyio.WouldBlock errors caused by stale singleton state
+    from previous test modules holding references to dead event loops
+    or closed memory streams.
+    """
+    # Import all modules with singletons
+    import nextcloud_mcp_server.app as app_module
+    import nextcloud_mcp_server.auth.client_registry as client_registry_module
+    import nextcloud_mcp_server.observability.tracing as tracing_module
+    import nextcloud_mcp_server.providers.bm25 as bm25_module
+    import nextcloud_mcp_server.providers.registry as registry_module
+    import nextcloud_mcp_server.vector.qdrant_client as qdrant_module
+
+    # Store originals for restoration after test
+    originals = {
+        "qdrant_client": qdrant_module._qdrant_client,
+        "bm25_service": bm25_module._bm25_service,
+        "provider": registry_module._provider,
+        "vector_sync_state": (
+            app_module._vector_sync_state.document_send_stream,
+            app_module._vector_sync_state.document_receive_stream,
+            app_module._vector_sync_state.shutdown_event,
+            app_module._vector_sync_state.scanner_wake_event,
+        ),
+        "tracer": tracing_module._tracer,
+        "registry": client_registry_module._registry,
+    }
+
+    # Close any open memory streams before reset
+    if app_module._vector_sync_state.document_send_stream is not None:
+        try:
+            await app_module._vector_sync_state.document_send_stream.aclose()
+        except Exception:
+            pass
+    if app_module._vector_sync_state.document_receive_stream is not None:
+        try:
+            await app_module._vector_sync_state.document_receive_stream.aclose()
+        except Exception:
+            pass
+
+    # Reset all singletons to None/fresh state
+    qdrant_module._qdrant_client = None
+    bm25_module._bm25_service = None
+    registry_module._provider = None
+    app_module._vector_sync_state.document_send_stream = None
+    app_module._vector_sync_state.document_receive_stream = None
+    app_module._vector_sync_state.shutdown_event = None
+    app_module._vector_sync_state.scanner_wake_event = None
+    tracing_module._tracer = None
+    client_registry_module._registry = None
+
+    logger.debug("All singletons reset for test module")
+
+    yield
+
+    # Cleanup: Close async resources created during test
+    if qdrant_module._qdrant_client is not None:
+        try:
+            await qdrant_module._qdrant_client.close()
+        except Exception:
+            pass
+
+    # Restore originals
+    qdrant_module._qdrant_client = originals["qdrant_client"]
+    bm25_module._bm25_service = originals["bm25_service"]
+    registry_module._provider = originals["provider"]
+    (
+        app_module._vector_sync_state.document_send_stream,
+        app_module._vector_sync_state.document_receive_stream,
+        app_module._vector_sync_state.shutdown_event,
+        app_module._vector_sync_state.scanner_wake_event,
+    ) = originals["vector_sync_state"]
+    tracing_module._tracer = originals["tracer"]
+    client_registry_module._registry = originals["registry"]

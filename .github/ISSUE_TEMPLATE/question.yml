@@ -1,0 +1,81 @@
+name: Question / setup help
+description: Configuration, deployment, or "how do I…" questions
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For open-ended discussion, please consider [GitHub Discussions](https://github.com/cbcoutinho/nextcloud-mcp-server/discussions) instead.
+        Use this template for specific, answerable questions about configuration or behavior.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do, and what's not working or unclear?
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands run, config files, docs you've already read.
+    validations:
+      required: false
+
+  - type: input
+    id: mcp_server_version
+    attributes:
+      label: nextcloud-mcp-server version
+      placeholder: "0.73.0"
+    validations:
+      required: true
+
+  - type: input
+    id: nextcloud_version
+    attributes:
+      label: Nextcloud server version
+      placeholder: "Nextcloud 30.0.2"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: deployment_mode
+    attributes:
+      label: Deployment mode
+      options:
+        - Single-user (BasicAuth)
+        - Multi-user BasicAuth (pass-through)
+        - Login Flow v2
+        - OAuth / OIDC (Nextcloud user_oidc)
+        - OAuth / OIDC (external IdP, e.g. Keycloak)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: MCP transport
+      options:
+        - stdio
+        - streamable-http
+        - sse (legacy)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: How are you running the server?
+      options:
+        - uvx
+        - Docker / docker compose
+        - Helm chart on Kubernetes
+        - Local checkout (`uv run`)
+        - Other
+    validations:
+      required: true

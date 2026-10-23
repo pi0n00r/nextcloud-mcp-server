@@ -1,0 +1,164 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+name: Build and Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact immutable package tag to publish
+        required: true
+        default: v1.9.9.3
+        type: string
+
+env:
+  IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
+  PACKAGE_TAG: v1.9.9.3
+  PACKAGE_VERSION: 0.199.3
+  PACKAGE_REVISION: f9f595f51707b8f017f29f923ddbe6ed7e69a142
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate exact immutable tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$INPUT_TAG" != "$PACKAGE_TAG" ]; then
+            echo "This workflow only publishes immutable package $PACKAGE_TAG." >&2
+            exit 1
+          fi
+
+      - name: Require private publication secret before checkout
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: |
+          if [ -z "$AI_NOTICE_PRIVATE_L1_TEXT" ]; then
+            echo "publication identity gate error: private comparison secret is missing" >&2
+            exit 2
+          fi
+
+      - name: Checkout maintained packaging tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Prepare exact tagged application source
+        id: source
+        run: |
+          git worktree add --detach package-source "$PACKAGE_TAG"
+          revision=$(git -C package-source rev-parse HEAD)
+          if [ "$revision" != "$PACKAGE_REVISION" ]; then
+            echo "Expected source revision $PACKAGE_REVISION, found $revision" >&2
+            exit 1
+          fi
+          mkdir package-context
+          git -C package-source archive HEAD | tar -x -C package-context
+          install -m 0644 Dockerfile package-context/Dockerfile
+          install -m 0644 scripts/check_publication_identity.py \
+            package-context/scripts/check_publication_identity.py
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Validate private publication identity before build
+        env:
+          AI_NOTICE_PRIVATE_L1_TEXT: ${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+        run: bash scripts/preflight-publication-identity.sh package-source
+
+      - name: Validate source version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' package-source/pyproject.toml)
+          if [ "$version" != "$PACKAGE_VERSION" ]; then
+            echo "Expected pyproject version $PACKAGE_VERSION, found $version" >&2
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Install Python 3.11
+        run: uv python install 3.11
+
+      - name: Build publication distributions
+        run: (cd package-source && uv build --out-dir publication-dist)
+
+      - name: Prepare exact publication-gate context
+        run: |
+          mkdir -p publication-gate-context/artifacts
+          git -C package-source archive --format=tar HEAD \
+            > publication-gate-context/exact-source.tar
+          cp package-source/publication-dist/* publication-gate-context/artifacts/
+          install -m 0644 scripts/check_publication_identity.py \
+            publication-gate-context/check_publication_identity.py
+          install -m 0644 Dockerfile.publication-gate \
+            publication-gate-context/Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # This runs before registry login or upload. The exact checked-out source
+      # and generated wheel/sdist must both pass; the private comparison value
+      # is a repository secret and the checker never prints it.
+      - name: Preflight immutable package inputs
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./publication-gate-context
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          secrets: |
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish exact immutable image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./package-context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            AI_NOTICE_PUBLICATION_GATE=1
+          secrets: |
+            AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.PACKAGE_TAG }}
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/pi0n00r/nextcloud-mcp-server
+            org.opencontainers.image.url=https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server
+            org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
+            org.opencontainers.image.title=nextcloud-mcp-server
+            org.opencontainers.image.description=Immutable v1.9.9.3 package for nextcloud-mcp-server 0.199.3
+
+      - name: Record immutable package digest
+        run: |
+          {
+            echo "### Immutable package"
+            echo
+            echo "- Tag: \`${IMAGE_NAME}:${PACKAGE_TAG}\`"
+            echo "- Source: \`${PACKAGE_REVISION}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

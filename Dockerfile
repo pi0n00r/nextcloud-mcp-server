@@ -1,0 +1,110 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+FROM docker.io/library/python:3.14-slim-trixie@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.3@sha256:bee0a2a458fd956c5df7b8b4c5fed2257b0af34866e3da7b51db0be3acb375d1 /uv /uvx /bin/
+
+# Install dependencies
+# 1. curl (required for container healthcheck probes)
+# 2. git (required for caldav dependency from git)
+# 3. sqlite for development with token db
+RUN apt update && apt install --no-install-recommends --no-install-suggests -y \
+    curl \
+    git \
+    tesseract-ocr \
+    sqlite3 && apt clean
+
+# Build in /src, run in /app, keep the venv in /opt/venv. The three have
+# different lifetimes: /opt/venv is immutable code, /app is mutable runtime
+# state (settings.toml, data/), /src is build-only. UV_PROJECT_ENVIRONMENT is
+# what stops uv defaulting the environment to <project>/.venv.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /src
+
+COPY pyproject.toml uv.lock README.md .
+
+# --no-build: ordinary third-party dependencies must arrive as wheels, so their
+# setup.py cannot execute at image-build time (docker:S8541). The Uvicorn
+# fork is the deliberate exception: skip it here, then let the second sync build
+# only that reviewed Git dependency and this project from source.
+RUN uv sync --locked --no-dev --no-install-project --no-install-package uvicorn --no-build --no-cache --extra semantic --extra postgres --extra observability
+
+COPY . .
+
+RUN uv sync --locked --no-dev --no-editable --no-cache --extra semantic --extra postgres --extra observability
+
+# Ordinary development and CI builds remain unchanged. The immutable package
+# workflow opts in and supplies the protected comparison through a BuildKit
+# secret, which is mounted only for this RUN and never enters an image layer.
+ARG AI_NOTICE_PUBLICATION_GATE=0
+RUN --mount=type=secret,id=AI_NOTICE_PRIVATE_L1_FILE,mode=0600 \
+    if [ "$AI_NOTICE_PUBLICATION_GATE" = "1" ]; then \
+        test -s /run/secrets/AI_NOTICE_PRIVATE_L1_FILE; \
+        package_dir="$(/opt/venv/bin/python -c 'import pathlib, nextcloud_mcp_server; print(pathlib.Path(nextcloud_mcp_server.__file__).parent)')"; \
+        metadata_dir="$(/opt/venv/bin/python -c 'from importlib.metadata import distribution; print(distribution("nextcloud-mcp-server")._path)')"; \
+        AI_NOTICE_PRIVATE_L1_FILE=/run/secrets/AI_NOTICE_PRIVATE_L1_FILE \
+            /opt/venv/bin/python scripts/check_publication_identity.py \
+                --candidate /src \
+                --candidate "$package_dir" \
+                --candidate "$metadata_dir" \
+                --require-private-comparison; \
+    fi
+
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+# Dump a Python + C-level traceback to stderr on a fatal native fault
+# (SIGSEGV/SIGABRT/SIGFPE/SIGBUS). In-process native code -- pymupdf's
+# classify/metadata open and embedded Qdrant -- can segfault the interpreter
+# during indexing, and without faulthandler the container just exits 139/133
+# with no logs (see issue #926). The handler is cheap and writes nothing in
+# normal operation.
+ENV PYTHONFAULTHANDLER=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+
+# Runtime directory: the settings.toml mount and data/ only. Pre-creating
+# data/ with the right owner matters -- docker seeds a named volume's
+# ownership from the image path, so a fresh volume comes up writable instead
+# of root-owned 0755.
+#
+# A real account rather than a bare numeric USER: appuser gets a passwd
+# entry, so getpwuid() resolves and HOME lands in /home/appuser instead of
+# the base image's /root. No password and a nologin shell -- it is only ever
+# switched to by the runtime, never logged into.
+#
+# The home directory is load-bearing, not cosmetic. /root is mode 0700
+# root-owned, so a non-root process cannot even traverse it; huggingface_hub
+# trips over that while resolving paths and fastembed's BM25 weight fetch
+# dies with "Could not load model Qdrant/bm25 from any source", taking
+# hybrid search's sparse vectors with it. Verified under a read-only root
+# filesystem too, matching the chart's readOnlyRootFilesystem pods.
+#
+# uid 1000 / gid 0 reproduces what the helm chart already runs
+# (runAsUser: 1000, no runAsGroup -> gid 0), so nothing about the pod
+# changes. The venv stays root-owned: a compromised process parsing a
+# hostile document cannot rewrite its own code.
+RUN useradd --uid 1000 --gid 0 --create-home --home-dir /home/appuser \
+    --shell /usr/sbin/nologin appuser \
+ && passwd --lock appuser \
+ && mkdir -p /app/data \
+ && chown 1000:0 /app /app/data
+
+WORKDIR /app
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/opt/venv/bin/python", "-m", "nextcloud_mcp_server.container_healthcheck"]
+
+ENTRYPOINT ["/opt/venv/bin/nextcloud-mcp-server", "run", "--host", "::", "--dual-stack"]

@@ -1,0 +1,99 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+from pathlib import Path
+
+import yaml
+
+from nextcloud_mcp_server.container_healthcheck import (
+    DEFAULT_PORT,
+    HEALTH_HOST,
+    resolve_health_port,
+)
+
+REPO_ROOT = Path(__file__).parents[2]
+
+
+def test_health_port_defaults_compatibly_to_8000():
+    assert DEFAULT_PORT == 8000
+    assert resolve_health_port([], {}) == 8000
+
+
+def test_health_port_uses_port_environment():
+    assert resolve_health_port([], {"PORT": "9000"}) == 9000
+
+
+def test_explicit_cli_port_matches_actual_listener_before_environment():
+    argv = ["nextcloud-mcp-server", "run", "--port", "8002"]
+    assert resolve_health_port(argv, {"PORT": "9000"}) == 8002
+
+
+def test_probe_uses_dual_stack_localhost_name():
+    assert HEALTH_HOST == "localhost"
+
+
+def test_dockerfile_runs_dynamic_internal_probe():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+    assert "ENV PORT=8000" in dockerfile
+    assert (
+        'CMD ["/opt/venv/bin/python", "-m", '
+        '"nextcloud_mcp_server.container_healthcheck"]' in dockerfile
+    )
+    assert "127.0.0.1:8000/health/live" not in dockerfile
+
+
+def test_dockerfile_builds_only_the_uvicorn_fork_exception_from_source():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    dependency_sync = next(
+        line
+        for line in dockerfile.splitlines()
+        if line.startswith("RUN uv sync") and "--no-install-project" in line
+    )
+    project_sync = next(
+        line
+        for line in dockerfile.splitlines()
+        if line.startswith("RUN uv sync") and "--no-editable" in line
+    )
+
+    assert "--no-build" in dependency_sync
+    assert "--no-install-package uvicorn" in dependency_sync
+    assert "--no-build" not in project_sync
+    assert "https://github.com/pi0n00r/uvicorn.git" in pyproject
+    assert "https://github.com/pi0n00r/uvicorn.git@" not in pyproject
+
+
+def test_shipped_compose_profile_ports_match_health_resolution():
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+
+    for service_name, expected_port in (
+        ("mcp-keycloak", 8002),
+        ("mcp-login-flow", 8004),
+    ):
+        service = compose["services"][service_name]
+        environment = dict(item.split("=", 1) for item in service["environment"])
+        argv = ["nextcloud-mcp-server", "run", *service["command"]]
+
+        assert environment["PORT"] == str(expected_port)
+        assert resolve_health_port(argv, environment) == expected_port
+
+
+def test_login_flow_profile_allows_expected_management_clients():
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    environment = dict(
+        item.split("=", 1)
+        for item in compose["services"]["mcp-login-flow"]["environment"]
+    )
+
+    assert set(environment["ALLOWED_MGMT_CLIENT"].split(",")) == {
+        "astrolabeMcpClientOAuth00000000000",
+        "nextcloudMcpServerUIPublicClient",
+    }

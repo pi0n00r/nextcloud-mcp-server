@@ -1,0 +1,68 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    # Same-repo PRs only. A fork PR's diff is untrusted input, and this job
+    # hands it to an agent holding CLAUDE_CODE_OAUTH_TOKEN -- so contributor
+    # PRs are reviewed by a human instead. Fork runs also cannot work: they get
+    # no OIDC token (ACTIONS_ID_TOKEN_REQUEST_URL is absent), so before this
+    # gate every contributor PR carried a failing `claude-review` check.
+    # Skipping the job outright leaves no check at all, which is the intent --
+    # do not "fix" that red check by removing this condition.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.254
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "renovate-bot-cbcoutinho"
+          # Reuse a single tracking comment per PR instead of stacking new comments
+          # on every push. track_progress forces tag mode (which posts a tracking
+          # comment) and use_sticky_comment makes that comment overwrite the prior
+          # Claude review on subsequent runs.
+          track_progress: true
+          use_sticky_comment: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request and provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+
+            Deliver the review by updating the tracking comment via
+            `mcp__github_comment__update_claude_comment`. Do not create a
+            separate PR comment — the tracking comment is the sticky review.
+
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://docs.claude.com/en/docs/claude-code/cli-reference for available options
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'

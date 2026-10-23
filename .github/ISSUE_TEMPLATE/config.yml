@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private report)
+    url: https://github.com/cbcoutinho/nextcloud-mcp-server/security/advisories/new
+    about: Do not file security issues publicly. Use GitHub's private vulnerability reporting, or see SECURITY.md for the email fallback.
+  - name: Question or discussion
+    url: https://github.com/cbcoutinho/nextcloud-mcp-server/discussions
+    about: For general questions, deployment help, or open-ended discussion, please use Discussions instead of opening an issue.

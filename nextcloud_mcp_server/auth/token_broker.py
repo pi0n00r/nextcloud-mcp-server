@@ -1,0 +1,693 @@
+"""
+Token Broker Service for ADR-004 Progressive Consent Architecture.
+
+This service manages the lifecycle of Nextcloud access tokens, implementing
+the dual OAuth flow pattern where:
+1. MCP clients authenticate to MCP server with aud:"mcp-server" tokens
+2. MCP server uses stored refresh tokens to obtain aud:"nextcloud" tokens
+
+The Token Broker provides:
+- Automatic token refresh when expired
+- Short-lived token caching (5-minute TTL)
+- Master refresh token rotation
+- Audience-specific token validation
+- Background token management
+"""
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple
+
+import anyio
+import httpx
+
+from nextcloud_mcp_server.auth.storage import RefreshTokenStorage
+
+from ..http import nextcloud_httpx_client
+
+logger = logging.getLogger(__name__)
+
+# Fallback lifetime for a rotated refresh token when the IdP's token response
+# has no usable ``refresh_expires_in`` (it is not part of RFC 6749, and many
+# IdPs omit it).
+_DEFAULT_REFRESH_TOKEN_LIFETIME = timedelta(days=90)
+
+# Ceiling on an IdP-reported lifetime. Some IdPs report "never expires" as a
+# very large number; capping it keeps the timestamp inside the BIGINT
+# ``expires_at`` column and inside ``timedelta``'s range.
+_MAX_REFRESH_TOKEN_LIFETIME = timedelta(days=3650)
+
+
+def _refresh_token_expires_at(token_data: dict) -> int:
+    """Unix timestamp at which the refresh token in *token_data* expires.
+
+    Uses the IdP's ``refresh_expires_in`` when it is a positive number of
+    seconds. A numeric string is accepted too, as the provisioning paths in
+    ``oauth_routes`` and ``browser_oauth_routes`` already do. Anything else
+    (absent, zero, negative, a bool, or not a number) falls back to
+    ``_DEFAULT_REFRESH_TOKEN_LIFETIME``. Zero is included because Keycloak
+    reports ``0`` for offline tokens that do not expire, and the sliding
+    90-day window is what the broker has always applied to those.
+
+    Storage deletes a refresh token once this time passes, so an expiry later
+    than the IdP's keeps a dead token in use, and an earlier one discards a
+    live token.
+    """
+    raw = token_data.get("refresh_expires_in")
+    seconds = 0
+    # bool is an int subclass, and ``true`` is not a lifetime.
+    if isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
+        try:
+            seconds = int(raw)
+        except (ValueError, OverflowError):  # "abc", "1.5", NaN, infinity
+            seconds = 0
+    if seconds > 0:
+        cap = int(_MAX_REFRESH_TOKEN_LIFETIME.total_seconds())
+        lifetime = timedelta(seconds=min(seconds, cap))
+    else:
+        if raw is not None:
+            logger.debug(
+                "Ignoring unusable refresh_expires_in=%r, using the %s-day default",
+                raw,
+                _DEFAULT_REFRESH_TOKEN_LIFETIME.days,
+            )
+        lifetime = _DEFAULT_REFRESH_TOKEN_LIFETIME
+    return int((datetime.now(timezone.utc) + lifetime).timestamp())
+
+
+class TokenCache:
+    """In-memory cache for short-lived Nextcloud access tokens."""
+
+    def __init__(self, ttl_seconds: int = 300, early_refresh_seconds: int = 30):
+        """
+        Initialize the token cache.
+
+        Args:
+            ttl_seconds: Default TTL for cached tokens (5 minutes default)
+            early_refresh_seconds: How many seconds before expiry to trigger early refresh (30s default)
+        """
+        self._cache: Dict[str, Tuple[str, datetime]] = {}
+        self._ttl = timedelta(seconds=ttl_seconds)
+        self._early_refresh = timedelta(seconds=early_refresh_seconds)
+        self._lock = anyio.Lock()
+
+    async def get(self, user_id: str) -> Optional[str]:
+        """Get cached token if valid."""
+        async with self._lock:
+            if user_id not in self._cache:
+                return None
+
+            token, expiry = self._cache[user_id]
+            now = datetime.now(timezone.utc)
+
+            # Check if token has expired
+            if now >= expiry:
+                del self._cache[user_id]
+                logger.debug("Cached token expired for user %s", user_id)
+                return None
+
+            # Check if token will expire soon (refresh early)
+            if now >= expiry - self._early_refresh:
+                logger.debug("Cached token expiring soon for user %s", user_id)
+                return None
+
+            logger.debug("Using cached token for user %s", user_id)
+            return token
+
+    async def set(self, user_id: str, token: str, expires_in: int | None = None):
+        """Store token in cache."""
+        async with self._lock:
+            # Use provided expiry or default TTL
+            if expires_in:
+                expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            else:
+                expiry = datetime.now(timezone.utc) + self._ttl
+
+            self._cache[user_id] = (token, expiry)
+            logger.debug("Cached token for user %s until %s", user_id, expiry)
+
+    async def invalidate(self, user_id: str):
+        """Remove token from cache."""
+        async with self._lock:
+            if user_id in self._cache:
+                del self._cache[user_id]
+                logger.debug("Invalidated cached token for user %s", user_id)
+
+
+class TokenBrokerService:
+    """
+    Manages token lifecycle for the Progressive Consent architecture.
+
+    This service handles:
+    - Getting or refreshing Nextcloud access tokens
+    - Managing a short-lived token cache
+    - Refreshing master refresh tokens periodically
+    - Validating token audiences
+    """
+
+    def __init__(
+        self,
+        storage: RefreshTokenStorage,
+        oidc_discovery_url: str,
+        nextcloud_host: str,
+        client_id: str,
+        client_secret: str,
+        cache_ttl: int = 300,
+        cache_early_refresh: int = 30,
+    ):
+        """
+        Initialize the Token Broker Service.
+
+        Args:
+            storage: Database storage for refresh tokens (handles encryption internally)
+            oidc_discovery_url: OIDC provider discovery URL
+            nextcloud_host: Nextcloud server URL
+            client_id: OAuth client ID for token operations
+            client_secret: OAuth client secret for token operations
+            cache_ttl: Cache TTL in seconds (default: 5 minutes)
+            cache_early_refresh: Early refresh threshold in seconds (default: 30 seconds)
+        """
+        self.storage = storage
+        self.oidc_discovery_url = oidc_discovery_url
+        self.nextcloud_host = nextcloud_host
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.cache = TokenCache(cache_ttl, cache_early_refresh)
+        self._oidc_config = None
+
+        # Per-user locks for token refresh operations (prevents race conditions)
+        self._user_refresh_locks: dict[str, anyio.Lock] = {}
+        self._locks_lock = anyio.Lock()  # Protects the locks dict itself
+        self._http_client = None
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client."""
+        if self._http_client is None:
+            self._http_client = nextcloud_httpx_client(
+                timeout=httpx.Timeout(30.0), follow_redirects=True
+            )
+        return self._http_client
+
+    async def _get_user_refresh_lock(self, user_id: str) -> anyio.Lock:
+        """
+        Get or create a lock for a specific user's refresh operations.
+
+        This prevents race conditions when multiple concurrent requests
+        attempt to refresh the same user's token simultaneously.
+
+        Args:
+            user_id: User ID to get lock for
+
+        Returns:
+            anyio.Lock for this user's refresh operations
+        """
+        async with self._locks_lock:
+            if user_id not in self._user_refresh_locks:
+                self._user_refresh_locks[user_id] = anyio.Lock()
+            return self._user_refresh_locks[user_id]
+
+    async def _get_oidc_config(self) -> dict:
+        """Get OIDC configuration from discovery endpoint."""
+        if self._oidc_config is None:
+            client = await self._get_http_client()
+            response = await client.get(self.oidc_discovery_url)
+            response.raise_for_status()
+            self._oidc_config = response.json()
+        return self._oidc_config
+
+    async def _idp_supports_offline_access(self) -> bool:
+        """Check if the IdP advertises ``offline_access`` in ``scopes_supported``.
+
+        Returns ``True`` when ``offline_access`` is explicitly listed **or**
+        when ``scopes_supported`` is absent from the discovery document (the
+        field is OPTIONAL per the OIDC spec, so absence means unknown —
+        include ``offline_access`` as a safe default).
+
+        Returns ``False`` when ``scopes_supported`` is present but does **not**
+        include ``offline_access`` (e.g. AWS Cognito, which provides refresh
+        tokens automatically without requiring the scope).
+        """
+        config = await self._get_oidc_config()
+        scopes_supported = config.get("scopes_supported")
+        if scopes_supported is None:
+            return True
+        return "offline_access" in scopes_supported
+
+    async def get_nextcloud_token(self, user_id: str) -> Optional[str]:
+        """
+        Get a valid Nextcloud access token for the user.
+
+        DEPRECATED: This method uses the old pattern of stored refresh tokens
+        for all operations. Use get_session_token() or get_background_token()
+        instead for proper session/background separation.
+
+        This method:
+        1. Checks the cache for a valid token
+        2. If not cached, checks for stored refresh token
+        3. If refresh token exists, obtains new access token
+        4. Caches the new token for future requests
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            Valid Nextcloud access token or None if not provisioned
+        """
+        # Check cache first
+        cached_token = await self.cache.get(user_id)
+        if cached_token:
+            return cached_token
+
+        # Get stored refresh token
+        refresh_data = await self.storage.get_refresh_token(user_id)
+        if not refresh_data:
+            logger.info("No refresh token found for user %s", user_id)
+            return None
+
+        try:
+            # storage.get_refresh_token() returns already-decrypted token
+            refresh_token = refresh_data["refresh_token"]
+
+            # Exchange refresh token for new access token
+            access_token, expires_in = await self._refresh_access_token(refresh_token)
+
+            # Cache the new token
+            await self.cache.set(user_id, access_token, expires_in)
+
+            return access_token
+
+        except Exception as e:
+            logger.error("Failed to get Nextcloud token for user %s: %s", user_id, e)
+            # Invalidate cache on error
+            await self.cache.invalidate(user_id)
+            return None
+
+    async def get_background_token(
+        self, user_id: str, required_scopes: list[str]
+    ) -> Optional[str]:
+        """
+        Get token for background job operations (uses stored refresh token).
+
+        This is for background/offline operations that run without user interaction.
+        Uses the stored refresh token from Flow 2 provisioning.
+
+        Key properties:
+        - Uses stored refresh token from Flow 2
+        - Different scopes than session tokens
+        - Longer-lived for background operations
+        - Can be cached for efficiency
+
+        Args:
+            user_id: The user identifier
+            required_scopes: Scopes needed for background operation
+
+        Returns:
+            Nextcloud access token for background operations or None if not provisioned
+        """
+        # Check cache first (background tokens can be cached)
+        cache_key = f"{user_id}:background:{','.join(sorted(required_scopes))}"
+        refresh_in_progress_key = f"{user_id}:refresh_in_progress"
+
+        cached_token = await self.cache.get(cache_key)
+        if cached_token:
+            return cached_token
+
+        # Acquire per-user lock BEFORE refresh operation to prevent race conditions
+        refresh_lock = await self._get_user_refresh_lock(user_id)
+        async with refresh_lock:
+            # Double-check cache after acquiring lock
+            # (another thread may have refreshed while we waited)
+            cached_token = await self.cache.get(cache_key)
+            if cached_token:
+                logger.debug(
+                    "Token found in cache after lock acquisition for user %s", user_id
+                )
+                return cached_token
+
+            # Check if another thread is currently refreshing
+            if await self.cache.get(refresh_in_progress_key):
+                logger.debug(
+                    "Refresh in progress for user %s, waiting briefly", user_id
+                )
+                await anyio.sleep(0.1)  # Brief wait for in-progress refresh
+                # Check cache one more time after wait
+                cached_token = await self.cache.get(cache_key)
+                if cached_token:
+                    logger.debug(
+                        "Token refreshed by another thread for user %s", user_id
+                    )
+                    return cached_token
+
+            # Mark refresh as in-progress
+            await self.cache.set(refresh_in_progress_key, "true", expires_in=5)
+
+            try:
+                # Get stored refresh token
+                refresh_data = await self.storage.get_refresh_token(user_id)
+                if not refresh_data:
+                    logger.info("No refresh token found for user %s", user_id)
+                    return None
+
+                # storage.get_refresh_token() returns already-decrypted token
+                refresh_token = refresh_data["refresh_token"]
+
+                # Get token with specific scopes for background operation
+                # Pass user_id to enable refresh token rotation storage
+                access_token, expires_in = await self._refresh_access_token_with_scopes(
+                    refresh_token, required_scopes, user_id=user_id
+                )
+
+                # Cache the background token
+                await self.cache.set(cache_key, access_token, expires_in)
+
+                logger.info(
+                    "Generated background token for user %s with scopes: %s",
+                    user_id,
+                    required_scopes,
+                )
+
+                return access_token
+
+            except Exception as e:
+                logger.error(
+                    "Failed to get background token for user %s: %s",
+                    user_id,
+                    e,
+                )
+                await self.cache.invalidate(cache_key)
+                return None
+
+            finally:
+                # Always clear the in-progress marker
+                await self.cache.invalidate(refresh_in_progress_key)
+
+    async def _refresh_access_token(
+        self, refresh_token: str, user_id: str | None = None
+    ) -> Tuple[str, int]:
+        """
+        Exchange refresh token for new access token.
+
+        DEPRECATED: Use _refresh_access_token_with_scopes() for scope-specific requests.
+
+        Args:
+            refresh_token: The refresh token
+            user_id: If provided, store the rotated refresh token for this user
+
+        Returns:
+            Tuple of (access_token, expires_in_seconds)
+        """
+        config = await self._get_oidc_config()
+        token_endpoint = config["token_endpoint"]
+
+        client = await self._get_http_client()
+
+        # Request new access token using refresh token
+        # Include client credentials as required by most OAuth servers
+        # Only request offline_access if the IdP advertises it (e.g. Cognito does not)
+        base_scopes = ["openid", "profile", "email"]
+        if await self._idp_supports_offline_access():
+            base_scopes.append("offline_access")
+        scope_str = " ".join(
+            base_scopes
+            + ["notes.read", "notes.write", "calendar.read", "calendar.write"]
+        )
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": scope_str,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }
+
+        response = await client.post(
+            token_endpoint,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                "Token refresh failed: %s - %s", response.status_code, response.text
+            )
+            raise Exception(f"Token refresh failed: {response.status_code}")
+
+        token_data = response.json()
+        access_token = token_data["access_token"]
+        expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+
+        # Handle refresh token rotation (Nextcloud OIDC rotates on every use)
+        new_refresh_token = token_data.get("refresh_token")
+        if user_id and new_refresh_token and new_refresh_token != refresh_token:
+            expires_at = _refresh_token_expires_at(token_data)
+            await self.storage.store_refresh_token(
+                user_id=user_id,
+                refresh_token=new_refresh_token,
+                expires_at=expires_at,
+            )
+            logger.info("Stored rotated refresh token for user %s", user_id)
+
+        # Note: Nextcloud validates token audience on API calls - no need to pre-validate here
+
+        logger.info("Refreshed access token (expires in %ss)", expires_in)
+        return access_token, expires_in
+
+    async def _refresh_access_token_with_scopes(
+        self, refresh_token: str, required_scopes: list[str], user_id: str | None = None
+    ) -> Tuple[str, int]:
+        """
+        Exchange refresh token for new access token with specific scopes.
+
+        This method implements scope downscoping for least privilege.
+
+        IMPORTANT: Nextcloud OIDC rotates refresh tokens on every use (one-time use).
+        When user_id is provided, this method stores the new refresh token returned
+        by Nextcloud to ensure subsequent refresh operations succeed.
+
+        Args:
+            refresh_token: The refresh token
+            required_scopes: Minimal scopes needed for this operation
+            user_id: If provided, store the rotated refresh token for this user
+
+        Returns:
+            Tuple of (access_token, expires_in_seconds)
+        """
+        config = await self._get_oidc_config()
+        token_endpoint = config["token_endpoint"]
+
+        client = await self._get_http_client()
+
+        # Always include basic OpenID scopes; only add offline_access if the IdP
+        # advertises it (e.g. AWS Cognito provides refresh tokens automatically
+        # without supporting the offline_access scope).
+        base_scopes = ["openid", "profile", "email"]
+        if await self._idp_supports_offline_access():
+            base_scopes.append("offline_access")
+        scopes = list(set(base_scopes + required_scopes))
+
+        # Request new access token with specific scopes
+        # Include client credentials as required by most OAuth servers
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": " ".join(scopes),
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }
+
+        logger.info(
+            "Token refresh request to %s with client_id=%s...",
+            token_endpoint,
+            self.client_id[:16],
+        )
+
+        response = await client.post(
+            token_endpoint,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                "Token refresh with scopes failed: %s - %s",
+                response.status_code,
+                response.text,
+            )
+            logger.error("  client_id used: %s...", self.client_id[:16])
+            raise Exception(f"Token refresh failed: {response.status_code}")
+
+        token_data = response.json()
+        access_token = token_data["access_token"]
+        expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+
+        # Handle refresh token rotation (Nextcloud OIDC rotates on every use)
+        new_refresh_token = token_data.get("refresh_token")
+        if user_id and new_refresh_token and new_refresh_token != refresh_token:
+            # Store the new refresh token for future use
+            expires_at = _refresh_token_expires_at(token_data)
+            await self.storage.store_refresh_token(
+                user_id=user_id,
+                refresh_token=new_refresh_token,
+                expires_at=expires_at,
+            )
+            logger.info("Stored rotated refresh token for user %s", user_id)
+
+        # Note: Nextcloud validates token audience on API calls - no need to pre-validate here
+
+        logger.info(
+            "Refreshed access token with scopes %s (expires in %ss)", scopes, expires_in
+        )
+        return access_token, expires_in
+
+    async def refresh_master_token(self, user_id: str) -> bool:
+        """
+        Refresh the master refresh token (periodic rotation).
+
+        This should be called periodically (e.g., daily) to rotate
+        refresh tokens for security.
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            True if refresh successful, False otherwise
+        """
+        refresh_data = await self.storage.get_refresh_token(user_id)
+        if not refresh_data:
+            logger.warning("No refresh token to rotate for user %s", user_id)
+            return False
+
+        try:
+            # storage.get_refresh_token() returns already-decrypted token
+            current_refresh_token = refresh_data["refresh_token"]
+
+            # Get OIDC configuration
+            config = await self._get_oidc_config()
+            token_endpoint = config["token_endpoint"]
+
+            client = await self._get_http_client()
+
+            # Request new refresh token
+            # Only request offline_access if the IdP advertises it
+            base_scopes = ["openid", "profile", "email"]
+            if await self._idp_supports_offline_access():
+                base_scopes.append("offline_access")
+            scope_str = " ".join(
+                base_scopes
+                + ["notes.read", "notes.write", "calendar.read", "calendar.write"]
+            )
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": current_refresh_token,
+                "scope": scope_str,
+            }
+
+            response = await client.post(
+                token_endpoint,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+            if response.status_code != 200:
+                logger.error("Master token refresh failed: %s", response.status_code)
+                return False
+
+            token_data = response.json()
+            new_refresh_token = token_data.get("refresh_token")
+
+            if new_refresh_token and new_refresh_token != current_refresh_token:
+                # storage.store_refresh_token() handles encryption internally
+                expires_at = _refresh_token_expires_at(token_data)
+                await self.storage.store_refresh_token(
+                    user_id=user_id,
+                    refresh_token=new_refresh_token,
+                    expires_at=expires_at,
+                )
+                logger.info("Rotated master refresh token for user %s", user_id)
+
+                # Invalidate cached access token
+                await self.cache.invalidate(user_id)
+                return True
+
+            return True
+
+        except Exception as e:
+            logger.error("Failed to refresh master token for user %s: %s", user_id, e)
+            return False
+
+    async def has_nextcloud_provisioning(self, user_id: str) -> bool:
+        """
+        Check if user has provisioned Nextcloud access (Flow 2).
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            True if user has stored refresh token, False otherwise
+        """
+        refresh_data = await self.storage.get_refresh_token(user_id)
+        return refresh_data is not None
+
+    async def revoke_nextcloud_access(self, user_id: str) -> bool:
+        """
+        Revoke stored Nextcloud access for a user.
+
+        This removes stored refresh tokens and clears cache.
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            True if revocation successful
+        """
+        try:
+            # Get refresh token for revocation at IdP
+            refresh_data = await self.storage.get_refresh_token(user_id)
+            if refresh_data:
+                try:
+                    # storage.get_refresh_token() returns already-decrypted token
+                    refresh_token = refresh_data["refresh_token"]
+                    await self._revoke_token_at_idp(refresh_token)
+                except Exception as e:
+                    logger.warning("Failed to revoke at IdP: %s", e)
+
+            # Remove from storage
+            await self.storage.delete_refresh_token(user_id)
+
+            # Clear cache
+            await self.cache.invalidate(user_id)
+
+            logger.info("Revoked Nextcloud access for user %s", user_id)
+            return True
+
+        except Exception as e:
+            logger.error("Failed to revoke access for user %s: %s", user_id, e)
+            return False
+
+    async def _revoke_token_at_idp(self, token: str):
+        """Revoke token at the IdP if revocation endpoint exists."""
+        config = await self._get_oidc_config()
+        revocation_endpoint = config.get("revocation_endpoint")
+
+        if not revocation_endpoint:
+            logger.debug("No revocation endpoint available")
+            return
+
+        client = await self._get_http_client()
+
+        data = {"token": token, "token_type_hint": "refresh_token"}
+
+        response = await client.post(
+            revocation_endpoint,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+        if response.status_code == 200:
+            logger.info("Token revoked at IdP")
+        else:
+            logger.warning("Token revocation returned %s", response.status_code)
+
+    async def close(self):
+        """Clean up resources."""
+        if self._http_client:
+            await self._http_client.aclose()

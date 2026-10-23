@@ -1,0 +1,752 @@
+"""Unit tests for the contacts client vCard builder.
+
+These exercise ``_build_contact_from_data`` in isolation — no HTTP, no fixtures —
+so they cover the issue #716 regression surface and the edge cases flagged in
+PR #719 review without standing up the compose stack.
+
+Lossless update behavior is covered separately by
+``tests/client/contacts/test_byte_preserving.py``. The fork does not use
+upstream's projection-based ``_merge_vcard_properties`` write path.
+"""
+
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+from datetime import date
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from httpx import HTTPStatusError, Request, Response
+
+from nextcloud_mcp_server.client.contacts import (
+    ContactsClient,
+    EtagConflictError,
+    EtagPreconditionError,
+    _build_contact_from_data,
+    _first_custom,
+    _normalize_contact_data,
+    _vcard_to_json_projection,
+    _wrap_contact_field,
+)
+from nextcloud_mcp_server.server.contacts import _contact_write_tool_error
+
+pytestmark = pytest.mark.unit
+
+MANKIND_VCARD = (
+    "BEGIN:VCARD\r\n"
+    "VERSION:3.0\r\n"
+    "UID:mankind\r\n"
+    "FN:Mankind Grooming\r\n"
+    "PHOTO;ENCODING=b;TYPE=JPEG:abc\r\n"
+    " def\r\n"
+    "X-BARBER-NAME:Kosta\r\n"
+    "NOTE:Original\r\n"
+    "END:VCARD\r\n"
+)
+
+
+@pytest.fixture
+def write_client():
+    client = ContactsClient.__new__(ContactsClient)
+    client._resolved_vcard_url = AsyncMock(return_value="/contacts/mankind.vcf")
+    client._get_raw_vcard = AsyncMock(return_value=(MANKIND_VCARD, '"opaque-v1"'))
+    response = SimpleNamespace(
+        headers={"etag": '"opaque-v2"'}, raise_for_status=lambda: None
+    )
+    client._make_request = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.parametrize("etag", [None, "", " \t"])
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_missing_or_blank_etag_before_network(
+    write_client, method, etag
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="non-blank strong ETag"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_weak_etag_before_network(
+    write_client, method
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": 'W/"opaque-v1"'}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="weak ETags"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "etag",
+    [
+        "*",
+        "opaque-v1",
+        ' "opaque-v1"',
+        '"opaque-v1" ',
+        '"bad"quote"',
+        '"bad\nvalue"',
+        '"bad\x00value"',
+        '"bad\x1fvalue"',
+        '"bad\x7fvalue"',
+        '"bad\u0100value"',
+    ],
+    ids=[
+        "wildcard",
+        "bare-token",
+        "leading-whitespace",
+        "trailing-whitespace",
+        "internal-quote",
+        "newline-control",
+        "nul-control",
+        "unit-separator-control",
+        "del-control",
+        "non-byte-unicode",
+    ],
+)
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_reject_malformed_strong_etag_before_network(
+    write_client, method, etag
+):
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    with pytest.raises(EtagPreconditionError, match="valid strong HTTP entity-tag"):
+        await getattr(write_client, method)(**kwargs)
+
+    write_client._resolved_vcard_url.assert_not_awaited()
+    write_client._get_raw_vcard.assert_not_awaited()
+    write_client._make_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method", ["patch_contact", "put_contact"])
+async def test_modern_contact_writes_preserve_exact_strong_if_match(
+    write_client, method
+):
+    etag = '"opaque!#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~\x80\xff"'
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, etag)
+    kwargs = {"addressbook": "contacts", "uid": "mankind", "etag": etag}
+    if method == "patch_contact":
+        kwargs["set_props"] = {"NOTE": "Changed"}
+    else:
+        kwargs["vcard_text"] = MANKIND_VCARD
+
+    await getattr(write_client, method)(**kwargs)
+
+    request = write_client._make_request.await_args
+    assert request.kwargs["headers"]["If-Match"] == etag
+    assert request.args[0] == "PUT"
+    if method == "patch_contact":
+        written = request.kwargs["content"]
+        assert "NOTE:Changed\r\n" in written
+        assert "PHOTO;ENCODING=b;TYPE=JPEG:abc\r\n def\r\n" in written
+        assert "X-BARBER-NAME:Kosta\r\n" in written
+
+
+async def test_patch_rejects_stale_etag_without_put(write_client):
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, '"current"')
+
+    with pytest.raises(EtagConflictError) as caught:
+        await write_client.patch_contact(
+            addressbook="contacts",
+            uid="mankind",
+            etag='"stale"',
+            set_props={"NOTE": "Changed"},
+        )
+
+    assert caught.value.current_etag == '"current"'
+    write_client._make_request.assert_not_awaited()
+
+
+async def test_put_maps_server_412_to_typed_conflict(write_client):
+    request = Request("PUT", "https://cloud.example/contacts/mankind.vcf")
+    response = Response(412, headers={"etag": '"current"'}, request=request)
+    write_client._make_request.side_effect = HTTPStatusError(
+        "precondition failed", request=request, response=response
+    )
+
+    with pytest.raises(EtagConflictError) as caught:
+        await write_client.put_contact(
+            addressbook="contacts",
+            uid="mankind",
+            vcard_text=MANKIND_VCARD,
+            etag='"stale"',
+        )
+
+    assert caught.value.current_etag == '"current"'
+    assert write_client._make_request.await_count == 1
+
+
+def test_contact_precondition_failure_maps_to_actionable_tool_error():
+    error = _contact_write_tool_error(
+        EtagPreconditionError("put_contact requires a strong ETag"), uid="mankind"
+    )
+
+    assert "put_contact requires a strong ETag" in str(error)
+    assert "Read the contact" in str(error)
+
+
+def test_contact_conflict_maps_current_etag_to_tool_error():
+    error = _contact_write_tool_error(
+        EtagConflictError("stale", current_etag='"current"'), uid="mankind"
+    )
+
+    assert '"current"' in str(error)
+    assert "modified since it was read" in str(error)
+
+
+def _vcard(**kwargs) -> str:
+    """Build a vCard from ``contact_data`` with a fixed uid, return the serialised text.
+
+    Mirrors ``create_contact``'s real call chain: normalise aliases first, then hand
+    canonical keys to ``_build_contact_from_data``.
+    """
+    data = _normalize_contact_data(kwargs)
+    return _build_contact_from_data(data, uid="unit-test-uid").to_vcard()
+
+
+def test_issue_716_minimal_payload_keeps_all_fields():
+    """Reporter's exact payload from issue #716: every field must survive."""
+    vcard = _vcard(
+        fn="Repro User",
+        email="repro@example.com",
+        phone="555-0716",
+        organization="Acme Corp",
+        note="Issue 716",
+    )
+    assert "FN:Repro User" in vcard
+    assert "EMAIL" in vcard and "repro@example.com" in vcard
+    assert "TEL" in vcard and "555-0716" in vcard
+    assert "ORG:Acme Corp" in vcard
+    assert "NOTE:Issue 716" in vcard
+
+
+def test_org_preserves_comma_in_company_name():
+    """Regression: ``_as_list`` used to comma-split ORG, mangling names like
+    "Smith, Jones & Associates" into a two-component ORG. After the fix the whole
+    string is a single ORG component (with the comma RFC-6350-escaped as ``\\,``).
+    """
+    vcard = _vcard(fn="Alice", organization="Smith, Jones & Associates")
+    org_line = next(line for line in vcard.splitlines() if line.startswith("ORG"))
+    # Single component: no unescaped semicolon separator.
+    payload = org_line.split(":", 1)[1]
+    assert ";" not in payload
+    # Comma is escaped per RFC 6350 but the logical value is preserved.
+    assert payload.replace(r"\,", ",") == "Smith, Jones & Associates"
+
+
+def test_org_list_input_produces_structured_org():
+    """A list input is the opt-in shape for multi-component ORG (Company;Department)."""
+    vcard = _vcard(fn="Alice", org=["Acme", "Engineering"])
+    assert "ORG:Acme;Engineering" in vcard
+
+
+def test_vcard_projection_surfaces_complete_read_metadata():
+    """The read projection must retain every field exposed by Contact."""
+    vcard = (
+        "BEGIN:VCARD\r\n"
+        "VERSION:4.0\r\n"
+        "UID:projection-1\r\n"
+        "FN:Projection User\r\n"
+        "ORG:Acme Corp\r\n"
+        "TITLE:Engineer\r\n"
+        "NOTE:Projection note\r\n"
+        "URL:https://example.com/profile\r\n"
+        "CATEGORIES:vip,customer\r\n"
+        "PHOTO:data:image/png;base64,aGVsbG8=\r\n"
+        "X-TEST:preserve-me\r\n"
+        "END:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="projection-1")
+
+    assert projected["org"] == "Acme Corp"
+    assert projected["title"] == "Engineer"
+    assert projected["note"] == "Projection note"
+    assert projected["url"] == ["https://example.com/profile"]
+    assert projected["categories"] == ["vip", "customer"]
+    assert projected["photo"] == "data:image/png;base64,aGVsbG8="
+    assert projected["custom_fields"] == {"X-TEST": ["preserve-me"]}
+
+
+@pytest.mark.parametrize("bad_line", ["BDAY;VALUE=DATE:--1226", "GEO:37.38,-122.08"])
+def test_vcard_projection_drops_only_unparseable_property(bad_line: str):
+    """One unsupported property must not blank the otherwise valid contact."""
+    vcard = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\n"
+        f"TEL;TYPE=CELL:+1 555 010 1234\r\n{bad_line}\r\nUID:u1\r\nEND:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="u1")
+
+    assert projected["fullname"] == "Jane Doe"
+    assert projected["tel"][0]["value"] == "+1 555 010 1234"
+    assert projected["birthday"] is None
+
+
+def test_vcard_projection_drops_multiple_unparseable_properties():
+    """Isolation handles several bad properties in the same stored card."""
+    vcard = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nBDAY:--1226\r\n"
+        "GEO:37.38,-122.08\r\nEMAIL:jane@example.com\r\nEND:VCARD\r\n"
+    )
+
+    projected = _vcard_to_json_projection(vcard, fallback_uid="u1")
+
+    assert projected["fullname"] == "Jane Doe"
+    assert projected["email"][0]["value"] == "jane@example.com"
+
+
+def test_invalid_bday_is_dropped_not_raised(caplog):
+    """An unparseable BDAY must warn and be omitted, not crash the call."""
+    import logging
+
+    with caplog.at_level(
+        logging.WARNING, logger="nextcloud_mcp_server.client.contacts"
+    ):
+        vcard = _vcard(fn="Alice", bday="not-a-date")
+    assert "BDAY" not in vcard
+    assert any("bday" in r.message.lower() for r in caplog.records)
+
+
+def test_valid_iso_bday_is_persisted():
+    vcard = _vcard(fn="Alice", bday="1990-05-01")
+    assert "BDAY:1990-05-01" in vcard
+
+
+def test_date_object_bday_is_persisted():
+    vcard = _vcard(fn="Alice", bday=date(1985, 12, 24))
+    assert "BDAY:1985-12-24" in vcard
+
+
+def test_tel_takes_precedence_over_phone_alias():
+    """When the caller supplies both canonical and alias, canonical wins. Documents
+    the precedence so future callers aren't surprised.
+    """
+    vcard = _vcard(fn="Alice", tel="111-1111", phone="222-2222")
+    assert "111-1111" in vcard
+    assert "222-2222" not in vcard
+
+
+def test_organization_alias_fills_in_when_org_absent():
+    vcard = _vcard(fn="Alice", organization="Acme")
+    assert "ORG:Acme" in vcard
+
+
+def test_categories_string_is_split_on_commas():
+    vcard = _vcard(fn="Alice", categories="friends,work,vip")
+    cat_line = next(
+        line for line in vcard.splitlines() if line.startswith("CATEGORIES")
+    )
+    assert cat_line == "CATEGORIES:friends,work,vip"
+
+
+def test_categories_list_passes_through_unchanged():
+    """A caller that already supplied a list shouldn't have their entries split again
+    — ``["friends,work"]`` stays as one item (with the comma RFC-6350-escaped), not
+    two categories ``friends`` + ``work``.
+    """
+    vcard = _vcard(fn="Alice", categories=["friends,work"])
+    cat_line = next(
+        line for line in vcard.splitlines() if line.startswith("CATEGORIES")
+    )
+    payload = cat_line.split(":", 1)[1]
+    assert payload == r"friends\,work"  # one item, comma escaped
+
+
+def test_nickname_bare_string_is_not_char_iterated():
+    """Regression: pythonvCard4 iterates bare strings; we wrap to prevent that."""
+    vcard = _vcard(fn="Alice", nickname="Bob")
+    nick_line = next(line for line in vcard.splitlines() if line.startswith("NICKNAME"))
+    assert nick_line == "NICKNAME:Bob"
+
+
+def test_url_bare_string_is_not_char_iterated():
+    vcard = _vcard(fn="Alice", url="https://example.com")
+    # Must appear as a single URL, not one URL: per character.
+    url_lines = [line for line in vcard.splitlines() if line.startswith("URL")]
+    assert url_lines == ["URL:https://example.com"]
+
+
+def test_unknown_keys_are_ignored_without_error(caplog):
+    """Future-compat: callers sending unknown keys shouldn't blow up."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="nextcloud_mcp_server.client.contacts"):
+        vcard = _vcard(fn="Alice", totally_made_up_field="ignored")
+    assert "FN:Alice" in vcard
+    assert "totally_made_up_field" not in vcard
+    # A debug log is expected but not required — main guarantee is that no exception is raised.
+
+
+def test_empty_email_is_skipped():
+    """An empty string for email must not emit an EMAIL: line."""
+    vcard = _vcard(fn="Alice", email="")
+    assert "EMAIL" not in vcard
+
+
+def test_dict_form_email_preserves_custom_type():
+    vcard = _vcard(
+        fn="Alice",
+        email={"value": "work@example.com", "type": ["WORK"]},
+    )
+    assert "EMAIL;TYPE=WORK:work@example.com" in vcard
+
+
+def test_dict_form_email_with_bare_string_type():
+    """Regression: a dict with ``type="WORK"`` (bare string) used to be
+    char-iterated into ``["W","O","R","K"]`` because of an unguarded ``list()``
+    call inside ``_wrap_contact_field``.
+    """
+    vcard = _vcard(
+        fn="Alice",
+        email={"value": "work@example.com", "type": "WORK"},
+    )
+    assert "EMAIL;TYPE=WORK:work@example.com" in vcard
+    # The bug would emit something like ``EMAIL;TYPE=W,O,R,K:`` — guard against it.
+    assert "TYPE=W," not in vcard
+
+
+def test_wrap_field_dict_without_value_is_dropped():
+    """Dict inputs lacking the ``value`` key are silently dropped so malformed
+    payloads don't emit an EMAIL/TEL line pointing at nothing.
+    """
+    assert _wrap_contact_field({"type": ["WORK"]}) == []
+    # Mixed list: the valid entry survives, the value-less dict is omitted.
+    out = _wrap_contact_field(
+        [{"value": "ok@example.com", "type": ["WORK"]}, {"type": ["HOME"]}]
+    )
+    assert out == [{"value": "ok@example.com", "type": ["WORK"]}]
+
+
+def test_missing_fn_logs_warning(caplog):
+    """A missing ``fn`` should log a warning so operators notice malformed payloads."""
+    import logging
+
+    with caplog.at_level(
+        logging.WARNING, logger="nextcloud_mcp_server.client.contacts"
+    ):
+        try:
+            _build_contact_from_data({"email": "x@example.com"}, uid="no-fn-uid")
+        except Exception:
+            # pythonvCard4 may raise on missing fn; we only care about the warning log.
+            pass
+    assert any("fn" in r.message.lower() for r in caplog.records)
+
+
+def _multistatus(*object_names: str, addressbook: str = "contacts") -> bytes:
+    """Build a minimal PROPFIND multistatus body for ``_list_object_names``.
+
+    Includes the collection itself (trailing-slash href) plus one ``response``
+    per object name so the parser's collection-skipping is exercised.
+    """
+    base = f"/remote.php/dav/addressbooks/users/testuser/{addressbook}"
+    responses = [
+        f"<d:response><d:href>{base}/</d:href>"
+        "<d:propstat><d:prop><d:getetag>&quot;col&quot;</d:getetag></d:prop>"
+        "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+    ]
+    for name in object_names:
+        responses.append(
+            f"<d:response><d:href>{base}/{name}</d:href>"
+            "<d:propstat><d:prop><d:getetag>&quot;e&quot;</d:getetag></d:prop>"
+            "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        )
+    body = (
+        '<?xml version="1.0"?>'
+        '<d:multistatus xmlns:d="DAV:">' + "".join(responses) + "</d:multistatus>"
+    )
+    return body.encode()
+
+
+class TestObjectNameResolution:
+    """Issue #874: the CardDAV object filename is independent of the vCard UID
+    and may lack a ``.vcf`` extension, so write paths must resolve the real
+    object name instead of assuming ``<uid>.vcf``.
+    """
+
+    @staticmethod
+    def _client(mocker, multistatus: bytes) -> ContactsClient:
+        client = ContactsClient.__new__(ContactsClient)  # no HTTP / no __init__
+        client.username = "testuser"
+        response = mocker.Mock()
+        response.content = multistatus
+        client._make_request = mocker.AsyncMock(return_value=response)
+        return client
+
+    async def test_list_object_names_skips_collection(self, mocker):
+        client = self._client(mocker, _multistatus("alice.vcf", "default"))
+        names = await client._list_object_names("contacts")
+        assert names == ["alice.vcf", "default"]  # collection href omitted
+
+    async def test_resolves_conventional_vcf_name(self, mocker):
+        client = self._client(mocker, _multistatus("alice.vcf"))
+        assert await client._resolve_object_name("contacts", "alice") == "alice.vcf"
+
+    async def test_resolves_name_without_vcf_extension(self, mocker):
+        """The #874 case: object stored at ``.../default`` (no extension)."""
+        client = self._client(mocker, _multistatus("default"))
+        assert await client._resolve_object_name("contacts", "default") == "default"
+
+    async def test_prefers_vcf_when_both_present(self, mocker):
+        """Deterministic tie-break: ``<uid>.vcf`` wins over a bare ``<uid>``."""
+        client = self._client(mocker, _multistatus("dup", "dup.vcf"))
+        assert await client._resolve_object_name("contacts", "dup") == "dup.vcf"
+
+    async def test_returns_none_when_no_match(self, mocker):
+        client = self._client(mocker, _multistatus("alice.vcf"))
+        assert await client._resolve_object_name("contacts", "missing") is None
+
+    async def test_get_contact_surfaces_resolved_object_path(self, mocker):
+        """Single-contact reads expose the real extensionless CardDAV path."""
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        resolved = "/remote.php/dav/addressbooks/users/testuser/contacts/default"
+        mocker.patch.object(
+            client, "_resolved_vcard_url", mocker.AsyncMock(return_value=resolved)
+        )
+        response = mocker.Mock(
+            headers={"etag": '"etag"'},
+            text=(
+                "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:default\r\n"
+                "FN:No Extension\r\nEND:VCARD\r\n"
+            ),
+        )
+        response.raise_for_status = mocker.Mock()
+        mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+
+        result = await client.get_contact(addressbook="contacts", uid="default")
+
+        assert result["object_name"] == "default"
+        assert result["object_path"] == resolved
+
+    async def test_delete_targets_real_no_extension_path(self, mocker):
+        """Regression for #874: delete must hit ``.../default`` not ``.../default.vcf``."""
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        mocker.patch.object(
+            client, "_resolve_object_name", mocker.AsyncMock(return_value="default")
+        )
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+        await client.delete_contact(addressbook="contacts", uid="default")
+        make_request.assert_awaited_once_with(
+            "DELETE",
+            "/remote.php/dav/addressbooks/users/testuser/contacts/default",
+            headers={},
+        )
+
+    async def test_delete_falls_back_to_vcf_when_unresolved(self, mocker):
+        """A genuinely missing contact resolves to None → fall back to the
+        conventional name so the caller still gets a clean 404 from the DELETE.
+        """
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        mocker.patch.object(
+            client, "_resolve_object_name", mocker.AsyncMock(return_value=None)
+        )
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+        await client.delete_contact(addressbook="contacts", uid="ghost")
+        make_request.assert_awaited_once_with(
+            "DELETE",
+            "/remote.php/dav/addressbooks/users/testuser/contacts/ghost.vcf",
+            headers={},
+        )
+
+    async def test_put_targets_real_no_extension_path(self, mocker):
+        """Regression for #874: replacement must PUT to ``.../default`` not
+        ``.../default.vcf`` (parallels the delete coverage).
+        """
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        mocker.patch.object(
+            client, "_resolve_object_name", mocker.AsyncMock(return_value="default")
+        )
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+        await client.put_contact(
+            addressbook="contacts",
+            uid="default",
+            vcard_text="BEGIN:VCARD\nVERSION:3.0\nUID:default\nFN:Updated\nEND:VCARD\n",
+            etag='"etag"',
+        )
+        method, url = make_request.await_args.args[0], make_request.await_args.args[1]
+        assert method == "PUT"
+        assert url == "/remote.php/dav/addressbooks/users/testuser/contacts/default"
+
+    async def test_put_falls_back_to_vcf_when_unresolved(self, mocker):
+        """When resolution finds nothing, replacement falls back to ``<uid>.vcf`` so
+        the caller still gets a clean 404 from the PUT (mirrors delete).
+        """
+        client = ContactsClient.__new__(ContactsClient)
+        client.username = "testuser"
+        client._principal_discovered = True
+        mocker.patch.object(
+            client, "_resolve_object_name", mocker.AsyncMock(return_value=None)
+        )
+        response = mocker.Mock(headers={})
+        make_request = mocker.patch.object(
+            client, "_make_request", mocker.AsyncMock(return_value=response)
+        )
+        await client.put_contact(
+            addressbook="contacts",
+            uid="ghost",
+            vcard_text="BEGIN:VCARD\nVERSION:3.0\nUID:ghost\nFN:Ghost\nEND:VCARD\n",
+            etag='"x"',
+        )
+        method, url = make_request.await_args.args[0], make_request.await_args.args[1]
+        assert method == "PUT"
+        assert url == "/remote.php/dav/addressbooks/users/testuser/contacts/ghost.vcf"
+
+
+class TestFirstCustom:
+    """``_first_custom`` is the read-side companion to PR #719 — it pulls
+    ORG / TITLE / unencoded PHOTO out of pythonvCard4's ``custom`` dict because
+    the library has no typed parser for them.
+    """
+
+    def test_returns_first_value_from_list(self):
+        assert _first_custom({"ORG": ["Acme Corp"]}, "ORG") == "Acme Corp"
+
+    def test_returns_first_value_when_library_uses_bare_string(self):
+        """The library's typeshed allows ``str`` as a value shape too. Accept it
+        so we don't break if the parser changes shape upstream.
+        """
+        assert _first_custom({"TITLE": "Engineer"}, "TITLE") == "Engineer"
+
+    def test_returns_none_for_missing_key(self):
+        assert _first_custom({"ORG": ["Acme"]}, "TITLE") is None
+
+    def test_returns_none_for_empty_list(self):
+        assert _first_custom({"ORG": []}, "ORG") is None
+
+    def test_returns_none_for_empty_string(self):
+        assert _first_custom({"ORG": ""}, "ORG") is None
+
+
+class TestNormalizeContactData:
+    """Direct tests for the alias helper — it's load-bearing for update_contact too."""
+
+    def test_phone_maps_to_tel(self):
+        assert _normalize_contact_data({"phone": "123"}) == {"tel": "123"}
+
+    def test_organization_maps_to_org(self):
+        assert _normalize_contact_data({"organization": "Acme"}) == {"org": "Acme"}
+
+    def test_canonical_wins_when_both_present(self):
+        """Caller intent: they set ``tel`` deliberately. A stray ``phone`` entry
+        must not clobber the canonical value.
+        """
+        out = _normalize_contact_data({"tel": "canonical", "phone": "alias"})
+        assert out == {"tel": "canonical"}
+
+    def test_does_not_mutate_input(self):
+        original = {"phone": "123", "organization": "Acme"}
+        _normalize_contact_data(original)
+        assert original == {"phone": "123", "organization": "Acme"}
+
+    def test_passthrough_for_unknown_keys(self):
+        assert _normalize_contact_data({"foo": "bar"}) == {"foo": "bar"}
+
+
+async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        result = await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={"url": "https://example.com/profile"},
+            etag="etag-1",
+        )
+
+    assert result == {"uid": "alice"}
+    client._do_patch.assert_awaited_once_with(
+        addressbook="contacts",
+        uid="alice",
+        etag="etag-1",
+        set_props={"URL": "https://example.com/profile"},
+        add_props=None,
+        remove_props=None,
+        verify=False,
+        retry_on_conflict=False,
+        attempt=0,
+        legacy_optional_etag=True,
+    )
+
+
+async def test_update_contact_keeps_legacy_optional_etag_contract(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={"note": "legacy"},
+        )
+
+    assert client._do_patch.await_args.kwargs["etag"] == ""
+    assert client._do_patch.await_args.kwargs["legacy_optional_etag"] is True
+
+
+@pytest.mark.parametrize("server_etag", ["", 'W/"weak"'])
+async def test_legacy_update_contact_refuses_missing_or_weak_server_etag(
+    write_client, server_etag
+):
+    write_client._get_raw_vcard.return_value = (MANKIND_VCARD, server_etag)
+
+    with (
+        pytest.warns(DeprecationWarning),
+        pytest.raises(EtagPreconditionError),
+    ):
+        await write_client.update_contact(
+            addressbook="contacts",
+            uid="mankind",
+            contact_data={"fn": "After"},
+        )
+
+    write_client._make_request.assert_not_awaited()
