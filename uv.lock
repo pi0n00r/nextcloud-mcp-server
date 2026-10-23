@@ -4593,8 +4593,8 @@ wheels = [
 
 [[package]]
 name = "uvicorn"
-version = "0.52.4"
-source = { git = "https://github.com/pi0n00r/uvicorn.git#7b36fd98bca23a22ff80ae74761f54733584a691" }
+version = "0.54.0"
+source = { git = "https://github.com/pi0n00r/uvicorn.git#bd17ac60b5a6b01c6cd3800b354fb4068fa03152" }
 dependencies = [
     { name = "click" },
     { name = "h11" },
