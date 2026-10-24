@@ -24,7 +24,7 @@ services:
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:f667976416e07240e8f8ecab7151a04c452055aa030660ad84c696cae8a71bad}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:4b396b9119588e6a3a1f4bf9a19a635009bb3f0d7117586ac412e007c42ea74b}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -92,7 +92,7 @@ services:
       context: .
       dockerfile: docker/docling/Dockerfile
       args:
-        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.37.0@sha256:6eda9c524992147c1b0b06a1a9be4894bd68b1f43c86d92c32f996c4c60d18a3
+        DOCLING_IMAGE: ghcr.io/docling-project/docling-serve-cpu:v1.38.1@sha256:203c2ce82f19413bc3b83641962082165510352b9f93c1a840c0036be616eebf
     image: nextcloud-mcp-docling:local
     restart: always
     command: ["docling-serve", "run", "--host", "::"]
@@ -124,7 +124,7 @@ services:
   # the MCP server reaches it on the compose network. The image ships no shell,
   # so there is no container healthcheck; poll /hosting/capabilities instead.
   collabora:
-    image: docker.io/collabora/code:26.04.4.2.1@sha256:4e983196eb9878f339cc506c38c21f1cc3473bca3d6de883c5de08f9c0cc3a6c
+    image: docker.io/collabora/code:26.04.5.2.1@sha256:c7415b963e32eb0986a562583f154d36d3d7a461e1ddfb660a95e87094328acb
     restart: always
     ports:
       - "127.0.0.1:9980:9980"
@@ -367,7 +367,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8.0@sha256:27b3230fbabb8c9ff3c66c864cf09dcd8a41aca82e5100679d109ef0eeb05741
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:a78d6b79572168cb25886b80a8b5b8d4ed4390743e3eecb810538683e209dd6b
     command:
       - "start-dev"
       - "--import-realm"

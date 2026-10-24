@@ -160,9 +160,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:f667976416e07240e8f8ecab7151a04c452055aa030660ad84c696cae8a71bad"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:4b396b9119588e6a3a1f4bf9a19a635009bb3f0d7117586ac412e007c42ea74b"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:ca04a99f5a081030dd6c494bdfbb1cbc2bf3e2e10c0f9fcdc3be031ac3803f77"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:e02fb1a7558bae683188eb94471cdb1b4550970f905e615c8e9d10c4760f13a1"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -174,7 +174,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:5cd0788a5c7e0374256939dd86fefa34160ae03730cb28246d16939eacfd4c08"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:1f9212adecae32010cdbf137d7e0db78d08c696dc3e77f1eddcbf902d10209b4"
 
           # Mode-specific properties
           - mode: single-user
@@ -270,9 +270,17 @@ jobs:
         with:
           node-version: 24
 
-      # Astrolabe is the only app built from its submodule here; oidc is
-      # installed from the app store by app-hooks/post-installation, so it
-      # needs no build step and no mount in docker-compose.yml.
+      # TEMPORARY: oidc is mounted from its submodule (group scope limits are
+      # unreleased). The post-installation hook only uses the mount once it is
+      # built; lanes that skip this step fall back to the app store.
+      - name: Build OIDC app
+        if: matrix.mode != 'single-user'
+        run: |
+          cd third_party/oidc
+          composer install --no-dev --optimize-autoloader
+          npm ci --ignore-scripts
+          npm run build
+
       - name: Build Astrolabe app
         if: matrix.mode != 'single-user'
         run: |

@@ -5,6 +5,40 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.201.2 (2026-10-24)
+
+### Fix
+
+- **auth**: stop reporting every failed AS-proxy refresh as invalid_grant
+
+### Refactor
+
+- **auth**: drop _is_absolute_http_url from the AS-proxy refresh path
+
+## v0.201.1 (2026-10-24)
+
+### Fix
+
+- **server**: default serverInfo.version in NextcloudMCPServer itself
+- **server**: advertise serverInfo.version in the MCP handshake
+
+## v0.201.0 (2026-10-24)
+
+### Feat
+
+- **deck**: refuse startdate/color on Deck < 1.18
+- **deck**: support card startdate and color (Deck 1.18)
+
+### Fix
+
+- **deck**: surface malformed card color as ToolError
+- **deck**: drop semicolons from card tool descriptions
+- **deck**: reject non-hex card colors
+
+### Refactor
+
+- **deck**: extract _isoformat for date carry-over (Sonar S3358)
+
 ## v0.200.5 (2026-10-21)
 
 ### Fix
