@@ -93,10 +93,10 @@ jobs:
         shell: bash
         run: uv build --wheel --out-dir dist
       # Installs the built wheel (not the source tree) into a throwaway
-      # environment: --no-build cannot install this project from source, and
-      # the wheel is the artifact users actually get. Its runtime dependencies
-      # all publish wheels, which is what keeps --no-build viable here. bash on
-      # both runners so the glob expands on Windows too.
+      # environment: the package itself must come from the wheel, which is the
+      # artifact users actually get. Runtime dependencies may still require a
+      # source build; the maintained Uvicorn fork is intentionally installed
+      # from Git. Use bash on both runners so the glob expands on Windows too.
       - name: Smoke test CLI (isolated install)
         shell: bash
         env:
@@ -107,7 +107,7 @@ jobs:
         run: |
           wheel=$(ls dist/*.whl)
           req="nextcloud-mcp-server${EXTRA:+[$EXTRA]} @ ./$wheel"
-          run() { uv run --isolated --no-project --no-build --with "$req" "$@"; }
+          run() { uv run --isolated --no-project --no-build-package nextcloud-mcp-server --with "$req" "$@"; }
           run nextcloud-mcp-server --help
           # Each extra is either fully there or fully absent (semantic includes
           # documents), and without semantic, semantic search is refused at
