@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 185 application
+Deck, Talk, and other Nextcloud application surfaces through 186 application
 tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -59,7 +59,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 185 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
+| **Current tool surface** | 186 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v1.10.1.2` (application `0.201.2`): Talk threads, Deck start dates and colours, Word content controls, safer authentication refresh, and credential-safe request logging |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.1.2` (application `0.201.2`) |
@@ -150,12 +150,12 @@ The current full single-user source profile exposes the following tool surface:
 | **Files (WebDAV)** | 22 | Read/write, search, move/copy, directories, favorites, comments, file tags, trash restore and version rollback |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
-| **Notes** | 7 | Create, read, update, append, search, attachments |
+| **Notes** | 8 | Create, read, update, append, search, attachments and bounded listing with total count |
 | **Mail** | 13 | Accounts, messages, raw source, flags, tags, move/delete, sending |
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
-| **Total** | **185** | Tools in the current full single-user source profile |
+| **Total** | **186** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its

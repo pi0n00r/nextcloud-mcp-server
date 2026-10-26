@@ -545,7 +545,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:18-alpine@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792
+    image: docker.io/library/postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp
@@ -568,7 +568,7 @@ services:
   # provisioned by the post-installation hook can connect without seeding users.
   # SMTP 3025 / IMAP 3143 are the plaintext ports (ssl-mode "none").
   greenmail:
-    image: docker.io/greenmail/standalone:2.1.13@sha256:3df66b7edd01c8a301343ca5e3601d8674760d4708655573560c24745e624fb2
+    image: docker.io/greenmail/standalone:2.1.15@sha256:309ba544ea482e5d4265d09921cdab07c8dad2cc4481d715c9b8ff5d3f0a149f
     restart: always
     environment:
       - GREENMAIL_OPTS=-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose

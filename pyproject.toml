@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.201.2"
+version = "0.202.1"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -10,14 +10,14 @@ license = {text = "AGPL-3.0-only"}
 requires-python = ">=3.11"
 keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude", "webdav", "caldav", "carddav"]
 dependencies = [
-    "mcp[cli] (>=2.1,<3)",
-    "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git",
+    "mcp[cli] (>=2.3)",
     "httpx (>=0.28.1,<0.29.0)",
     # Imported directly at runtime. Each was previously reachable only because
     # some other dependency happened to pull it in — the accident that broke
     # #1285 when the resolver stopped doing so. Declared explicitly so the
     # install closure no longer depends on a transitive coincidence.
     "anyio>=4.0", # structured concurrency, used throughout
+    "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git", # fork: dual-stack listener
     "cryptography>=42.0", # auth/storage.py token encryption
     "lxml>=5.0", # client/calendar.py CalDAV XML parsing
     "packaging>=24.0", # capabilities.py compares advertised app versions
@@ -104,6 +104,9 @@ update_changelog_on_bump = true
 major_version_zero = true
 
 [tool.ruff.lint]
+# ruff 0.17 widened the default rule set (1698 new findings); pin the pre-0.17
+# defaults so adopting the new rules is a deliberate, separate change.
+select = ["E4", "E7", "E9", "F"]
 extend-select = ["I", "PLC0415", "G004"]
 
 [tool.ruff.lint.per-file-ignores]
@@ -172,8 +175,6 @@ dev = [
     # failure. That job must therefore stay off .github/actions/uv-env, which
     # syncs the dev group -- a comment on the job says so.
     "pyroscope-io>=0.8.0",
-    "certifi>=2026.6.17",
-    "pyyaml>=6.0.3",
 ]
 
 [project.entry-points."nextcloud_mcp_server.plugins"]

@@ -5,6 +5,34 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.202.1 (2026-10-26)
+
+### Fix
+
+- **contract**: close GatewayProvider on the test's own event loop
+- **deps**: pin mcp to 2.3.x for the streamable-HTTP session idle timeout
+
+## v0.202.0 (2026-10-26)
+
+### Feat
+
+- **notes**: add nc_notes_list_notes tool with a total count
+
+### Fix
+
+- **notes**: drop semicolons from the list_notes description
+- **notes**: keep list_notes count visible under truncation and bound its output
+
+### Refactor
+
+- **notes**: validate list_notes limit and stream the count
+
+## v0.201.3 (2026-10-26)
+
+### Fix
+
+- **ci**: never cancel pact runs for master pushes
+
 ## v0.201.2 (2026-10-24)
 
 ### Fix

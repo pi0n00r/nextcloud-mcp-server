@@ -41,6 +41,7 @@ async def test_mcp_connectivity(nc_mcp_client: ClientSession):
         "nc_notes_update_note",
         "nc_notes_append_content",
         "nc_notes_search_notes",
+        "nc_notes_list_notes",
         "nc_notes_delete_note",
         "nc_tables_list_tables",
         "nc_tables_get_schema",
@@ -295,6 +296,36 @@ async def test_mcp_notes_crud_workflow(
             f"Created note not found in search results. Search returned: {search_response}"
         )
         assert found_note["title"] == updated_title
+
+        # 8b. List notes via MCP: unfiltered includes ours, and the count matches
+        # the Notes API; the category filter narrows to it.
+        list_result = await nc_mcp_client.call_tool(
+            "nc_notes_list_notes", {"limit": 100000}
+        )
+        assert list_result.is_error is False, (
+            f"MCP note list failed: {list_result.content}"
+        )
+        list_response = json.loads(list_result.content[0].text)
+        assert note_id in [n["id"] for n in list_response["results"]]
+        # Compare within one response only: integration runs with xdist, so other
+        # workers create/delete notes for this user between any two calls.
+        assert list_response["total_found"] == len(list_response["results"])
+
+        # limit caps the listing, never the count (our note exists throughout).
+        limited = json.loads(
+            (await nc_mcp_client.call_tool("nc_notes_list_notes", {"limit": 0}))
+            .content[0]
+            .text
+        )
+        assert limited["results"] == []
+        assert limited["total_found"] >= 1
+
+        filtered_result = await nc_mcp_client.call_tool(
+            "nc_notes_list_notes", {"category": test_category}
+        )
+        filtered = json.loads(filtered_result.content[0].text)
+        assert note_id in [n["id"] for n in filtered["results"]]
+        assert all(n["category"] == test_category for n in filtered["results"])
 
         # 9. Delete note via MCP
         logger.info("Deleting note via MCP: %s", note_id)

@@ -204,22 +204,15 @@ sequenceDiagram
 def configure_notes_tools(mcp: FastMCP):
     @mcp.tool()
     async def nc_notes_create_note(
-        title: str,
-        content: str,
-        category: str,
-        ctx: Context
+        title: str, content: str, category: str, ctx: Context
     ) -> CreateNoteResponse:
         """Create a new note"""
         client = get_client(ctx)  # Auto-detects auth mode
         note_data = await client.notes.create_note(
-            title=title,
-            content=content,
-            category=category
+            title=title, content=content, category=category
         )
         return CreateNoteResponse(
-            id=note_data["id"],
-            title=note_data["title"],
-            etag=note_data["etag"]
+            id=note_data["id"], title=note_data["title"], etag=note_data["etag"]
         )
 
     # Resources for structured data access
@@ -262,7 +255,7 @@ async def get_tools(nc: Nextcloud):
         end_date: str,
         attendees: list[str] | None,
         start_time: str | None,
-        end_time: str | None
+        end_time: str | None,
     ):
         """Create a new event or meeting in a calendar"""
         # Parse dates and times
@@ -275,8 +268,10 @@ async def get_tools(nc: Nextcloud):
 
     return [list_calendars, schedule_event, ...]
 
+
 def get_category_name():
     return "Calendar and Tasks"
+
 
 def is_available(nc: Nextcloud):
     return True  # or check capabilities
@@ -435,20 +430,15 @@ try:
     return CreateNoteResponse(...)
 except HTTPStatusError as e:
     if e.response.status_code == 403:
-        raise McpError(ErrorData(
-            code=-1,
-            message="Access denied: insufficient permissions"
-        ))
+        raise McpError(
+            ErrorData(code=-1, message="Access denied: insufficient permissions")
+        )
     elif e.response.status_code == 413:
-        raise McpError(ErrorData(
-            code=-1,
-            message="Note content too large"
-        ))
+        raise McpError(ErrorData(code=-1, message="Note content too large"))
     elif e.response.status_code == 409:
-        raise McpError(ErrorData(
-            code=-1,
-            message="Note with this title already exists"
-        ))
+        raise McpError(
+            ErrorData(code=-1, message="Note with this title already exists")
+        )
 ```
 
 **Features**:
