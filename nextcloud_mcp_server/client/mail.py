@@ -339,15 +339,18 @@ class MailClient(BaseNextcloudClient):
             payload: dict[str, Any] = {"init": init, "ids": []}
             if query is not None:
                 payload["query"] = query
-            response = await self._make_request(
-                "POST",
-                f"{self.API_BASE}/mailboxes/{mailbox_id}/sync",
-                json=payload,
-                headers=self._API_JSON_HEADERS,
-            )
-            if response.status_code == 412 and not init:
-                await self.sync_mailbox(mailbox_id, max_rounds=max_rounds)
-                return
+            try:
+                response = await self._make_request(
+                    "POST",
+                    f"{self.API_BASE}/mailboxes/{mailbox_id}/sync",
+                    json=payload,
+                    headers=self._API_JSON_HEADERS,
+                )
+            except HTTPStatusError as e:
+                if e.response.status_code == 412 and not init:
+                    await self.sync_mailbox(mailbox_id, max_rounds=max_rounds)
+                    return
+                raise
             if response.status_code != 202:
                 return
         logger.warning(

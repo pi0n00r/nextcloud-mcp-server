@@ -284,7 +284,7 @@ async def test_incremental_sync_initializes_uncached_mailbox(mocker):
         MailClient,
         "_make_request",
         side_effect=[
-            create_mock_response(status_code=412, json_data={}),
+            _http_error(412),
             create_mock_response(status_code=200, json_data={}),
         ],
     )
