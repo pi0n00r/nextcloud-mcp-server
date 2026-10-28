@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.3-noble@sha256:99c125f103f5d081ebbc9ffe064e63daf7f688ac33a5f7f29af2d7260a96debf
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:58919b5d041049f509624364148d8881e045679dc6bc520e5705bfdd47cba49d
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -20,7 +20,7 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.2-alpine@sha256:615b4cedaff0c1437a1548acae4222572df8c021eeb7382d64cb8b5e3a13ac7a
+    image: docker.io/library/redis:8.10.3-alpine@sha256:896f241f438ab6a210cfb24f573b84bea721a4cbe67f1b4fd07eb638b3b02a7b
     restart: always
 
   app:
@@ -178,7 +178,7 @@ services:
   # tests exercise SAR export redaction (ADR-040) without a model. It detects
   # only the synthetic names hard-coded in tests/fixtures/ner_stub.py.
   ner-stub:
-    image: docker.io/library/python:3.14-alpine@sha256:01ddf82b43479870a7ea87037b7d68472bef12cc244941843c26bb75bf9a9b04
+    image: docker.io/library/python:3.14-alpine@sha256:bc62fbcb684904b1bb81a6240041bb60e9c1ee19ddeaf17a6b4297e1cc9c95d2
     restart: always
     command: ["python", "/stub/ner_stub.py"]
     volumes:

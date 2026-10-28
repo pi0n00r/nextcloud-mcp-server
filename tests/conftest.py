@@ -17,6 +17,7 @@ import anyio
 import httpx
 import httpx2
 import pytest
+from anyio.from_thread import BlockingPortal
 from httpx import HTTPStatusError
 from mcp import ClientSession
 from mcp.client.context import ClientRequestContext
@@ -25,6 +26,12 @@ from mcp.types import ElicitRequestParams, ElicitResult, ErrorData
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from nextcloud_mcp_server.client import NextcloudClient
+
+# Starlette 0.52.1 is the newest release inside the project's supported <1.0
+# range and still resolves this compatibility alias while importing its test
+# client. Install the canonical type before collection instead of weakening the
+# suite's warning-as-error policy.
+setattr(anyio.abc, "BlockingPortal", BlockingPortal)
 
 logger = logging.getLogger(__name__)
 
