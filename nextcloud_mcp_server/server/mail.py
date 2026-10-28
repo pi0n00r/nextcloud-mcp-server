@@ -142,8 +142,9 @@ async def nc_mail_list_messages(
 ) -> ListMessagesResponse:
     """List message envelopes in a mailbox, newest first (requires mail.read scope).
 
-    Reads cached envelope metadata (fast). Does not fetch bodies. Use
-    nc_mail_get_message to fetch a full body.
+    Refreshes the mailbox envelope cache on the first page, then reads cached
+    envelope metadata. Does not fetch bodies. Use nc_mail_get_message to fetch
+    a full body.
 
     Args:
         mailbox_id: Numeric mailbox id (``database_id`` from nc_mail_list_mailboxes)

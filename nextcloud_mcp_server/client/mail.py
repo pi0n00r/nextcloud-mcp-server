@@ -283,6 +283,18 @@ class MailClient(BaseNextcloudClient):
         if view is not None:
             params["view"] = view
 
+        # Mail's messages endpoint reads only its local envelope cache. The
+        # web UI refreshes that cache before listing; without the same step a
+        # previously initialized nested mailbox can report a live unread
+        # count while returning a stale empty list. Refresh only the first
+        # page so cursor pagination remains stable.
+        if cursor is None:
+            await self.sync_mailbox(
+                mailbox_id,
+                init=False,
+                query=search_filter,
+            )
+
         try:
             data = await self._api_get("/messages", params=params)
         except HTTPStatusError as e:
@@ -302,24 +314,40 @@ class MailClient(BaseNextcloudClient):
             data = await self._api_get("/messages", params=params)
         return data if isinstance(data, list) else []
 
-    async def sync_mailbox(self, mailbox_id: int, max_rounds: int = 20) -> None:
-        """Run Mail's initial IMAP→DB sync for a mailbox so it can be listed.
+    async def sync_mailbox(
+        self,
+        mailbox_id: int,
+        max_rounds: int = 20,
+        *,
+        init: bool = True,
+        query: str | None = None,
+    ) -> None:
+        """Run Mail's bounded IMAP→DB envelope synchronization.
 
         Uses ``POST /index.php/apps/mail/api/mailboxes/{id}/sync`` with
-        ``init=true``. A large mailbox is cached in chunks: Mail answers 202
-        until the initial sync completes, so repeat until it stops.
+        ``init=true`` for an uncached mailbox and ``init=false`` for an
+        incremental refresh. A large mailbox is cached in chunks: Mail answers
+        202 until synchronization completes, so repeat until it stops.
 
         Args:
             mailbox_id: The mailbox database ID.
             max_rounds: Upper bound on 202 retries.
+            init: Whether this is an initial cache population.
+            query: Optional Mail search query to synchronize.
         """
         for _ in range(max_rounds):
+            payload: dict[str, Any] = {"init": init, "ids": []}
+            if query is not None:
+                payload["query"] = query
             response = await self._make_request(
                 "POST",
                 f"{self.API_BASE}/mailboxes/{mailbox_id}/sync",
-                json={"init": True},
+                json=payload,
                 headers=self._API_JSON_HEADERS,
             )
+            if response.status_code == 412 and not init:
+                await self.sync_mailbox(mailbox_id, max_rounds=max_rounds)
+                return
             if response.status_code != 202:
                 return
         logger.warning(
