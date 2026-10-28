@@ -1,5 +1,16 @@
 """MCP tools for Nextcloud Mail app (read, send, flags, tags, move, delete)."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import json
 import logging
 from collections.abc import Generator
@@ -142,8 +153,9 @@ async def nc_mail_list_messages(
 ) -> ListMessagesResponse:
     """List message envelopes in a mailbox, newest first (requires mail.read scope).
 
-    Reads cached envelope metadata (fast). Does not fetch bodies. Use
-    nc_mail_get_message to fetch a full body.
+    Refreshes the mailbox envelope cache on the first page, then reads cached
+    envelope metadata. Does not fetch bodies. Use nc_mail_get_message to fetch
+    a full body.
 
     Args:
         mailbox_id: Numeric mailbox id (``database_id`` from nc_mail_list_mailboxes)

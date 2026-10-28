@@ -22,6 +22,17 @@ payload. Shapes are the real ones verified against a live Mail 5.x backend via
 the GreenMail integration suite.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import base64
 import logging
 from typing import Any
@@ -165,13 +176,23 @@ async def test_list_messages_omits_optional_params(mocker):
     mock_response = create_mock_response(json_data=[])
     mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
     mock_make_request = mocker.patch.object(
-        MailClient, "_make_request", return_value=mock_response
+        MailClient,
+        "_make_request",
+        side_effect=[create_mock_response(json_data={}), mock_response],
     )
 
     client = MailClient(mock_client, "testuser")
     await client.list_messages(10)
 
-    _, kwargs = mock_make_request.call_args
+    assert mock_make_request.call_args_list[0].args == (
+        "POST",
+        "/apps/mail/api/mailboxes/10/sync",
+    )
+    assert mock_make_request.call_args_list[0].kwargs["json"] == {
+        "init": False,
+        "ids": [0],
+    }
+    _, kwargs = mock_make_request.call_args_list[1]
     params = kwargs["params"]
     assert params["mailboxId"] == 10
     assert params["limit"] == 20  # default
@@ -202,6 +223,7 @@ async def test_list_messages_syncs_uncached_mailbox_and_retries(mocker):
         MailClient,
         "_make_request",
         side_effect=[
+            create_mock_response(status_code=200, json_data={}),
             _http_error(400, _NOT_CACHED_BODY),
             create_mock_response(status_code=202, json_data={}),
             create_mock_response(status_code=200, json_data={}),
@@ -215,12 +237,20 @@ async def test_list_messages_syncs_uncached_mailbox_and_retries(mocker):
     assert messages == [{"databaseId": 7}]
     calls = [c.args for c in mock_make_request.call_args_list]
     assert calls == [
+        ("POST", "/apps/mail/api/mailboxes/2/sync"),
         ("GET", "/apps/mail/api/messages"),
         ("POST", "/apps/mail/api/mailboxes/2/sync"),
         ("POST", "/apps/mail/api/mailboxes/2/sync"),
         ("GET", "/apps/mail/api/messages"),
     ]
-    assert mock_make_request.call_args_list[1].kwargs["json"] == {"init": True}
+    assert mock_make_request.call_args_list[0].kwargs["json"] == {
+        "init": False,
+        "ids": [0],
+    }
+    assert mock_make_request.call_args_list[2].kwargs["json"] == {
+        "init": True,
+        "ids": [0],
+    }
 
 
 @pytest.mark.parametrize(
@@ -233,13 +263,15 @@ async def test_list_messages_syncs_uncached_mailbox_and_retries(mocker):
 )
 async def test_list_messages_other_errors_are_not_retried(mocker, error):
     mock_make_request = mocker.patch.object(
-        MailClient, "_make_request", side_effect=error
+        MailClient,
+        "_make_request",
+        side_effect=[create_mock_response(json_data={}), error],
     )
 
     client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
     with pytest.raises(httpx.HTTPStatusError):
         await client.list_messages(2)
-    assert mock_make_request.call_count == 1
+    assert mock_make_request.call_count == 2
 
 
 async def test_sync_mailbox_stops_after_max_rounds(mocker):
@@ -253,6 +285,33 @@ async def test_sync_mailbox_stops_after_max_rounds(mocker):
     client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
     await client.sync_mailbox(2, max_rounds=3)
     assert mock_make_request.call_count == 3
+    for call in mock_make_request.call_args_list:
+        assert call.kwargs["json"] == {"init": True, "ids": [0]}
+
+
+async def test_incremental_sync_initializes_uncached_mailbox(mocker):
+    """An incremental refresh falls back to bounded initial cache population."""
+    mock_make_request = mocker.patch.object(
+        MailClient,
+        "_make_request",
+        side_effect=[
+            _http_error(412),
+            create_mock_response(status_code=200, json_data={}),
+        ],
+    )
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    await client.sync_mailbox(2, init=False)
+
+    assert mock_make_request.call_count == 2
+    assert mock_make_request.call_args_list[0].kwargs["json"] == {
+        "init": False,
+        "ids": [0],
+    }
+    assert mock_make_request.call_args_list[1].kwargs["json"] == {
+        "init": True,
+        "ids": [0],
+    }
 
 
 async def test_get_message_unwraps_full_message(mocker):

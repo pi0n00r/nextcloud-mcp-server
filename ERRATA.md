@@ -13,6 +13,36 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 # Errata
 
+## Nextcloud Mail listings can omit newly arrived messages
+
+**Status:** Corrected in Bridgette `v1.10.2.3` (application `0.202.3`).
+
+**Affected releases and packages:** all earlier Bridgette source releases and
+container packages that expose `nc_mail_list_messages`.
+
+Nextcloud Mail's messages endpoint lists its local envelope cache. Its web UI
+synchronizes the selected mailbox before reading that endpoint. Earlier
+Bridgette builds synchronized only when Mail explicitly reported that a
+mailbox had never been cached. A previously initialized folder, especially a
+nested folder, could therefore report an accurate unread count through
+`nc_mail_list_mailboxes` while `nc_mail_list_messages` returned an empty or
+stale result. The underlying IMAP message was not lost or changed.
+
+### Operator action
+
+Upgrade to `v1.10.2.3` or later before relying on Nextcloud Mail listings for
+new-message detection. On an affected build, use the Nextcloud Mail web UI or
+the authoritative mail source to confirm mailbox contents; do not interpret an
+empty Bridgette listing as proof that the mailbox is empty.
+
+### Correction
+
+Bridgette now performs Nextcloud Mail's bounded incremental envelope
+synchronization before the first listing page. Uncached folders fall back to
+bounded initial synchronization. Cursor pages are not resynchronized, keeping
+pagination stable. The refresh does not mark messages read, move or delete
+mail, or fetch message bodies.
+
 ## Login Flow v2 grant ownership
 
 **BasicAuth is *not* affected.**
