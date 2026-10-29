@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 186 application
+Deck, Talk, and other Nextcloud application surfaces through 190 application
 tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -61,7 +61,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 186 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
+| **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v1.10.2.3` (application `0.202.3`): current Nextcloud Mail folder listings, Notes listing, dependency updates, and retained fork hardening |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.2.3` (application `0.202.3`) |
@@ -149,15 +149,15 @@ The current full single-user source profile exposes the following tool surface:
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Shopping List** | 12 | Lists, items, bulk ingredient entry, completion and checked-item cleanup |
-| **Files (WebDAV)** | 22 | Read/write, search, move/copy, directories, favorites, comments, file tags, trash restore and version rollback |
+| **Files (WebDAV)** | 24 | Read/write, in-place text editing, image viewing, search, move/copy, directories, favorites, comments, file tags, trash restore and version rollback |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 8 | Create, read, update, append, search, attachments and bounded listing with total count |
-| **Mail** | 13 | Accounts, messages, raw source, flags, tags, move/delete, sending |
+| **Mail** | 15 | Accounts, messages, raw source, attachments and image viewing, flags, tags, move/delete, sending and saved drafts |
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
-| **Total** | **186** | Tools in the current full single-user source profile |
+| **Total** | **190** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its

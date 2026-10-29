@@ -21,6 +21,7 @@ Requires the `mail` + `single-user` compose profiles:
 
 import base64
 import imaplib
+import io
 import json
 import smtplib
 import subprocess
@@ -29,6 +30,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 pytestmark = [pytest.mark.integration]
 
@@ -315,6 +317,86 @@ async def test_get_pdf_attachment_roundtrip(nc_mcp_client, provisioned_mail_acco
     assert fetched["size"] == len(payload)
 
 
+def _jpeg_bytes(size: tuple[int, int]) -> bytes:
+    """A solid-colour JPEG of ``size``, for the image-attachment tests."""
+    out = io.BytesIO()
+    Image.new("RGB", size, (20, 100, 180)).save(out, format="JPEG")
+    return out.getvalue()
+
+
+async def test_view_image_attachment_arrives_as_a_scaled_image(
+    nc_mcp_client, provisioned_mail_account
+):
+    """A photo attachment comes back as an MCP image block a vision model can see.
+
+    Goes through the real Mail app: the bytes are downloaded from the direct
+    attachment route, decoded and scaled on the MCP server, and the image block
+    is decoded here to assert what a model would actually receive.
+    """
+    subject = "Image attachment integration probe"
+    _seed_message_with_attachment(
+        subject,
+        _jpeg_bytes((3000, 2000)),
+        "photo.jpg",
+        maintype="image",
+        subtype="jpeg",
+    )
+
+    full = await _sync_and_fetch_message(nc_mcp_client, subject)
+    attachments = full["attachments"]
+    assert attachments, f"no attachments on message {full}"
+    att = attachments[0]
+    assert att["fileName"] == "photo.jpg"
+
+    result = await nc_mcp_client.call_tool(
+        "nc_mail_view_attachment",
+        {"message_id": full["id"], "attachment_id": att["id"]},
+    )
+
+    assert result.is_error is False, f"tool failed: {result.content}"
+    block = result.content[0]
+    assert block.type == "image", f"first block is {block.type}, not an image"
+    assert block.mime_type == "image/jpeg"
+    image = Image.open(io.BytesIO(base64.b64decode(block.data)))
+    assert image.size == (1568, 1045)
+    data = result.structured_content
+    assert data["name"] == "photo.jpg"
+    assert data["message_id"] == full["id"]
+    assert data["attachment_id"] == att["id"]
+    assert data["mime_type"] == "image/jpeg"
+    assert (data["width"], data["height"]) == (1568, 1045)
+    assert (data["source_width"], data["source_height"]) == (3000, 2000)
+    assert data["size"] == len(base64.b64decode(block.data))
+
+
+async def test_view_attachment_refuses_a_pdf(nc_mcp_client, provisioned_mail_account):
+    """A non-image attachment is refused, and the error names the right tool."""
+    subject = "PDF view-attachment integration probe"
+    _seed_message_with_attachment(
+        subject,
+        _minimal_pdf_bytes(),
+        "sample.pdf",
+        maintype="application",
+        subtype="pdf",
+    )
+
+    full = await _sync_and_fetch_message(nc_mcp_client, subject)
+    attachments = full["attachments"]
+    assert attachments, f"no attachments on message {full}"
+    att = attachments[0]
+
+    result = await nc_mcp_client.call_tool(
+        "nc_mail_view_attachment",
+        {"message_id": full["id"], "attachment_id": att["id"]},
+    )
+
+    assert result.is_error is True
+    text = result.content[0].text
+    assert "not an image" in text
+    assert "sample.pdf" in text
+    assert "nc_mail_get_attachment" in text
+
+
 @pytest.mark.xfail(
     reason="Mail outbox send fails internally (HTTP 500, before any SMTP "
     "connection) for a CLI-provisioned GreenMail account — the sender identity "
@@ -342,6 +424,78 @@ async def test_send_message_via_outbox(nc_mcp_client, provisioned_mail_account):
         )
     )
     assert data["success"] is True
+
+
+async def test_save_draft_lands_in_drafts_and_delivers_nothing(
+    nc_mcp_client, nc_client, provisioned_mail_account
+):
+    """Save a draft, find it in the account's Drafts mailbox, and prove nothing went out.
+
+    Both halves matter. The draft has to reach IMAP: one only staged in
+    Nextcloud's database is invisible to every mail client, which is why the
+    tool moves it. And the recipient must receive nothing: ``mail.draft`` exists
+    for deployments that withhold ``mail.send``, so a delivered draft would be a
+    privilege escalation, not a cosmetic bug.
+
+    GreenMail starts with no Drafts mailbox, so on a fresh stack this also
+    covers the Mail app creating one on the first save. Both checks go to IMAP
+    directly rather than through nc_mail_list_messages, whose listing of a
+    mailbox Mail does not sync in the background can lag behind the server.
+    """
+    token = uuid.uuid4().hex[:8]
+    subject = f"Draft probe {token}"
+    recipient = f"draft-probe-{token}@example.org"
+
+    account_id = await _first_account_id(nc_mcp_client)
+    saved = _tool_payload(
+        await nc_mcp_client.call_tool(
+            "nc_mail_save_draft",
+            {
+                "account_id": account_id,
+                "to": json.dumps([{"label": "Draft Probe", "email": recipient}]),
+                "subject": subject,
+                "body": "prepared through the MCP server, never sent",
+            },
+        )
+    )
+    assert saved["account_id"] == account_id
+    assert saved["move_result"] == "Message moved to IMAP"
+
+    # The account's own drafts mailbox, as the Mail app records it.
+    accounts = await nc_client.mail.list_accounts()
+    account = next(a for a in accounts if a["id"] == account_id)
+    drafts_id = account.get("draftsMailboxId")
+    assert drafts_id is not None, f"no drafts mailbox after saving: {account}"
+    mailboxes = await nc_client.mail.get_mailboxes(account_id)
+    drafts_name = next(m["name"] for m in mailboxes if m["databaseId"] == drafts_id)
+
+    imap = imaplib.IMAP4("localhost", 3143)
+    try:
+        imap.login(ADMIN_EMAIL, "greenmail-test-pw")
+        typ, _ = imap.select(drafts_name, readonly=True)
+        assert typ == "OK", f"IMAP SELECT {drafts_name} failed"
+        _, found = imap.search(None, "SUBJECT", token)
+        ids = found[0].split()
+        assert len(ids) == 1, f"expected one draft {subject!r} in {drafts_name}"
+        _, flags = imap.fetch(ids[0], "(FLAGS)")
+        assert b"\\Draft" in flags[0], f"draft lacks the \\Draft flag: {flags}"
+        # Every draft the tool saves is marked as AI-generated, which Mail
+        # (5.12+) writes into the IMAP draft as a header.
+        _, header = imap.fetch(ids[0], "(BODY.PEEK[HEADER.FIELDS (X-AI-GENERATED)])")
+        assert b"X-AI-Generated: 1" in header[0][1], f"draft not marked: {header}"
+    finally:
+        imap.logout()
+
+    # Nothing was delivered. GreenMail runs with auth disabled, so logging in
+    # as the recipient works (and creates the mailbox if nothing ever arrived).
+    imap = imaplib.IMAP4("localhost", 3143)
+    try:
+        imap.login(recipient, "greenmail-test-pw")
+        imap.select("INBOX", readonly=True)
+        _, found = imap.search(None, "SUBJECT", token)
+        assert found[0].split() == [], f"draft {subject!r} was delivered"
+    finally:
+        imap.logout()
 
 
 # --- Write operations -------------------------------------------------------

@@ -86,7 +86,7 @@ jobs:
       # "pyroscope-io==1.1.0 ... marked as --no-build but has no binary
       # distribution".
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
       - name: Build the wheel
@@ -160,9 +160,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:5dc64c74624f880ff1dcbb8badc4654c3355bd8f63040e41eaaca98403aada85"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:a7ab427cdc56de0bb44152d743b8a2938c65897b9c021f97db1e2ccc3ed9bc46"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:6133769b4d3016ac980cb519d112370e72a5e68223ac754304fabe7e2b8dfc73"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -174,7 +174,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:ba479b85d9d28386af84eef6fcb22b3a9c4f6167067d51f7ea75fa9225548cae"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:515c072ea1cf82ece3503f301fdf75dd5a7148abcc8fa10aaefd5ec56643b703"
 
           # Mode-specific properties
           - mode: single-user

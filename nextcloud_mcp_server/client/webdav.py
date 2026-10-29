@@ -55,7 +55,7 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
-def _normalize_etag(raw: Optional[str]) -> Optional[str]:
+def normalize_etag(raw: Optional[str]) -> Optional[str]:
     """Return a reusable ETag, repairing known content-coding suffixes.
 
     Apache and other compression proxies can append ``-gzip``, ``-br``,
@@ -78,6 +78,11 @@ def _normalize_etag(raw: Optional[str]) -> Optional[str]:
             value = value[: -len(suffix)]
             break
     return f"{prefix}{value}"
+
+
+# Internal compatibility alias retained for the fork's destination-ETag and
+# compressed-validator handling. Public callers use ``normalize_etag``.
+_normalize_etag = normalize_etag
 
 
 _GENERIC_CONTENT_TYPES = frozenset({"application/octet-stream", "text/plain"})
@@ -850,7 +855,7 @@ class WebDAVClient(BaseNextcloudClient):
 
                 etag_elem = prop.find(".//{DAV:}getetag")
                 etag = (
-                    _normalize_etag(etag_elem.text)
+                    normalize_etag(etag_elem.text)
                     if etag_elem is not None and etag_elem.text
                     else None
                 )
@@ -992,7 +997,7 @@ class WebDAVClient(BaseNextcloudClient):
                 response.headers.get("content-type", "application/octet-stream"),
                 path,
             )
-            etag = _normalize_etag(response.headers.get("etag"))
+            etag = normalize_etag(response.headers.get("etag"))
 
             logger.debug(
                 f"Successfully read file '{path}' ({len(content)} bytes, etag={etag!r})"
@@ -1066,6 +1071,47 @@ class WebDAVClient(BaseNextcloudClient):
             if conflict is not None:
                 return conflict
             raise error
+
+    async def get_preview(self, path: str, size: int) -> tuple[bytes, str]:
+        """Fetch Nextcloud's preview of a file, scaled to fit ``size`` x ``size``.
+
+        Uses ``GET /index.php/core/preview.png?file=<path>``, the route the
+        Files app loads thumbnails from. Despite the name it answers with what
+        the preview provider produces: JPEG for photos, PNG for images with
+        transparency. Nextcloud keeps the aspect ratio (``a=1``), applies the
+        EXIF orientation, never upscales, and only renders a few sizes,
+        rounding the request up to the next one (256, 1024, or the largest
+        preview the server allows).
+
+        ``forceIcon=0`` and ``mimeFallback=false`` make a file without a
+        preview provider answer 404 instead of a generic file-type icon.
+
+        Args:
+            path: File path relative to the user's files root.
+            size: Requested bounding box edge, in pixels.
+
+        Returns:
+            ``(content, content_type)`` of the preview image.
+
+        Raises:
+            HTTPStatusError: 404 when the file does not exist or Nextcloud
+                cannot render a preview for it.
+        """
+        response = await self._make_request(
+            "GET",
+            "/core/preview.png",
+            params={
+                "file": "/" + path.lstrip("/"),
+                "x": size,
+                "y": size,
+                "a": 1,
+                "forceIcon": 0,
+                "mimeFallback": "false",
+            },
+        )
+        content = _read_complete_body(response, path)
+        content_type = response.headers.get("content-type", "application/octet-stream")
+        return content, content_type
 
     async def write_file(
         self,
@@ -1905,7 +1951,7 @@ class WebDAVClient(BaseNextcloudClient):
                 elif tag == "getlastmodified":
                     item["last_modified"] = value
                 elif tag == "getetag":
-                    item["etag"] = _normalize_etag(value) if value else None
+                    item["etag"] = normalize_etag(value) if value else None
                 elif tag == "fileid":
                     item["file_id"] = int(value) if value else None
                 elif tag == "favorite":
@@ -2382,7 +2428,7 @@ class WebDAVClient(BaseNextcloudClient):
 
         etag_elem = prop.find(".//{DAV:}getetag")
         etag = (
-            _normalize_etag(etag_elem.text)
+            normalize_etag(etag_elem.text)
             if etag_elem is not None and etag_elem.text
             else None
         )
@@ -2723,7 +2769,7 @@ class WebDAVClient(BaseNextcloudClient):
             "last_modified": lastmodified_elem.text
             if lastmodified_elem is not None
             else None,
-            "etag": _normalize_etag(etag_elem.text)
+            "etag": normalize_etag(etag_elem.text)
             if etag_elem is not None and etag_elem.text
             else None,
             "is_directory": is_directory,

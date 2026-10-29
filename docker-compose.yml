@@ -20,11 +20,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.3-alpine@sha256:896f241f438ab6a210cfb24f573b84bea721a4cbe67f1b4fd07eb638b3b02a7b
+    image: docker.io/library/redis:8.10.3-alpine@sha256:21090af93f8324db2f0f0f4f38a7c60369d47d917e000c3423d89d2ae2883537
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:5dc64c74624f880ff1dcbb8badc4654c3355bd8f63040e41eaaca98403aada85}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:a7ab427cdc56de0bb44152d743b8a2938c65897b9c021f97db1e2ccc3ed9bc46}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -63,7 +63,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.6-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
+    image: docker.io/library/nginx:1.31.8-alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -598,7 +598,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:ffe216e09673d9b3f561a6b02e691bab44a2f9849f7d3bb8be16957f6f826dae
+    image: docker.io/vegardit/openldap:2.6.10@sha256:0d27368ed45842100a49746971e2e759634a79921af989c319525a2618f67463
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org
