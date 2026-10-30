@@ -24,7 +24,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from nextcloud_mcp_server.astrolabe_links import astrolabe_browser_base
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client.webdav import (
     OversizeDownload,
@@ -33,7 +32,7 @@ from nextcloud_mcp_server.client.webdav import (
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.features import documents_installed
-from nextcloud_mcp_server.links import file_url, with_links
+from nextcloud_mcp_server.links import browser_base, file_url, with_links
 from nextcloud_mcp_server.models import (
     CopyResourceResponse,
     CreateFileCommentResponse,
@@ -646,11 +645,11 @@ def configure_webdav_tools(mcp: MCPServer):
         # ParseError depending on how it goes wrong) and logged rather than
         # propagated. The read that follows surfaces any real access problem
         # with a far better error than this lookup could.
-        browser_base = astrolabe_browser_base()
+        nextcloud_base = browser_base()
         url = None
-        if browser_base:
+        if nextcloud_base:
             try:
-                url = file_url(browser_base, await client.webdav.get_fileid(path))
+                url = file_url(nextcloud_base, await client.webdav.get_fileid(path))
             except Exception as e:
                 logger.debug("No file link for %r: fileid lookup failed: %s", path, e)
 

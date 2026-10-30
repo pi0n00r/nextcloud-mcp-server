@@ -13,6 +13,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
   v0.203.0
 - **docs**: remove the obsolete opt-in draft-marking claim; saved drafts are
   always marked as AI-generated
+- **links**: use the generic Nextcloud browser-base helper for file links and
+  isolate chunk-viewer URL construction from removed product branding
 
 ## v0.203.0 (2026-10-29)
 

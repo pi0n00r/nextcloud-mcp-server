@@ -32,12 +32,11 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
 
-from nextcloud_mcp_server.astrolabe_links import astrolabe_browser_base
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client.webdav import OversizeDownload
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
-from nextcloud_mcp_server.links import file_url
+from nextcloud_mcp_server.links import browser_base, file_url
 from nextcloud_mcp_server.models.webdav import ViewImageResponse
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 from nextcloud_mcp_server.server.tag_exclusion import (
@@ -115,11 +114,11 @@ async def _fetch_original(client: "NextcloudClient", path: str) -> bytes:
 async def _file_link(client: "NextcloudClient", path: str) -> str | None:
     """Files-app link to ``path``, or None. Fail-open, as in nc_webdav_read_file:
     the link is a convenience, the image is the tool's job."""
-    browser_base = astrolabe_browser_base()
-    if not browser_base:
+    nextcloud_base = browser_base()
+    if not nextcloud_base:
         return None
     try:
-        return file_url(browser_base, await client.webdav.get_fileid(path))
+        return file_url(nextcloud_base, await client.webdav.get_fileid(path))
     except Exception as e:  # noqa: BLE001 - see docstring
         logger.debug("No file link for %r: fileid lookup failed: %s", path, e)
         return None

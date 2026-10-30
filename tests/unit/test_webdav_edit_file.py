@@ -99,9 +99,7 @@ def webdav(mocker):
     mocker.patch(
         "nextcloud_mcp_server.server.webdav.get_settings", return_value=_settings()
     )
-    mocker.patch(
-        "nextcloud_mcp_server.server.webdav.astrolabe_browser_base", return_value=None
-    )
+    mocker.patch("nextcloud_mcp_server.server.webdav.browser_base", return_value=None)
     state["client"] = client
     return state
 

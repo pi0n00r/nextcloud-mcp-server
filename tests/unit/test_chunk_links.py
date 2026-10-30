@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 """Unit tests for Astrolabe deep-link construction.
 
 The consumer side already exists: Astrolabe's ``src/App.vue`` opens its chunk
@@ -13,11 +24,11 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from nextcloud_mcp_server.astrolabe_links import (
+from nextcloud_mcp_server.chunk_links import (
     ASTROLABE_APP_PATH,
-    astrolabe_browser_base,
     chunk_url,
 )
+from nextcloud_mcp_server.links import browser_base
 
 pytestmark = pytest.mark.unit
 
@@ -47,7 +58,7 @@ def _params(url: str) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
 
 
-# --- astrolabe_browser_base -------------------------------------------------
+# --- browser_base -----------------------------------------------------------
 
 
 def test_base_prefers_public_url_over_issuer_and_host():
@@ -57,31 +68,31 @@ def test_base_prefers_public_url_over_issuer_and_host():
         public_issuer_url="https://keycloak.example.com/realms/x",
         host="http://internal:8080",
     )
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        assert astrolabe_browser_base() == BASE
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        assert browser_base() == BASE
 
 
 def test_base_strips_trailing_slash():
     """Otherwise the joined path would carry a doubled slash."""
     fake = _fake_settings(public_url=f"{BASE}/")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        assert astrolabe_browser_base() == BASE
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        assert browser_base() == BASE
 
 
 def test_base_is_none_when_nothing_configured():
     with patch(
-        "nextcloud_mcp_server.astrolabe_links.get_settings",
+        "nextcloud_mcp_server.links.get_settings",
         return_value=_fake_settings(),
     ):
-        assert astrolabe_browser_base() is None
+        assert browser_base() is None
 
 
 def test_base_is_none_and_warns_when_scheme_missing(caplog):
     """A bare hostname yields a non-clickable link, so surface it instead."""
     fake = _fake_settings(host="internal-host:8080")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        with caplog.at_level("WARNING", logger="nextcloud_mcp_server.astrolabe_links"):
-            result = astrolabe_browser_base()
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        with caplog.at_level("WARNING", logger="nextcloud_mcp_server.links"):
+            result = browser_base()
     assert result is None
     assert any("missing an http:// or https://" in r.message for r in caplog.records), (
         f"expected scheme-missing warning, got {[r.message for r in caplog.records]}"
@@ -93,8 +104,8 @@ def test_base_allows_plain_http():
     compose stack is http://localhost:8080). Demanding TLS would strip the link
     from exactly the deployments that need it."""
     fake = _fake_settings(host="http://localhost:8080")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        assert astrolabe_browser_base() == "http://localhost:8080"
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        assert browser_base() == "http://localhost:8080"
 
 
 @pytest.mark.parametrize(
@@ -107,16 +118,16 @@ def test_base_allows_plain_http():
 )
 def test_base_is_none_for_unopenable_urls(configured):
     fake = _fake_settings(host=configured)
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        assert astrolabe_browser_base() is None
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        assert browser_base() is None
 
 
 def test_base_accepts_uppercase_scheme():
     """urlparse normalizes the scheme, so HTTPS:// is a working URL rather than
     a misconfiguration — a prefix match would have rejected it."""
     fake = _fake_settings(host="HTTPS://nc.example.com")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        assert astrolabe_browser_base() == "HTTPS://nc.example.com"
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        assert browser_base() == "HTTPS://nc.example.com"
 
 
 # --- chunk_url --------------------------------------------------------------

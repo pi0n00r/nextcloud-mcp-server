@@ -103,7 +103,7 @@ def webdav(mocker):
         f"{_MODULE}.get_settings",
         return_value=SimpleNamespace(document_spool_dir=None),
     )
-    mocker.patch(f"{_MODULE}.astrolabe_browser_base", return_value=None)
+    mocker.patch(f"{_MODULE}.browser_base", return_value=None)
     state["client"] = client
     return state
 
@@ -269,7 +269,7 @@ async def test_excluded_path_is_not_requested(webdav):
 
 
 async def test_link_is_added_when_a_browser_base_is_configured(webdav, mocker):
-    mocker.patch(f"{_MODULE}.astrolabe_browser_base", return_value="https://nc.example")
+    mocker.patch(f"{_MODULE}.browser_base", return_value="https://nc.example")
     webdav["client"].webdav.get_fileid = AsyncMock(return_value="42")
 
     result = await nc_webdav_view_image(path="a.jpg", ctx=_ctx())
@@ -278,7 +278,7 @@ async def test_link_is_added_when_a_browser_base_is_configured(webdav, mocker):
 
 
 async def test_link_lookup_failure_does_not_cost_the_image(webdav, mocker):
-    mocker.patch(f"{_MODULE}.astrolabe_browser_base", return_value="https://nc.example")
+    mocker.patch(f"{_MODULE}.browser_base", return_value="https://nc.example")
     webdav["client"].webdav.get_fileid = AsyncMock(side_effect=_http_error(403))
 
     result = await nc_webdav_view_image(path="a.jpg", ctx=_ctx())
