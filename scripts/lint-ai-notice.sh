@@ -35,6 +35,7 @@ fi
 # fork ownership) aren't penalized.
 FORK_TOUCHED=(
     "nextcloud_mcp_server/api/visualization.py"
+    "nextcloud_mcp_server/auth/elicitation.py"
     "nextcloud_mcp_server/client/base.py"
     "nextcloud_mcp_server/client/calendar.py"
     "nextcloud_mcp_server/client/contacts.py"
@@ -73,6 +74,7 @@ FORK_TOUCHED=(
     "tests/client/calendar/test_task_operations.py"
     "tests/client/contacts/test_byte_preserving.py"
     "tests/client/mail/test_mail_api.py"
+    "tests/conftest.py"
     "tests/server/login_flow/test_group_scope_ceiling.py"
     "tests/client/webdav/test_size_limit.py"
     "tests/contract/test_gateway_rerank_consumer.py"
@@ -94,6 +96,7 @@ FORK_TOUCHED=(
     "tests/unit/test_chunk_links.py"
     "tests/unit/test_compact_tool_results.py"
     "tests/unit/test_compose_network_policy.py"
+    "tests/unit/test_elicitation.py"
     "tests/unit/test_image_view.py"
     "tests/unit/test_links.py"
     "tests/unit/test_mail_draft_scope.py"
