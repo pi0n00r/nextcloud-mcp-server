@@ -97,6 +97,9 @@ async def _token_scopes(
         client,
         callback_server,
         scopes=REQUESTED,
+        # This test inspects the OIDC scope claim, not MCP audience binding.
+        # The shared client does not approve the MCP resource identifier.
+        resource="",
         username=username,
         password=password,
     )
