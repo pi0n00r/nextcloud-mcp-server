@@ -126,7 +126,7 @@ async def test_create_event_returns_the_fresh_server_etag(client):
     )
 
     assert created["etag"] == '"created-event"'
-    event.get_property.assert_awaited_once()
+    event.get_property.assert_not_awaited()
 
 
 async def test_create_todo_returns_the_fresh_server_etag(client):
@@ -137,7 +137,27 @@ async def test_create_todo_returns_the_fresh_server_etag(client):
     created = await client.create_todo("main", {"summary": "Created"})
 
     assert created["etag"] == '"created-todo"'
-    todo.get_property.assert_awaited_once()
+    todo.get_property.assert_not_awaited()
+
+
+async def test_create_refetches_the_etag_when_put_did_not_return_one(client):
+    event = DavObject("event-1", EVENT_ICAL, None)
+    event.get_property = AsyncMock(return_value='"fetched-event"')
+    calendar = SimpleNamespace(save_event=AsyncMock(return_value=event))
+    client._get_calendar = lambda _name: calendar
+
+    created = await client.create_event(
+        "main",
+        {
+            "title": "Created",
+            "start_datetime": "2026-07-26",
+            "end_datetime": "2026-07-27",
+            "all_day": True,
+        },
+    )
+
+    assert created["etag"] == '"fetched-event"'
+    event.get_property.assert_awaited_once()
 
 
 async def test_uid_lookup_requests_getetag_in_search_report(client):

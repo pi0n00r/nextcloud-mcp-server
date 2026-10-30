@@ -1273,7 +1273,7 @@ class CalendarClient:
 
         # caldav v3's _async_put raises PutError on HTTP failure
         event = await calendar.save_event(ical=ical_content)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
-        event_etag = await self._get_object_etag(event, fresh=True)
+        event_etag = await self._get_object_etag(event)
 
         logger.debug("Created event %s", event_uid)
 
@@ -1800,7 +1800,7 @@ class CalendarClient:
 
         # caldav v3's _async_put raises PutError on HTTP failure
         todo = await calendar.save_todo(ical=ical_content)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
-        todo_etag = await self._get_object_etag(todo, fresh=True)
+        todo_etag = await self._get_object_etag(todo)
 
         logger.debug("Created todo %s", todo_uid)
 
