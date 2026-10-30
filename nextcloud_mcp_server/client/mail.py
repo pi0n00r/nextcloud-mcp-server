@@ -63,6 +63,7 @@ DEFAULT_TAG_COLOR = "#0082c9"
 # following /messages call is the only envelope projection and enforces limit.
 SYNC_NO_ENVELOPE_ID = 0
 SYNC_CONFLICT_RETRY_DELAY_SECONDS = 0.25
+MESSAGE_LIST_CONFLICT_MAX_ATTEMPTS = 20
 
 
 def _ocs_response(response: Response) -> Any:
@@ -315,7 +316,7 @@ class MailClient(BaseNextcloudClient):
             )
 
         try:
-            data = await self._api_get("/messages", params=params)
+            data = await self._list_messages_after_sync(params)
         except HTTPStatusError as e:
             # Mail answers 400 (MailboxNotCachedException) for a mailbox it has
             # never synced from IMAP. Background sync only covers INBOX, so
@@ -330,8 +331,29 @@ class MailClient(BaseNextcloudClient):
                 raise
             logger.debug("Mailbox %s not cached; running initial sync", mailbox_id)
             await self.sync_mailbox(mailbox_id)
-            data = await self._api_get("/messages", params=params)
+            data = await self._list_messages_after_sync(params)
         return data if isinstance(data, list) else []
+
+    async def _list_messages_after_sync(
+        self,
+        params: dict[str, Any],
+        max_attempts: int = MESSAGE_LIST_CONFLICT_MAX_ATTEMPTS,
+    ) -> Any:
+        """Read Mail's envelope cache after a possibly concurrent sync.
+
+        Nextcloud Mail can release its mailbox synchronization lock shortly
+        after the sync response arrives. During that interval the messages
+        endpoint returns 409. Wait within a fixed bound, without broadening
+        retries to writes or unrelated Mail endpoints.
+        """
+        for attempt in range(max_attempts):
+            try:
+                return await self._api_get("/messages", params=params)
+            except HTTPStatusError as e:
+                if e.response.status_code != 409 or attempt + 1 >= max_attempts:
+                    raise
+                await asyncio.sleep(SYNC_CONFLICT_RETRY_DELAY_SECONDS)
+        raise RuntimeError("unreachable")
 
     async def sync_mailbox(
         self,
