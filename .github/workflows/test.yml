@@ -149,7 +149,6 @@ jobs:
           - "32"
           - "33"
           - "34"
-          - "35"
         mode:
           - "single-user"
           - "multi-user-basic"
@@ -164,10 +163,18 @@ jobs:
             nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:a7ab427cdc56de0bb44152d743b8a2938c65897b9c021f97db1e2ccc3ed9bc46"
           - nextcloud_version: "33"
             nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305"
+          # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
+          # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
+          # (max-version="34") is merged but not yet released, so
+          # `occ app:install astrolabe` still aborts the app container with
+          # "App "Astrolabe" cannot be installed because it is not compatible with
+          # this version of the server". Check availability with:
+          #   curl -sL https://apps.nextcloud.com/api/v1/platform/34.0.0/apps.json \
+          #     | jq '[.[] | select(.id=="astrolabe")] | length'
+          # A non-zero result means the release is live and these lanes should go
+          # green on a re-run.
           - nextcloud_version: "34"
             nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:515c072ea1cf82ece3503f301fdf75dd5a7148abcc8fa10aaefd5ec56643b703"
-          - nextcloud_version: "35"
-            nextcloud_image: "docker.io/library/nextcloud:35.0.1@sha256:8f2f0e93aca5e9457019933936dea1f313052e72c696b4aecb31580a208b859f"
 
           # Mode-specific properties
           - mode: single-user

@@ -32,10 +32,6 @@
       "allowedVersions": "/^34\\./"
     },
     {
-      "matchDepNames": ["nextcloud-35"],
-      "allowedVersions": "/^35\\./"
-    },
-    {
       "description": "Pin docker-compose.yml Nextcloud image to 32.x",
       "matchPackageNames": ["docker.io/library/nextcloud"],
       "matchFileNames": ["docker-compose.yml"],
