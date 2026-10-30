@@ -34,6 +34,7 @@ some setups it returns HTTP 200 with an empty, non-JSON body (see GH #989).
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
+import asyncio
 import base64
 import logging
 from email.message import Message
@@ -61,6 +62,7 @@ DEFAULT_TAG_COLOR = "#0082c9"
 # the endpoint refresh the IMAP cache while keeping its response bounded; the
 # following /messages call is the only envelope projection and enforces limit.
 SYNC_NO_ENVELOPE_ID = 0
+SYNC_CONFLICT_RETRY_DELAY_SECONDS = 0.25
 
 
 def _ocs_response(response: Response) -> Any:
@@ -352,7 +354,7 @@ class MailClient(BaseNextcloudClient):
             init: Whether this is an initial cache population.
             query: Optional Mail search query to synchronize.
         """
-        for _ in range(max_rounds):
+        for round_number in range(max_rounds):
             payload: dict[str, Any] = {
                 "init": init,
                 "ids": [SYNC_NO_ENVELOPE_ID],
@@ -367,6 +369,16 @@ class MailClient(BaseNextcloudClient):
                     headers=self._API_JSON_HEADERS,
                 )
             except HTTPStatusError as e:
+                # Mail serializes synchronization per mailbox. A background
+                # scanner and a foreground tool call can therefore overlap,
+                # in which case the second sync receives 409 while the first
+                # one still owns the lock. Wait for that bounded operation
+                # instead of surfacing a transient conflict to the caller.
+                if e.response.status_code == 409:
+                    if round_number + 1 >= max_rounds:
+                        raise
+                    await asyncio.sleep(SYNC_CONFLICT_RETRY_DELAY_SECONDS)
+                    continue
                 if e.response.status_code in (412, 428) and not init:
                     await self.sync_mailbox(
                         mailbox_id, max_rounds=max_rounds, query=query
