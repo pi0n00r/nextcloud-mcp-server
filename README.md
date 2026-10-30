@@ -63,7 +63,7 @@ automation:
 |---|---|
 | **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
-| **Latest source release** | `v1.10.2.3` (application `0.202.3`): current Nextcloud Mail folder listings, Notes listing, dependency updates, and retained fork hardening |
+| **Latest source release** | `v1.10.3.1` (application `0.203.1`): mail draft saving, bounded WebDAV text edits, image viewing, and retained fork hardening |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.2.3` (application `0.202.3`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
@@ -126,7 +126,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.10.2.3 --depth 1 \
+git clone --branch v1.10.3.1 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
