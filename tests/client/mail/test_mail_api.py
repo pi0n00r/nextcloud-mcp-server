@@ -302,16 +302,18 @@ async def test_incremental_sync_initializes_uncached_mailbox(mocker, status_code
     )
 
     client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    await client.sync_mailbox(2, init=False)
+    await client.sync_mailbox(2, init=False, query="flagged")
 
     assert mock_make_request.call_count == 2
     assert mock_make_request.call_args_list[0].kwargs["json"] == {
         "init": False,
         "ids": [0],
+        "query": "flagged",
     }
     assert mock_make_request.call_args_list[1].kwargs["json"] == {
         "init": True,
         "ids": [0],
+        "query": "flagged",
     }
 
 
