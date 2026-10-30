@@ -5,6 +5,14 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## Unreleased
+
+### Fix
+
+- **calendar**: serialize absolute non-recurring VTODO dates, completion times,
+  and alarm triggers in UTC; preserve recurring wall-clock TZIDs; and remove
+  duplicate or orphaned VTIMEZONE histories during guarded updates
+
 ## v0.203.1 (2026-10-30)
 
 ### Fix

@@ -1654,17 +1654,17 @@ def test_timed_todo_dates_still_carry_a_zone():
     assert client._parse_ical_todo(ical)["due"] == "2026-08-08T14:30:00+00:00"
 
 
-def test_timed_todo_promotes_toronto_offset_to_iana_timezone():
-    """The date-only fix must retain the fork's canonical Toronto TZID."""
+def test_timed_nonrecurring_todo_normalizes_toronto_offset_to_utc():
+    """An absolute non-recurring task instant does not need a VTIMEZONE."""
     client = _pure_client()
     ical = client._create_ical_todo(
         {"summary": "Toronto", "due": "2026-08-08T14:30:00-04:00"},
         "uid-todo-toronto",
     )
 
-    assert "DUE;TZID=America/Toronto:20260808T143000" in ical
-    assert "BEGIN:VTIMEZONE" in ical
-    assert client._parse_ical_todo(ical)["due"] == "2026-08-08T14:30:00-04:00"
+    assert "DUE:20260808T183000Z" in ical
+    assert "VTIMEZONE" not in ical
+    assert client._parse_ical_todo(ical)["due"] == "2026-08-08T18:30:00+00:00"
 
 
 def test_mixed_todo_dates_stay_date_times():

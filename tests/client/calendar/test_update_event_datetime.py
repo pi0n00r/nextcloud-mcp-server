@@ -219,16 +219,15 @@ EXISTING_TODO_ICAL = (
 )
 
 
-def test_todo_due_update_preserves_tzid(client):
-    """Update a todo's due datetime; verify TZID=America/Toronto preserved."""
+def test_todo_due_update_normalizes_absolute_time_to_utc(client):
+    """A non-recurring todo due time is an instant and needs no VTIMEZONE."""
     updated = client._merge_ical_todo_properties(
         EXISTING_TODO_ICAL,
         {"due": "2026-06-15T14:30:00-04:00"},
         "test-todo-001",
     )
-    assert "DUE;TZID=America/Toronto:20260615T143000" in updated, (
-        f"todo DUE update did not carry TZID=America/Toronto. Output:\n{updated}"
-    )
+    assert "DUE:20260615T183000Z" in updated
+    assert "TZID=America/Toronto" not in updated
     # No Python repr leak (defensive — todo path was already wrapping with vDDDTypes
     # but the new helper adds TZID promotion)
     assert "DUE:2026-06-15 14:30:00-04:00" not in updated
@@ -247,14 +246,14 @@ def test_todo_empty_due_removes_property(client):
 
 
 def test_todo_omitted_due_preserves_property(client):
-    """An unrelated partial update retains the existing DUE value."""
+    """An unrelated update retains the DUE instant in canonical UTC form."""
     updated = client._merge_ical_todo_properties(
         EXISTING_TODO_ICAL,
         {"summary": "Updated todo"},
         "test-todo-001",
     )
 
-    assert "DUE;TZID=America/Toronto:20260515T120000" in updated
+    assert "DUE:20260515T160000Z" in updated
 
 
 def test_todo_clear_due_does_not_block_timed_dtstart_update(client):
@@ -271,7 +270,7 @@ def test_todo_clear_due_does_not_block_timed_dtstart_update(client):
     )
 
     assert "DUE" not in updated
-    assert "DTSTART;TZID=America/Toronto:20260515T100000" in updated
+    assert "DTSTART:20260515T140000Z" in updated
 
 
 # === T8 — non-Toronto offset is preserved as fixed offset (don't impose Toronto) ===
@@ -308,8 +307,8 @@ def test_event_update_retains_explicit_timezone_behavior(client):
     assert "TZID:America/New_York" in updated
 
 
-def test_create_todo_promotes_toronto_offset_and_emits_vtimezone(client):
-    """New todos use the same wall-clock-preserving parser as updates."""
+def test_create_todo_normalizes_absolute_time_without_vtimezone(client):
+    """A new non-recurring todo stores its absolute due instant in UTC."""
     created = client._create_ical_todo(
         {
             "summary": "Release test",
@@ -317,8 +316,8 @@ def test_create_todo_promotes_toronto_offset_and_emits_vtimezone(client):
         },
         "test-todo-create-001",
     )
-    assert "DUE;TZID=America/Toronto:20261115T100000" in created
-    assert "TZID:America/Toronto" in created
+    assert "DUE:20261115T150000Z" in created
+    assert "VTIMEZONE" not in created
 
 
 def test_create_todo_rejects_naive_due(client):

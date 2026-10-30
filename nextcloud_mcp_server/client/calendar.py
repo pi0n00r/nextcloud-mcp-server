@@ -3048,6 +3048,91 @@ class CalendarClient:
             return dt.datetime.combine(parsed_date, dt.time.min, tzinfo=dt.UTC)
         return self._parse_caldav_datetime(value)
 
+    @staticmethod
+    def _vtodo_is_recurring(component: Any) -> bool:
+        """Whether a VTODO needs local wall-clock recurrence semantics."""
+        return any(name in component for name in ("RRULE", "RDATE", "RECURRENCE-ID"))
+
+    @staticmethod
+    def _as_utc_property(value: Any) -> vDDDTypes | None:
+        """Return an aware DATE-TIME as a canonical UTC iCalendar value."""
+        parsed = getattr(value, "dt", value)
+        if isinstance(parsed, dt.datetime) and parsed.tzinfo is None:
+            tzid = str(getattr(value, "params", {}).get("TZID", ""))
+            try:
+                if tzid.startswith(("UTC+", "UTC-")):
+                    tzinfo = dt.datetime.fromisoformat(
+                        f"2000-01-01T00:00:00{tzid.removeprefix('UTC')}"
+                    ).tzinfo
+                else:
+                    tzinfo = ZoneInfo(tzid) if tzid else None
+            except (ValueError, ZoneInfoNotFoundError):
+                tzinfo = None
+            if tzinfo is not None:
+                parsed = parsed.replace(tzinfo=tzinfo)
+        if (
+            isinstance(parsed, dt.datetime)
+            and parsed.tzinfo is not None
+            and parsed.utcoffset() is not None
+        ):
+            return vDDDTypes(parsed.astimezone(dt.UTC))
+        return None
+
+    @classmethod
+    def _normalize_vtodo_absolute_times(cls, component: Any) -> None:
+        """Canonicalize absolute VTODO instants without moving recurring wall time.
+
+        A non-recurring DTSTART or DUE is an instant, so retaining a TZID only
+        inflates the resource with a VTIMEZONE history. Recurring tasks are the
+        exception: their DTSTART/DUE can describe local wall time across DST and
+        therefore keep their TZID. COMPLETED and absolute VALARM triggers are
+        instants in either shape and are always written in UTC.
+        """
+        if not cls._vtodo_is_recurring(component):
+            for name in ("DTSTART", "DUE"):
+                value = component.get(name)
+                normalized = cls._as_utc_property(value) if value is not None else None
+                if normalized is not None:
+                    component[name] = normalized
+
+        completed = component.get("COMPLETED")
+        normalized = cls._as_utc_property(completed) if completed is not None else None
+        if normalized is not None:
+            component["COMPLETED"] = normalized
+
+        for alarm in (
+            child for child in component.subcomponents if child.name == "VALARM"
+        ):
+            trigger = alarm.get("TRIGGER")
+            normalized = cls._as_utc_property(trigger) if trigger is not None else None
+            if normalized is not None:
+                alarm["TRIGGER"] = normalized
+
+    @staticmethod
+    def _prune_orphan_vtimezones(cal: Any) -> None:
+        """Remove duplicate or unreferenced top-level VTIMEZONE components."""
+        referenced: set[str] = set()
+        for component in cal.walk():
+            if component.name == "VTIMEZONE":
+                continue
+            for name in component:
+                for value in _as_list(component[name]):
+                    tzid = getattr(value, "params", {}).get("TZID")
+                    if tzid:
+                        referenced.add(str(tzid))
+
+        seen: set[str] = set()
+        retained = []
+        for component in cal.subcomponents:
+            if component.name != "VTIMEZONE":
+                retained.append(component)
+                continue
+            tzid = str(component.get("TZID", ""))
+            if tzid in referenced and tzid not in seen:
+                retained.append(component)
+                seen.add(tzid)
+        cal.subcomponents = retained
+
     def _create_ical_todo(self, todo_data: dict[str, Any], todo_uid: str) -> str:
         """Create iCalendar VTODO content from todo data."""
         cal = Calendar()
@@ -3058,8 +3143,6 @@ class CalendarClient:
         todo.add("uid", todo_uid)
         todo.add("summary", todo_data.get("summary", ""))
         todo.add("description", todo_data.get("description", ""))
-        used_timezones: set[ZoneInfo] = set()
-
         # Status
         status = todo_data.get("status", "NEEDS-ACTION").upper()
         todo.add("status", status)
@@ -3084,18 +3167,12 @@ class CalendarClient:
             if not value:
                 continue
             parsed = self._parse_todo_date(value, date_only=date_only)
-            if isinstance(parsed, dt.datetime) and isinstance(parsed.tzinfo, ZoneInfo):
-                used_timezones.add(parsed.tzinfo)
             todo.add(prop, vDDDTypes(parsed))
 
         # Completed timestamp
         completed = todo_data.get("completed", "")
         if completed:
             completed_dt = self._parse_caldav_datetime(completed)
-            if isinstance(completed_dt, dt.datetime) and isinstance(
-                completed_dt.tzinfo, ZoneInfo
-            ):
-                used_timezones.add(completed_dt.tzinfo)
             todo.add("completed", vDDDTypes(completed_dt))
 
         # Categories
@@ -3114,9 +3191,10 @@ class CalendarClient:
         todo.add("dtstamp", now)
         todo.add("last-modified", now)
 
-        for zi in used_timezones:
-            cal.add_component(Timezone.from_tzinfo(zi))
+        self._normalize_vtodo_absolute_times(todo)
+
         cal.add_component(todo)
+        self._prune_orphan_vtimezones(cal)
         return cal.to_ical().decode("utf-8")
 
     @staticmethod
@@ -3301,6 +3379,13 @@ class CalendarClient:
                         status_value = todo_data["status"].upper()
                         component["STATUS"] = status_value
                         logger.debug("Set STATUS to %s", status_value)
+                        if (
+                            status_value != "COMPLETED"
+                            and "completed" not in todo_data
+                            and "COMPLETED" in component
+                        ):
+                            del component["COMPLETED"]
+                            logger.debug("Removed stale COMPLETED from reopened todo")
                     if "priority" in todo_data:
                         component["PRIORITY"] = todo_data["priority"]
                     if "percent_complete" in todo_data:
@@ -3368,12 +3453,11 @@ class CalendarClient:
                         completed_str = todo_data["completed"]
                         if completed_str:
                             completed_dt = self._parse_caldav_datetime(completed_str)
-                            if isinstance(completed_dt, dt.datetime) and isinstance(
-                                completed_dt.tzinfo, ZoneInfo
-                            ):
-                                used_timezones.add(completed_dt.tzinfo)
                             component["COMPLETED"] = vDDDTypes(completed_dt)
                             logger.debug("Set COMPLETED to %s", completed_dt)
+                        elif "COMPLETED" in component:
+                            del component["COMPLETED"]
+                            logger.debug("Removed COMPLETED")
 
                     # Handle categories
                     if "categories" in todo_data:
@@ -3397,6 +3481,8 @@ class CalendarClient:
                     component["LAST-MODIFIED"] = vDDDTypes(now)
                     component["DTSTAMP"] = vDDDTypes(now)
 
+                    self._normalize_vtodo_absolute_times(component)
+
                     existing_tzids = {
                         str(sub.get("TZID", ""))
                         for sub in cal.subcomponents
@@ -3405,6 +3491,8 @@ class CalendarClient:
                     for zi in used_timezones:
                         if str(zi) not in existing_tzids:
                             cal.add_component(Timezone.from_tzinfo(zi))
+
+                    self._prune_orphan_vtimezones(cal)
 
                     break
 
