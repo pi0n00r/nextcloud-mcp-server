@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from nextcloud_mcp_server.client import NextcloudClient
-from nextcloud_mcp_server.client.dav_errors import DavPreconditionFailed
+from nextcloud_mcp_server.client.calendar import CalendarEtagConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ async def test_stale_etag_write_is_refused_and_changes_nothing(
     )
 
     # Writer B still holds the now-stale etag.
-    with pytest.raises(DavPreconditionFailed):
+    with pytest.raises(CalendarEtagConflictError):
         await nc_client.calendar.update_event(
             calendar_name, uid, {"title": "writer B"}, shared_etag
         )

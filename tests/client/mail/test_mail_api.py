@@ -289,13 +289,14 @@ async def test_sync_mailbox_stops_after_max_rounds(mocker):
         assert call.kwargs["json"] == {"init": True, "ids": [0]}
 
 
-async def test_incremental_sync_initializes_uncached_mailbox(mocker):
+@pytest.mark.parametrize("status_code", [412, 428])
+async def test_incremental_sync_initializes_uncached_mailbox(mocker, status_code):
     """An incremental refresh falls back to bounded initial cache population."""
     mock_make_request = mocker.patch.object(
         MailClient,
         "_make_request",
         side_effect=[
-            _http_error(412),
+            _http_error(status_code),
             create_mock_response(status_code=200, json_data={}),
         ],
     )

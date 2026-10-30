@@ -15,6 +15,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
   always marked as AI-generated
 - **links**: use the generic Nextcloud browser-base helper for file links and
   isolate chunk-viewer URL construction from removed product branding
+- **calendar**: return the server ETag from event and todo creation so the
+  result can be used immediately for guarded updates
+- **mail**: initialize an uncached Mail 5.x folder when incremental sync
+  returns HTTP 428 as well as HTTP 412
+- **ci**: remove the retired Astrolabe submodule build step so integration
+  lanes exercise the maintained app-store installation path
 
 ## v0.203.0 (2026-10-29)
 

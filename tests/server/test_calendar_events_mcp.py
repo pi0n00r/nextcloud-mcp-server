@@ -211,7 +211,10 @@ async def test_mcp_update_event_shorthand_reminder_fields_are_independent(
         assert create_result.is_error is False, (
             f"MCP event creation failed: {create_result.content}"
         )
-        event_uid = json.loads(create_result.content[0].text)["uid"]
+        created = json.loads(create_result.content[0].text)
+        event_uid = created["uid"]
+        event_etag = created["etag"]
+        assert event_etag
 
         # Change only the offset: the EMAIL alarm must survive at the new offset.
         update_result = await nc_mcp_client.call_tool(
@@ -220,6 +223,7 @@ async def test_mcp_update_event_shorthand_reminder_fields_are_independent(
                 "calendar_name": calendar_name,
                 "event_uid": event_uid,
                 "reminder_minutes": 45,
+                "etag": event_etag,
             },
         )
         assert update_result.is_error is False, (
@@ -275,7 +279,10 @@ async def test_mcp_update_event_ordered_reminders(
         assert create_result.is_error is False, (
             f"MCP event creation failed: {create_result.content}"
         )
-        event_uid = json.loads(create_result.content[0].text)["uid"]
+        created = json.loads(create_result.content[0].text)
+        event_uid = created["uid"]
+        event_etag = created["etag"]
+        assert event_etag
 
         event, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
         stored = event.get("reminders", [])
@@ -292,11 +299,13 @@ async def test_mcp_update_event_ordered_reminders(
                 "calendar_name": calendar_name,
                 "event_uid": event_uid,
                 "location": "Room 2",
+                "etag": event_etag,
             },
         )
         assert touch_result.is_error is False, (
             f"MCP event update failed: {touch_result.content}"
         )
+        event_etag = json.loads(touch_result.content[0].text)["etag"]
         touched, _ = await nc_client.calendar.get_event(calendar_name, event_uid)
         assert len(touched.get("reminders", [])) == 2, (
             f"Expected reminders preserved, got: {touched.get('reminders')}"
@@ -309,6 +318,7 @@ async def test_mcp_update_event_ordered_reminders(
                 "calendar_name": calendar_name,
                 "event_uid": event_uid,
                 "reminders": [],
+                "etag": event_etag,
             },
         )
         assert clear_result.is_error is False, (

@@ -367,7 +367,7 @@ class MailClient(BaseNextcloudClient):
                     headers=self._API_JSON_HEADERS,
                 )
             except HTTPStatusError as e:
-                if e.response.status_code == 412 and not init:
+                if e.response.status_code in (412, 428) and not init:
                     await self.sync_mailbox(mailbox_id, max_rounds=max_rounds)
                     return
                 raise
