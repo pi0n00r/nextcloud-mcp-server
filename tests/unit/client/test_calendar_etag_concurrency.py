@@ -110,6 +110,78 @@ def response(status=204, etag='"new"'):
     return SimpleNamespace(status=status, headers={"etag": etag} if etag else {})
 
 
+async def test_create_event_returns_the_fresh_server_etag(client):
+    event = DavObject("event-1", EVENT_ICAL, '"created-event"')
+    calendar = SimpleNamespace(save_event=AsyncMock(return_value=event))
+    client._get_calendar = lambda _name: calendar
+
+    created = await client.create_event(
+        "main",
+        {
+            "title": "Created",
+            "start_datetime": "2026-07-26",
+            "end_datetime": "2026-07-27",
+            "all_day": True,
+        },
+    )
+
+    assert created["etag"] == '"created-event"'
+    event.get_property.assert_not_awaited()
+
+
+async def test_create_todo_returns_the_fresh_server_etag(client):
+    todo = DavObject("todo-1", TODO_ICAL, '"created-todo"')
+    calendar = SimpleNamespace(save_todo=AsyncMock(return_value=todo))
+    client._get_calendar = lambda _name: calendar
+
+    created = await client.create_todo("main", {"summary": "Created"})
+
+    assert created["etag"] == '"created-todo"'
+    todo.get_property.assert_not_awaited()
+
+
+async def test_create_refetches_the_etag_when_put_did_not_return_one(client):
+    event = DavObject("event-1", EVENT_ICAL, None)
+    event.get_property = AsyncMock(return_value='"fetched-event"')
+    calendar = SimpleNamespace(save_event=AsyncMock(return_value=event))
+    client._get_calendar = lambda _name: calendar
+
+    created = await client.create_event(
+        "main",
+        {
+            "title": "Created",
+            "start_datetime": "2026-07-26",
+            "end_datetime": "2026-07-27",
+            "all_day": True,
+        },
+    )
+
+    assert created["etag"] == '"fetched-event"'
+    event.get_property.assert_awaited_once()
+
+
+async def test_create_does_not_report_a_committed_write_as_failed(client):
+    event = DavObject("event-1", EVENT_ICAL, None)
+    event.get_property = AsyncMock(side_effect=RuntimeError("PROPFIND failed"))
+    calendar = SimpleNamespace(save_event=AsyncMock(return_value=event))
+    client._get_calendar = lambda _name: calendar
+
+    created = await client.create_event(
+        "main",
+        {
+            "title": "Created",
+            "start_datetime": "2026-07-26",
+            "end_datetime": "2026-07-27",
+            "all_day": True,
+        },
+    )
+
+    assert created["uid"]
+    assert created["href"] == event.url
+    assert created["etag"] == ""
+    event.get_property.assert_awaited_once()
+
+
 async def test_uid_lookup_requests_getetag_in_search_report(client):
     event = DavObject("event-1", EVENT_ICAL, '"report-v1"')
     calendar = SimpleNamespace(search=AsyncMock(return_value=[event]))

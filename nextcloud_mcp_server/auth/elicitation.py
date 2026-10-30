@@ -4,6 +4,17 @@ Provides a unified way to present login URLs to users, using MCP elicitation
 when the client supports it, or falling back to returning the URL in a message.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 from typing import Any
 
@@ -11,7 +22,7 @@ from mcp.server.mcpserver import Context
 from mcp.shared.exceptions import NoBackChannelError
 from pydantic import BaseModel, Field
 
-from nextcloud_mcp_server.astrolabe_links import astrolabe_browser_base
+from nextcloud_mcp_server.links import browser_base
 from nextcloud_mcp_server.observability.metrics import record_elicitation
 
 logger = logging.getLogger(__name__)
@@ -47,11 +58,11 @@ def _astrolabe_settings_url() -> str | None:
     """Construct the Astrolabe settings page URL from settings.
 
     Delegates the base-URL resolution and its scheme check to
-    :func:`astrolabe_browser_base`, so that logic lives in one place. Returns
+    :func:`browser_base`, so that logic lives in one place. Returns
     None when no browser-reachable Nextcloud URL is configured — the caller then
     renders the tool-only fallback message instead of a broken link.
     """
-    base = astrolabe_browser_base()
+    base = browser_base()
     if base is None:
         return None
     return f"{base}{ASTROLABE_SETTINGS_PATH}"

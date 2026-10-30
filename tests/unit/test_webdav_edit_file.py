@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 """Server-layer tests for ``nc_webdav_edit_file`` and line-range reads.
 
 The edit logic itself is covered in ``test_text_edit.py``. These pin the
@@ -88,9 +99,7 @@ def webdav(mocker):
     mocker.patch(
         "nextcloud_mcp_server.server.webdav.get_settings", return_value=_settings()
     )
-    mocker.patch(
-        "nextcloud_mcp_server.server.webdav.astrolabe_browser_base", return_value=None
-    )
+    mocker.patch("nextcloud_mcp_server.server.webdav.browser_base", return_value=None)
     state["client"] = client
     return state
 

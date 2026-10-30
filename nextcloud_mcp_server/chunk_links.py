@@ -1,4 +1,15 @@
-"""Deep links into the Astrolabe Nextcloud app's UI.
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
+"""Chunk-viewer deep links for semantic search results.
 
 The Astrolabe frontend opens its chunk viewer from query parameters on the app
 root (``src/App.vue``'s ``handleUrlParameters``), and strips them via
@@ -7,55 +18,11 @@ that *builds* such a link; the parser has existed for far longer than any
 generator.
 """
 
-import logging
-from urllib.parse import urlencode, urlparse
-
-from nextcloud_mcp_server.config import get_settings
-
-logger = logging.getLogger(__name__)
-
-# Schemes a browser can follow. Plain http stays allowed deliberately: local and
-# self-hosted Nextcloud instances are routinely served over http (the dev
-# compose stack is http://localhost:8080), so demanding TLS here would strip the
-# link from exactly the deployments that need it. This is a "can a browser open
-# it" check, not a transport-security decision — the base URL is operator
-# configuration, never user input.
-BROWSER_SCHEMES = ("http", "https")
+from urllib.parse import urlencode
 
 # Astrolabe's app root. The chunk viewer is opened by query parameters on it —
 # the app has no vue-router, so there is no per-document path to link to.
 ASTROLABE_APP_PATH = "/index.php/apps/astrolabe/"
-
-
-def astrolabe_browser_base() -> str | None:
-    """Return the browser-reachable Nextcloud base URL, or None.
-
-    Uses ``nextcloud_browser_url`` (``nextcloud_public_url`` →
-    ``nextcloud_public_issuer_url`` → ``nextcloud_host``) so links point at
-    Nextcloud even in external-IdP deployments where the OAuth issuer URL is the
-    IdP rather than Nextcloud.
-
-    Returns None when nothing is configured, and when the configured base URL
-    is not something a browser can open — a bare ``internal-host:8080`` parses
-    as scheme ``internal-host`` with no host, and would yield a non-clickable
-    link, so the misconfiguration is surfaced as a warning and callers omit the
-    link instead.
-    """
-    base = (get_settings().nextcloud_browser_url or "").strip()
-    if not base:
-        return None
-    # Parsed rather than prefix-matched: this also rejects a scheme-only
-    # "https:" (no host) and accepts an uppercase scheme, both of which a
-    # startswith check gets wrong.
-    parsed = urlparse(base)
-    if parsed.scheme not in BROWSER_SCHEMES or not parsed.netloc:
-        logger.warning(
-            "Cannot build an Astrolabe URL: configured Nextcloud base URL %r is "
-            "missing an http:// or https:// scheme.",
-            base,
-        )
-        return None
-    return base.rstrip("/")
 
 
 def chunk_url(
@@ -74,9 +41,9 @@ def chunk_url(
 ) -> str | None:
     """Build a link that opens ``doc_id``'s chunk in the Astrolabe chunk viewer.
 
-    ``base`` comes from :func:`astrolabe_browser_base`; it is a parameter rather
-    than an internal call so a search resolves it once instead of once per
-    result.
+    ``base`` comes from :func:`nextcloud_mcp_server.links.browser_base`; it is a
+    parameter rather than an internal call so a search resolves it once instead
+    of once per result.
 
     Returns None when there is no base URL, or when either chunk offset is
     missing — Astrolabe requires ``doc_type``, ``doc_id``, ``chunk_start`` and

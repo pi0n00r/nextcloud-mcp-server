@@ -1,5 +1,16 @@
 """Unit tests for the MCP elicitation helpers."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,7 +50,7 @@ def test_astrolabe_settings_url_prefers_public_url():
         public_issuer_url="https://keycloak.example.com/realms/x",
         host="https://internal.example",
     )
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         assert (
             _astrolabe_settings_url()
             == f"https://nc.example.com{ASTROLABE_SETTINGS_PATH}"
@@ -51,7 +62,7 @@ def test_astrolabe_settings_url_prefers_public_issuer():
     fake = _fake_settings(
         public_issuer_url="https://nc.example.com", host="http://internal:8080"
     )
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         assert (
             _astrolabe_settings_url()
             == f"https://nc.example.com{ASTROLABE_SETTINGS_PATH}"
@@ -61,7 +72,7 @@ def test_astrolabe_settings_url_prefers_public_issuer():
 def test_astrolabe_settings_url_strips_trailing_slash_from_public_issuer():
     """Trailing slash on nextcloud_public_issuer_url is normalized."""
     fake = _fake_settings(public_issuer_url="https://nc.example.com/")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         assert (
             _astrolabe_settings_url()
             == f"https://nc.example.com{ASTROLABE_SETTINGS_PATH}"
@@ -71,7 +82,7 @@ def test_astrolabe_settings_url_strips_trailing_slash_from_public_issuer():
 def test_astrolabe_settings_url_falls_back_to_host():
     """When only nextcloud_host is set, use it (and strip a trailing slash)."""
     fake = _fake_settings(host="https://only-host.example.com/")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         assert (
             _astrolabe_settings_url()
             == f"https://only-host.example.com{ASTROLABE_SETTINGS_PATH}"
@@ -81,7 +92,7 @@ def test_astrolabe_settings_url_falls_back_to_host():
 def test_astrolabe_settings_url_returns_none_when_unset():
     """No NC URL configured → None (caller renders the tool-only message)."""
     fake = _fake_settings()
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         assert _astrolabe_settings_url() is None
 
 
@@ -89,8 +100,8 @@ def test_astrolabe_settings_url_returns_none_when_scheme_missing(caplog):
     """Bare hostname (no http:// or https://) → None + a warning so the operator
     sees the misconfiguration instead of getting a silently-broken URL."""
     fake = _fake_settings(host="internal-host:8080")
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
-        with caplog.at_level("WARNING", logger="nextcloud_mcp_server.astrolabe_links"):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
+        with caplog.at_level("WARNING", logger="nextcloud_mcp_server.links"):
             assert _astrolabe_settings_url() is None
     assert any(
         "missing an http:// or https://" in rec.message for rec in caplog.records
@@ -105,7 +116,7 @@ async def test_present_provisioning_required_elicits_with_url():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(return_value=SimpleNamespace(action="accept", data=None))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "accepted"
@@ -121,7 +132,7 @@ async def test_present_provisioning_required_without_url():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(return_value=SimpleNamespace(action="accept", data=None))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "accepted"
@@ -139,7 +150,7 @@ async def test_present_provisioning_required_no_elicit_method():
     ctx = _NoElicit()
 
     fake = _fake_settings()
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)  # type: ignore[arg-type]
 
     assert result == "message_only"
@@ -151,7 +162,7 @@ async def test_present_provisioning_required_handles_not_implemented():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(side_effect=NotImplementedError("client lacks elicit"))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "message_only"
@@ -163,7 +174,7 @@ async def test_present_provisioning_required_handles_unexpected_error():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(side_effect=RuntimeError("transport boom"))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "message_only"
@@ -175,7 +186,7 @@ async def test_present_provisioning_required_decline_returns_declined():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(return_value=SimpleNamespace(action="decline", data=None))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "declined"
@@ -187,7 +198,7 @@ async def test_present_provisioning_required_cancel_returns_cancelled():
     ctx = MagicMock()
     ctx.elicit = AsyncMock(return_value=SimpleNamespace(action="cancel", data=None))
 
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         result = await present_provisioning_required(ctx)
 
     assert result == "cancelled"
@@ -210,7 +221,7 @@ _PROVISIONING = "provisioning_required"
 
 async def _run_provisioning(ctx) -> str:
     fake = _fake_settings()
-    with patch("nextcloud_mcp_server.astrolabe_links.get_settings", return_value=fake):
+    with patch("nextcloud_mcp_server.links.get_settings", return_value=fake):
         return await present_provisioning_required(ctx)
 
 

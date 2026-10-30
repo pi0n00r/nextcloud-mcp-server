@@ -34,6 +34,7 @@ some setups it returns HTTP 200 with an empty, non-JSON body (see GH #989).
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
+import asyncio
 import base64
 import logging
 from email.message import Message
@@ -61,6 +62,8 @@ DEFAULT_TAG_COLOR = "#0082c9"
 # the endpoint refresh the IMAP cache while keeping its response bounded; the
 # following /messages call is the only envelope projection and enforces limit.
 SYNC_NO_ENVELOPE_ID = 0
+SYNC_CONFLICT_RETRY_DELAY_SECONDS = 0.25
+MESSAGE_LIST_CONFLICT_MAX_ATTEMPTS = 20
 
 
 def _ocs_response(response: Response) -> Any:
@@ -313,7 +316,7 @@ class MailClient(BaseNextcloudClient):
             )
 
         try:
-            data = await self._api_get("/messages", params=params)
+            data = await self._list_messages_after_sync(params)
         except HTTPStatusError as e:
             # Mail answers 400 (MailboxNotCachedException) for a mailbox it has
             # never synced from IMAP. Background sync only covers INBOX, so
@@ -328,8 +331,29 @@ class MailClient(BaseNextcloudClient):
                 raise
             logger.debug("Mailbox %s not cached; running initial sync", mailbox_id)
             await self.sync_mailbox(mailbox_id)
-            data = await self._api_get("/messages", params=params)
+            data = await self._list_messages_after_sync(params)
         return data if isinstance(data, list) else []
+
+    async def _list_messages_after_sync(
+        self,
+        params: dict[str, Any],
+        max_attempts: int = MESSAGE_LIST_CONFLICT_MAX_ATTEMPTS,
+    ) -> Any:
+        """Read Mail's envelope cache after a possibly concurrent sync.
+
+        Nextcloud Mail can release its mailbox synchronization lock shortly
+        after the sync response arrives. During that interval the messages
+        endpoint returns 409. Wait within a fixed bound, without broadening
+        retries to writes or unrelated Mail endpoints.
+        """
+        for attempt in range(max_attempts):
+            try:
+                return await self._api_get("/messages", params=params)
+            except HTTPStatusError as e:
+                if e.response.status_code != 409 or attempt + 1 >= max_attempts:
+                    raise
+                await asyncio.sleep(SYNC_CONFLICT_RETRY_DELAY_SECONDS)
+        raise RuntimeError("unreachable")
 
     async def sync_mailbox(
         self,
@@ -338,6 +362,7 @@ class MailClient(BaseNextcloudClient):
         *,
         init: bool = True,
         query: str | None = None,
+        max_conflict_attempts: int = 20,
     ) -> None:
         """Run Mail's bounded IMAP→DB envelope synchronization.
 
@@ -351,8 +376,11 @@ class MailClient(BaseNextcloudClient):
             max_rounds: Upper bound on 202 retries.
             init: Whether this is an initial cache population.
             query: Optional Mail search query to synchronize.
+            max_conflict_attempts: Upper bound on waits for another sync owner.
         """
-        for _ in range(max_rounds):
+        round_number = 0
+        conflict_attempts = 0
+        while round_number < max_rounds:
             payload: dict[str, Any] = {
                 "init": init,
                 "ids": [SYNC_NO_ENVELOPE_ID],
@@ -367,10 +395,27 @@ class MailClient(BaseNextcloudClient):
                     headers=self._API_JSON_HEADERS,
                 )
             except HTTPStatusError as e:
-                if e.response.status_code == 412 and not init:
-                    await self.sync_mailbox(mailbox_id, max_rounds=max_rounds)
+                # Mail serializes synchronization per mailbox. A background
+                # scanner and a foreground tool call can therefore overlap,
+                # in which case the second sync receives 409 while the first
+                # one still owns the lock. Wait for that bounded operation
+                # instead of surfacing a transient conflict to the caller.
+                if e.response.status_code == 409:
+                    conflict_attempts += 1
+                    if conflict_attempts >= max_conflict_attempts:
+                        raise
+                    await asyncio.sleep(SYNC_CONFLICT_RETRY_DELAY_SECONDS)
+                    continue
+                if e.response.status_code in (412, 428) and not init:
+                    await self.sync_mailbox(
+                        mailbox_id,
+                        max_rounds=max_rounds,
+                        query=query,
+                        max_conflict_attempts=max_conflict_attempts,
+                    )
                     return
                 raise
+            round_number += 1
             if response.status_code != 202:
                 return
         logger.warning(

@@ -23,12 +23,12 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from nextcloud_mcp_server.astrolabe_links import astrolabe_browser_base, chunk_url
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.capabilities import allowed_doc_types
+from nextcloud_mcp_server.chunk_links import chunk_url
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
-from nextcloud_mcp_server.links import file_url
+from nextcloud_mcp_server.links import browser_base, file_url
 from nextcloud_mcp_server.models.semantic import (
     SemanticSearchResponse,
     SemanticSearchResult,
@@ -676,7 +676,7 @@ def configure_semantic_tools(
             # Resolved once per search rather than once per result: it reads
             # config and logs a warning when the base URL is unusable, and doing
             # that per row would repeat the warning `limit` times.
-            browser_base = astrolabe_browser_base()
+            nextcloud_base = browser_base()
 
             # Convert SearchResult objects to SemanticSearchResult for response.
             # SearchResult.id is `str` (Qdrant keyword-indexed payload), but
@@ -738,7 +738,7 @@ def configure_semantic_tools(
                         page_number=r.page_number,
                         page_end=r.page_end,
                         url=chunk_url(
-                            browser_base,
+                            nextcloud_base,
                             doc_type=r.doc_type,
                             doc_id=narrowed_id,
                             chunk_start=r.chunk_start_offset,
@@ -757,7 +757,7 @@ def configure_semantic_tools(
                         # note id fed to /f/ would open an unrelated file or
                         # 404.
                         file_url=(
-                            file_url(browser_base, narrowed_id)
+                            file_url(nextcloud_base, narrowed_id)
                             if r.doc_type == "file"
                             else None
                         ),

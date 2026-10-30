@@ -5,6 +5,23 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.203.1 (2026-10-30)
+
+### Fix
+
+- **licensing**: add the required AI-NOTICE block to Python files introduced in
+  v0.203.0
+- **docs**: remove the obsolete opt-in draft-marking claim; saved drafts are
+  always marked as AI-generated
+- **links**: use the generic Nextcloud browser-base helper for file links and
+  isolate chunk-viewer URL construction from removed product branding
+- **calendar**: return the server ETag from event and todo creation so the
+  result can be used immediately for guarded updates
+- **mail**: initialize an uncached Mail 5.x folder when incremental sync
+  returns HTTP 428 as well as HTTP 412
+- **ci**: remove the retired Astrolabe submodule build step so integration
+  lanes exercise the maintained app-store installation path
+
 ## v0.203.0 (2026-10-29)
 
 ### Feat
@@ -13,7 +30,6 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 - **webdav**: add nc_webdav_view_image to show images to vision models
 - **client**: add WebDAVClient.get_preview for Nextcloud file previews
 - **webdav**: add nc_webdav_edit_file and line-range reads
-- **mail**: add opt-in MAIL_DRAFT_MARK_AI_GENERATED for saved drafts
 - **mail**: add mail.draft scope and nc_mail_save_draft tool
 
 ### Fix

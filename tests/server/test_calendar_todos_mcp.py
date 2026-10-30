@@ -717,7 +717,8 @@ async def test_stale_etag_refuses_the_write_end_to_end(
             },
         )
         assert refused.is_error is True
-        assert "nc_calendar_list_todos" in refused.content[0].text
+        assert "Read the todo again" in refused.content[0].text
+        assert second_etag in refused.content[0].text
 
         # ...and the refusal really did leave the stored copy alone.
         todos = await nc_client.calendar.list_todos(calendar_name)

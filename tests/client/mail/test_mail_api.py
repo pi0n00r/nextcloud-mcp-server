@@ -274,6 +274,51 @@ async def test_list_messages_other_errors_are_not_retried(mocker, error):
     assert mock_make_request.call_count == 2
 
 
+async def test_list_messages_waits_for_sync_lock_release(mocker):
+    """A short-lived 409 after sync is retried without changing the query."""
+    mock_make_request = mocker.patch.object(
+        MailClient,
+        "_make_request",
+        side_effect=[
+            create_mock_response(json_data={}),
+            _http_error(409),
+            create_mock_response(json_data=[{"databaseId": 7}]),
+        ],
+    )
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    messages = await client.list_messages(2, search_filter="flagged")
+
+    assert messages == [{"databaseId": 7}]
+    assert mock_make_request.call_args_list[1].kwargs["params"] == {
+        "mailboxId": 2,
+        "limit": 20,
+        "filter": "flagged",
+    }
+    assert (
+        mock_make_request.call_args_list[2].kwargs["params"]
+        == mock_make_request.call_args_list[1].kwargs["params"]
+    )
+    sleep.assert_awaited_once_with(0.25)
+
+
+async def test_list_messages_surfaces_conflict_after_retry_bound(mocker):
+    """A stuck post-sync lock remains visible after the bounded wait."""
+    mock_api_get = mocker.patch.object(
+        MailClient, "_api_get", side_effect=_http_error(409)
+    )
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        await client._list_messages_after_sync({"mailboxId": 2}, max_attempts=2)
+
+    assert excinfo.value.response.status_code == 409
+    assert mock_api_get.call_count == 2
+    sleep.assert_awaited_once_with(0.25)
+
+
 async def test_sync_mailbox_stops_after_max_rounds(mocker):
     """A sync that never completes (always 202) is bounded, not an endless loop."""
     mock_make_request = mocker.patch.object(
@@ -289,28 +334,87 @@ async def test_sync_mailbox_stops_after_max_rounds(mocker):
         assert call.kwargs["json"] == {"init": True, "ids": [0]}
 
 
-async def test_incremental_sync_initializes_uncached_mailbox(mocker):
+async def test_sync_mailbox_retries_a_concurrent_sync_conflict(mocker):
+    """A mailbox lock held by another sync is retried within the same bound."""
+    conflict = _http_error(409)
+    mock_make_request = mocker.patch.object(
+        MailClient,
+        "_make_request",
+        side_effect=[conflict, create_mock_response(status_code=200, json_data={})],
+    )
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    await client.sync_mailbox(2, max_rounds=2, init=False, query="flagged")
+
+    assert mock_make_request.call_count == 2
+    assert all(
+        call.kwargs["json"] == {"init": False, "ids": [0], "query": "flagged"}
+        for call in mock_make_request.call_args_list
+    )
+    sleep.assert_awaited_once_with(0.25)
+
+
+async def test_sync_conflicts_do_not_consume_sync_rounds(mocker):
+    """Lock waits have a separate budget from 202 synchronization rounds."""
+    conflict = _http_error(409)
+    mock_make_request = mocker.patch.object(
+        MailClient,
+        "_make_request",
+        side_effect=[
+            conflict,
+            conflict,
+            create_mock_response(status_code=202, json_data={}),
+            create_mock_response(status_code=200, json_data={}),
+        ],
+    )
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=3, init=False)
+
+    assert mock_make_request.call_count == 4
+    assert sleep.await_count == 2
+
+
+async def test_sync_mailbox_surfaces_conflict_after_retry_bound(mocker):
+    """A stuck mailbox lock remains visible after the bounded wait."""
+    mocker.patch.object(MailClient, "_make_request", side_effect=_http_error(409))
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=2)
+
+    assert excinfo.value.response.status_code == 409
+    sleep.assert_awaited_once_with(0.25)
+
+
+@pytest.mark.parametrize("status_code", [412, 428])
+async def test_incremental_sync_initializes_uncached_mailbox(mocker, status_code):
     """An incremental refresh falls back to bounded initial cache population."""
     mock_make_request = mocker.patch.object(
         MailClient,
         "_make_request",
         side_effect=[
-            _http_error(412),
+            _http_error(status_code),
             create_mock_response(status_code=200, json_data={}),
         ],
     )
 
     client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    await client.sync_mailbox(2, init=False)
+    await client.sync_mailbox(2, init=False, query="flagged")
 
     assert mock_make_request.call_count == 2
     assert mock_make_request.call_args_list[0].kwargs["json"] == {
         "init": False,
         "ids": [0],
+        "query": "flagged",
     }
     assert mock_make_request.call_args_list[1].kwargs["json"] == {
         "init": True,
         "ids": [0],
+        "query": "flagged",
     }
 
 
