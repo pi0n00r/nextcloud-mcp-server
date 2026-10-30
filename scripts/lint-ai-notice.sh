@@ -73,6 +73,7 @@ FORK_TOUCHED=(
     "tests/client/calendar/test_task_operations.py"
     "tests/client/contacts/test_byte_preserving.py"
     "tests/client/mail/test_mail_api.py"
+    "tests/server/login_flow/test_group_scope_ceiling.py"
     "tests/client/webdav/test_size_limit.py"
     "tests/contract/test_gateway_rerank_consumer.py"
     "tests/server/test_calendar_todos_mcp.py"
