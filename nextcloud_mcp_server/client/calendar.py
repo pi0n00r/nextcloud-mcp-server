@@ -706,6 +706,16 @@ class CalendarClient:
         etag = await _maybe_await(obj.get_property(dav.GetEtag()))
         return str(etag) if etag else None
 
+    async def _etag_after_create(self, obj: Any, *, kind: str, uid: str) -> str | None:
+        """Read a creation ETag without turning a committed write into failure."""
+        try:
+            return await self._get_object_etag(obj)
+        except Exception as exc:
+            logger.warning(
+                "Created %s %s but could not read its ETag: %s", kind, uid, exc
+            )
+            return None
+
     async def _require_current_etag(
         self, obj: Any, caller_etag: str, *, kind: str, uid: str
     ) -> str:
@@ -1273,7 +1283,7 @@ class CalendarClient:
 
         # caldav v3's _async_put raises PutError on HTTP failure
         event = await calendar.save_event(ical=ical_content)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
-        event_etag = await self._get_object_etag(event)
+        event_etag = await self._etag_after_create(event, kind="event", uid=event_uid)
 
         logger.debug("Created event %s", event_uid)
 
@@ -1800,7 +1810,7 @@ class CalendarClient:
 
         # caldav v3's _async_put raises PutError on HTTP failure
         todo = await calendar.save_todo(ical=ical_content)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
-        todo_etag = await self._get_object_etag(todo)
+        todo_etag = await self._etag_after_create(todo, kind="todo", uid=todo_uid)
 
         logger.debug("Created todo %s", todo_uid)
 
