@@ -362,6 +362,7 @@ class MailClient(BaseNextcloudClient):
         *,
         init: bool = True,
         query: str | None = None,
+        max_conflict_attempts: int = 20,
     ) -> None:
         """Run Mail's bounded IMAP→DB envelope synchronization.
 
@@ -375,8 +376,11 @@ class MailClient(BaseNextcloudClient):
             max_rounds: Upper bound on 202 retries.
             init: Whether this is an initial cache population.
             query: Optional Mail search query to synchronize.
+            max_conflict_attempts: Upper bound on waits for another sync owner.
         """
-        for round_number in range(max_rounds):
+        round_number = 0
+        conflict_attempts = 0
+        while round_number < max_rounds:
             payload: dict[str, Any] = {
                 "init": init,
                 "ids": [SYNC_NO_ENVELOPE_ID],
@@ -397,16 +401,21 @@ class MailClient(BaseNextcloudClient):
                 # one still owns the lock. Wait for that bounded operation
                 # instead of surfacing a transient conflict to the caller.
                 if e.response.status_code == 409:
-                    if round_number + 1 >= max_rounds:
+                    conflict_attempts += 1
+                    if conflict_attempts >= max_conflict_attempts:
                         raise
                     await asyncio.sleep(SYNC_CONFLICT_RETRY_DELAY_SECONDS)
                     continue
                 if e.response.status_code in (412, 428) and not init:
                     await self.sync_mailbox(
-                        mailbox_id, max_rounds=max_rounds, query=query
+                        mailbox_id,
+                        max_rounds=max_rounds,
+                        query=query,
+                        max_conflict_attempts=max_conflict_attempts,
                     )
                     return
                 raise
+            round_number += 1
             if response.status_code != 202:
                 return
         logger.warning(

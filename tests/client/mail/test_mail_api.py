@@ -355,6 +355,28 @@ async def test_sync_mailbox_retries_a_concurrent_sync_conflict(mocker):
     sleep.assert_awaited_once_with(0.25)
 
 
+async def test_sync_conflicts_do_not_consume_sync_rounds(mocker):
+    """Lock waits have a separate budget from 202 synchronization rounds."""
+    conflict = _http_error(409)
+    mock_make_request = mocker.patch.object(
+        MailClient,
+        "_make_request",
+        side_effect=[
+            conflict,
+            conflict,
+            create_mock_response(status_code=202, json_data={}),
+            create_mock_response(status_code=200, json_data={}),
+        ],
+    )
+    sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
+
+    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=3, init=False)
+
+    assert mock_make_request.call_count == 4
+    assert sleep.await_count == 2
+
+
 async def test_sync_mailbox_surfaces_conflict_after_retry_bound(mocker):
     """A stuck mailbox lock remains visible after the bounded wait."""
     mocker.patch.object(MailClient, "_make_request", side_effect=_http_error(409))
@@ -362,7 +384,7 @@ async def test_sync_mailbox_surfaces_conflict_after_retry_bound(mocker):
 
     client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
     with pytest.raises(httpx.HTTPStatusError) as excinfo:
-        await client.sync_mailbox(2, max_rounds=2)
+        await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=2)
 
     assert excinfo.value.response.status_code == 409
     sleep.assert_awaited_once_with(0.25)
