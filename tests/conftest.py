@@ -2364,7 +2364,7 @@ async def _get_oauth_token_with_scopes(
                 break
             await anyio.sleep(0.1)
         else:
-            current_url = page.url
+            current_url = urlparse(page.url)._replace(query="", fragment="").geturl()
             raise TimeoutError(
                 f"Auth code not received within {timeout}s. State: {state[:16]}... "
                 f"Page URL: {current_url}"
