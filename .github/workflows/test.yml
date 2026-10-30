@@ -281,14 +281,6 @@ jobs:
           npm ci --ignore-scripts
           npm run build
 
-      - name: Build Astrolabe app
-        if: matrix.mode != 'single-user'
-        run: |
-          cd third_party/astrolabe
-          composer install --no-dev --optimize-autoloader
-          npm ci --ignore-scripts
-          npm run build
-
       # Generate an ephemeral Fernet key per CI run. docker-compose.yml
       # requires TOKEN_ENCRYPTION_KEY (PR #758 finding 5 removed the
       # hardcoded default), but the CI tokens.db is destroyed at the end of
