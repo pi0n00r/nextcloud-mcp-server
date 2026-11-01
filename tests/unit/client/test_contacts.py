@@ -773,6 +773,15 @@ def test_structured_name_escaped_semicolon_round_trips_through_projection():
     assert projected["n"][:2] == ["Van;Buren", "Jane"]
 
 
+def test_structured_name_escaped_backslash_is_not_decoded_as_newline():
+    normalised = _normalize_contact_data({"n": r"Doe\\nson;Jane;;;"})
+    assert normalised["n"]["family_name"] == r"Doe\nson"
+
+    card = _build_contact_from_data(normalised, "projection-backslash").to_vcard()
+    projected = _vcard_to_json_projection(card, fallback_uid="projection-backslash")
+    assert projected["n"][:2] == [r"Doe\nson", "Jane"]
+
+
 def test_structured_name_merge_splits_after_even_backslash_run():
     assert (
         _merge_n_value(r"Doe\\;Jane;Q\;R;Dr.;Jr.", {"given_name": "Janet"})

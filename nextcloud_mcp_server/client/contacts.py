@@ -42,7 +42,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import unquote
 
 from httpx2 import HTTPStatusError
-from pythonvCard4.vcard import Contact, escape_text, unescape_text, unfold_lines
+from pythonvCard4.vcard import Contact, escape_text, unfold_lines
 
 from .base import BaseNextcloudClient
 from .entity_tag import (
@@ -113,12 +113,36 @@ def _split_vcard_components(value: str) -> list[str]:
     return components
 
 
+def _unescape_vcard_component(value: str) -> str:
+    """Decode one vCard text component without reinterpreting escaped slashes."""
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character != "\\" or index + 1 >= len(value):
+            decoded.append(character)
+            index += 1
+            continue
+        escaped = value[index + 1]
+        if escaped in {"n", "N"}:
+            decoded.append("\n")
+        elif escaped in {"\\", ",", ";"}:
+            decoded.append(escaped)
+        else:
+            decoded.extend(("\\", escaped))
+        index += 2
+    return "".join(decoded)
+
+
 def _pop_name_parts(data: dict[str, Any]) -> dict[str, str]:
     """Pop explicitly supplied vCard N components from contact data."""
     raw = data.pop("n", None)
     if isinstance(raw, str):
         raw = (
-            [unescape_text(component) for component in _split_vcard_components(raw)]
+            [
+                _unescape_vcard_component(component)
+                for component in _split_vcard_components(raw)
+            ]
             if raw.strip()
             else None
         )
@@ -1014,7 +1038,7 @@ def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str
         name_matches = parsed_vcard.find("N")
         if name_matches:
             raw_name = [
-                unescape_text(component)
+                _unescape_vcard_component(component)
                 for component in _split_vcard_components(
                     parsed_vcard.lines[name_matches[0]].value
                 )

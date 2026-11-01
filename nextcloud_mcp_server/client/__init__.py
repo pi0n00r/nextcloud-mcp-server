@@ -141,7 +141,7 @@ def _normalise_search_result(item: dict) -> dict:
 class AsyncDisableCookieTransport(AsyncBaseTransport):
     """This Transport disable cookies from accumulating in the httpx2 AsyncClient
 
-    Thanks to: https://github.com/encode/httpx2/issues/2992#issuecomment-2133258994
+    Thanks to: https://github.com/encode/httpx/issues/2992#issuecomment-2133258994
     """
 
     def __init__(self, transport: AsyncBaseTransport):

@@ -94,8 +94,8 @@ Broker-dependent steps are skipped when `PACT_BROKER` is unset (forks).
 
 ### Upstream Nextcloud apps (decided 2026-10-29)
 
-Pact covers only boundaries where **both sides are ours**: astrolabe and
-astrolabe-cloud-gateway. The Nextcloud server and the upstream apps the MCP
+Pact covers only boundaries where **both sides are ours**, such as astrolabe.
+The Nextcloud server and the upstream apps the MCP
 tools wrap (Mail, WebDAV, `/core/preview.png`, Notes, Deck, Tables, …) are
 **not** Pact participants:
 

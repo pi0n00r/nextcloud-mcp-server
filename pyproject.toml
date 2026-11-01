@@ -208,7 +208,7 @@ semantic = [
 # parses with, and what semantic ingest builds on. Without it the read tool
 # returns PDF/Office files raw, with a note naming this extra.
 documents = [
-    "mistralai>=2.4.5", # document_processors/ocr.py (Mistral OCR tier)
+    "mistralai>=3.6.0", # document_processors/ocr.py uses httpx2 timeout types
     # Pinned exactly, and upgraded deliberately rather than by range. The
     # per-page ``metadata`` that ``to_markdown(page_chunks=True)`` emits is a
     # hard dependency of our page-boundary/citation path, and it is not stable

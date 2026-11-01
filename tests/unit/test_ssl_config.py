@@ -259,12 +259,12 @@ class TestGetNextcloudHTTPKeepalive:
         assert Settings().nextcloud_http_keepalive is True
 
     def test_env_false(self):
-        with patch.dict(os.environ, {"NEXTCLOUD_HTTP_KEEPALIVE": "false"}):
-            _reload_config()
-            try:
-                assert get_nextcloud_http_keepalive() is False
-            finally:
+        try:
+            with patch.dict(os.environ, {"NEXTCLOUD_HTTP_KEEPALIVE": "false"}):
                 _reload_config()
+                assert get_nextcloud_http_keepalive() is False
+        finally:
+            _reload_config()
 
 
 # Postgres backend TLS is configured entirely in DATABASE_URL (?sslmode=...)
