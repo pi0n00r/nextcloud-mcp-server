@@ -200,6 +200,34 @@ class TestHTTPClientFactory:
             client = nextcloud_httpx_client(timeout=5.0, follow_redirects=True)
             assert isinstance(client, httpx2.AsyncClient)
 
+    def test_client_disabled_keepalive_forces_fresh_connections(self):
+        with patch(
+            "nextcloud_mcp_server.http.get_nextcloud_http_keepalive",
+            return_value=False,
+        ):
+            client = nextcloud_httpx_client()
+            assert client._transport._pool._max_keepalive_connections == 0
+
+    def test_client_explicit_limits_take_precedence(self):
+        limits = httpx2.Limits(max_keepalive_connections=7)
+        with patch(
+            "nextcloud_mcp_server.http.get_nextcloud_http_keepalive",
+            return_value=False,
+        ):
+            client = nextcloud_httpx_client(limits=limits)
+            assert client._transport._pool._max_keepalive_connections == 7
+
+    def test_client_custom_transport_takes_precedence(self):
+        transport = httpx2.AsyncHTTPTransport(
+            limits=httpx2.Limits(max_keepalive_connections=9)
+        )
+        with patch(
+            "nextcloud_mcp_server.http.get_nextcloud_http_keepalive",
+            return_value=False,
+        ):
+            client = nextcloud_httpx_client(transport=transport)
+            assert client._transport is transport
+
 
 class TestHTTPTransportLimits:
     """Nextcloud HTTP transport keeps pooling enabled with a short idle expiry."""

@@ -42,7 +42,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import unquote
 
 from httpx2 import HTTPStatusError
-from pythonvCard4.vcard import Contact, escape_text, unfold_lines
+from pythonvCard4.vcard import Contact, escape_text, unescape_text, unfold_lines
 
 from .base import BaseNextcloudClient
 from .entity_tag import (
@@ -117,7 +117,11 @@ def _pop_name_parts(data: dict[str, Any]) -> dict[str, str]:
     """Pop explicitly supplied vCard N components from contact data."""
     raw = data.pop("n", None)
     if isinstance(raw, str):
-        raw = _split_vcard_components(raw) if raw.strip() else None
+        raw = (
+            [unescape_text(component) for component in _split_vcard_components(raw)]
+            if raw.strip()
+            else None
+        )
     if isinstance(raw, list):
         raw = dict(zip(_N_COMPONENTS, raw))
     parts = (
@@ -1004,6 +1008,19 @@ def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str
         for key, value in custom.items()
         if isinstance(key, str) and key.upper().startswith("X-")
     }
+    raw_name = getattr(contact, "n", None)
+    try:
+        parsed_vcard = VCard.parse(vcard_text)
+        name_matches = parsed_vcard.find("N")
+        if name_matches:
+            raw_name = [
+                unescape_text(component)
+                for component in _split_vcard_components(
+                    parsed_vcard.lines[name_matches[0]].value
+                )
+            ]
+    except Exception:
+        logger.debug("Could not recover raw N components for projection", exc_info=True)
 
     return {
         "fullname": fn,
@@ -1018,7 +1035,7 @@ def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str
         "categories": getattr(contact, "categories", None),
         "photo": getattr(contact, "photo", None) or _first_custom(custom, "PHOTO"),
         "adr": getattr(contact, "adr", None),
-        "n": getattr(contact, "n", None),
+        "n": raw_name,
         "custom": custom_fields,
         "custom_fields": custom_fields,
     }

@@ -53,6 +53,12 @@ def nextcloud_httpx_client(**kwargs: Any) -> httpx2.AsyncClient:
     headers = httpx2.Headers(NEXTCLOUD_DEFAULT_HEADERS)
     headers.update(kwargs.get("headers") or {})
     kwargs["headers"] = headers
+    if (
+        not get_nextcloud_http_keepalive()
+        and "transport" not in kwargs
+        and "limits" not in kwargs
+    ):
+        kwargs["limits"] = httpx2.Limits(max_keepalive_connections=0)
     return httpx2.AsyncClient(**kwargs)
 
 

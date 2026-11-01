@@ -759,11 +759,18 @@ def test_structured_name_string_preserves_escaped_semicolon_component():
         "n": {
             "family_name": "Doe",
             "given_name": "Jane",
-            "additional_names": r"Q\;R",
+            "additional_names": "Q;R",
             "honorific_prefix": "Dr.",
             "honorific_suffix": "Jr.",
         }
     }
+
+
+def test_structured_name_escaped_semicolon_round_trips_through_projection():
+    card = _vcard(given_name="Jane", family_name="Van;Buren")
+    projected = _vcard_to_json_projection(card, fallback_uid="projection-name")
+
+    assert projected["n"][:2] == ["Van;Buren", "Jane"]
 
 
 def test_structured_name_merge_splits_after_even_backslash_run():
