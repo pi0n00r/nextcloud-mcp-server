@@ -31,6 +31,7 @@ from nextcloud_mcp_server.client.contacts import (
     ContactsClient,
     EtagConflictError,
     EtagPreconditionError,
+    VerifyMismatchError,
     _build_contact_from_data,
     _first_custom,
     _merge_n_value,
@@ -751,6 +752,36 @@ def test_structured_name_merge_preserves_unsupplied_components():
     assert _merge_n_value("Doe;Jane;Q\\;R;Dr.;Jr.", {"given_name": "Janet"}) == (
         "Doe;Janet;Q\\;R;Dr.;Jr."
     )
+
+
+def test_structured_name_string_preserves_escaped_semicolon_component():
+    assert _normalize_contact_data({"n": r"Doe;Jane;Q\;R;Dr.;Jr."}) == {
+        "n": {
+            "family_name": "Doe",
+            "given_name": "Jane",
+            "additional_names": r"Q\;R",
+            "honorific_prefix": "Dr.",
+            "honorific_suffix": "Jr.",
+        }
+    }
+
+
+def test_structured_name_merge_splits_after_even_backslash_run():
+    assert (
+        _merge_n_value(r"Doe\\;Jane;Q\;R;Dr.;Jr.", {"given_name": "Janet"})
+        == r"Doe\\;Janet;Q\;R;Dr.;Jr."
+    )
+
+
+async def test_patch_verify_rejects_retained_old_value(write_client):
+    with pytest.raises(VerifyMismatchError, match="NOTE value differs"):
+        await write_client.patch_contact(
+            addressbook="contacts",
+            uid="mankind",
+            etag='"opaque-v1"',
+            set_props={"NOTE": "Changed"},
+            verify=True,
+        )
 
 
 async def test_update_contact_threads_structured_name_to_byte_preserving_patch(mocker):

@@ -34,7 +34,6 @@ on ``patch_contact``.
 
 import hashlib
 import logging
-import re
 import unicodedata
 import warnings
 import xml.etree.ElementTree as ET
@@ -90,11 +89,35 @@ def _name_component_str(value: Any) -> str:
     return str(value)
 
 
+def _split_vcard_components(value: str) -> list[str]:
+    """Split a structured value on unescaped semicolons.
+
+    A delimiter is escaped only when preceded by an odd-length backslash run.
+    Counting the run avoids treating ``\\\\;`` (a literal backslash followed by
+    a delimiter) as escaped while preserving every input byte.
+    """
+    components: list[str] = []
+    start = 0
+    for index, character in enumerate(value):
+        if character != ";":
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and value[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            components.append(value[start:index])
+            start = index + 1
+    components.append(value[start:])
+    return components
+
+
 def _pop_name_parts(data: dict[str, Any]) -> dict[str, str]:
     """Pop explicitly supplied vCard N components from contact data."""
     raw = data.pop("n", None)
     if isinstance(raw, str):
-        raw = raw.split(";") if raw.strip() else None
+        raw = _split_vcard_components(raw) if raw.strip() else None
     if isinstance(raw, list):
         raw = dict(zip(_N_COMPONENTS, raw))
     parts = (
@@ -130,7 +153,7 @@ def _escape_n_component(value: str) -> str:
 
 def _merge_n_value(existing: str, parts: dict[str, str]) -> str:
     """Replace only supplied N components, preserving all others verbatim."""
-    components = re.split(r"(?<!\\);", existing) if existing else []
+    components = _split_vcard_components(existing) if existing else []
     components += [""] * (len(_N_COMPONENTS) - len(components))
     for index, key in enumerate(_N_COMPONENTS):
         if key in parts:
@@ -758,11 +781,17 @@ class ContactsClient(BaseNextcloudClient):
         if verify:
             check_vcard, _ = await self._get_raw_vcard(addressbook, uid)
             if effective_set_props:
-                for sel in effective_set_props:
-                    found = VCard.parse(check_vcard).find(sel)
+                parsed_check = VCard.parse(check_vcard)
+                for sel, expected_value in effective_set_props.items():
+                    found = parsed_check.find(sel)
                     if not found:
                         raise VerifyMismatchError(
                             f"verify: property {sel} missing after PUT"
+                        )
+                    actual_value = parsed_check.lines[found[0]].value
+                    if actual_value != expected_value:
+                        raise VerifyMismatchError(
+                            f"verify: property {sel} value differs after PUT"
                         )
             verified = True
 

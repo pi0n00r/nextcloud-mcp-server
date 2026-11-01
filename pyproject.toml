@@ -40,7 +40,7 @@ dependencies = [
     "opentelemetry-sdk>=1.28.2", # OpenTelemetry SDK
     "starlette<1.0", # Pin until we address starlette 1.0 breaking changes (#648)
     "opentelemetry-instrumentation-asgi>=0.49b2", # Auto-instrument ASGI/Starlette
-    "opentelemetry-instrumentation-httpx>=0.49b2", # Auto-instrument httpx client
+    "opentelemetry-instrumentation-httpx>=0.65b0", # HTTPX2ClientInstrumentor added in 0.65b0
     "opentelemetry-instrumentation-logging>=0.49b2", # Logging integration
     "opentelemetry-exporter-otlp-proto-grpc>=1.28.2", # OTLP gRPC exporter
     "python-json-logger>=3.2.0", # Structured JSON logging

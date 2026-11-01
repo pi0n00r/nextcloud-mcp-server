@@ -360,7 +360,12 @@ async def test_mcp_contacts_structured_name_round_trip(
             },
         )
         assert update_result.is_error is False
-        updated = _extract_payload(update_result)["contact"]
+        updated = _extract_payload(
+            await nc_mcp_client.call_tool(
+                "nc_contacts_get_contact",
+                {"addressbook": addressbook_name, "uid": contact_uid},
+            )
+        )["contact"]["json"]
         assert updated["given_name"] == "Jane"
         assert updated["family_name"] == "Roe"
     finally:
