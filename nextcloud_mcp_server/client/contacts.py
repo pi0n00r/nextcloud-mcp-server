@@ -34,6 +34,7 @@ on ``patch_contact``.
 
 import hashlib
 import logging
+import re
 import unicodedata
 import warnings
 import xml.etree.ElementTree as ET
@@ -41,8 +42,8 @@ from datetime import date
 from typing import Any, Iterable, Optional
 from urllib.parse import unquote
 
-from httpx import HTTPStatusError
-from pythonvCard4.vcard import Contact, unfold_lines
+from httpx2 import HTTPStatusError
+from pythonvCard4.vcard import Contact, escape_text, unfold_lines
 
 from .base import BaseNextcloudClient
 from .entity_tag import (
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_CONTACT_KEYS = frozenset(
     {
         "fn",
+        "n",
         "email",
         "tel",
         "org",
@@ -72,15 +74,82 @@ _SUPPORTED_CONTACT_KEYS = frozenset(
     }
 )
 
+_N_COMPONENTS = (
+    "family_name",
+    "given_name",
+    "additional_names",
+    "honorific_prefix",
+    "honorific_suffix",
+)
+
+
+def _name_component_str(value: Any) -> str:
+    """Normalize one structured-name component without guessing its meaning."""
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item)
+    return str(value)
+
+
+def _pop_name_parts(data: dict[str, Any]) -> dict[str, str]:
+    """Pop explicitly supplied vCard N components from contact data."""
+    raw = data.pop("n", None)
+    if isinstance(raw, str):
+        raw = raw.split(";") if raw.strip() else None
+    if isinstance(raw, list):
+        raw = dict(zip(_N_COMPONENTS, raw))
+    parts = (
+        {key: value for key, value in raw.items() if key in _N_COMPONENTS}
+        if isinstance(raw, dict)
+        else {}
+    )
+    for key in _N_COMPONENTS:
+        value = data.pop(key, None)
+        if value is not None:
+            parts[key] = value
+    return {
+        key: _name_component_str(value)
+        for key, value in parts.items()
+        if value is not None
+    }
+
+
+def _fn_from_name_parts(parts: dict[str, str]) -> str:
+    order = (
+        "honorific_prefix",
+        "given_name",
+        "additional_names",
+        "family_name",
+        "honorific_suffix",
+    )
+    return " ".join(parts[key] for key in order if parts.get(key))
+
+
+def _escape_n_component(value: str) -> str:
+    return escape_text(value.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def _merge_n_value(existing: str, parts: dict[str, str]) -> str:
+    """Replace only supplied N components, preserving all others verbatim."""
+    components = re.split(r"(?<!\\);", existing) if existing else []
+    components += [""] * (len(_N_COMPONENTS) - len(components))
+    for index, key in enumerate(_N_COMPONENTS):
+        if key in parts:
+            components[index] = _escape_n_component(parts[key])
+    return ";".join(components)
+
 
 def _normalize_contact_data(contact_data: dict[str, Any]) -> dict[str, Any]:
     """Map documented aliases to canonical keys.
 
     ``phone`` → ``tel``, ``organization`` → ``org``. The canonical key wins if both
     are supplied, so callers who set ``tel`` don't lose it to a stray ``phone`` entry.
+    Structured-name keys collapse into ``n`` without guessing from ``fn``.
     Returns a new dict — does not mutate the caller's argument.
     """
     normalised = dict(contact_data)
+    name_parts = _pop_name_parts(normalised)
+    if name_parts:
+        normalised["n"] = name_parts
     if "phone" in normalised and "tel" not in normalised:
         normalised["tel"] = normalised.pop("phone")
     else:
@@ -202,14 +271,20 @@ def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
     invoking this helper; it assumes canonical keys only.
     """
     data = contact_data
+    name_parts = data.get("n") or {}
+    fn = data.get("fn") or _fn_from_name_parts(name_parts)
 
-    if not data.get("fn"):
+    if not fn:
         logger.warning(
             "contact_data missing required 'fn' field; pythonvCard4 may reject or "
             "produce an invalid vCard"
         )
 
-    kwargs: dict[str, Any] = {"fn": data.get("fn"), "uid": uid}
+    kwargs: dict[str, Any] = {
+        "fn": fn,
+        "uid": uid,
+        "n": [name_parts.get(key, "") for key in _N_COMPONENTS],
+    }
 
     emails = _wrap_contact_field(data.get("email"))
     if emails:
@@ -608,6 +683,7 @@ class ContactsClient(BaseNextcloudClient):
         retry_on_conflict: bool,
         attempt: int,
         legacy_optional_etag: bool,
+        name_parts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         url = await self._resolved_vcard_url(addressbook, uid)
         current_vcard, current_etag = await self._get_raw_vcard(addressbook, uid)
@@ -616,9 +692,15 @@ class ContactsClient(BaseNextcloudClient):
                 f"caller etag {etag!r} != current server etag {current_etag!r}",
                 current_etag=current_etag,
             )
+        effective_set_props = dict(set_props or {})
+        if name_parts:
+            parsed = VCard.parse(current_vcard)
+            matches = parsed.find("N")
+            existing_n = parsed.lines[matches[0]].value if matches else ""
+            effective_set_props["N"] = _merge_n_value(existing_n, name_parts)
         new_vcard = patch_vcard(
             current_vcard,
-            set_props=set_props,
+            set_props=effective_set_props or None,
             add_props=add_props,
             remove_props=remove_props,
         )
@@ -655,6 +737,7 @@ class ContactsClient(BaseNextcloudClient):
                         retry_on_conflict=False,
                         attempt=1,
                         legacy_optional_etag=False,
+                        name_parts=name_parts,
                     )
                 raise EtagConflictError(
                     f"412 PUT {url}; vCard modified by another writer",
@@ -664,8 +747,8 @@ class ContactsClient(BaseNextcloudClient):
 
         new_etag = response.headers.get("etag", "")
         applied: list[str] = []
-        if set_props:
-            applied.extend(set_props.keys())
+        if effective_set_props:
+            applied.extend(effective_set_props.keys())
         if add_props:
             applied.extend(t[0] for t in add_props)
         if remove_props:
@@ -674,8 +757,8 @@ class ContactsClient(BaseNextcloudClient):
         verified = False
         if verify:
             check_vcard, _ = await self._get_raw_vcard(addressbook, uid)
-            if set_props:
-                for sel, expected_value in set_props.items():
+            if effective_set_props:
+                for sel in effective_set_props:
                     found = VCard.parse(check_vcard).find(sel)
                     if not found:
                         raise VerifyMismatchError(
@@ -761,8 +844,10 @@ class ContactsClient(BaseNextcloudClient):
             DeprecationWarning,
             stacklevel=2,
         )
+        normalised = _normalize_contact_data(contact_data)
+        name_parts = normalised.pop("n", None)
         set_props: dict[str, str] = {}
-        for key, value in contact_data.items():
+        for key, value in normalised.items():
             key_l = key.lower()
             if key_l == "fn":
                 set_props["FN"] = str(value)
@@ -811,6 +896,7 @@ class ContactsClient(BaseNextcloudClient):
             retry_on_conflict=False,
             attempt=1 if not etag else 0,
             legacy_optional_etag=True,
+            name_parts=name_parts,
         )
 
 

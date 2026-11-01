@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
 import anyio
-from httpx import HTTPStatusError, ReadError, RemoteProtocolError, Response
+from httpx2 import HTTPStatusError, ReadError, RemoteProtocolError, Response
 
 from nextcloud_mcp_server.observability.metrics import (
     document_download_truncated_total,
@@ -924,7 +924,7 @@ class WebDAVClient(BaseNextcloudClient):
         hand the etag back as ``write_file``'s ``if_match`` (or report it) without
         a second request. The etag is ``None`` if the server sent no ``ETag``.
         Raises :class:`OversizeDownload` if ``max_bytes`` is exceeded, or
-        :class:`httpx.RemoteProtocolError` on a short read (#965).
+        :class:`httpx2.RemoteProtocolError` on a short read (#965).
         """
         await self._ensure_principal_id()
         webdav_path = self._webdav_path(path)

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-import httpx
+import httpx2
 import pytest
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.requests import Request
@@ -183,9 +183,9 @@ def _guarded_app(settings: Settings):
     return app
 
 
-async def _request(settings: Settings, **headers: str) -> httpx.Response:
-    transport = httpx.ASGITransport(app=_guarded_app(settings))
-    async with httpx.AsyncClient(
+async def _request(settings: Settings, **headers: str) -> httpx2.Response:
+    transport = httpx2.ASGITransport(app=_guarded_app(settings))
+    async with httpx2.AsyncClient(
         transport=transport,
         base_url="http://transport.test",
     ) as client:

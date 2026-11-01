@@ -37,7 +37,7 @@ import base64
 import logging
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 from nextcloud_mcp_server.client.mail import MailClient
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.unit
 
 
-def _ocs_response(data: Any, status_code: int = 200) -> httpx.Response:
+def _ocs_response(data: Any, status_code: int = 200) -> httpx2.Response:
     """Wrap a payload in the standard OCS envelope (for OCS-route tests)."""
     return create_mock_response(
         status_code=status_code,
@@ -75,7 +75,7 @@ async def test_list_accounts_unwraps_direct_payload(mocker):
             {"id": 2, "emailAddress": "bob@example.com", "isDelegated": False},
         ]
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -118,7 +118,7 @@ async def test_get_mailboxes_unwraps_account_envelope(mocker):
             ],
         }
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -149,7 +149,7 @@ async def test_list_messages_builds_params(mocker):
             }
         ]
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -174,7 +174,7 @@ async def test_list_messages_builds_params(mocker):
 async def test_list_messages_omits_optional_params(mocker):
     """Optional params are omitted when not supplied; mailboxId/limit always present."""
     mock_response = create_mock_response(json_data=[])
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient,
         "_make_request",
@@ -201,9 +201,9 @@ async def test_list_messages_omits_optional_params(mocker):
     assert "view" not in params
 
 
-def _http_error(status_code: int, body: dict | None = None) -> httpx.HTTPStatusError:
+def _http_error(status_code: int, body: dict | None = None) -> httpx2.HTTPStatusError:
     response = create_mock_response(status_code=status_code, json_data=body or {})
-    return httpx.HTTPStatusError("err", request=response.request, response=response)
+    return httpx2.HTTPStatusError("err", request=response.request, response=response)
 
 
 # What Mail's ErrorMiddleware returns for an uncached mailbox (JsonResponse::failWith).
@@ -231,7 +231,7 @@ async def test_list_messages_syncs_uncached_mailbox_and_retries(mocker):
         ],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     messages = await client.list_messages(2)
 
     assert messages == [{"databaseId": 7}]
@@ -268,8 +268,8 @@ async def test_list_messages_other_errors_are_not_retried(mocker, error):
         side_effect=[create_mock_response(json_data={}), error],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.HTTPStatusError):
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.HTTPStatusError):
         await client.list_messages(2)
     assert mock_make_request.call_count == 2
 
@@ -287,7 +287,7 @@ async def test_list_messages_waits_for_sync_lock_release(mocker):
     )
     sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     messages = await client.list_messages(2, search_filter="flagged")
 
     assert messages == [{"databaseId": 7}]
@@ -310,8 +310,8 @@ async def test_list_messages_surfaces_conflict_after_retry_bound(mocker):
     )
     sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client._list_messages_after_sync({"mailboxId": 2}, max_attempts=2)
 
     assert excinfo.value.response.status_code == 409
@@ -327,7 +327,7 @@ async def test_sync_mailbox_stops_after_max_rounds(mocker):
         return_value=create_mock_response(status_code=202, json_data={}),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.sync_mailbox(2, max_rounds=3)
     assert mock_make_request.call_count == 3
     for call in mock_make_request.call_args_list:
@@ -344,7 +344,7 @@ async def test_sync_mailbox_retries_a_concurrent_sync_conflict(mocker):
     )
     sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.sync_mailbox(2, max_rounds=2, init=False, query="flagged")
 
     assert mock_make_request.call_count == 2
@@ -370,7 +370,7 @@ async def test_sync_conflicts_do_not_consume_sync_rounds(mocker):
     )
     sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=3, init=False)
 
     assert mock_make_request.call_count == 4
@@ -382,8 +382,8 @@ async def test_sync_mailbox_surfaces_conflict_after_retry_bound(mocker):
     mocker.patch.object(MailClient, "_make_request", side_effect=_http_error(409))
     sleep = mocker.patch("nextcloud_mcp_server.client.mail.asyncio.sleep")
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.sync_mailbox(2, max_rounds=2, max_conflict_attempts=2)
 
     assert excinfo.value.response.status_code == 409
@@ -402,7 +402,7 @@ async def test_incremental_sync_initializes_uncached_mailbox(mocker, status_code
         ],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.sync_mailbox(2, init=False, query="flagged")
 
     assert mock_make_request.call_count == 2
@@ -437,7 +437,7 @@ async def test_get_message_unwraps_full_message(mocker):
             ],
         }
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -467,7 +467,7 @@ async def test_get_attachment_returns_base64_bytes(mocker):
             "content-disposition": 'attachment; filename="doc.pdf"',
         },
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -491,7 +491,7 @@ async def test_get_attachment_synthesizes_name_without_disposition(mocker):
         content=b"data",
         headers={"content-type": "application/octet-stream"},
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mocker.patch.object(MailClient, "_make_request", return_value=mock_response)
 
     client = MailClient(mock_client, "testuser")
@@ -504,7 +504,7 @@ async def test_get_attachment_synthesizes_name_without_disposition(mocker):
 async def test_get_attachment_url_encodes_attachment_id(mocker):
     """A traversal-style attachment_id is percent-encoded in the URL path."""
     mock_response = create_mock_response(content=b"y")
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -531,7 +531,7 @@ async def test_download_attachment_returns_raw_bytes_mime_and_name(mocker):
             "content-disposition": 'attachment; filename="photo.jpg"',
         },
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -551,7 +551,7 @@ async def test_download_attachment_synthesizes_name_and_mime_without_headers(moc
     """Without Content-Disposition a synthetic name is used, and without a
     Content-Type the generic octet-stream, exactly as get_attachment reports."""
     mock_response = create_mock_response(content=b"data")
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mocker.patch.object(MailClient, "_make_request", return_value=mock_response)
 
     client = MailClient(mock_client, "testuser")
@@ -565,7 +565,7 @@ async def test_download_attachment_synthesizes_name_and_mime_without_headers(moc
 async def test_download_attachment_url_encodes_attachment_id(mocker):
     """A traversal-style attachment_id is percent-encoded in the URL path."""
     mock_response = create_mock_response(content=b"y")
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         MailClient, "_make_request", return_value=mock_response
     )
@@ -583,7 +583,7 @@ async def test_download_attachment_url_encodes_attachment_id(mocker):
 async def test_empty_data_returns_empty_list(mocker):
     """A non-list direct payload degrades to an empty list for list endpoints."""
     mock_response = create_mock_response(json_data={})
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mocker.patch.object(MailClient, "_make_request", return_value=mock_response)
 
     client = MailClient(mock_client, "testuser")
@@ -605,11 +605,11 @@ async def test_ocs_meta_failure_raises_httpstatuserror(mocker):
             }
         },
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mocker.patch.object(MailClient, "_make_request", return_value=mock_response)
 
     client = MailClient(mock_client, "testuser")
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.get_message(100)
     assert excinfo.value.response.status_code == 404
 
@@ -619,11 +619,11 @@ async def test_non_json_response_raises_requesterror(mocker):
     mock_response = create_mock_response(
         status_code=200, content=b"<html>not found</html>"
     )
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mocker.patch.object(MailClient, "_make_request", return_value=mock_response)
 
     client = MailClient(mock_client, "testuser")
-    with pytest.raises(httpx.RequestError):
+    with pytest.raises(httpx2.RequestError):
         await client.get_message(100)
 
 
@@ -640,7 +640,7 @@ async def test_send_message_two_step_flow(mocker):
         MailClient, "_make_request", side_effect=[create_response, send_response]
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     result = await client.send_message(
         1, [{"email": "a@b.com", "label": "A"}], "Hi", "body"
     )
@@ -662,8 +662,8 @@ async def test_send_message_missing_outbox_id_raises(mocker):
     create_response = create_mock_response(json_data={"unexpected": "shape"})
     mocker.patch.object(MailClient, "_make_request", return_value=create_response)
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.RequestError):
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.RequestError):
         await client.send_message(1, [{"email": "a@b.com", "label": "A"}], "Hi", "body")
 
 
@@ -683,7 +683,7 @@ async def test_set_flags_sends_flag_map_not_imap_names(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.set_flags(42, {"seen": True, "flagged": False})
 
     call = mock_make_request.call_args
@@ -711,7 +711,7 @@ async def test_ensure_tag_reads_bare_tag_response(mocker):
         ),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     tag = await client.ensure_tag("Vector Index")
 
     assert tag["id"] == 7
@@ -729,8 +729,8 @@ async def test_ensure_tag_without_id_raises(mocker):
         return_value=create_mock_response(json_data={"unexpected": "shape"}),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.RequestError):
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.RequestError):
         await client.ensure_tag("Vector Index")
 
 
@@ -742,7 +742,7 @@ async def test_set_and_remove_tag_url_encode_the_label(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.set_tag(42, "$to do")
     await client.remove_tag(42, "$to do")
 
@@ -758,7 +758,7 @@ async def test_move_message_sends_dest_folder_id(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.move_message(42, 9)
 
     call = mock_make_request.call_args
@@ -773,7 +773,7 @@ async def test_delete_message_issues_delete(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.delete_message(42)
 
     assert mock_make_request.call_args.args == (
@@ -792,7 +792,7 @@ async def test_write_helpers_send_a_json_body(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.set_flags(42, {"seen": True})
 
     headers = mock_make_request.call_args.kwargs["headers"]
@@ -807,7 +807,7 @@ async def test_bodyless_writes_declare_no_json_content_type(mocker):
         return_value=create_mock_response(status_code=200, content=b""),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.delete_message(42)
 
     call = mock_make_request.call_args
@@ -826,7 +826,7 @@ async def test_send_message_outbox_payload(mocker):
         ],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.send_message(
         1,
         [{"email": "a@b.com", "label": "A"}],
@@ -852,7 +852,7 @@ async def test_send_message_outbox_payload(mocker):
 # --- Drafts -----------------------------------------------------------------
 
 
-def _staged_draft_response(draft_id: int = 42) -> httpx.Response:
+def _staged_draft_response(draft_id: int = 42) -> httpx2.Response:
     """The 201 ``DraftsController::create`` answers with: a LocalMessage in ``data``."""
     return create_mock_response(
         status_code=201,
@@ -863,7 +863,7 @@ def _staged_draft_response(draft_id: int = 42) -> httpx.Response:
     )
 
 
-def _moved_response() -> httpx.Response:
+def _moved_response() -> httpx2.Response:
     """The 202 ``DraftsController::move`` answers with."""
     return create_mock_response(
         status_code=202,
@@ -882,7 +882,7 @@ async def test_create_draft_posts_a_local_message(mocker):
         MailClient, "_make_request", return_value=_staged_draft_response()
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     draft = await client.create_draft(
         1,
         [{"email": "a@b.com", "label": "A"}],
@@ -914,7 +914,7 @@ async def test_create_draft_sends_html_as_body_html(mocker):
         MailClient, "_make_request", return_value=_staged_draft_response()
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.create_draft(1, [], "Hi", "<p>body</p>", is_html=True)
 
     body = mock_make_request.call_args.kwargs["json"]
@@ -932,7 +932,7 @@ async def test_save_draft_marks_the_draft_ai_generated(mocker):
         side_effect=[_staged_draft_response(42), _moved_response()],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.save_draft(1, [], "Hi", "body")
 
     assert mock_make_request.call_args_list[0].kwargs["json"]["isAiGenerated"] is True
@@ -948,8 +948,8 @@ async def test_create_draft_without_id_raises(mocker):
         ),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.RequestError):
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.RequestError):
         await client.create_draft(1, [], "Hi", "body")
 
 
@@ -959,7 +959,7 @@ async def test_move_draft_to_imap_is_a_bodyless_post(mocker):
         MailClient, "_make_request", return_value=_moved_response()
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     result = await client.move_draft_to_imap(42)
 
     assert result["data"] == "Message moved to IMAP"
@@ -979,7 +979,7 @@ async def test_delete_local_draft_issues_delete(mocker):
         ),
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.delete_local_draft(42)
 
     assert mock_make_request.call_args.args == ("DELETE", "/apps/mail/api/drafts/42")
@@ -993,7 +993,7 @@ async def test_save_draft_stages_then_moves_and_never_touches_the_outbox(mocker)
         side_effect=[_staged_draft_response(42), _moved_response()],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     result = await client.save_draft(1, [{"email": "a@b.com"}], "Hi", "body")
 
     assert result["draft"]["id"] == 42
@@ -1023,8 +1023,8 @@ async def test_save_draft_discards_the_staged_draft_when_the_move_fails(mocker):
         ],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.HTTPStatusError) as exc_info:
         await client.save_draft(1, [], "Hi", "body")
 
     assert exc_info.value is move_error
@@ -1050,8 +1050,8 @@ async def test_save_draft_reports_the_move_error_when_cleanup_also_fails(
         ],
     )
 
-    client = MailClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
-    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+    client = MailClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
+    with pytest.raises(httpx2.HTTPStatusError) as exc_info:
         await client.save_draft(1, [], "Hi", "body")
 
     assert exc_info.value is move_error

@@ -7,7 +7,7 @@ into a queue-hop / same-tier retry / give-up decision.
 
 from datetime import datetime, timezone
 
-import httpx
+import httpx2
 import pytest
 from procrastinate.jobs import Job
 
@@ -87,7 +87,7 @@ class TestTieredEscalationStrategy:
 
     def test_transient_retries_same_queue_under_cap(self):
         decision = self._strategy(max_transient=5).get_retry_decision(
-            exception=httpx.ConnectError("refused"), job=_job(attempts=1)
+            exception=httpx2.ConnectError("refused"), job=_job(attempts=1)
         )
         assert decision is not None
         # Same-tier retry: no queue override (stays on its current queue).
@@ -97,8 +97,8 @@ class TestTieredEscalationStrategy:
     @pytest.mark.parametrize(
         "exception",
         [
-            httpx.RemoteProtocolError("stale response"),
-            httpx.ReadError("pooled connection reset"),
+            httpx2.RemoteProtocolError("stale response"),
+            httpx2.ReadError("pooled connection reset"),
         ],
     )
     def test_stale_get_transport_retries_same_queue_under_cap(self, exception):
@@ -111,14 +111,14 @@ class TestTieredEscalationStrategy:
 
     def test_stale_get_transport_stops_at_transient_cap(self):
         decision = self._strategy(max_transient=5).get_retry_decision(
-            exception=httpx.ReadError("pooled connection reset"),
+            exception=httpx2.ReadError("pooled connection reset"),
             job=_job(attempts=5),
         )
         assert decision is None
 
     def test_local_protocol_error_is_not_classified_as_stale_transport(self):
         decision = self._strategy().get_retry_decision(
-            exception=httpx.LocalProtocolError("invalid request framing"),
+            exception=httpx2.LocalProtocolError("invalid request framing"),
             job=_job(attempts=1),
         )
         assert decision is None
@@ -133,7 +133,7 @@ class TestTieredEscalationStrategy:
         for attempts, expected in [(1, 4), (2, 8), (3, 16), (4, 32), (20, 300)]:
             before = datetime.now(timezone.utc)
             decision = strat.get_retry_decision(
-                exception=httpx.ConnectError("x"), job=_job(attempts=attempts)
+                exception=httpx2.ConnectError("x"), job=_job(attempts=attempts)
             )
             after = datetime.now(timezone.utc)
             assert decision is not None and decision.retry_at is not None
@@ -145,7 +145,7 @@ class TestTieredEscalationStrategy:
 
     def test_transient_gives_up_over_cap(self):
         decision = self._strategy(max_transient=5).get_retry_decision(
-            exception=httpx.ConnectError("refused"), job=_job(attempts=5)
+            exception=httpx2.ConnectError("refused"), job=_job(attempts=5)
         )
         assert decision is None
 

@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.203.1"
+version = "0.204.0"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude", "webdav", "caldav", "carddav"]
 dependencies = [
     "mcp[cli] (>=2.3)",
-    "httpx (>=0.28.1,<0.29.0)",
+    "httpx2>=2.5.0",
     # Imported directly at runtime. Each was previously reachable only because
     # some other dependency happened to pull it in — the accident that broke
     # #1285 when the resolver stopped doing so. Declared explicitly so the
@@ -103,6 +103,9 @@ version_provider = "uv"
 update_changelog_on_bump = true
 major_version_zero = true
 
+[tool.ruff]
+extend-exclude = ["third_party/notes", "third_party/oidc"]
+
 [tool.ruff.lint]
 # ruff 0.17 widened the default rule set (1698 new findings); pin the pre-0.17
 # defaults so adopting the new rules is a deliberate, separate change.
@@ -123,6 +126,7 @@ extend-select = ["I", "PLC0415", "G004"]
 # (re-exports, plugin-only deps like pyroscope-io) and stay off.
 [tool.deptry]
 ignore = ["DEP002", "DEP004"]
+exclude = [".venv", "third_party"]
 
 [tool.deptry.per_rule_ignores]
 # Optional local-OCR extra, imported inside a try/except ImportError.
@@ -156,6 +160,8 @@ dev = [
     "pytest-playwright-asyncio>=0.7.1",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.6.1",
+    "pyyaml>=6.0.2",
+    "certifi>=2025.1.31",
     "ruff>=0.11.13",
     "reportlab>=4.0.0",
     # ty 0.0.62 only honours bracketed suppression codes carrying a `ty:` prefix.

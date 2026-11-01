@@ -21,7 +21,14 @@ from functools import wraps
 from urllib.parse import unquote
 
 import anyio
-from httpx import AsyncClient, HTTPError, HTTPStatusError, RequestError, codes
+from httpx2 import (
+    AsyncClient,
+    HTTPError,
+    HTTPStatusError,
+    RequestError,
+    Response,
+    codes,
+)
 
 from nextcloud_mcp_server.observability.metrics import (
     record_nextcloud_api_call,
@@ -92,8 +99,8 @@ def _lock_backoff(attempt: int) -> float:
 def retry_on_429(func):
     """Retry the two Nextcloud responses that mean "not now" rather than "no".
 
-    The `func` is assumed to be a method that is similar to `httpx.Client.get`,
-    and returns an `httpx.Response` object.
+    The `func` is assumed to be a method that is similar to `httpx2.Client.get`,
+    and returns an `httpx2.Response` object.
 
     * **429 Too Many Requests** -- the server is rate limiting. Waits
       ``RATE_LIMIT_BACKOFF_SECONDS`` and retries, up to ``MAX_RETRIES``
@@ -369,7 +376,7 @@ class BaseNextcloudClient(ABC):
         )
 
     @retry_on_429
-    async def _make_request(self, method: str, url: str, **kwargs):
+    async def _make_request(self, method: str, url: str, **kwargs) -> Response:
         """Common request wrapper with logging, tracing, and error handling.
 
         Args:

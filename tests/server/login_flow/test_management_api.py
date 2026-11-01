@@ -10,7 +10,7 @@ Regression coverage for the bug where /api/v1/apps proxied to OCS v1
 which is reachable for OAuth bearer tokens.
 """
 
-import httpx
+import httpx2
 import pytest
 
 LOGIN_FLOW_API_BASE_URL = "http://localhost:8004"
@@ -22,7 +22,7 @@ async def test_get_installed_apps_returns_capability_keys(
     login_flow_static_client_token: str,
 ):
     """GET /api/v1/apps returns 200 with a list of enabled-app capability keys."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx2.AsyncClient(timeout=30.0) as client:
         response = await client.get(
             f"{LOGIN_FLOW_API_BASE_URL}/api/v1/apps",
             headers={"Authorization": f"Bearer {login_flow_static_client_token}"},
@@ -46,7 +46,7 @@ async def test_get_installed_apps_returns_capability_keys(
 
 async def test_get_installed_apps_requires_bearer_token():
     """No Authorization header → 401 (handler's token validator rejects it)."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx2.AsyncClient(timeout=30.0) as client:
         response = await client.get(f"{LOGIN_FLOW_API_BASE_URL}/api/v1/apps")
 
     assert response.status_code == 401

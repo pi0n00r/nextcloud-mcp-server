@@ -55,6 +55,7 @@ _DEFAULTS: dict[str, Any] = {
     "nextcloud_password": None,
     "nextcloud_verify_ssl": True,
     "nextcloud_ca_bundle": None,
+    "nextcloud_http_keepalive": True,
     "nextcloud_mcp_server_url": None,
     "nextcloud_resource_uri": None,
     "nextcloud_public_issuer_url": None,
@@ -1180,6 +1181,11 @@ class Settings:
     nextcloud_verify_ssl: bool = True
     nextcloud_ca_bundle: str | None = None
 
+    # Reuse pooled keep-alive connections for the Nextcloud HTTP client.
+    # Operators can disable reuse without changing callers when diagnosing a
+    # poisoned keep-alive path.
+    nextcloud_http_keepalive: bool = True
+
     # Postgres connection pool sizing — DEPRECATED, retained for
     # backward compatibility. The psycopg engine switched to NullPool
     # in #799 (cross-event-loop crashes under anyio TaskGroups made
@@ -1564,7 +1570,7 @@ class Settings:
     # direct mistral backend strips it.
     document_ocr_model: str = "mistral/mistral-ocr-latest"
     # OCR backend HTTP request timeout (seconds). float for parity with the
-    # parse timeout / httpx.Timeout; per-tenant tunable so a gateway with a
+    # parse timeout / httpx2.Timeout; per-tenant tunable so a gateway with a
     # shorter ceiling isn't masked by the 180s default.
     document_ocr_timeout_seconds: float = 180.0
     # OCR execution mode: "sync" | "batch" (Deck #332). batch is opt-in and routes
@@ -2531,6 +2537,12 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
     return True
 
 
+@functools.cache
+def get_nextcloud_http_keepalive() -> bool:
+    """Return whether the Nextcloud HTTP client may reuse pooled connections."""
+    return get_settings().nextcloud_http_keepalive
+
+
 def _clear_settings_caches() -> None:
     """Drop memoized settings and SSL state before the next config read.
 
@@ -2539,6 +2551,7 @@ def _clear_settings_caches() -> None:
     """
     _build_settings.cache_clear()
     get_nextcloud_ssl_verify.cache_clear()
+    get_nextcloud_http_keepalive.cache_clear()
     # _warn_unknown_env_vars is deliberately NOT cleared: it is a once-per-process
     # advisory, and re-arming it here would re-log the same warning on every CLI
     # override and every test reload.

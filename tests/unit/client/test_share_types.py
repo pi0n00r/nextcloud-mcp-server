@@ -20,7 +20,7 @@ client-side here.
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import pytest
-from httpx import AsyncClient
+from httpx2 import AsyncClient
 from mcp.server.mcpserver import MCPServer
 
 from nextcloud_mcp_server.client.ocs import OCSAuthenticationError, OCSError

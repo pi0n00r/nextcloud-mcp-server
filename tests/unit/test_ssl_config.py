@@ -1,6 +1,6 @@
 """Tests for SSL/TLS configuration.
 
-Covers ``NEXTCLOUD_VERIFY_SSL`` / ``NEXTCLOUD_CA_BUNDLE`` for the httpx
+Covers ``NEXTCLOUD_VERIFY_SSL`` / ``NEXTCLOUD_CA_BUNDLE`` for the httpx2
 client talking to Nextcloud.
 
 Postgres backend TLS is no longer configured here: under Model A (ADR-026)
@@ -15,12 +15,13 @@ import ssl
 from unittest.mock import patch
 
 import certifi
-import httpx
+import httpx2
 import pytest
 
 from nextcloud_mcp_server.config import (
     Settings,
     _reload_config,
+    get_nextcloud_http_keepalive,
     get_nextcloud_ssl_verify,
     get_settings,
 )
@@ -168,14 +169,14 @@ class TestHTTPClientFactory:
         ):
             client = nextcloud_httpx_client()
             # httpx stores verify as an SSLConfig; check the _transport
-            assert isinstance(client, httpx.AsyncClient)
+            assert isinstance(client, httpx2.AsyncClient)
 
     def test_client_applies_verify_false(self):
         with patch(
             "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=False
         ):
             client = nextcloud_httpx_client()
-            assert isinstance(client, httpx.AsyncClient)
+            assert isinstance(client, httpx2.AsyncClient)
 
     def test_client_caller_override_takes_precedence(self):
         """Caller-supplied verify kwarg should not be overridden."""
@@ -183,21 +184,21 @@ class TestHTTPClientFactory:
             "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=True
         ):
             client = nextcloud_httpx_client(verify=False)
-            assert isinstance(client, httpx.AsyncClient)
+            assert isinstance(client, httpx2.AsyncClient)
 
     def test_transport_applies_verify(self):
         with patch(
             "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=False
         ):
             transport = nextcloud_httpx_transport()
-            assert isinstance(transport, httpx.AsyncHTTPTransport)
+            assert isinstance(transport, httpx2.AsyncHTTPTransport)
 
     def test_client_passes_extra_kwargs(self):
         with patch(
             "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=True
         ):
             client = nextcloud_httpx_client(timeout=5.0, follow_redirects=True)
-            assert isinstance(client, httpx.AsyncClient)
+            assert isinstance(client, httpx2.AsyncClient)
 
 
 class TestHTTPTransportLimits:
@@ -211,10 +212,31 @@ class TestHTTPTransportLimits:
     def test_caller_supplied_limits_take_precedence(self):
         """An explicit limits kwarg is not overridden."""
         transport = nextcloud_httpx_transport(
-            limits=httpx.Limits(max_keepalive_connections=7, keepalive_expiry=30.0)
+            limits=httpx2.Limits(max_keepalive_connections=7, keepalive_expiry=30.0)
         )
         assert transport._pool._max_keepalive_connections == 7
         assert transport._pool._keepalive_expiry == 30.0
+
+    def test_disabled_forces_fresh_connections(self):
+        with patch(
+            "nextcloud_mcp_server.http.get_nextcloud_http_keepalive",
+            return_value=False,
+        ):
+            transport = nextcloud_httpx_transport()
+            assert transport._pool._max_keepalive_connections == 0
+
+
+class TestGetNextcloudHTTPKeepalive:
+    def test_default_true(self):
+        assert Settings().nextcloud_http_keepalive is True
+
+    def test_env_false(self):
+        with patch.dict(os.environ, {"NEXTCLOUD_HTTP_KEEPALIVE": "false"}):
+            _reload_config()
+            try:
+                assert get_nextcloud_http_keepalive() is False
+            finally:
+                _reload_config()
 
 
 # Postgres backend TLS is configured entirely in DATABASE_URL (?sslmode=...)

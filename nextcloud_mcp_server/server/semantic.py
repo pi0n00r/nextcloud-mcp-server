@@ -17,7 +17,7 @@ from typing import Annotated, Literal, Protocol, cast
 
 import anyio
 from anyio.abc import TaskGroup
-from httpx import RequestError
+from httpx2 import RequestError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import MCPError
 from mcp.types import ToolAnnotations

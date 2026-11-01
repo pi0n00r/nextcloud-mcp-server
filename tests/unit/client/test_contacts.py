@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from httpx import HTTPStatusError, Request, Response
+from httpx2 import HTTPStatusError, Request, Response
 
 from nextcloud_mcp_server.client.contacts import (
     ContactsClient,
@@ -33,6 +33,7 @@ from nextcloud_mcp_server.client.contacts import (
     EtagPreconditionError,
     _build_contact_from_data,
     _first_custom,
+    _merge_n_value,
     _normalize_contact_data,
     _vcard_to_json_projection,
     _wrap_contact_field,
@@ -715,6 +716,7 @@ async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
         retry_on_conflict=False,
         attempt=0,
         legacy_optional_etag=True,
+        name_parts=None,
     )
 
 
@@ -731,6 +733,39 @@ async def test_update_contact_keeps_legacy_optional_etag_contract(mocker):
 
     assert client._do_patch.await_args.kwargs["etag"] == ""
     assert client._do_patch.await_args.kwargs["legacy_optional_etag"] is True
+
+
+def test_create_writes_structured_n_and_derives_fn():
+    card = _vcard(given_name="Jane", family_name="Doe")
+    assert "FN:Jane Doe" in card
+    assert "N:Doe;Jane;;;" in card
+
+
+def test_structured_name_normalization_preserves_null_and_clear_semantics():
+    assert _normalize_contact_data({"n": ""}) == {}
+    assert _normalize_contact_data({"given_name": None}) == {}
+    assert _normalize_contact_data({"given_name": ""}) == {"n": {"given_name": ""}}
+
+
+def test_structured_name_merge_preserves_unsupplied_components():
+    assert _merge_n_value("Doe;Jane;Q\\;R;Dr.;Jr.", {"given_name": "Janet"}) == (
+        "Doe;Janet;Q\\;R;Dr.;Jr."
+    )
+
+
+async def test_update_contact_threads_structured_name_to_byte_preserving_patch(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={"given_name": "Janet"},
+            etag='"etag-1"',
+        )
+
+    assert client._do_patch.await_args.kwargs["name_parts"] == {"given_name": "Janet"}
 
 
 @pytest.mark.parametrize("server_etag", ["", 'W/"weak"'])

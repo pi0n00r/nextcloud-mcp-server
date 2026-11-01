@@ -3,9 +3,9 @@
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
-from httpx import HTTPStatusError, Request, Response
+from httpx2 import HTTPStatusError, Request, Response
 
 from nextcloud_mcp_server.client.webdav import (
     WebDAVClient,
@@ -179,7 +179,7 @@ async def test_get_file_info_raises_on_404(mocker):
     "absent → None" semantics should catch HTTPStatusError and check the
     status code themselves.
     """
-    from httpx import HTTPStatusError, Response
+    from httpx2 import HTTPStatusError, Response
 
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
@@ -690,7 +690,7 @@ async def test_read_file_raises_on_truncated_body(mocker):
     error (so the vector-sync processor retries/re-queues instead of parsing the
     empty bytes and dead-lettering the file), not return the truncated content.
     """
-    from httpx import RemoteProtocolError
+    from httpx2 import RemoteProtocolError
 
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
@@ -745,15 +745,15 @@ async def test_read_file_retries_once_after_truncated_body_then_succeeds(mocker)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
+@pytest.mark.parametrize("error_type", [httpx2.RemoteProtocolError, httpx2.ReadError])
 async def test_read_file_retries_stale_transport_once_then_succeeds(mocker, error_type):
     """Both stale pooled-GET failure shapes get one fresh request."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
     client._principal_discovered = True
-    request = httpx.Request("GET", "https://nc/remote.php/dav/files/testuser/f.txt")
+    request = httpx2.Request("GET", "https://nc/remote.php/dav/files/testuser/f.txt")
     stale = error_type("stale pooled connection", request=request)
-    healthy = httpx.Response(
+    healthy = httpx2.Response(
         200,
         content=b"complete",
         headers={"content-length": "8", "content-type": "text/plain"},
@@ -773,14 +773,14 @@ async def test_read_file_does_not_retry_auth_status(mocker):
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
     client._principal_discovered = True
-    response = httpx.Response(
+    response = httpx2.Response(
         401,
         content=b"unauthorized",
-        request=httpx.Request("GET", "https://nc/remote.php/dav/files/testuser/f.txt"),
+        request=httpx2.Request("GET", "https://nc/remote.php/dav/files/testuser/f.txt"),
     )
     mock_http_client.request = AsyncMock(return_value=response)
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(httpx2.HTTPStatusError):
         await client.read_file("f.txt")
 
     assert mock_http_client.request.await_count == 1
@@ -1107,7 +1107,7 @@ async def test_write_file_still_raises_on_other_http_errors(mocker):
 @pytest.mark.unit
 async def test_get_note_attachment_raises_on_truncated_body(mocker):
     """get_note_attachment shares the short-read guard with read_file (#965)."""
-    from httpx import RemoteProtocolError
+    from httpx2 import RemoteProtocolError
 
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
@@ -1146,7 +1146,7 @@ async def test_move_copy_encode_destination_header(
     mocker, method, destination, expected_suffix
 ):
     """MOVE/COPY carry the target in a header, so it needs the same encoding
-    the request URL gets for free from httpx."""
+    the request URL gets for free from httpx2."""
     mock_http_client = AsyncMock()
     client = WebDAVClient(mock_http_client, "testuser")
     client._principal_discovered = True
@@ -1327,7 +1327,7 @@ async def test_get_fileid_parses_oc_fileid(mocker):
 @pytest.mark.unit
 async def test_get_fileid_returns_none_on_404(mocker):
     """A gone/inaccessible path resolves to None so the caller degrades."""
-    from httpx import HTTPStatusError, Response
+    from httpx2 import HTTPStatusError, Response
 
     client = WebDAVClient(AsyncMock(), "testuser")
     mocker.patch.object(client, "_ensure_principal_id", AsyncMock())

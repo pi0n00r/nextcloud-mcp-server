@@ -662,6 +662,11 @@ def configure_contacts_tools(mcp: MCPServer):
             uid: Contact UID.
             contact_data: Legacy JSON fields. Plain strings are supported for
                 ``fn``, ``email``, ``tel``/``phone``, ``title`` and ``note``.
+                Structured vCard ``N`` components may be supplied as
+                ``given_name``, ``family_name``, ``additional_names``,
+                ``honorific_prefix``, ``honorific_suffix``, or as ``n``.
+                Only supplied components change. ``None`` preserves and an
+                empty string clears that component.
                 ``org``/``organization``, ``nickname``, ``categories`` and
                 ``url`` also accept the compatibility shapes handled by the
                 byte-preserving client. Unknown fields are ignored.

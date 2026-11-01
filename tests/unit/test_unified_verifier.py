@@ -21,7 +21,7 @@ import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import jwt
 import pytest
 from mcp.server.auth.provider import AccessToken
@@ -925,7 +925,7 @@ class TestUserinfoFallback:
             patch.object(
                 verifier.http_client,
                 "post",
-                AsyncMock(side_effect=httpx.TimeoutException("introspect down")),
+                AsyncMock(side_effect=httpx2.TimeoutException("introspect down")),
             ),
             patch.object(
                 verifier.http_client, "get", AsyncMock(return_value=userinfo_resp)
@@ -1058,7 +1058,7 @@ class TestUserinfoFallback:
         with patch.object(
             verifier.http_client,
             "get",
-            AsyncMock(side_effect=httpx.TimeoutException("timeout")),
+            AsyncMock(side_effect=httpx2.TimeoutException("timeout")),
         ):
             result = await verifier._validate_via_userinfo("opaque-token")
         assert result is None
@@ -1068,7 +1068,7 @@ class TestUserinfoFallback:
         with patch.object(
             verifier.http_client,
             "get",
-            AsyncMock(side_effect=httpx.ConnectError("boom")),
+            AsyncMock(side_effect=httpx2.ConnectError("boom")),
         ):
             result = await verifier._validate_via_userinfo("opaque-token")
         assert result is None

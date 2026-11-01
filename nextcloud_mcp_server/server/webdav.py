@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import anyio
 from anyio.to_thread import run_sync
-from httpx import HTTPStatusError
+from httpx2 import HTTPStatusError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations

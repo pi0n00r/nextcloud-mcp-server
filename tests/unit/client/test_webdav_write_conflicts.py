@@ -18,7 +18,7 @@ rather than discarded in favour of our generic wording.
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 import pytest
-from httpx import HTTPStatusError, Request, Response
+from httpx2 import HTTPStatusError, Request, Response
 
 from nextcloud_mcp_server.client.dav_errors import dav_error_from_status_error
 from nextcloud_mcp_server.client.webdav import (

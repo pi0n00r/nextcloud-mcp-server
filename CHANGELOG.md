@@ -5,6 +5,24 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.204.0 (2026-11-01)
+
+### Feat
+
+- **contacts**: write structured vCard N names on create and legacy update
+
+### Fix
+
+- **contacts**: preserve byte fidelity while updating only supplied N components
+- **tables**: parse Tables row payloads into TableRow results
+- **mcp**: wrap raw list returns from Calendar and Tables tools
+- **calendar**: never rebuild a VTODO from a partial update after a merge error
+
+### Refactor
+
+- migrate outbound HTTP calls from httpx to httpx2 while retaining the fork's
+  short keep-alive expiry and operator disable switch
+
 ## v0.203.1 (2026-10-30)
 
 ### Fix

@@ -391,15 +391,15 @@ def _is_transient_infra_error(exc: BaseException) -> bool:
     infrastructure that should recover on its own. Imports are lazy: this only
     runs in the worker, and the module is also imported by the API pod to defer.
     """
-    import httpx  # noqa: PLC0415
+    import httpx2  # noqa: PLC0415
 
     if isinstance(
         exc,
         (
-            httpx.TimeoutException,
-            httpx.ConnectError,
-            httpx.RemoteProtocolError,
-            httpx.ReadError,
+            httpx2.TimeoutException,
+            httpx2.ConnectError,
+            httpx2.RemoteProtocolError,
+            httpx2.ReadError,
         ),
     ):
         return True

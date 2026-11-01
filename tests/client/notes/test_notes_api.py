@@ -11,7 +11,7 @@
 
 import logging
 
-import httpx
+import httpx2
 import pytest
 
 from nextcloud_mcp_server.client.notes import NotesClient
@@ -36,7 +36,7 @@ async def test_notes_api_get_note(mocker):
     )
 
     # Mock the _make_request method
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         NotesClient, "_make_request", return_value=mock_response
     )
@@ -66,7 +66,7 @@ async def test_notes_api_create_note(mocker):
         etag="def456",
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         NotesClient, "_make_request", return_value=mock_response
     )
@@ -100,7 +100,7 @@ async def test_notes_api_update(mocker):
         etag="new_etag",
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
 
     # Mock _make_request to return the update response
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
@@ -131,17 +131,17 @@ async def test_notes_api_update_conflict(mocker):
     # Mock the 412 error response
     error_response = create_mock_error_response(412, "Precondition Failed")
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
-    mock_make_request.side_effect = httpx.HTTPStatusError(
+    mock_make_request.side_effect = httpx2.HTTPStatusError(
         "412 Precondition Failed",
-        request=httpx.Request("PUT", "http://test.local"),
+        request=httpx2.Request("PUT", "http://test.local"),
         response=error_response,
     )
 
     client = NotesClient(mock_client, "testuser")
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.update(
             note_id=123,
             etag="old_etag",
@@ -159,7 +159,7 @@ async def test_notes_api_delete_note(mocker):
     # Mock delete response
     delete_response = create_mock_note_response(note_id=123)
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
     mock_make_request.side_effect = [get_response, delete_response]
     mock_cleanup = mocker.patch.object(WebDAVClient, "cleanup_note_attachments")
@@ -177,17 +177,17 @@ async def test_notes_api_delete_nonexistent(mocker):
     # Mock 404 error when fetching note details
     error_response = create_mock_error_response(404, "Not Found")
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
-    mock_make_request.side_effect = httpx.HTTPStatusError(
+    mock_make_request.side_effect = httpx2.HTTPStatusError(
         "404 Not Found",
-        request=httpx.Request("GET", "http://test.local"),
+        request=httpx2.Request("GET", "http://test.local"),
         response=error_response,
     )
 
     client = NotesClient(mock_client, "testuser")
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.delete_note(note_id=999999999)
 
     assert excinfo.value.response.status_code == 404
@@ -209,7 +209,7 @@ async def test_notes_api_append_content(mocker):
         etag="new_etag",
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
     # First call: GET (from get_note), second call: PUT (from update)
     mock_make_request.side_effect = [get_response, update_response]
@@ -237,7 +237,7 @@ async def test_notes_api_append_content_to_empty_note(mocker):
         etag="new_etag",
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
     # First call: GET (from get_note), second call: PUT (from update)
     mock_make_request.side_effect = [get_response, update_response]
@@ -253,17 +253,17 @@ async def test_notes_api_append_content_nonexistent_note(mocker):
     """Test that appending to a non-existent note raises 404."""
     error_response = create_mock_error_response(404, "Not Found")
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(NotesClient, "_make_request")
-    mock_make_request.side_effect = httpx.HTTPStatusError(
+    mock_make_request.side_effect = httpx2.HTTPStatusError(
         "404 Not Found",
-        request=httpx.Request("GET", "http://test.local"),
+        request=httpx2.Request("GET", "http://test.local"),
         response=error_response,
     )
 
     client = NotesClient(mock_client, "testuser")
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.append_content(note_id=999999999, content="This should fail")
 
     assert excinfo.value.response.status_code == 404

@@ -1,6 +1,6 @@
 import logging
 
-import httpx
+import httpx2
 import pytest
 
 from nextcloud_mcp_server.client.deck import DeckClient
@@ -80,7 +80,7 @@ async def test_deck_get_boards(mocker):
         ],
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -103,7 +103,7 @@ async def test_deck_create_board(mocker):
         board_id=123, title="New Board", color="FF0000"
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -128,7 +128,7 @@ async def test_deck_get_board(mocker):
         board_id=123, title="Test Board", color="0000FF"
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -148,7 +148,7 @@ async def test_deck_update_board(mocker):
     """Test that update_board makes the correct API call."""
     mock_response = create_mock_response(status_code=200, json_data={})
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -167,17 +167,17 @@ async def test_deck_get_board_nonexistent(mocker):
     """Test that getting a non-existent board raises HTTPStatusError."""
     error_response = create_mock_error_response(404, "Board not found")
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(DeckClient, "_make_request")
-    mock_make_request.side_effect = httpx.HTTPStatusError(
+    mock_make_request.side_effect = httpx2.HTTPStatusError(
         "404 Not Found",
-        request=httpx.Request("GET", "http://test.local"),
+        request=httpx2.Request("GET", "http://test.local"),
         response=error_response,
     )
 
     client = DeckClient(mock_client, "testuser")
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(httpx2.HTTPStatusError) as excinfo:
         await client.get_board(board_id=999999999)
 
     assert excinfo.value.response.status_code == 404
@@ -192,7 +192,7 @@ async def test_deck_create_stack(mocker):
         stack_id=456, title="Test Stack", board_id=123, order=1
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -214,7 +214,7 @@ async def test_deck_get_stack(mocker):
         stack_id=456, title="Test Stack", board_id=123, order=1
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -240,7 +240,7 @@ async def test_deck_get_stacks(mocker):
         ],
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -270,7 +270,7 @@ async def test_deck_get_archived_stacks(mocker):
         ],
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -295,7 +295,7 @@ async def test_deck_create_card(mocker):
         card_id=789, title="Test Card", stack_id=456, description="Test description"
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -331,7 +331,7 @@ async def test_deck_create_card_persists_duedate(mocker):
         duedate="2025-07-15T17:00:00Z",
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(DeckClient, "_make_request")
     mock_make_request.side_effect = [
         create_response,
@@ -368,7 +368,7 @@ async def test_deck_get_card(mocker):
         card_id=789, title="Test Card", stack_id=456
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -396,7 +396,7 @@ async def test_deck_get_card_uses_api_v11_so_attachments_are_not_filtered(mocker
         ),
     )
 
-    client = DeckClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = DeckClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.get_card(board_id=123, stack_id=456, card_id=789)
 
     assert "/apps/deck/api/v1.1/" in DeckClient._make_request.call_args[0][1]
@@ -408,7 +408,7 @@ async def test_deck_get_attachments_uses_api_v11(mocker):
         DeckClient, "_make_request", return_value=create_mock_response(json_data=[])
     )
 
-    client = DeckClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = DeckClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     attachments = await client.get_attachments(board_id=123, stack_id=456, card_id=789)
 
     assert attachments == []
@@ -425,7 +425,7 @@ async def test_deck_delete_attachment_passes_the_type_through(mocker):
         DeckClient, "_make_request", return_value=create_mock_response(json_data={})
     )
 
-    client = DeckClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = DeckClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.delete_attachment(
         board_id=123, stack_id=456, card_id=789, attachment_id=1, file_type="file"
     )
@@ -439,7 +439,7 @@ async def test_deck_delete_attachment_defaults_to_deck_file(mocker):
         DeckClient, "_make_request", return_value=create_mock_response(json_data={})
     )
 
-    client = DeckClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = DeckClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await client.delete_attachment(
         board_id=123, stack_id=456, card_id=789, attachment_id=1
     )
@@ -459,7 +459,7 @@ async def test_deck_attachment_routes_address_the_id_by_type(mocker, method):
         return_value=create_mock_response(json_data={}, content=b""),
     )
 
-    client = DeckClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = DeckClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     await getattr(client, method)(
         board_id=123, stack_id=456, card_id=789, attachment_id=1, file_type="file"
     )
@@ -473,7 +473,7 @@ async def test_deck_assign_dependent_card(mocker):
         card_id=789, title="Test Card", stack_id=456, dependentCards=[555]
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -500,7 +500,7 @@ async def test_deck_remove_dependent_card(mocker):
         card_id=789, title="Test Card", stack_id=456, dependentCards=[]
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -531,7 +531,7 @@ async def test_deck_update_card(mocker):
     # Mock update response
     update_response = create_mock_response(status_code=200, json_data={})
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(DeckClient, "_make_request")
     # First call returns the card, second call is the update
     mock_make_request.side_effect = [get_response, update_response]
@@ -566,7 +566,7 @@ async def test_deck_update_card_converts_offset_duedate_to_utc(mocker):
     )
     update_response = create_mock_response(status_code=200, json_data={})
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(DeckClient, "_make_request")
     mock_make_request.side_effect = [get_response, update_response]
 
@@ -592,7 +592,7 @@ async def test_deck_create_label(mocker):
         label_id=111, title="Test Label", color="FF0000", board_id=123
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -614,7 +614,7 @@ async def test_deck_get_label(mocker):
         label_id=111, title="Test Label", color="FF0000", board_id=123
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -639,7 +639,7 @@ async def test_deck_create_comment(mocker):
         comment_id=222, message="Test comment", card_id=789
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -687,7 +687,7 @@ async def test_deck_get_comments(mocker):
         },
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -709,7 +709,7 @@ async def test_deck_update_comment(mocker):
         comment_id=222, message="Updated comment", card_id=789
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -736,7 +736,7 @@ async def test_deck_create_comment_reply(mocker):
         comment_id=333, message="A reply", card_id=789
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -760,7 +760,7 @@ async def test_deck_create_comment_omits_parent_id_when_none(mocker):
         comment_id=444, message="Top-level", card_id=789
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -780,7 +780,7 @@ async def test_deck_delete_comment(mocker):
         json_data={"ocs": {"meta": {"status": "ok"}, "data": []}},
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -802,7 +802,7 @@ async def test_deck_get_comments_pagination(mocker):
         json_data={"ocs": {"meta": {"status": "ok"}, "data": []}},
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
@@ -835,7 +835,7 @@ async def test_deck_get_config(mocker):
         },
     )
 
-    mock_client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    mock_client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     mock_make_request = mocker.patch.object(
         DeckClient, "_make_request", return_value=mock_response
     )
