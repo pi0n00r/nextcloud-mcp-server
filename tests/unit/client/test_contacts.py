@@ -742,6 +742,12 @@ def test_create_writes_structured_n_and_derives_fn():
     assert "N:Doe;Jane;;;" in card
 
 
+def test_create_omits_structured_n_when_only_fn_is_supplied():
+    card = _vcard(fn="Mankind Grooming")
+    assert "FN:Mankind Grooming" in card
+    assert "\nN:" not in card
+
+
 def test_structured_name_normalization_preserves_null_and_clear_semantics():
     assert _normalize_contact_data({"n": ""}) == {}
     assert _normalize_contact_data({"given_name": None}) == {}

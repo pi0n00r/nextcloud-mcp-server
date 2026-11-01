@@ -99,9 +99,10 @@ The Nextcloud server and the upstream apps the MCP
 tools wrap (Mail, WebDAV, `/core/preview.png`, Notes, Deck, Tables, …) are
 **not** Pact participants:
 
-- Nobody can run a provider verifier for them. A consumer pact on its own only
-  restates our client's assumptions, so it would stay green when Mail or core
-  changes its API. That is the failure we would want it to catch.
+- No upstream project participates as the Pact provider or owns provider
+  verification. A consumer pact on its own only restates our client's
+  assumptions, so it would stay green when Mail or core changes its API. That
+  is the failure we would want it to catch.
 - Making such a pact bite would mean verifying it against the docker-compose
   Nextcloud, with provider states that seed accounts, mail, drafts and files.
   That is the integration matrix again, with extra machinery on top.

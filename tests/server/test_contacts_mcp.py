@@ -376,7 +376,7 @@ async def test_mcp_contacts_structured_name_round_trip(
                 "nc_contacts_get_contact",
                 {"addressbook": addressbook_name, "uid": contact_uid},
             )
-        )["contact"]["json"]
+        )["contact"]
         assert updated["given_name"] == "Jane"
         assert updated["family_name"] == "Roe"
     finally:

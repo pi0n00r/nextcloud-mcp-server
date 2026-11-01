@@ -334,8 +334,9 @@ def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
     kwargs: dict[str, Any] = {
         "fn": fn,
         "uid": uid,
-        "n": [name_parts.get(key, "") for key in _N_COMPONENTS],
     }
+    if name_parts:
+        kwargs["n"] = [name_parts.get(key, "") for key in _N_COMPONENTS]
 
     emails = _wrap_contact_field(data.get("email"))
     if emails:
