@@ -236,12 +236,18 @@ async def test_token_scopes_enforced_on_tool_call(
 @pytest.mark.integration
 @pytest.mark.login_flow
 @pytest.mark.parametrize(
-    "uri", ["notes://settings", "nc://Deck/boards", "nc://Notes/1"]
+    ("uri", "required_scope"),
+    [
+        ("notes://settings", "notes.read"),
+        ("nc://Deck/boards", "deck.read"),
+        ("nc://Notes/1", "notes.read"),
+    ],
 )
 async def test_token_scopes_enforced_on_resource_read(
     nc_mcp_login_flow_client,
     nc_mcp_login_flow_client_no_custom_scopes,
     uri,
+    required_scope,
 ):
     """resources/read must enforce the same scopes as the tools
     (GHSA-29mh-jqx8-rg3v): an openid-only token was able to read notes/deck
@@ -251,8 +257,10 @@ async def test_token_scopes_enforced_on_resource_read(
     provisioned, so the refusal comes from the scope check rather than from
     ProvisioningRequiredError.
     """
-    with pytest.raises(MCPError):
+    with pytest.raises(MCPError) as exc_info:
         await nc_mcp_login_flow_client_no_custom_scopes.read_resource(uri)
+    assert "Missing required scopes" in str(exc_info.value)
+    assert required_scope in str(exc_info.value)
 
 
 @pytest.mark.integration

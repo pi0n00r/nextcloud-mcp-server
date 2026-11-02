@@ -102,6 +102,7 @@ FORK_TOUCHED=(
     "tests/unit/test_mail_draft_scope.py"
     "tests/unit/test_mail_view_attachment.py"
     "tests/unit/test_publication_identity.py"
+    "tests/unit/test_resource_scopes.py"
     "tests/unit/test_plugins.py"
     "tests/unit/test_tool_call_logging.py"
     "tests/unit/test_text_edit.py"
