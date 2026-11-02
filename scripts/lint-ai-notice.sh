@@ -36,6 +36,7 @@ fi
 FORK_TOUCHED=(
     "nextcloud_mcp_server/api/visualization.py"
     "nextcloud_mcp_server/auth/elicitation.py"
+    "nextcloud_mcp_server/auth/scope_authorization.py"
     "nextcloud_mcp_server/client/base.py"
     "nextcloud_mcp_server/client/calendar.py"
     "nextcloud_mcp_server/client/contacts.py"
@@ -102,6 +103,7 @@ FORK_TOUCHED=(
     "tests/unit/test_mail_draft_scope.py"
     "tests/unit/test_mail_view_attachment.py"
     "tests/unit/test_publication_identity.py"
+    "tests/unit/test_resource_scopes.py"
     "tests/unit/test_plugins.py"
     "tests/unit/test_tool_call_logging.py"
     "tests/unit/test_text_edit.py"

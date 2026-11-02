@@ -37,6 +37,7 @@ import os
 
 import httpx2
 import pytest
+from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult
 
 from nextcloud_mcp_server.models.auth import ALL_SUPPORTED_SCOPES
@@ -230,6 +231,46 @@ async def test_token_scopes_enforced_on_tool_call(
     assert "notes.write" in message, (
         f"expected the missing scope to be named in the denial, got: {message}"
     )
+
+
+@pytest.mark.integration
+@pytest.mark.login_flow
+@pytest.mark.parametrize(
+    ("uri", "required_scope"),
+    [
+        ("notes://settings", "notes.read"),
+        ("nc://Deck/boards", "deck.read"),
+        ("nc://Notes/1", "notes.read"),
+    ],
+)
+async def test_token_scopes_enforced_on_resource_read(
+    nc_mcp_login_flow_client,
+    nc_mcp_login_flow_client_no_custom_scopes,
+    uri,
+    required_scope,
+):
+    """resources/read must enforce the same scopes as the tools
+    (GHSA-29mh-jqx8-rg3v): an openid-only token was able to read notes/deck
+    data the matching tools refused.
+
+    Depends on nc_mcp_login_flow_client only to guarantee the user is
+    provisioned, so the refusal comes from the scope check rather than from
+    ProvisioningRequiredError.
+    """
+    with pytest.raises(MCPError) as exc_info:
+        await nc_mcp_login_flow_client_no_custom_scopes.read_resource(uri)
+    assert "Missing required scopes" in str(exc_info.value)
+    assert required_scope in str(exc_info.value)
+
+
+@pytest.mark.integration
+@pytest.mark.login_flow
+async def test_resource_read_allowed_with_scope(nc_mcp_login_flow_client_full_access):
+    """The positive mirror: the scope gate must not lock out a granted token."""
+    result = await nc_mcp_login_flow_client_full_access.read_resource(
+        "notes://settings"
+    )
+    assert result.contents
 
 
 @pytest.mark.integration
