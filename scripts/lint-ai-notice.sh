@@ -36,6 +36,7 @@ fi
 FORK_TOUCHED=(
     "nextcloud_mcp_server/api/visualization.py"
     "nextcloud_mcp_server/auth/elicitation.py"
+    "nextcloud_mcp_server/auth/scope_authorization.py"
     "nextcloud_mcp_server/client/base.py"
     "nextcloud_mcp_server/client/calendar.py"
     "nextcloud_mcp_server/client/contacts.py"
