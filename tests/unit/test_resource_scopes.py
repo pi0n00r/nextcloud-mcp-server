@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceError
 
 from nextcloud_mcp_server.auth.scope_authorization import (
     InsufficientScopeError,
@@ -75,7 +76,9 @@ async def test_resource_read_refused_without_app_scope(uri):
     """Static and template resources alike refuse an openid-only token."""
     mcp = _server()
     get_client = AsyncMock(side_effect=AssertionError("reached Nextcloud"))
-    reset = set_request_context(_request_context())
+    request_context = _request_context()
+    request_context.method = "resources/read"
+    reset = set_request_context(request_context)
     try:
         with (
             _settings(),
@@ -89,12 +92,10 @@ async def test_resource_read_refused_without_app_scope(uri):
     finally:
         reset_request_context(reset)
 
-    # The SDK wraps non-MCPError handler exceptions in UnexpectedResourceError,
-    # keeping the original as __cause__.
     err = exc_info.value
-    assert isinstance(err, InsufficientScopeError) or isinstance(
-        err.__cause__, InsufficientScopeError
-    )
+    assert isinstance(err, ResourceError)
+    assert isinstance(err.__cause__, InsufficientScopeError)
+    assert "Missing required scopes" in str(err)
     get_client.assert_not_called()
 
 

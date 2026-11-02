@@ -4,11 +4,12 @@ import inspect
 import logging
 import time
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ResourceError
 from mcp.server.mcpserver.utilities.context_injection import find_context_parameter
 
 from nextcloud_mcp_server.auth.storage import get_shared_storage
@@ -61,6 +62,18 @@ class ProvisioningRequiredError(ScopeAuthorizationError):
                 "Please run the 'provision_nextcloud_access' tool to grant access."
             )
         )
+
+
+def _raise_authorization_error(
+    ctx: Context, error: ScopeAuthorizationError
+) -> NoReturn:
+    """Preserve expected authorization details at the MCP resource boundary."""
+    if (
+        getattr(getattr(ctx, "request_context", None), "method", None)
+        == "resources/read"
+    ):
+        raise ResourceError(str(error)) from error
+    raise error
 
 
 def require_scopes(*required_scopes: str):
@@ -166,10 +179,13 @@ def require_scopes(*required_scopes: str):
                         "token on this request",
                         func_name,
                     )
-                    raise InsufficientScopeError(
-                        list(required_scopes),
-                        f"Access denied to {func_name}: no verified access token "
-                        f"on this request.",
+                    _raise_authorization_error(
+                        ctx,
+                        InsufficientScopeError(
+                            list(required_scopes),
+                            f"Access denied to {func_name}: no verified access token "
+                            f"on this request.",
+                        ),
                     )
                 logger.debug(
                     "No access token for %s - allowing (BasicAuth mode)", func_name
@@ -252,7 +268,9 @@ def require_scopes(*required_scopes: str):
                                 f"Nextcloud access not provisioned. "
                                 f"Please call 'nc_auth_provision_access' first."
                             )
-                        raise ProvisioningRequiredError(error_msg)
+                        _raise_authorization_error(
+                            ctx, ProvisioningRequiredError(error_msg)
+                        )
 
                     if stored_scopes == "all":
                         # NULL scopes in DB = no *additional* restriction. This
@@ -279,7 +297,10 @@ def require_scopes(*required_scopes: str):
                                 f"Call 'nc_auth_update_scopes' to add permissions."
                             )
                             logger.warning(error_msg)
-                            raise InsufficientScopeError(list(missing), error_msg)
+                            _raise_authorization_error(
+                                ctx,
+                                InsufficientScopeError(list(missing), error_msg),
+                            )
 
                         logger.debug(
                             "Stored app password scope check passed for %s", func_name
@@ -349,7 +370,9 @@ def require_scopes(*required_scopes: str):
                             f"Please run the 'provision_nextcloud_access' tool first."
                         )
                         logger.warning(error_msg)
-                        raise ProvisioningRequiredError(error_msg)
+                        _raise_authorization_error(
+                            ctx, ProvisioningRequiredError(error_msg)
+                        )
 
             # Check if all required scopes are present
             missing_scopes = required_scopes_set - token_scopes
@@ -377,7 +400,10 @@ def require_scopes(*required_scopes: str):
                         "obtain a new token."
                     )
                 logger.warning(error_msg)
-                raise InsufficientScopeError(list(missing_scopes), error_msg)
+                _raise_authorization_error(
+                    ctx,
+                    InsufficientScopeError(list(missing_scopes), error_msg),
+                )
 
             # All required scopes present - allow execution
             logger.debug(
