@@ -39,12 +39,16 @@ def _close_test_streams(monkeypatch):
     create_stream = anyio.create_memory_object_stream
     opened = []
 
-    def tracked_create_stream(*args, **kwargs):
-        streams = create_stream(*args, **kwargs)
-        opened.extend(streams)
-        return streams
+    class TrackedStreamFactory:
+        def __call__(self, *args, **kwargs):
+            streams = create_stream(*args, **kwargs)
+            opened.extend(streams)
+            return streams
 
-    monkeypatch.setattr(anyio, "create_memory_object_stream", tracked_create_stream)
+        def __getitem__(self, item):
+            return create_stream[item]
+
+    monkeypatch.setattr(anyio, "create_memory_object_stream", TrackedStreamFactory())
     yield
     for stream in opened:
         stream.close()
