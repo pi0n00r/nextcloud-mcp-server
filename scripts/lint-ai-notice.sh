@@ -93,6 +93,7 @@ FORK_TOUCHED=(
     "tests/unit/client/test_share_types.py"
     "tests/unit/providers/test_rerank_client.py"
     "tests/unit/client/test_webdav_write_conflicts.py"
+    "tests/unit/test_app_starlette_wiring.py"
     "tests/unit/test_calendar_tools.py"
     "tests/unit/test_chunk_links.py"
     "tests/unit/test_compact_tool_results.py"
@@ -110,6 +111,7 @@ FORK_TOUCHED=(
     "tests/unit/test_unified_verifier.py"
     "tests/unit/test_webdav_edit_file.py"
     "tests/unit/test_webdav_view_image.py"
+    "tests/unit/test_webhook_endpoint.py"
 )
 
 failures=0

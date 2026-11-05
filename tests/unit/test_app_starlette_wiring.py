@@ -5,6 +5,17 @@ Starlette 1.0 removed; the server then crashed at startup while every unit
 test still passed, because none built the real app.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 
 import pytest
@@ -20,6 +31,7 @@ def test_get_app_builds_and_logs_user_agent(monkeypatch, caplog):
     monkeypatch.setenv("NEXTCLOUD_HOST", "http://nextcloud.invalid")
     monkeypatch.setenv("NEXTCLOUD_USERNAME", "user")
     monkeypatch.setenv("NEXTCLOUD_PASSWORD", "pass")
+    monkeypatch.setenv("METRICS_ENABLED", "false")
     _reload_config()
 
     app = get_app()
