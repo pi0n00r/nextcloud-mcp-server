@@ -58,6 +58,7 @@ from nextcloud_mcp_server.models.contacts import (
     PutContactResponse,
 )
 from nextcloud_mcp_server.observability.metrics import instrument_tool
+from nextcloud_mcp_server.utils.parsing import split_csv
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +155,8 @@ def _parse_url_fields(raw_urls: str | list | None) -> list[ContactField]:
 def _parse_categories(raw_categories: str | list | None) -> list[str]:
     raw_categories = raw_categories or []
     if isinstance(raw_categories, str):
-        return [item.strip() for item in raw_categories.split(",") if item.strip()]
-    return [item for item in raw_categories if isinstance(item, str) and item]
+        return split_csv(raw_categories)
+    return [c for c in raw_categories if isinstance(c, str) and c]
 
 
 def _build_custom_fields(contact_info: dict) -> dict[str, Any]:

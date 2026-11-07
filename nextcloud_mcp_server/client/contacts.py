@@ -44,6 +44,8 @@ from urllib.parse import unquote
 from httpx2 import HTTPStatusError
 from pythonvCard4.vcard import Contact, escape_text, unfold_lines
 
+from nextcloud_mcp_server.utils.parsing import split_csv
+
 from .base import BaseNextcloudClient
 from .entity_tag import (
     StrongEntityTagError,
@@ -259,7 +261,7 @@ def _split_categories(value: str | list[str]) -> list[str]:
     """
     if isinstance(value, list):
         return value
-    return [v.strip() for v in value.split(",") if v.strip()]
+    return split_csv(value)
 
 
 def _parse_bday(value: str | date | None) -> date | None:
