@@ -838,3 +838,26 @@ async def test_legacy_update_contact_refuses_missing_or_weak_server_etag(
         )
 
     write_client._make_request.assert_not_awaited()
+
+
+def test_projection_preserves_escaped_structured_separators():
+    text = "\n".join(
+        [
+            "BEGIN:VCARD",
+            "VERSION:4.0",
+            "UID:escaped-components",
+            "FN:Example",
+            r"N:Doe\;Jr;John;;;",
+            r"ADR;TYPE=home:;;1\; Main St;Town;;;",
+            r"NICKNAME:J\;D",
+            r"CATEGORIES:R\,D,Sales",
+            "END:VCARD",
+        ]
+    )
+
+    projection = _vcard_to_json_projection(text, fallback_uid="escaped-components")
+
+    assert projection["n"][:2] == ["Doe;Jr", "John"]
+    assert projection["adr"][0]["value"][2] == "1; Main St"
+    assert projection["nickname"] == ["J;D"]
+    assert projection["categories"] == ["R,D", "Sales"]

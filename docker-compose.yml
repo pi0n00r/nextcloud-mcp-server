@@ -20,11 +20,11 @@ services:
   # Note: Redis is an external service. You can find more information about the configuration here:
   # https://hub.docker.com/_/redis
   redis:
-    image: docker.io/library/redis:8.10.3-alpine@sha256:21090af93f8324db2f0f0f4f38a7c60369d47d917e000c3423d89d2ae2883537
+    image: docker.io/library/redis:8.10.3-alpine@sha256:71885d8cc6e42f2bc0aa2eb853bfc4be200b5108a46ac50e117ae1df0531fb80
     restart: always
 
   app:
-    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:a7ab427cdc56de0bb44152d743b8a2938c65897b9c021f97db1e2ccc3ed9bc46}
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud:32.0.15@sha256:68feaa8992524ac26b4c00194b81c1ae6dc8e9f412ac82de0c5f4d4a2ee4bbcd}
     restart: always
     ports:
       - "127.0.0.1:8080:80"
@@ -63,7 +63,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.8-alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
+    image: docker.io/library/nginx:1.31.8-alpine@sha256:b2f80f8f88146b0772fdcc7d92cea621aa8c2889fa8d07ed61d4884fcea53e09
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -178,7 +178,7 @@ services:
   # tests exercise SAR export redaction (ADR-040) without a model. It detects
   # only the synthetic names hard-coded in tests/fixtures/ner_stub.py.
   ner-stub:
-    image: docker.io/library/python:3.14-alpine@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1e830083e89b89d2
+    image: docker.io/library/python:3.14-alpine@sha256:a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894
     restart: always
     command: ["python", "/stub/ner_stub.py"]
     volumes:
@@ -367,7 +367,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+    image: quay.io/keycloak/keycloak:26.8.2@sha256:3879c623248408de29a5303178b5816c77e8dfef3890c361f8c0bbeaa979ba3b
     command:
       - "start-dev"
       - "--import-realm"

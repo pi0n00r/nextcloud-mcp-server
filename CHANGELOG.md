@@ -5,6 +5,58 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.205.3 (2026-11-06)
+
+### Fix
+
+- keep an escaped ; or , inside one N, ADR, NICKNAME or CATEGORIES component on read
+
+## v0.205.2 (2026-11-06)
+
+### Fix
+
+- log a malformed webhook event body at warning with its traceback
+- make four payload parsers total over the inputs they claim to accept
+- bind new_string as a lambda default in apply_edits (Sonar S1515)
+- a quote ending in CR must not match half a CRLF pair in apply_edits
+- keep CRLF pairs intact in apply_edits and make normalize_etag idempotent
+
+### Refactor
+
+- reject a non-string webhook event class up front and log parser failures with exc_info
+
+## v0.205.1 (2026-11-06)
+
+### Fix
+
+- **ci**: kill the orphaned apt-get between Playwright install attempts
+- log what was swallowed where a handler falls back silently
+
+## v0.205.0 (2026-11-06)
+
+### Feat
+
+- **calendar**: report truncation in list_events and apply min_duration_minutes
+
+### Fix
+
+- **calendar**: reject negative list_events limit, log when a listing is cut
+- **calendar**: raise bulk-operation match cap from 50 to BULK_EVENT_LIMIT
+- **calendar**: apply event filters before the limit and honour limit across calendars
+- **sar**: cap the shielded case-folder cleanup and log why it failed
+- **sar**: keep the 403 to refused writes and clean up on cancellation
+- **sar**: report a refused case-file write as 403 and remove the new folder
+
+### Refactor
+
+- **calendar**: drop unused _apply_event_filters, note intentional full scan
+
+## v0.204.3 (2026-11-05)
+
+### Fix
+
+- resolve ty 0.0.97 diagnostics
+
 ## v0.204.2 (2026-11-05)
 
 ### Fix

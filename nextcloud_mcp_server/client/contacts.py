@@ -89,8 +89,8 @@ def _name_component_str(value: Any) -> str:
     return str(value)
 
 
-def _split_vcard_components(value: str) -> list[str]:
-    """Split a structured value on unescaped semicolons.
+def _split_vcard_components(value: str, separator: str = ";") -> list[str]:
+    """Split a structured value on its unescaped separator.
 
     A delimiter is escaped only when preceded by an odd-length backslash run.
     Counting the run avoids treating ``\\\\;`` (a literal backslash followed by
@@ -99,7 +99,7 @@ def _split_vcard_components(value: str) -> list[str]:
     components: list[str] = []
     start = 0
     for index, character in enumerate(value):
-        if character != ";":
+        if character != separator:
             continue
         backslashes = 0
         cursor = index - 1
@@ -970,6 +970,35 @@ def _parses_vcard_property(line: str) -> bool:
     return True
 
 
+_STRUCTURED_SEPARATORS = {"N": ";", "ADR": ";", "NICKNAME": ";", "CATEGORIES": ","}
+
+
+def _resplit_structured_projection(contact: Contact, lines: list[str]) -> None:
+    """Repair structured fields that pythonvCard4 splits after unescaping."""
+    adr_entries = iter(contact.adr)
+    n_done = False
+    for line in lines:
+        key, colon, raw = line.partition(":")
+        name = key.split(";", 1)[0].upper()
+        separator = _STRUCTURED_SEPARATORS.get(name)
+        if not colon or separator is None:
+            continue
+        components = [
+            _unescape_vcard_component(component)
+            for component in _split_vcard_components(raw, separator)
+        ]
+        if name == "N" and not n_done:
+            contact.n, n_done = components, True
+        elif name == "ADR":
+            entry = next(adr_entries, None)
+            if entry is not None:
+                entry["value"] = components
+        elif name == "NICKNAME":
+            contact.nickname = components
+        elif name == "CATEGORIES":
+            contact.categories = components
+
+
 def _parse_vcard_for_projection(vcard_text: str) -> Contact:
     """Parse a vCard while isolating malformed properties from its projection.
 
@@ -979,10 +1008,10 @@ def _parse_vcard_for_projection(vcard_text: str) -> Contact:
     phone, and email. The original vCard remains untouched for raw reads and
     byte-preserving writes; this retry affects only the JSON projection.
     """
+    lines = unfold_lines(vcard_text.splitlines())
     try:
-        return Contact.from_vcard(vcard_text)
+        contact = Contact.from_vcard(vcard_text)
     except Exception:
-        lines = unfold_lines(vcard_text.splitlines())
         dropped = [line for line in lines if not _parses_vcard_property(line)]
         if not dropped:
             raise
@@ -990,8 +1019,10 @@ def _parse_vcard_for_projection(vcard_text: str) -> Contact:
             "Dropped unparseable vCard properties from projection (properties=%s)",
             [line.split(":", 1)[0] for line in dropped],
         )
-        kept = [line for line in lines if line not in dropped]
-        return Contact.from_vcard("\n".join(kept))
+        lines = [line for line in lines if line not in dropped]
+        contact = Contact.from_vcard("\n".join(lines))
+    _resplit_structured_projection(contact, lines)
+    return contact
 
 
 def _vcard_to_json_projection(vcard_text: str, *, fallback_uid: str) -> dict[str, Any]:
