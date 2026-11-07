@@ -16,7 +16,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 The published container package is pinned to an immutable product tag:
 
 ```bash
-ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.5
+ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.6
 ```
 
 [Browse published package versions](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server).
@@ -52,7 +52,7 @@ docker run --detach --name nextcloud-mcp \
   --health-timeout 5s \
   --health-retries 3 \
   --health-start-period 20s \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.5
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.6
 ```
 
 Then connect the MCP client to:
@@ -83,5 +83,5 @@ http://[::1]:8000/health/ready
   checks.
 - The package uses the exact package tag and does not publish a floating
   `latest` tag.
-- Package `v1.10.5` is built from application version `0.205.3` at source
-  revision `91e602a0673fae5a9e025046d8e071b565fae178`.
+- Package `v1.10.6` is built from application version `0.206.0` at source
+  revision `13f540d28aeca669b94ec6772f2de9c02057b084`.
