@@ -64,7 +64,7 @@ automation:
 | **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v1.10.5` (application `0.205.3`): upstream catch-up with fork byte-fidelity, dual-stack, dependency and publication hardening retained |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.5` (application `0.204.1`) |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.10.5` (application `0.205.3`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
