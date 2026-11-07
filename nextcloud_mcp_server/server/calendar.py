@@ -958,6 +958,7 @@ def configure_calendar_tools(mcp: MCPServer):
                     end_datetime=end_datetime,
                     filters=filter_criteria,
                     limit=BULK_EVENT_LIMIT + 1,
+                    strict=True,
                 )
 
             try:
@@ -1040,7 +1041,10 @@ def configure_calendar_tools(mcp: MCPServer):
 
             try:
                 return await client.calendar.bulk_update_events(
-                    filter_criteria, update_data, apply_to_series=apply_to_series
+                    filter_criteria,
+                    update_data,
+                    apply_to_series=apply_to_series,
+                    calendar_name=calendar_name,
                 )
             except CalendarBulkLimitExceededError as e:
                 raise ToolError(str(e)) from e
@@ -1064,6 +1068,7 @@ def configure_calendar_tools(mcp: MCPServer):
                     end_datetime=end_datetime,
                     filters=filter_criteria,
                     limit=BULK_EVENT_LIMIT + 1,
+                    strict=True,
                 )
 
             try:

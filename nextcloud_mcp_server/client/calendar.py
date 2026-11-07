@@ -3643,8 +3643,9 @@ class CalendarClient:
         filter_criteria: dict[str, Any],
         update_data: dict[str, Any],
         apply_to_series: bool = False,
+        calendar_name: str | None = None,
     ) -> dict[str, Any]:
-        """Bulk update events matching filter criteria."""
+        """Bulk update a complete, optionally calendar-scoped match set."""
         await self._ensure_calendar_home()
         try:
             start_datetime = None
@@ -3656,12 +3657,24 @@ class CalendarClient:
             if "end_date" in filter_criteria and filter_criteria["end_date"]:
                 end_datetime = dt.datetime.fromisoformat(filter_criteria["end_date"])
 
-            events = await self.search_events_across_calendars(
-                start_datetime=start_datetime,
-                end_datetime=end_datetime,
-                filters=filter_criteria,
-                limit=BULK_EVENT_LIMIT + 1,
-            )
+            if calendar_name:
+                events = await self.get_calendar_events(
+                    calendar_name=calendar_name,
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                    filters=filter_criteria or None,
+                    limit=BULK_EVENT_LIMIT + 1,
+                )
+                for event in events:
+                    event["calendar_name"] = calendar_name
+            else:
+                events = await self.search_events_across_calendars(
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                    filters=filter_criteria,
+                    limit=BULK_EVENT_LIMIT + 1,
+                    strict=True,
+                )
 
             require_complete_bulk_match_set(events)
 

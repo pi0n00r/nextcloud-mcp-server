@@ -234,49 +234,6 @@ def _raise_if_unavailable(e: HTTPStatusError, path: str) -> None:
         ) from e
 
 
-async def _remove_empty_new_case_dir(
-    nc: NextcloudClient, case_dir: str, case_file: str
-) -> None:
-    """Remove a failed create only after proving its case file is absent.
-
-    A lost PUT response is not proof that the write failed. Deleting the whole
-    directory in that state can erase a case that Nextcloud committed. A 404
-    readback is the only state in which cleanup is safe enough to attempt.
-    """
-    try:
-        await nc.webdav.read_file(case_file)
-    except HTTPStatusError as e:
-        if e.response.status_code != 404:
-            logger.warning(
-                "Retaining %r after an uncertain case create; readback returned "
-                "HTTP %s",
-                case_dir,
-                e.response.status_code,
-            )
-            return
-    except Exception:
-        logger.warning(
-            "Retaining %r after an uncertain case create; readback failed",
-            case_dir,
-            exc_info=True,
-        )
-        return
-    else:
-        logger.warning(
-            "Retaining %r after a failed case create because %r exists",
-            case_dir,
-            case_file,
-        )
-        return
-
-    try:
-        await nc.webdav.delete_resource(case_dir)
-    except Exception:
-        logger.warning(
-            "Could not remove %r after a failed case create", case_dir, exc_info=True
-        )
-
-
 async def create_case(
     nc: NextcloudClient,
     *,
@@ -291,9 +248,9 @@ async def create_case(
         ExportError: invalid name or folder (400), the folder is missing or not
             writable, or Nextcloud refuses the case file (403), a case of that
             name exists there (409), or Nextcloud is failing (503). Any other
-            failure to write the case file is re-raised. Whenever the case
-            file cannot be written, the case folder created for it is
-            removed again only when readback proves the case file is absent.
+            failure to write the case file is re-raised. A directory created
+            before a failed or cancelled case-file write is retained because
+            WebDAV cannot atomically prove that no write landed in it.
     """
     case_dir = f"{normalize_folder(folder)}/{validate_name(name)}"
     case_file = f"{case_dir}/{CASE_FILE}"
@@ -322,12 +279,15 @@ async def create_case(
             case_file, case.model_dump_json(indent=2).encode(), "application/json"
         )
     except BaseException as e:
-        # We created case_dir just above (MKCOL 201). A cancelled request or a
-        # lost response can still mean the PUT landed, so read back before any
-        # destructive cleanup. Shielding lets the bounded readback/cleanup
-        # finish while preserving the original cancellation or write error.
-        with anyio.CancelScope(shield=True), anyio.move_on_after(10):
-            await _remove_empty_new_case_dir(nc, case_dir, case_file)
+        # A cancelled request or lost response can still mean the PUT landed.
+        # Even a later 404 cannot atomically exclude an in-flight PUT or a
+        # concurrent writer, so never delete the directory from this failure
+        # path. The retained directory is visible and recoverable; deleting a
+        # committed or concurrently populated case is not.
+        logger.warning(
+            "Retaining %r after a failed or cancelled case-file write",
+            case_dir,
+        )
         if isinstance(e, HTTPStatusError):
             _raise_if_unavailable(e, case_file)
             if e.response.status_code in (401, 403):
