@@ -144,6 +144,7 @@ from nextcloud_mcp_server.server import (
 )
 from nextcloud_mcp_server.server.auth_tools import register_auth_tools
 from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
+from nextcloud_mcp_server.utils.parsing import split_csv
 
 # The vector/semantic-search stack (vector/, search/, document_processors/,
 # admin/payload_backfill, api/{visualization,vector_sync,sar}, server/{semantic,
@@ -1634,9 +1635,7 @@ async def setup_oauth_config_for_multi_user_basic(
 
 def _split_csv(raw: str | None) -> list[str]:
     """Split a comma-separated setting into a clean list of entries."""
-    if not raw:
-        return []
-    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+    return split_csv(raw)
 
 
 #: Room for the JSON-RPC envelope around a maximum-size `nc_webdav_write_file`

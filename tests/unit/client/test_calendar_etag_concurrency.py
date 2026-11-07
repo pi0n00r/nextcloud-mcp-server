@@ -19,6 +19,8 @@ from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
 
 from nextcloud_mcp_server.client.calendar import (
+    BULK_EVENT_LIMIT,
+    CalendarBulkLimitExceededError,
     CalendarClient,
     CalendarEtagConflictError,
     CalendarEtagUnavailableError,
@@ -499,3 +501,58 @@ async def test_bulk_update_propagates_each_search_result_etag(client):
     assert client.update_event.await_count == 1
     assert result["updated_count"] == 1
     assert result["failed_count"] == 2
+
+
+async def test_bulk_update_refuses_a_truncated_match_set_before_writes(client):
+    """The one-result probe rejects an oversized set before mutation."""
+
+    client.search_events_across_calendars = AsyncMock(
+        return_value=[
+            {
+                "calendar_name": "main",
+                "uid": f"event-{index}",
+                "etag": f'"event-{index}-v1"',
+            }
+            for index in range(BULK_EVENT_LIMIT + 1)
+        ]
+    )
+    client.update_event = AsyncMock()
+
+    with pytest.raises(CalendarBulkLimitExceededError, match="no events were changed"):
+        await client.bulk_update_events({}, {"title": "Changed"})
+
+    client.search_events_across_calendars.assert_awaited_once_with(
+        start_datetime=None,
+        end_datetime=None,
+        filters={},
+        limit=BULK_EVENT_LIMIT + 1,
+        strict=True,
+    )
+    client.update_event.assert_not_awaited()
+
+
+async def test_bulk_update_scopes_discovery_before_enforcing_limit(client):
+    """A named-calendar update discovers and limits only that calendar."""
+
+    client.get_calendar_events = AsyncMock(
+        return_value=[{"uid": "one", "etag": '"one-v1"'}]
+    )
+    client.search_events_across_calendars = AsyncMock()
+    client.update_event = AsyncMock(return_value={"status_code": 200})
+
+    result = await client.bulk_update_events(
+        {}, {"title": "Changed"}, calendar_name="main"
+    )
+
+    client.get_calendar_events.assert_awaited_once_with(
+        calendar_name="main",
+        start_datetime=None,
+        end_datetime=None,
+        filters=None,
+        limit=BULK_EVENT_LIMIT + 1,
+    )
+    client.search_events_across_calendars.assert_not_awaited()
+    client.update_event.assert_awaited_once_with(
+        "main", "one", {"title": "Changed"}, '"one-v1"'
+    )
+    assert result["updated_count"] == 1

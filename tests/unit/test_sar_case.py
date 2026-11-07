@@ -1,6 +1,17 @@
 """Unit tests for SAR cases (ADR-040): the case file, its state machine,
 ETag-guarded changes, and exporting a case. Synthetic names only."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import io
 import json
 import logging
@@ -215,15 +226,16 @@ async def test_create_reports_a_failed_case_file_write_as_retryable(nc, monkeypa
     with pytest.raises(sar_export.ExportError, match="try again") as info:
         await _create(nc)
     assert info.value.status == 503
-    assert "/Team/SAR-1" not in nc.webdav.dirs
+    assert "/Team/SAR-1" in nc.webdav.dirs
+    assert nc.webdav.deleted == []
 
 
 @pytest.mark.parametrize("status", [401, 403])
 async def test_create_reports_a_refused_case_file_write_as_403(nc, monkeypatch, status):
     """Nextcloud can accept the MKCOL and refuse the PUT into it (seen on a
     tenant whose storage made new folders read-only). That is a permissions
-    problem to report as one, not a 500, and the folder must not linger and
-    turn every retry into 'already exists'."""
+    problem to report as one, not a 500. The folder is retained because a
+    failed response cannot establish that the PUT had no effect."""
 
     write_file = nc.webdav.write_file
     refuse = [True]
@@ -238,33 +250,31 @@ async def test_create_reports_a_refused_case_file_write_as_403(nc, monkeypatch, 
     with pytest.raises(sar_export.ExportError, match="refused") as info:
         await _create(nc)
     assert info.value.status == 403
-    assert nc.webdav.deleted == ["/Team/SAR-1"]
+    assert nc.webdav.deleted == []
+    assert "/Team/SAR-1" in nc.webdav.dirs
 
-    assert (await _create(nc)).path == "/Team/SAR-1/sar-case.json"
 
-
-async def test_create_cleanup_failure_does_not_mask_the_write_error(
-    nc, monkeypatch, caplog
-):
-    """The delete is best effort: its failure is logged, and the write's
-    error is what the caller sees."""
+async def test_create_never_attempts_destructive_cleanup(nc, monkeypatch, caplog):
+    """A failed write retains the directory without issuing a DELETE."""
     caplog.set_level(logging.WARNING, logger="nextcloud_mcp_server.sar_case")
 
     async def forbidden(*args, **kwargs):
         raise _http_error(403)
 
-    async def undeletable(path):
-        raise _http_error(403)
+    async def unexpected_delete(path):
+        raise AssertionError(f"unexpected DELETE of {path}")
 
     monkeypatch.setattr(nc.webdav, "write_file", forbidden)
-    monkeypatch.setattr(nc.webdav, "delete_resource", undeletable)
+    monkeypatch.setattr(nc.webdav, "delete_resource", unexpected_delete)
     with pytest.raises(sar_export.ExportError) as info:
         await _create(nc)
     assert info.value.status == 403
-    assert "after a failed case create" in caplog.text
+    assert "Retaining '/Team/SAR-1'" in caplog.text
 
 
-async def test_create_reraises_other_write_errors_and_still_cleans_up(nc, monkeypatch):
+async def test_create_reraises_other_write_errors_and_retains_directory(
+    nc, monkeypatch
+):
     """Only a 401/403 is a permissions problem; any other 4xx is not reported
     as one."""
 
@@ -274,11 +284,31 @@ async def test_create_reraises_other_write_errors_and_still_cleans_up(nc, monkey
     monkeypatch.setattr(nc.webdav, "write_file", not_found)
     with pytest.raises(httpx2.HTTPStatusError):
         await _create(nc)
-    assert nc.webdav.deleted == ["/Team/SAR-1"]
+    assert nc.webdav.deleted == []
+    assert "/Team/SAR-1" in nc.webdav.dirs
 
 
-async def test_create_cleans_up_when_cancelled_during_the_write(nc, monkeypatch):
-    """A request cancelled mid-PUT must not leave the folder behind either."""
+async def test_create_does_not_delete_case_when_put_lands_but_response_is_lost(
+    nc, webdav
+):
+    """An uncertain PUT outcome must preserve a case that actually landed."""
+
+    async def lose_response_after_write():
+        raise httpx2.ReadTimeout("PUT response lost")
+
+    webdav.after_write = lose_response_after_write
+
+    with pytest.raises(httpx2.ReadTimeout, match="response lost"):
+        await _create(nc)
+
+    assert webdav.deleted == []
+    assert "/Team/SAR-1" in webdav.dirs
+    stored = json.loads(webdav.files["/Team/SAR-1/sar-case.json"][0])
+    assert stored["subject"] == ["Jane Doe"]
+
+
+async def test_create_retains_directory_when_cancelled_during_write(nc, monkeypatch):
+    """Cancellation cannot establish that an in-flight PUT had no effect."""
 
     async def hang(*args, **kwargs):
         await anyio.sleep_forever()
@@ -286,7 +316,8 @@ async def test_create_cleans_up_when_cancelled_during_the_write(nc, monkeypatch)
     monkeypatch.setattr(nc.webdav, "write_file", hang)
     with anyio.move_on_after(0.01):
         await _create(nc)
-    assert nc.webdav.deleted == ["/Team/SAR-1"]
+    assert nc.webdav.deleted == []
+    assert "/Team/SAR-1" in nc.webdav.dirs
 
 
 async def test_create_never_removes_an_existing_folder(nc, webdav):
