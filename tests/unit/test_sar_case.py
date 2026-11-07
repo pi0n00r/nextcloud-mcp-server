@@ -1,6 +1,17 @@
 """Unit tests for SAR cases (ADR-040): the case file, its state machine,
 ETag-guarded changes, and exporting a case. Synthetic names only."""
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import io
 import json
 import logging
@@ -275,6 +286,23 @@ async def test_create_reraises_other_write_errors_and_still_cleans_up(nc, monkey
     with pytest.raises(httpx2.HTTPStatusError):
         await _create(nc)
     assert nc.webdav.deleted == ["/Team/SAR-1"]
+
+
+async def test_create_does_not_delete_case_when_put_lands_but_response_is_lost(
+    nc, webdav
+):
+    async def lose_response_after_write():
+        raise httpx2.ReadTimeout("PUT response lost")
+
+    webdav.after_write = lose_response_after_write
+
+    with pytest.raises(httpx2.ReadTimeout, match="response lost"):
+        await _create(nc)
+
+    assert webdav.deleted == []
+    assert "/Team/SAR-1" in webdav.dirs
+    stored = json.loads(webdav.files["/Team/SAR-1/sar-case.json"][0])
+    assert stored["subject"] == ["Jane Doe"]
 
 
 async def test_create_cleans_up_when_cancelled_during_the_write(nc, monkeypatch):

@@ -70,8 +70,9 @@ CALENDAR_FANOUT = 8
 # listing into memory.
 AVAILABILITY_EVENT_LIMIT = 1000
 
-# Per-calendar match cap for bulk update/delete/move. Same reasoning: the
-# listing default of 50 made a bulk operation silently leave matches untouched.
+# Total match safety cap for bulk update/delete/move. Discovery fetches one
+# surplus event and refuses the whole operation before mutation when this cap
+# is exceeded; silently acting on a partial set is unsafe.
 BULK_EVENT_LIMIT = 1000
 
 # The URI scheme RFC 6638 addresses attendees by.
@@ -96,6 +97,19 @@ class CalendarEtagConflictError(Exception):
             "message": str(self),
             "current_etag": self.current_etag,
         }
+
+
+class CalendarBulkLimitExceededError(ValueError):
+    """A bulk write matched more events than can be changed safely at once."""
+
+
+def require_complete_bulk_match_set(events: list[dict[str, Any]]) -> None:
+    """Refuse a truncated bulk match set before its first side effect."""
+    if len(events) > BULK_EVENT_LIMIT:
+        raise CalendarBulkLimitExceededError(
+            f"Bulk operation matched more than {BULK_EVENT_LIMIT} events; no events "
+            "were changed. Narrow the calendars, date range, or filters and retry."
+        )
 
 
 class CalendarEtagUnavailableError(Exception):
@@ -3646,8 +3660,10 @@ class CalendarClient:
                 start_datetime=start_datetime,
                 end_datetime=end_datetime,
                 filters=filter_criteria,
-                limit=BULK_EVENT_LIMIT,
+                limit=BULK_EVENT_LIMIT + 1,
             )
+
+            require_complete_bulk_match_set(events)
 
             targets, skipped = self._bulk_targets(events, apply_to_series, "update")
             updated_count = 0

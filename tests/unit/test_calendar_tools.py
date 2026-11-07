@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from nextcloud_mcp_server.client.calendar import (
+    BULK_EVENT_LIMIT,
     CalendarEtagConflictError,
     CalendarEtagUnavailableError,
 )
@@ -286,6 +287,52 @@ async def test_list_events_all_calendars_without_calendar_name(
         failures=[],
     )
     calendar_client.calendar.get_calendar_events.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["delete", "move"])
+async def test_bulk_tool_refuses_truncated_matches_before_effects(operation):
+    mcp = MCPServer("test-calendar-bulk-limit")
+    configure_calendar_tools(mcp)
+    tool = {item.name: item for item in mcp._tool_manager.list_tools()}[
+        "nc_calendar_bulk_operations"
+    ]
+    events = [
+        {"calendar_name": "main", "uid": f"event-{index}"}
+        for index in range(BULK_EVENT_LIMIT + 1)
+    ]
+    calendar = SimpleNamespace(
+        get_calendar_events=AsyncMock(return_value=events),
+        search_events_across_calendars=AsyncMock(return_value=events),
+        delete_event=AsyncMock(),
+        create_event=AsyncMock(),
+    )
+    client = SimpleNamespace(calendar=calendar)
+    kwargs = {
+        "operation": operation,
+        "calendar_name": "main",
+        "ctx": _context(),
+    }
+    if operation == "move":
+        kwargs["target_calendar"] = "archive"
+
+    with (
+        patch(
+            "nextcloud_mcp_server.server.calendar.get_client",
+            new=AsyncMock(return_value=client),
+        ),
+        pytest.raises(ToolError, match="no events were changed"),
+    ):
+        await tool.fn(**kwargs)
+
+    calendar.get_calendar_events.assert_awaited_once_with(
+        calendar_name="main",
+        start_datetime=None,
+        end_datetime=None,
+        filters=None,
+        limit=BULK_EVENT_LIMIT + 1,
+    )
+    calendar.delete_event.assert_not_awaited()
+    calendar.create_event.assert_not_awaited()
 
 
 def test_event_summary_preserves_exact_etag():

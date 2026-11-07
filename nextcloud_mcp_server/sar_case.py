@@ -19,6 +19,17 @@ operations ("add these items"), not whole-document replaces.
 The same functions back the MCP tools and the management API.
 """
 
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 import logging
 import posixpath
 import random
@@ -223,8 +234,41 @@ def _raise_if_unavailable(e: HTTPStatusError, path: str) -> None:
         ) from e
 
 
-async def _remove_new_case_dir(nc: NextcloudClient, case_dir: str) -> None:
-    """Best effort: a failure here must not mask why the create failed."""
+async def _remove_empty_new_case_dir(
+    nc: NextcloudClient, case_dir: str, case_file: str
+) -> None:
+    """Remove a failed create only after proving its case file is absent.
+
+    A lost PUT response is not proof that the write failed. Deleting the whole
+    directory in that state can erase a case that Nextcloud committed. A 404
+    readback is the only state in which cleanup is safe enough to attempt.
+    """
+    try:
+        await nc.webdav.read_file(case_file)
+    except HTTPStatusError as e:
+        if e.response.status_code != 404:
+            logger.warning(
+                "Retaining %r after an uncertain case create; readback returned "
+                "HTTP %s",
+                case_dir,
+                e.response.status_code,
+            )
+            return
+    except Exception:
+        logger.warning(
+            "Retaining %r after an uncertain case create; readback failed",
+            case_dir,
+            exc_info=True,
+        )
+        return
+    else:
+        logger.warning(
+            "Retaining %r after a failed case create because %r exists",
+            case_dir,
+            case_file,
+        )
+        return
+
     try:
         await nc.webdav.delete_resource(case_dir)
     except Exception:
@@ -249,7 +293,7 @@ async def create_case(
             name exists there (409), or Nextcloud is failing (503). Any other
             failure to write the case file is re-raised. Whenever the case
             file cannot be written, the case folder created for it is
-            removed again.
+            removed again only when readback proves the case file is absent.
     """
     case_dir = f"{normalize_folder(folder)}/{validate_name(name)}"
     case_file = f"{case_dir}/{CASE_FILE}"
@@ -278,15 +322,12 @@ async def create_case(
             case_file, case.model_dump_json(indent=2).encode(), "application/json"
         )
     except BaseException as e:
-        # We created case_dir just above (MKCOL 201), so it holds nothing but
-        # our failed write. Left behind, it would turn every retry with this
-        # name into "already exists". BaseException, and shielded, so a
-        # cancelled or timed-out request cleans up too; capped so a hung
-        # DELETE cannot hold up the cancellation for long. If the PUT did
-        # land and only the response was lost, this discards it, which is
-        # fine: the caller saw an error and will retry.
+        # We created case_dir just above (MKCOL 201). A cancelled request or a
+        # lost response can still mean the PUT landed, so read back before any
+        # destructive cleanup. Shielding lets the bounded readback/cleanup
+        # finish while preserving the original cancellation or write error.
         with anyio.CancelScope(shield=True), anyio.move_on_after(10):
-            await _remove_new_case_dir(nc, case_dir)
+            await _remove_empty_new_case_dir(nc, case_dir, case_file)
         if isinstance(e, HTTPStatusError):
             _raise_if_unavailable(e, case_file)
             if e.response.status_code in (401, 403):

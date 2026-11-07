@@ -23,8 +23,10 @@ from mcp.types import ToolAnnotations
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client.calendar import (
     BULK_EVENT_LIMIT,
+    CalendarBulkLimitExceededError,
     CalendarEtagConflictError,
     CalendarEtagUnavailableError,
+    require_complete_bulk_match_set,
 )
 from nextcloud_mcp_server.client.dav_errors import DavPreconditionFailed
 from nextcloud_mcp_server.context import get_client
@@ -948,15 +950,20 @@ def configure_calendar_tools(mcp: MCPServer):
                     start_datetime=start_datetime,
                     end_datetime=end_datetime,
                     filters=filter_criteria or None,
-                    limit=BULK_EVENT_LIMIT,
+                    limit=BULK_EVENT_LIMIT + 1,
                 )
             else:
                 events = await client.calendar.search_events_across_calendars(
                     start_datetime=start_datetime,
                     end_datetime=end_datetime,
                     filters=filter_criteria,
-                    limit=BULK_EVENT_LIMIT,
+                    limit=BULK_EVENT_LIMIT + 1,
                 )
+
+            try:
+                require_complete_bulk_match_set(events)
+            except CalendarBulkLimitExceededError as e:
+                raise ToolError(str(e)) from e
 
             targets, skipped = client.calendar._bulk_targets(
                 events, apply_to_series, "delete"
@@ -1031,9 +1038,12 @@ def configure_calendar_tools(mcp: MCPServer):
             if not update_data:
                 raise ValueError("No update data provided for update operation")
 
-            return await client.calendar.bulk_update_events(
-                filter_criteria, update_data, apply_to_series=apply_to_series
-            )
+            try:
+                return await client.calendar.bulk_update_events(
+                    filter_criteria, update_data, apply_to_series=apply_to_series
+                )
+            except CalendarBulkLimitExceededError as e:
+                raise ToolError(str(e)) from e
 
         elif operation == "move":
             if not target_calendar:
@@ -1046,15 +1056,20 @@ def configure_calendar_tools(mcp: MCPServer):
                     start_datetime=start_datetime,
                     end_datetime=end_datetime,
                     filters=filter_criteria or None,
-                    limit=BULK_EVENT_LIMIT,
+                    limit=BULK_EVENT_LIMIT + 1,
                 )
             else:
                 events = await client.calendar.search_events_across_calendars(
                     start_datetime=start_datetime,
                     end_datetime=end_datetime,
                     filters=filter_criteria,
-                    limit=BULK_EVENT_LIMIT,
+                    limit=BULK_EVENT_LIMIT + 1,
                 )
+
+            try:
+                require_complete_bulk_match_set(events)
+            except CalendarBulkLimitExceededError as e:
+                raise ToolError(str(e)) from e
 
             targets, skipped = client.calendar._bulk_targets(
                 events, apply_to_series, "move"

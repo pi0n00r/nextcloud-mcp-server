@@ -19,6 +19,8 @@ from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
 
 from nextcloud_mcp_server.client.calendar import (
+    BULK_EVENT_LIMIT,
+    CalendarBulkLimitExceededError,
     CalendarClient,
     CalendarEtagConflictError,
     CalendarEtagUnavailableError,
@@ -499,3 +501,28 @@ async def test_bulk_update_propagates_each_search_result_etag(client):
     assert client.update_event.await_count == 1
     assert result["updated_count"] == 1
     assert result["failed_count"] == 2
+
+
+async def test_bulk_update_refuses_a_truncated_match_set_before_writes(client):
+    client.search_events_across_calendars = AsyncMock(
+        return_value=[
+            {
+                "calendar_name": "main",
+                "uid": f"event-{index}",
+                "etag": f'"event-{index}-v1"',
+            }
+            for index in range(BULK_EVENT_LIMIT + 1)
+        ]
+    )
+    client.update_event = AsyncMock()
+
+    with pytest.raises(CalendarBulkLimitExceededError, match="no events were changed"):
+        await client.bulk_update_events({}, {"title": "Changed"})
+
+    client.search_events_across_calendars.assert_awaited_once_with(
+        start_datetime=None,
+        end_datetime=None,
+        filters={},
+        limit=BULK_EVENT_LIMIT + 1,
+    )
+    client.update_event.assert_not_awaited()
