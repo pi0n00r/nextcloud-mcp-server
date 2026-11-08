@@ -285,8 +285,7 @@ async def create_case(
         # path. The retained directory is visible and recoverable; deleting a
         # committed or concurrently populated case is not.
         logger.warning(
-            "Retaining %r after a failed or cancelled case-file write",
-            case_dir,
+            "Retaining case directory after a failed or cancelled case-file write"
         )
         if isinstance(e, HTTPStatusError):
             _raise_if_unavailable(e, case_file)

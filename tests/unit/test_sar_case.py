@@ -269,7 +269,11 @@ async def test_create_never_attempts_destructive_cleanup(nc, monkeypatch, caplog
     with pytest.raises(sar_export.ExportError) as info:
         await _create(nc)
     assert info.value.status == 403
-    assert "Retaining '/Team/SAR-1'" in caplog.text
+    assert (
+        "Retaining case directory after a failed or cancelled case-file write"
+        in caplog.text
+    )
+    assert "/Team/SAR-1" not in caplog.text
 
 
 async def test_create_reraises_other_write_errors_and_retains_directory(
