@@ -38,7 +38,7 @@ from icalendar import (
 )
 from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
-from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]
+from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[import-not-found]
 
 from ..config import get_nextcloud_ssl_verify
 from .availability import (

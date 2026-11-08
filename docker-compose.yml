@@ -63,7 +63,7 @@ services:
       retries: 30
 
   recipes:
-    image: docker.io/library/nginx:1.31.8-alpine@sha256:b2f80f8f88146b0772fdcc7d92cea621aa8c2889fa8d07ed61d4884fcea53e09
+    image: docker.io/library/nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
     restart: always
     volumes:
       - ./tests/fixtures/test_recipe.html:/usr/share/nginx/html/test_recipe.html:ro
@@ -124,7 +124,7 @@ services:
   # the MCP server reaches it on the compose network. The image ships no shell,
   # so there is no container healthcheck; poll /hosting/capabilities instead.
   collabora:
-    image: docker.io/collabora/code:26.04.5.2.1@sha256:c7415b963e32eb0986a562583f154d36d3d7a461e1ddfb660a95e87094328acb
+    image: docker.io/collabora/code:26.04.6.1.1@sha256:95f29f1c0a1778999125f53f058d968fe0afb37c95e32ebfb9f3444140faebd2
     restart: always
     ports:
       - "127.0.0.1:9980:9980"
