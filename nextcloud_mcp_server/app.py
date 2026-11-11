@@ -632,6 +632,61 @@ async def _check_nextcloud_health() -> None:
     record_dependency_check("nextcloud", time.time() - start)
 
 
+def _dav_probe_result(status_code: int) -> tuple[bool, str]:
+    """Return a stable, secret-free DAV capability result."""
+    if status_code in (200, 207):
+        return True, "ok"
+    if status_code in (401, 403):
+        return False, "error: authorization"
+    if status_code == 404:
+        return False, "error: prerequisite_missing"
+    if status_code == 507:
+        return False, "error: insufficient_storage"
+    if status_code >= 500:
+        return False, "error: dependency_unavailable"
+    return False, f"error: status_{status_code}"
+
+
+async def _check_nextcloud_dav_health() -> None:
+    """Probe the configured user's Files and Calendar DAV roots.
+
+    Basic-auth deployments have one concrete principal, so a depth-zero
+    PROPFIND can prove both capabilities without listing or mutating user data.
+    Multi-user/OAuth deployments have no single global principal and are
+    intentionally skipped. Results are observational and non-gating.
+    """
+    settings = get_settings()
+    host = settings.nextcloud_host
+    username = settings.nextcloud_username
+    password = settings.nextcloud_password
+    if not (host and username and password):
+        return
+
+    principal = quote(username, safe="")
+    probes = {
+        "nextcloud_files": f"{host}/remote.php/dav/files/{principal}/",
+        "nextcloud_caldav": f"{host}/remote.php/dav/calendars/{principal}/",
+    }
+    headers = {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"}
+    body = '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+
+    for name, url in probes.items():
+        start = time.time()
+        try:
+            async with nextcloud_httpx_client(
+                timeout=2.0, auth=(username, password)
+            ) as client:
+                response = await client.request(
+                    "PROPFIND", url, headers=headers, content=body
+                )
+            healthy, detail = _dav_probe_result(response.status_code)
+        except Exception:  # noqa: BLE001 - expose a stable capability code only
+            healthy, detail = False, "error: unreachable"
+        _readiness_cache.update(name, healthy, detail)
+        set_dependency_health(name, healthy)
+        record_dependency_check(name, time.time() - start)
+
+
 async def _check_qdrant_health() -> None:
     """Probe Qdrant (network mode) and record the result in the readiness cache.
 
@@ -790,6 +845,12 @@ async def _refresh_dependency_health() -> None:
     settings = get_settings()
     async with anyio.create_task_group() as tg:
         tg.start_soon(_check_nextcloud_health)
+        if (
+            getattr(settings, "nextcloud_host", None)
+            and getattr(settings, "nextcloud_username", None)
+            and getattr(settings, "nextcloud_password", None)
+        ):
+            tg.start_soon(_check_nextcloud_dav_health)
         if settings.vector_sync_enabled and settings.qdrant_url:
             tg.start_soon(_check_qdrant_health)
         elif settings.vector_sync_enabled:

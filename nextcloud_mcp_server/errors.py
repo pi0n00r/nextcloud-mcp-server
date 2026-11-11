@@ -29,6 +29,7 @@ from importlib.metadata import version
 from typing import Any
 from urllib.parse import unquote
 
+from caldav.lib import error as caldav_error
 from httpx2 import URL, HTTPStatusError, RequestError, Response, ResponseNotRead
 from mcp.server.context import CallNext, ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
@@ -205,6 +206,27 @@ def friendly_tool_error(exc: BaseException | None, tool_name: str) -> str | None
             "The server may be down or unreachable from here; retry once, then "
             "report it to the user."
         )
+
+    if isinstance(exc, caldav_error.DAVError):
+        status = exc.status
+        if isinstance(exc, caldav_error.AuthorizationError) or status in (401, 403):
+            summary, hint = _STATUS[status if status in (401, 403) else 401]
+        elif isinstance(exc, caldav_error.NotFoundError) or status == 404:
+            summary, hint = _STATUS[404]
+        elif isinstance(exc, caldav_error.RateLimitError) or status == 429:
+            summary, hint = _STATUS[429]
+        elif status == 507:
+            summary, hint = _STATUS[507]
+        elif isinstance(status, int) and status >= 500:
+            summary, hint = _GENERIC_SERVER
+        else:
+            summary = "CalDAV dependency error"
+            hint = (
+                "The calendar service rejected the operation. Verify CalDAV "
+                "availability before retrying."
+            )
+        suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+        return f"{tool_name} failed: {summary}{suffix}. {hint}"
 
     return None
 

@@ -2,6 +2,7 @@
 
 import httpx2
 import pytest
+from caldav.lib import error as caldav_error
 from httpx2 import HTTPStatusError
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
@@ -185,6 +186,33 @@ def test_request_error_reports_unreachable_server():
     assert message is not None
     assert "could not reach Nextcloud" in message
     assert "ConnectError" in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            caldav_error.AuthorizationError(url="https://private/dav"),
+            "Authentication failed",
+        ),
+        (caldav_error.NotFoundError(url="https://private/dav"), "Not found"),
+        (caldav_error.RateLimitError(url="https://private/dav"), "Rate limited"),
+        (
+            caldav_error.DAVError(url="https://private/dav", status=507),
+            "Insufficient storage",
+        ),
+        (
+            caldav_error.DAVError(url="https://private/dav", status=503),
+            "Nextcloud server error",
+        ),
+    ],
+)
+def test_caldav_errors_are_structured_without_internal_urls(exc, expected):
+    message = friendly_tool_error(exc, "nc_calendar_create_event")
+
+    assert message is not None
+    assert expected in message
+    assert "https://private" not in message
 
 
 @pytest.mark.parametrize(
