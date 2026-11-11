@@ -1,5 +1,7 @@
 """Unit tests for the LLM-friendly tool-error formatter (GH #1208)."""
 
+import errno
+
 import httpx2
 import pytest
 from caldav.lib import error as caldav_error
@@ -213,6 +215,26 @@ def test_caldav_errors_are_structured_without_internal_urls(exc, expected):
     assert message is not None
     assert expected in message
     assert "https://private" not in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (OSError(errno.EIO, "/private/ingest.bin"), "Local storage unavailable"),
+        (OSError(errno.ENOSPC, "/private/ingest.bin"), "Local storage exhausted"),
+        (OSError(errno.ENOENT, "/private/ingest.bin"), "Local filesystem error"),
+        (
+            ImportError("urllib3 failed from /private/site-packages"),
+            "runtime dependency unavailable",
+        ),
+    ],
+)
+def test_local_failures_are_structured_without_paths(exc, expected):
+    message = friendly_tool_error(exc, "nc_semantic_search")
+
+    assert message is not None
+    assert expected in message
+    assert "/private" not in message
 
 
 @pytest.mark.parametrize(

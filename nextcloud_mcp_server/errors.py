@@ -23,6 +23,7 @@ the tool boundary fixes every tool at once -- see :class:`NextcloudMCPServer`.
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
+import errno
 import json
 import re
 from importlib.metadata import version
@@ -227,6 +228,28 @@ def friendly_tool_error(exc: BaseException | None, tool_name: str) -> str | None
             )
         suffix = f" (HTTP {status})" if isinstance(status, int) else ""
         return f"{tool_name} failed: {summary}{suffix}. {hint}"
+
+    if isinstance(exc, OSError):
+        if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+            summary = "Local storage exhausted"
+            hint = "Free local storage or quota before retrying."
+        elif exc.errno in {errno.EIO, errno.EROFS, getattr(errno, "ESTALE", -1)}:
+            summary = "Local storage unavailable"
+            hint = (
+                "The server cannot safely access its local storage. Do not retry "
+                "until the filesystem is healthy and writable."
+            )
+        else:
+            summary = "Local filesystem error"
+            hint = "The server could not access a required local file; report it."
+        return f"{tool_name} failed: {summary}. {hint}"
+
+    if isinstance(exc, ImportError):
+        return (
+            f"{tool_name} failed: runtime dependency unavailable. "
+            "The server installation is incomplete or inconsistent; report it "
+            "instead of retrying the operation."
+        )
 
     return None
 

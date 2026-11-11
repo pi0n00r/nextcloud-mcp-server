@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import os
+import tempfile
 import time
 import traceback
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
@@ -687,6 +688,66 @@ async def _check_nextcloud_dav_health() -> None:
         record_dependency_check(name, time.time() - start)
 
 
+def _probe_local_ingest_storage(spool_dir: str | None) -> tuple[bool, str]:
+    """Create, flush, remove and directory-sync one non-business probe file."""
+    directory = spool_dir or tempfile.gettempdir()
+    name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".bridgette-ready-", dir=directory, delete=False
+        ) as probe:
+            name = probe.name
+            probe.write(b"ready")
+            probe.flush()
+            os.fsync(probe.fileno())
+        os.unlink(name)
+        name = None
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        return False, "error: storage_unavailable"
+    finally:
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+    return True, "ok"
+
+
+def _probe_semantic_imports() -> tuple[bool, str]:
+    """Import the configured ingest stack rather than trusting package metadata."""
+    try:
+        for module_name in ("qdrant_client", "fastembed", "huggingface_hub", "urllib3"):
+            importlib.import_module(module_name)
+    except Exception:  # noqa: BLE001 - readiness publishes only a stable code
+        return False, "error: dependency_unavailable"
+    return True, "ok"
+
+
+async def _check_local_ingest_health() -> None:
+    """Report local ingest storage and imports without gating the only replica."""
+    settings = get_settings()
+    start = time.time()
+    storage_healthy, storage_detail = await anyio.to_thread.run_sync(
+        _probe_local_ingest_storage, getattr(settings, "document_spool_dir", None)
+    )
+    _readiness_cache.update("local_ingest_storage", storage_healthy, storage_detail)
+    set_dependency_health("local_ingest_storage", storage_healthy)
+    record_dependency_check("local_ingest_storage", time.time() - start)
+
+    start = time.time()
+    imports_healthy, imports_detail = await anyio.to_thread.run_sync(
+        _probe_semantic_imports
+    )
+    _readiness_cache.update("semantic_imports", imports_healthy, imports_detail)
+    set_dependency_health("semantic_imports", imports_healthy)
+    record_dependency_check("semantic_imports", time.time() - start)
+
+
 async def _check_qdrant_health() -> None:
     """Probe Qdrant (network mode) and record the result in the readiness cache.
 
@@ -851,6 +912,8 @@ async def _refresh_dependency_health() -> None:
             and getattr(settings, "nextcloud_password", None)
         ):
             tg.start_soon(_check_nextcloud_dav_health)
+        if settings.vector_sync_enabled:
+            tg.start_soon(_check_local_ingest_health)
         if settings.vector_sync_enabled and settings.qdrant_url:
             tg.start_soon(_check_qdrant_health)
         elif settings.vector_sync_enabled:
