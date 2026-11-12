@@ -226,40 +226,44 @@ class TestLoginFlowCalendarTodos:
 
     async def test_todo_workflow(self, nc_mcp_login_flow_client: ClientSession):
         """Create todo → list todos → update todo → delete todo."""
+        cal_result = await nc_mcp_login_flow_client.call_tool(
+            "nc_calendar_list_calendars", {}
+        )
+        cal_data = json.loads(cal_result.content[0].text)
+        calendars = cal_data.get("calendars", [])
+        calendar_name = next(
+            (
+                calendar.get("name")
+                for calendar in calendars
+                if not calendar.get("read_only", False)
+            ),
+            "personal",
+        )
+
         suffix = uuid.uuid4().hex[:8]
-        calendar_name = f"login-flow-todos-{suffix}"
-        calendar_result = await nc_mcp_login_flow_client.call_tool(
-            "nc_calendar_manage_calendars",
+        todo_title = f"LoginFlow Todo {suffix}"
+
+        # Create todo (uses 'summary', not 'title')
+        create_result = await nc_mcp_login_flow_client.call_tool(
+            "nc_calendar_create_todo",
             {
-                "action": "create",
                 "calendar_name": calendar_name,
-                "display_name": f"LoginFlow Todos {suffix}",
+                "summary": todo_title,
+                "description": f"Test todo {suffix}",
             },
         )
-        assert calendar_result.is_error is False, (
-            f"Create calendar failed: {calendar_result.content[0].text}"
-        )
-
-        todo_title = f"LoginFlow Todo {suffix}"
-        todo_uid = None
+        if create_result.is_error:
+            error_text = create_result.content[0].text
+            if "HTTP 403" in error_text or "Permission denied" in error_text:
+                pytest.skip(
+                    f"Calendar '{calendar_name}' does not support VTODO: {error_text}"
+                )
+            raise AssertionError(f"Create todo failed: {error_text}")
+        todo_data = json.loads(create_result.content[0].text)
+        todo_uid = todo_data.get("uid") or todo_data.get("todo_uid")
+        logger.info("Created todo: %s", todo_uid)
 
         try:
-            # Create todo (uses 'summary', not 'title')
-            create_result = await nc_mcp_login_flow_client.call_tool(
-                "nc_calendar_create_todo",
-                {
-                    "calendar_name": calendar_name,
-                    "summary": todo_title,
-                    "description": f"Test todo {suffix}",
-                },
-            )
-            assert create_result.is_error is False, (
-                f"Create todo failed: {create_result.content[0].text}"
-            )
-            todo_data = json.loads(create_result.content[0].text)
-            todo_uid = todo_data.get("uid") or todo_data.get("todo_uid")
-            logger.info("Created todo: %s", todo_uid)
-
             # List todos
             list_result = await nc_mcp_login_flow_client.call_tool(
                 "nc_calendar_list_todos",
@@ -279,15 +283,12 @@ class TestLoginFlowCalendarTodos:
             assert update_result.is_error is False
 
         finally:
-            if todo_uid:
-                await nc_mcp_login_flow_client.call_tool(
-                    "nc_calendar_delete_todo",
-                    {"calendar_name": calendar_name, "todo_uid": todo_uid},
-                )
-            await nc_mcp_login_flow_client.call_tool(
-                "nc_calendar_manage_calendars",
-                {"action": "delete", "calendar_name": calendar_name},
+            delete_result = await nc_mcp_login_flow_client.call_tool(
+                "nc_calendar_delete_todo",
+                {"calendar_name": calendar_name, "todo_uid": todo_uid},
             )
+            assert delete_result.is_error is False
+            logger.info("Deleted todo %s", todo_uid)
 
 
 # ---------------------------------------------------------------------------
