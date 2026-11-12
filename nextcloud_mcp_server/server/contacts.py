@@ -56,6 +56,7 @@ from nextcloud_mcp_server.models.contacts import (
     ListContactsResponse,
     PatchContactResponse,
     PutContactResponse,
+    UpdateContactResponse,
 )
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 from nextcloud_mcp_server.utils.parsing import split_csv
@@ -649,7 +650,7 @@ def configure_contacts_tools(mcp: MCPServer):
     @instrument_tool
     async def nc_contacts_update_contact(
         ctx: Context, *, addressbook: str, uid: str, contact_data: dict, etag: str = ""
-    ):
+    ) -> UpdateContactResponse:
         """DEPRECATED. Use ``nc_contacts_patch_contact`` directly.
 
         This shim translates the legacy JSON shape to a ``patch_contact``
@@ -680,6 +681,11 @@ def configure_contacts_tools(mcp: MCPServer):
             addressbook,
         )
         client = await get_client(ctx)
-        return await client.contacts.update_contact(
+        await client.contacts.update_contact(
             addressbook=addressbook, uid=uid, contact_data=contact_data, etag=etag
+        )
+        raw = await client.contacts.get_contact(addressbook=addressbook, uid=uid)
+        return UpdateContactResponse(
+            contact=_raw_contact_to_model(raw),
+            addressbook=addressbook,
         )

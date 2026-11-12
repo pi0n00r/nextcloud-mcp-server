@@ -85,24 +85,7 @@ BULK_EVENT_LIMIT = 1000
 _MAILTO = "mailto:"
 
 
-class CalendarEtagConflictError(PackageCalendarEtagConflictError):
-    """Raised when a CalDAV object changed before a conditional update."""
-
-    status_code = 412
-    error = "etag_conflict"
-
-    def __init__(self, message: str, current_etag: str | None = None):
-        super().__init__(message)
-        self.current_etag = current_etag
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return the stable structured error payload exposed to callers."""
-        return {
-            "error": self.error,
-            "status_code": self.status_code,
-            "message": str(self),
-            "current_etag": self.current_etag,
-        }
+CalendarEtagConflictError = PackageCalendarEtagConflictError
 
 
 class CalendarBulkLimitExceededError(ValueError):
@@ -118,20 +101,7 @@ def require_complete_bulk_match_set(events: list[dict[str, Any]]) -> None:
         )
 
 
-class CalendarEtagUnavailableError(PackageCalendarEtagUnavailableError):
-    """Raised when an existing CalDAV object has no usable server ETag."""
-
-    status_code = 409
-    error = "etag_unavailable"
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return the stable structured error payload exposed to callers."""
-        return {
-            "error": self.error,
-            "status_code": self.status_code,
-            "message": str(self),
-            "current_etag": None,
-        }
+CalendarEtagUnavailableError = PackageCalendarEtagUnavailableError
 
 
 def _as_list(value: Any) -> list[Any]:

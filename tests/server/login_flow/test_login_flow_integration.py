@@ -231,7 +231,14 @@ class TestLoginFlowCalendarTodos:
         )
         cal_data = json.loads(cal_result.content[0].text)
         calendars = cal_data.get("calendars", [])
-        calendar_name = calendars[0].get("name", "personal")
+        calendar_name = next(
+            (
+                calendar.get("name")
+                for calendar in calendars
+                if calendar.get("name") == "personal"
+            ),
+            calendars[0].get("name", "personal"),
+        )
 
         suffix = uuid.uuid4().hex[:8]
         todo_title = f"LoginFlow Todo {suffix}"
