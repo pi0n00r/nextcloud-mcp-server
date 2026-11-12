@@ -42,7 +42,7 @@ RUN uv sync --locked --no-dev --no-install-project --no-install-workspace --no-i
 COPY . .
 
 RUN uv sync --locked --no-dev --no-editable --no-install-package uvicorn --no-cache --extra semantic --extra postgres --extra observability \
-    && uv pip install --no-deps "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git"
+    && uv pip install --python /opt/venv/bin/python --no-deps "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git"
 
 # Ordinary development and CI builds remain unchanged. The immutable package
 # workflow opts in and supplies the protected comparison through a BuildKit
