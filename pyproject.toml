@@ -21,6 +21,7 @@ dependencies = [
     "uvicorn @ git+https://github.com/pi0n00r/uvicorn.git", # fork: dual-stack listener
     "cryptography>=42.0", # auth/storage.py token encryption
     "lxml>=5.0", # client/calendar.py CalDAV XML parsing
+    "markupsafe>=3.0", # auth/userinfo_routes.py escapes rendered identity data
     "packaging>=24.0", # capabilities.py compares advertised app versions
     # pythonvcard4 imports PIL at module level, so this is core (contacts), not
     # semantic. Upper bound for fastembed compatibility in the semantic extra.
