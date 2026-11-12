@@ -40,12 +40,12 @@ from typing import Any, Optional
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-
-from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.client.contacts import (
+from nextcloud_client.contacts import (
     EtagConflictError,
     EtagPreconditionError,
 )
+
+from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.contacts import (
     AddressBook,

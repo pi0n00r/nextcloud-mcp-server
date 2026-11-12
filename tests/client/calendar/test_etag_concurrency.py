@@ -12,9 +12,9 @@ import uuid
 from datetime import datetime, timedelta
 
 import pytest
+from nextcloud_mcp_server.client.calendar import CalendarEtagConflictError
 
 from nextcloud_mcp_server.client import NextcloudClient
-from nextcloud_mcp_server.client.calendar import CalendarEtagConflictError
 
 logger = logging.getLogger(__name__)
 

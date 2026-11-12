@@ -39,6 +39,7 @@ from nextcloud_mcp_server.api.management import (
     _sanitize_error_for_client,
     _validate_query_string,
     select_search_algorithm,
+    supported_search_types,
     validate_token_and_get_user,
 )
 from nextcloud_mcp_server.config import Settings, get_settings
@@ -50,9 +51,7 @@ from nextcloud_mcp_server.search import (
     GRANULARITY_CHUNK,
     GRANULARITY_DOCUMENT,
     VALID_GRANULARITIES,
-    BM25HybridSearchAlgorithm,
     SearchAlgorithm,
-    SemanticSearchAlgorithm,
 )
 from nextcloud_mcp_server.search.access_filter import (
     AccessibleScope,
@@ -61,11 +60,11 @@ from nextcloud_mcp_server.search.access_filter import (
     normalize_path_prefixes,
 )
 from nextcloud_mcp_server.search.algorithms import QueryEmbeddingUnavailable
-from nextcloud_mcp_server.search.bm25_hybrid import search_method_label
 from nextcloud_mcp_server.search.context import (
     get_chunk_bbox_and_page_from_qdrant,
     get_chunk_with_context,
 )
+from nextcloud_mcp_server.search.exact import ExactMatchAlgorithm
 from nextcloud_mcp_server.search.relevance import (
     RELEVANCE_ORDINAL,
     filter_by_relevance,
@@ -79,6 +78,11 @@ from nextcloud_mcp_server.search.rerank import (
     effective_pool_size,
     rerank_available,
     rerank_results,
+)
+from nextcloud_mcp_server.search.selection import (
+    build_search_algorithm,
+    normalize_fusion,
+    search_algorithm_label,
 )
 from nextcloud_mcp_server.search.verification import verify_search_results
 from nextcloud_mcp_server.usage.search import record_search_usage
@@ -119,11 +123,7 @@ def _search_algorithm_label(algorithm: str, fusion: str) -> str:
     Matches the MCP tool's ``search_method`` convention
     (``bm25_hybrid_<fusion>``) so the two entrypoints stay comparable.
     """
-    if algorithm in ("semantic", "bm25"):
-        return algorithm
-    # Shared helper: clamps an unrecognised fusion so a caller-supplied string
-    # can never reach a Prometheus label from either surface.
-    return search_method_label(fusion)
+    return search_algorithm_label(algorithm, fusion)
 
 
 def _embedding_unavailable_response(e: QueryEmbeddingUnavailable) -> JSONResponse:
@@ -278,29 +278,11 @@ def _build_search_algorithm(
     malformed-but-plausible body. Callers must use the returned value.
     """
     algorithm = select_search_algorithm(requested_algorithm, settings)
-    # Normalize before the branch so every caller gets a usable value, including
-    # the dense-only path where fusion is moot but still reaches metric labels.
-    fusion = fusion if fusion in ("rrf", "dbsf") else "rrf"
-    if algorithm == "semantic":
-        return (
-            SemanticSearchAlgorithm(score_threshold=score_threshold),
-            algorithm,
-            fusion,
-        )
-    # "hybrid" fuses dense semantic + sparse BM25 (keyword-only documents
-    # contribute via the sparse side of the same query). "bm25" runs the sparse
-    # prefetch alone and never embeds the query, so it keeps working while the
-    # embedding service is down — it is what Astrolabe offers when a search
-    # times out.
-    return (
-        BM25HybridSearchAlgorithm(
-            score_threshold=score_threshold,
-            fusion=fusion,
-            dense=algorithm != "bm25",
-        ),
-        algorithm,
-        fusion,
+    fusion = normalize_fusion(fusion)
+    search_algo = build_search_algorithm(
+        algorithm, score_threshold=score_threshold, fusion=fusion
     )
+    return search_algo, algorithm, fusion
 
 
 async def _search_with_acl(
@@ -565,6 +547,18 @@ async def unified_search(request: Request) -> JSONResponse:
         except UnsupportedSearchType as e:
             return _unsupported_search_type_response(e)
 
+        # An exact match is a set, not a ranking: always one row per document,
+        # and nothing for a reranker to order.
+        exact = algorithm == "exact"
+        if exact and rerank:
+            return JSONResponse(
+                {"error": "rerank does not apply to the exact algorithm"},
+                status_code=400,
+            )
+        if exact:
+            granularity = GRANULARITY_DOCUMENT
+        exact_total = 0
+
         # Only the hybrid algorithm implements grouping. The dense-only path
         # would accept the kwarg and silently ignore it, returning several
         # chunks of one document to a caller that asked for one row per
@@ -620,6 +614,7 @@ async def unified_search(request: Request) -> JSONResponse:
         async def _execute(scope: AccessibleScope | None) -> list:
             """Run the search across requested doc_types with the given access
             scope (None ⇒ self-only)."""
+            nonlocal exact_total, rerank_outcome
             owners = scope.owners if scope else None
             # Narrow the owner branch to the subtrees actually shared with the
             # caller; see access_filter.build_ownership_filter.
@@ -649,8 +644,9 @@ async def unified_search(request: Request) -> JSONResponse:
                 # with len(doc_types). 2x leaves headroom for verify-on-read
                 # drops before pagination, matching the nc_semantic_search
                 # pattern.
-                results.sort(key=lambda r: r.score, reverse=True)
-                results = results[: max(search_limit * 2, rerank_pool)]
+                if not exact:
+                    results.sort(key=lambda r: r.score, reverse=True)
+                    results = results[: max(search_limit * 2, rerank_pool)]
             else:
                 results = await search_algo.search(
                     query=query,
@@ -663,10 +659,21 @@ async def unified_search(request: Request) -> JSONResponse:
                     modified_before=modified_before,
                     path_prefixes=path_prefixes,
                 )
+            if exact:
+                # Every match, in a stable order so pages do not overlap. Cut
+                # to the page BEFORE verify-on-read: verifying is a Nextcloud
+                # round-trip per document, and an exact match can hold
+                # thousands. total_found therefore counts indexed matches; a
+                # stale one only shortens its page, and export re-checks
+                # access to every file anyway.
+                results.sort(
+                    key=lambda r: (r.doc_type, (r.title or "").casefold(), r.id)
+                )
+                exact_total = len(results)
+                return results[offset : offset + limit]
             # Rerank inside the closure, i.e. BEFORE verify-on-read runs in
             # _search_with_acl, and after the per-doc_type merge so one pass
             # covers every type.
-            nonlocal rerank_outcome
             if rerank:
                 results, rerank_outcome = await rerank_results(
                     results, query, settings=settings, surface="http"
@@ -717,6 +724,10 @@ async def unified_search(request: Request) -> JSONResponse:
         if rerank:
             total_found = min(total_found, unreranked_budget)
         paginated_results = sorted_results[offset : offset + limit]
+        if exact:
+            # Already this page (see _execute); the count is every match.
+            total_found = exact_total
+            paginated_results = sorted_results
 
         # Format results for Unified Search
         formatted_results = []
@@ -811,6 +822,9 @@ async def unified_search(request: Request) -> JSONResponse:
             # a caller can always tell which ordering it received.
             "reranked": rerank_outcome == RERANK_APPLIED,
         }
+        if isinstance(search_algo, ExactMatchAlgorithm):  # narrows the type; exact
+            # The match stopped at MAX_EXACT_DOCUMENTS: total_found is a floor.
+            response_data["truncated"] = search_algo.truncated
 
         # Optional PCA coordinates. PCA plots the result chunks around the query's
         # dense embedding. Keyword-only result chunks (``keyword-index`` tag) carry
@@ -1022,6 +1036,16 @@ async def vector_search(request: Request) -> JSONResponse:
             )
         except UnsupportedSearchType as e:
             return _unsupported_search_type_response(e)
+        # This deprecated endpoint has no offset and verifies every result, so
+        # an exact match (thousands of documents) is served by /api/v1/search
+        # only. Its callers predate "exact" and never send it.
+        if algorithm == "exact":
+            return _unsupported_search_type_response(
+                UnsupportedSearchType(
+                    algorithm,
+                    [a for a in supported_search_types(settings) if a != "exact"],
+                )
+            )
 
         # Capability gate after the query and algorithm checks, matching
         # /api/v1/search so an unsupported algorithm still wins over an

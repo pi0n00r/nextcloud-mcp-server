@@ -27,7 +27,6 @@ from __future__ import annotations
 import logging
 
 import pytest
-
 from nextcloud_mcp_server.client.calendar import (
     CalendarClient,
     CalendarEtagConflictError,
@@ -35,7 +34,7 @@ from nextcloud_mcp_server.client.calendar import (
 
 pytestmark = pytest.mark.unit
 
-CALENDAR_LOGGER = "nextcloud_mcp_server.client.calendar"
+CALENDAR_LOGGER = "nextcloud_client.calendar"
 
 
 def _precondition_failed() -> CalendarEtagConflictError:

@@ -30,6 +30,9 @@ from nextcloud_mcp_server.utils.parsing import parse_bool, split_csv
 
 logger = logging.getLogger(__name__)
 
+# Below this, the PDF parse worker's imports barely fit under RLIMIT_AS (#1635).
+_PARSE_MEM_LIMIT_WARN_MB = 1024
+
 # Sentinel for "key not in dynaconf at all" vs "explicitly set to None".
 _UNSET = object()
 
@@ -331,6 +334,12 @@ _DEFAULTS: dict[str, Any] = {
     # default: a deployment opts in, since only some need it. Also requires
     # vector sync and EMBEDDING_GATEWAY_URL (for name detection).
     "sar_enabled": False,
+    # TEXT index (with phrase matching) on chunk text, for algorithm="exact"
+    # searches: every document containing a phrase. Built in the background on
+    # startup; it costs disk and RAM roughly proportional to the indexed text.
+    # Off: exact searches still work by scanning, slower, except on Qdrant in
+    # strict mode, which refuses a filter on an unindexed field.
+    "exact_match_index_enabled": True,
     "ner_model": "local/urchade/gliner_multi_pii-v1",
     # Per-request budget. Export runs in the background, so this only needs to
     # cover one batch on the slowest backend (CPU GLiNER: ~570 chars/s).
@@ -839,6 +848,27 @@ _dynaconf = Dynaconf(
         ),
     ],
 )
+
+
+def _warn_low_parse_mem_limit(mem_limit_mb: int) -> None:
+    """Warn when the parse cap leaves the worker too little room (#1635).
+
+    The parse worker spends ~600 MiB of address space on imports alone (its
+    share of the app plus pymupdf4llm, which loads onnxruntime even in classic
+    mode), before any page is read. At 640 the markdown promotion failed
+    intermittently with "failed to map segment". The validator's floor of 128
+    only rejects nonsense, so this warns instead of refusing to start.
+    """
+    if mem_limit_mb < _PARSE_MEM_LIMIT_WARN_MB:
+        logger.warning(
+            "DOCUMENT_PARSE_MEM_LIMIT_MB=%d is below %d. The PDF parse worker "
+            "needs ~600 MiB of address space for its imports alone, so markdown "
+            "promotion is likely to fail (ImportError: failed to map segment). "
+            "The default is %d.",
+            mem_limit_mb,
+            _PARSE_MEM_LIMIT_WARN_MB,
+            _DEFAULTS["document_parse_mem_limit_mb"],
+        )
 
 
 def _reload_config():
@@ -1432,6 +1462,7 @@ class Settings:
     search_rerank_max_concurrency: int = 1
     # SAR export redaction (ADR-040; see _DEFAULTS for the semantics).
     sar_enabled: bool = False
+    exact_match_index_enabled: bool = True
     ner_model: str = "local/urchade/gliner_multi_pii-v1"
     ner_timeout_seconds: float = 120.0
     ner_batch_size: int = 8
@@ -1714,6 +1745,8 @@ class Settings:
                     f"NEXTCLOUD_CA_BUNDLE path does not exist: {self.nextcloud_ca_bundle}"
                 )
             logger.info("Using custom CA bundle: %s", self.nextcloud_ca_bundle)
+
+        _warn_low_parse_mem_limit(self.document_parse_mem_limit_mb)
 
         # Page-packing is a sub-mode of page-aware chunking (the packing logic
         # only runs inside the page-aware branch). Enabling it without page-aware

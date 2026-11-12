@@ -36,7 +36,6 @@ import datetime as dt
 from unittest.mock import MagicMock
 
 import pytest
-
 from nextcloud_mcp_server.client.calendar import CalendarClient
 
 # Existing iCal fixture that subsequent updates merge against.

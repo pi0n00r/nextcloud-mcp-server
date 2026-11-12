@@ -36,6 +36,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from nextcloud_client import NextcloudClient
 from opentelemetry.instrumentation.httpx import (
     HTTPX2ClientInstrumentor,
     HTTPXClientInstrumentor,
@@ -106,7 +107,6 @@ from nextcloud_mcp_server.auth.userinfo_routes import (
     user_info_html,
     vector_sync_status_fragment,
 )
-from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.config import (
     Settings,
     get_document_processor_config,
@@ -119,7 +119,7 @@ from nextcloud_mcp_server.config_validators import (
 )
 from nextcloud_mcp_server.errors import NextcloudMCPServer
 from nextcloud_mcp_server.features import semantic_installed
-from nextcloud_mcp_server.http import nextcloud_httpx_client
+from nextcloud_mcp_server.http import nextcloud_client_from_env, nextcloud_httpx_client
 from nextcloud_mcp_server.models.auth import ALL_SUPPORTED_SCOPES
 from nextcloud_mcp_server.observability import (
     ObservabilityMiddleware,
@@ -711,7 +711,7 @@ def _dav_multistatus_result(content: bytes) -> tuple[bool, str]:
         )
         if status_code == 200 and has_resourcetype:
             return True, "ok"
-        if status_code is not None:
+        if status_code is not None and not 200 <= status_code < 300:
             failures.append(status_code)
 
     if failures:
@@ -738,7 +738,7 @@ async def _dav_request(
 
 async def _discover_dav_probe_urls(
     client: httpx2.AsyncClient, host: str
-) -> tuple[dict[str, str] | None, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     """Discover the authenticated Files principal and CalDAV home."""
     principal_body = (
         '<d:propfind xmlns:d="DAV:"><d:prop>'
@@ -753,16 +753,31 @@ async def _discover_dav_probe_urls(
     )
     healthy, detail = _dav_probe_result(principal_response.status_code)
     if not healthy:
-        return None, detail
+        return {}, {
+            "nextcloud_files": detail,
+            "nextcloud_caldav": detail,
+        }
     principal_href = _dav_property_href(
         principal_response.content, "current-user-principal"
     )
     if not principal_href:
-        return None, "error: principal_discovery_failed"
+        return {}, {
+            "nextcloud_files": "error: principal_discovery_failed",
+            "nextcloud_caldav": "error: principal_discovery_failed",
+        }
 
     principal_id = unquote(principal_href.rstrip("/").split("/")[-1])
     if not principal_id:
-        return None, "error: principal_discovery_failed"
+        return {}, {
+            "nextcloud_files": "error: principal_discovery_failed",
+            "nextcloud_caldav": "error: principal_discovery_failed",
+        }
+
+    probes = {
+        "nextcloud_files": (
+            f"{host.rstrip('/')}/remote.php/dav/files/{quote(principal_id, safe='')}/"
+        )
+    }
 
     calendar_body = (
         '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
@@ -776,20 +791,13 @@ async def _discover_dav_probe_urls(
     )
     healthy, detail = _dav_probe_result(calendar_response.status_code)
     if not healthy:
-        return None, detail
+        return probes, {"nextcloud_caldav": detail}
     calendar_href = _dav_property_href(calendar_response.content, "calendar-home-set")
     if not calendar_href:
-        return None, "error: calendar_home_discovery_failed"
+        return probes, {"nextcloud_caldav": "error: calendar_home_discovery_failed"}
 
-    return (
-        {
-            "nextcloud_files": (
-                f"{host.rstrip('/')}/remote.php/dav/files/{quote(principal_id, safe='')}/"
-            ),
-            "nextcloud_caldav": urljoin(f"{host.rstrip('/')}/", calendar_href),
-        },
-        "ok",
-    )
+    probes["nextcloud_caldav"] = urljoin(f"{host.rstrip('/')}/", calendar_href)
+    return probes, {}
 
 
 async def _check_nextcloud_dav_health() -> None:
@@ -813,12 +821,12 @@ async def _check_nextcloud_dav_health() -> None:
             async with nextcloud_httpx_client(
                 timeout=2.0, auth=(username, password)
             ) as client:
-                probes, discovery_detail = await _discover_dav_probe_urls(client, host)
-                if probes is None:
-                    for name in ("nextcloud_files", "nextcloud_caldav"):
-                        _readiness_cache.update(name, False, discovery_detail)
-                        set_dependency_health(name, False)
-                    return
+                probes, discovery_failures = await _discover_dav_probe_urls(
+                    client, host
+                )
+                for name, detail in discovery_failures.items():
+                    _readiness_cache.update(name, False, detail)
+                    set_dependency_health(name, False)
 
                 for name, url in probes.items():
                     start = time.time()
@@ -1398,7 +1406,7 @@ async def app_lifespan_basic(server: MCPServer) -> AsyncGenerator[AppContext]:
     client = None
     if not is_multi_user:
         logger.info("Creating shared Nextcloud client with BasicAuth")
-        client = NextcloudClient.from_env()
+        client = nextcloud_client_from_env()
         logger.info("Client initialization complete")
     else:
         logger.info(
@@ -2729,7 +2737,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 )
 
             # Create client for vector sync (server-level, not per-session)
-            client = NextcloudClient.from_env()
+            client = nextcloud_client_from_env()
 
             # Initialize Qdrant collection before starting background tasks
             logger.info("Initializing Qdrant collection...")

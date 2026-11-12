@@ -42,6 +42,10 @@ from typing import Any, Iterable, Optional
 from urllib.parse import unquote
 
 from httpx2 import HTTPStatusError
+from nextcloud_client.contacts import EtagConflictError as PackageEtagConflictError
+from nextcloud_client.contacts import (
+    EtagPreconditionError as PackageEtagPreconditionError,
+)
 from pythonvCard4.vcard import Contact, escape_text, unfold_lines
 
 from nextcloud_mcp_server.utils.parsing import split_csv
@@ -211,6 +215,11 @@ def _normalize_contact_data(contact_data: dict[str, Any]) -> dict[str, Any]:
         normalised["org"] = normalised.pop("organization")
     else:
         normalised.pop("organization", None)
+    unknown = set(normalised) - _SUPPORTED_CONTACT_KEYS
+    if unknown:
+        logger.warning("Ignoring unknown contact_data keys: %s", sorted(unknown))
+        for key in unknown:
+            normalised.pop(key)
     return normalised
 
 
@@ -379,7 +388,7 @@ def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
     return Contact(**kwargs)  # type: ignore[arg-type]
 
 
-class EtagConflictError(Exception):
+class EtagConflictError(PackageEtagConflictError):
     """Raised when a CardDAV PUT/DELETE returns 412 Precondition Failed.
 
     Carries the current server ETag (if available) so callers can refetch
@@ -391,7 +400,7 @@ class EtagConflictError(Exception):
         self.current_etag = current_etag
 
 
-class EtagPreconditionError(StrongEntityTagError):
+class EtagPreconditionError(PackageEtagPreconditionError):
     """Raised when a mandatory CardDAV If-Match value is not a strong ETag."""
 
 

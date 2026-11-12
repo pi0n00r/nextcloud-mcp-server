@@ -66,7 +66,7 @@ CALENDAR_HOME_RESPONSE = _property_multistatus(
 
 @pytest.fixture
 def probe(monkeypatch):
-    async def _run(statuses):
+    async def _run(statuses, *, calendar_discovery=207):
         seen = []
 
         def handler(request: httpx2.Request) -> httpx2.Response:
@@ -74,6 +74,8 @@ def probe(monkeypatch):
             if len(seen) == 1:
                 return httpx2.Response(207, content=PRINCIPAL_RESPONSE)
             if len(seen) == 2:
+                if calendar_discovery != 207:
+                    return httpx2.Response(calendar_discovery)
                 return httpx2.Response(207, content=CALENDAR_HOME_RESPONSE)
 
             status = statuses[len(seen) - 3]
@@ -127,6 +129,15 @@ async def test_reports_storage_and_dependency_failures_without_urls(probe):
     assert "secret" not in rendered
 
 
+async def test_calendar_discovery_failure_does_not_mask_files(probe):
+    seen, statuses = await probe([207], calendar_discovery=503)
+
+    assert [request.method for request in seen] == ["PROPFIND"] * 3
+    assert seen[2].url.raw_path.endswith(b"/remote.php/dav/files/canonical%2Fuser/")
+    assert statuses["nextcloud_files"].detail == "ok"
+    assert statuses["nextcloud_caldav"].detail == "error: dependency_unavailable"
+
+
 async def test_transport_failure_is_stable_and_sanitized(probe):
     _seen, statuses = await probe([httpx2.ConnectError("contains-private-path"), 207])
 
@@ -144,6 +155,20 @@ def test_multistatus_requires_successful_resourcetype():
 
     assert healthy is False
     assert detail == "error: invalid_multistatus"
+
+
+def test_multistatus_ignores_unrelated_success_when_resourcetype_fails():
+    content = b"""<d:multistatus xmlns:d="DAV:"><d:response>
+      <d:propstat><d:prop><d:displayname/></d:prop>
+        <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+      <d:propstat><d:prop><d:resourcetype/></d:prop>
+        <d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>
+    </d:response></d:multistatus>"""
+
+    healthy, detail = _dav_multistatus_result(content)
+
+    assert healthy is False
+    assert detail == "error: authorization"
 
 
 async def test_request_has_overall_deadline(monkeypatch):

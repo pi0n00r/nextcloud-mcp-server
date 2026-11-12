@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx2 import HTTPStatusError, Request, Response
-
 from nextcloud_mcp_server.client.webdav import WebDAVClient
 
 

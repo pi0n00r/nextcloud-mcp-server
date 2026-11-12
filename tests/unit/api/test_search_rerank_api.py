@@ -93,7 +93,7 @@ def _post(
             new=AsyncMock(return_value=("alice", {})),
         ),
         patch(
-            "nextcloud_mcp_server.api.visualization.BM25HybridSearchAlgorithm",
+            "nextcloud_mcp_server.search.selection.BM25HybridSearchAlgorithm",
             return_value=algo,
         ),
         patch(

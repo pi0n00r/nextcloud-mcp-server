@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.206.1"
+version = "0.211.1"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -10,7 +10,8 @@ license = {text = "AGPL-3.0-only"}
 requires-python = ">=3.11"
 keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude", "webdav", "caldav", "carddav"]
 dependencies = [
-    "mcp[cli] (>=2.3)",
+    "nextcloud-client==0.211.1",
+    "mcp[cli] (>=2.3,<2.4)",
     "httpx2>=2.5.0",
     # Imported directly at runtime. Each was previously reachable only because
     # some other dependency happened to pull it in — the accident that broke
@@ -126,7 +127,7 @@ extend-select = ["I", "PLC0415", "G004"]
 # (re-exports, plugin-only deps like pyroscope-io) and stay off.
 [tool.deptry]
 ignore = ["DEP002", "DEP004"]
-exclude = [".venv", "third_party"]
+extend_exclude = [".venv", "third_party", "packages"]
 
 [tool.deptry.per_rule_ignores]
 # Optional local-OCR extra, imported inside a try/except ImportError.
@@ -139,6 +140,12 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "nextcloud_mcp_server"
 module-root = ""
+
+[tool.uv.workspace]
+members = ["packages/nextcloud-client"]
+
+[tool.uv.sources]
+nextcloud-client = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -169,7 +176,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.99,<0.0.100",
+    "ty>=0.0.100,<0.0.101",
     "pytest-otel>=2.0.1",
     "procrastinate>=3.8",
     "psycopg[binary,pool]>=3.2",

@@ -23,11 +23,9 @@ def test_basic_auth_passes_password_and_auth_type_basic(mocker):
     rejects with "Unexpected non-callable authentication" — the regression #731 came
     in via caldav 3.x's mandatory niquests dependency.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient("https://cloud.example.org", "alice", password="app-pw-1234")
 
@@ -47,11 +45,9 @@ def test_token_passes_token_and_auth_type_bearer(mocker):
     caldav v3 reuses the ``password`` slot for bearer tokens — see
     ``async_davclient.build_auth_object``.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient("https://cloud.example.org", "alice", token="oauth-bearer-xyz")
 
@@ -67,11 +63,9 @@ def test_no_credentials_leaves_dav_client_unauthenticated(mocker):
     AsyncDAVClient handles its own discovery when no auth is configured; we
     don't want to silently inject an empty password.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient("https://cloud.example.org", "alice")
 
@@ -85,11 +79,9 @@ def test_password_takes_precedence_over_token(mocker):
     """If a caller supplies both, password wins. Documents the precedence so a
     future caller passing both isn't surprised by which one selects auth_type.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient(
         "https://cloud.example.org",
@@ -110,11 +102,9 @@ def test_auth_username_used_for_credential_uid_for_fallback_path(mocker):
     the UID), but discovery starts from a UID-based calendar home fallback. The
     two identities must not be conflated.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient(
         "https://cloud.example.org",
@@ -137,11 +127,9 @@ def test_auth_username_defaults_to_username(mocker):
     """Backwards compat: without ``auth_username`` the UID is used for both,
     so single-user / OAuth callers (UID == loginName) are unchanged.
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient("https://cloud.example.org", "alice", password="app-pw")
 
@@ -155,11 +143,9 @@ def test_webcal_caching_header_enabled_on_client(mocker):
     CachedSubscription calendars, so their events are readable through the
     normal event/search tools (issue #830).
     """
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     CalendarClient("https://cloud.example.org", "alice", password="app-pw")
 
@@ -173,7 +159,7 @@ def test_webcal_caching_header_enabled_on_client(mocker):
 def test_calendar_url_is_encoded_for_a_uid_with_a_space():
     """``DAVObject.__init__`` rejects any URL containing a space."""
     # Unmocked: the guard under test is caldav's own.
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "Ada Lovelace")
 
@@ -192,9 +178,9 @@ def test_home_url_is_normalised_before_storage(mocker):
     ``BaseNextcloudClient._ensure_principal_id`` does) and re-encoded at the
     point of use. The round trip is lossless.
     """
-    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+    mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice")
 
@@ -218,8 +204,7 @@ async def test_event_objects_from_a_report_re_encode_their_href(mocker):
     import datetime as dt
 
     from caldav.response import DAVResponse
-
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     ics = (
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt-1\r\n"
@@ -264,7 +249,7 @@ def test_a_calendar_name_containing_a_hash_is_not_truncated():
     the rest, which is the spurious-404 failure ``encode_dav_path`` was added
     to fix (PR #891).
     """
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice")
 
@@ -288,7 +273,7 @@ def test_a_calendar_name_containing_a_hash_is_not_truncated():
 def test_a_percent_encoded_calendar_name_is_not_encoded_twice(decoded, encoded):
     """Names are passed as they appear in hrefs; ``%20`` must not become ``%2520``,
     which silently REPORTs an empty calendar instead of failing."""
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice")
 
@@ -308,8 +293,7 @@ async def test_event_objects_from_a_report_keep_a_hash_in_their_href(mocker):
     import datetime as dt
 
     from caldav.response import DAVResponse
-
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     ics = (
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt#1\r\n"
@@ -349,7 +333,7 @@ async def test_event_objects_from_a_report_keep_a_hash_in_their_href(mocker):
 
 async def test_list_calendars_puts_an_encoded_home_url_on_the_wire(mocker):
     """``_calendar_home_url`` is stored decoded, so the PROPFIND must encode it."""
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "Ada Lovelace")
     propfind = mocker.patch.object(
@@ -384,9 +368,9 @@ def test_home_set_absolute_path_resolves_against_origin_not_subpath(mocker):
     then hits Apache's default routing and 405s with an HTML body that fails
     CalDAV XML parsing (issue #1007). It must resolve against the origin only.
     """
-    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+    mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     # No credentials needed: the method under test derives the URL purely from
     # base_url, and constructing without auth keeps this free of S2068 (hard-
@@ -402,9 +386,9 @@ def test_home_set_absolute_path_resolves_against_origin_not_subpath(mocker):
 
 def test_home_set_absolute_path_resolves_against_root_origin(mocker):
     """Root-hosted deployments keep resolving absolute paths correctly."""
-    mocker.patch("nextcloud_mcp_server.client.calendar.AsyncDAVClient")
+    mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice")
 
@@ -458,13 +442,11 @@ _LIST_CALENDARS_MULTISTATUS = """<?xml version="1.0" encoding="utf-8"?>
 
 def _calendar_client_with_propfind(mocker, raw_xml: str):
     """Build a CalendarClient whose DAV client returns ``raw_xml`` from PROPFIND."""
-    mock_dav_client = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.AsyncDAVClient"
-    )
+    mock_dav_client = mocker.patch("nextcloud_client.calendar.AsyncDAVClient")
     instance = mock_dav_client.return_value
     instance.propfind = mocker.AsyncMock(return_value=mocker.Mock(raw=raw_xml))
 
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice", password="app-pw")
     return client, instance
@@ -541,7 +523,6 @@ def _calendar_client(mocker):
 async def test_delete_todo_retries_once_with_scheduling_disabled(mocker):
     """A plain caldav 403 gets one low-level scheduling-disabled retry."""
     from caldav.lib import error as caldav_error
-
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "task@example.invalid"
@@ -569,7 +550,6 @@ async def test_delete_todo_retries_once_with_scheduling_disabled(mocker):
 async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
     """The permanent-purge path is gated by Nextcloud's exact collision text."""
     from caldav.lib import error as caldav_error
-
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "arbiter-cpow-drift@example.invalid"
@@ -602,7 +582,6 @@ async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
 async def test_delete_todo_unrelated_403_does_not_purge_trash(mocker):
     """Authorization errors without the collision signature remain read-only."""
     from caldav.lib import error as caldav_error
-
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "plain-task"
@@ -810,15 +789,13 @@ def test_expand_without_window_returns_master_event(mocker):
     identical either way — only the diagnosis differs — so the assertion here is
     that no expansion is attempted.
     """
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     client = CalendarClient("https://cloud.example.org", "alice", password="app-pw")
     mocker.patch.object(
         CalendarClient, "_extract_vevent_data", return_value={"uid": "master"}
     )
-    expand = mocker.patch(
-        "nextcloud_mcp_server.client.calendar.recurring_ical_events.of"
-    )
+    expand = mocker.patch("nextcloud_client.calendar.recurring_ical_events.of")
 
     cal = mocker.MagicMock()
     cal.walk.return_value = [{"rrule": "FREQ=DAILY"}]
@@ -846,7 +823,7 @@ def _pure_client():
     credential — is involved; the helpers under test only touch dicts and
     icalendar objects.
     """
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     return CalendarClient.__new__(CalendarClient)
 
@@ -917,7 +894,7 @@ def test_all_day_end_date_drops_a_time_of_day_visibly(caplog):
     That is the sole correct reading rather than a caller error, but it should
     not happen invisibly — every other lossy edge in this change set says so.
     """
-    with caplog.at_level(logging.DEBUG, logger="nextcloud_mcp_server.client.calendar"):
+    with caplog.at_level(logging.DEBUG, logger="nextcloud_client.calendar"):
         ical = _pure_client()._create_ical_event(
             {
                 "title": "Bin day",
@@ -1865,7 +1842,7 @@ def _organizer():
 
 
 def _attendees_by_address(ical):
-    from nextcloud_mcp_server.client.calendar import _as_list
+    from nextcloud_client.calendar import _as_list
 
     return {
         str(a).lower().removeprefix("mailto:"): a
@@ -2155,7 +2132,7 @@ def _match(uid, recurring=False, calendar="personal"):
 
 
 def test_bulk_targets_dedupes_and_skips_series_without_opt_in():
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     events = [_match("single"), _match("series", True), _match("series", True)]
 
@@ -2166,7 +2143,7 @@ def test_bulk_targets_dedupes_and_skips_series_without_opt_in():
 
 
 def test_bulk_targets_acts_on_series_once_with_opt_in():
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     events = [
         _match("series", True),
@@ -2184,7 +2161,7 @@ def test_bulk_targets_acts_on_series_once_with_opt_in():
 
 
 def test_bulk_targets_never_moves_a_series():
-    from nextcloud_mcp_server.client.calendar import CalendarClient
+    from nextcloud_client.calendar import CalendarClient
 
     targets, skipped = CalendarClient._bulk_targets(
         [_match("series", True)], True, "move"
@@ -2231,7 +2208,6 @@ def test_split_vtimezone_rdates_leaves_one_value_per_rdate():
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
-
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = Timezone.from_tzinfo(ZoneInfo("Europe/Berlin"))
@@ -2252,7 +2228,6 @@ def test_split_vtimezone_rdates_survives_serialisation():
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
-
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = _split_vtimezone_rdates(Timezone.from_tzinfo(ZoneInfo("Europe/Berlin")))
@@ -2269,7 +2244,6 @@ def test_split_vtimezone_rdates_ignores_zones_without_dst(zone):
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
-
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = Timezone.from_tzinfo(ZoneInfo(zone))

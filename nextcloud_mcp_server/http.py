@@ -1,94 +1,102 @@
-"""Centralized HTTP client factory for Nextcloud connections.
+"""Nextcloud HTTP factories configured from the server's settings.
 
 All outbound connections to Nextcloud (API calls, OIDC endpoints) should use
-these factories to ensure consistent SSL/TLS configuration from environment
-variables (NEXTCLOUD_VERIFY_SSL, NEXTCLOUD_CA_BUNDLE).
+these factories, so they get consistent TLS settings from the environment
+(NEXTCLOUD_VERIFY_SSL, NEXTCLOUD_CA_BUNDLE, NEXTCLOUD_HTTP_KEEPALIVE). They wrap
+the configuration-free factories in ``nextcloud_client.http``.
 """
 
-from collections.abc import Mapping
-from types import MappingProxyType
-from typing import Any
+import logging
+import ssl
+from typing import Any, TypedDict
 
 import httpx2
+from nextcloud_client import NextcloudClient
+from nextcloud_client.http import (
+    nextcloud_httpx_client as _nextcloud_httpx_client,
+)
+from nextcloud_client.http import (
+    nextcloud_httpx_transport as _nextcloud_httpx_transport,
+)
 
-from .config import get_nextcloud_http_keepalive, get_nextcloud_ssl_verify
+from .config import (
+    cfg,
+    get_nextcloud_http_keepalive,
+    get_nextcloud_ssl_verify,
+    get_settings,
+)
+
+logger = logging.getLogger(__name__)
 
 NEXTCLOUD_KEEPALIVE_EXPIRY_SECONDS = 5.0
 
-#: Sent on every request to Nextcloud. ``OCS-APIRequest: true`` is how a
-#: non-browser client identifies itself: OCS routes refuse requests without it
-#: (``meta.statuscode: 997``), it exempts app routes from the CSRF check, and on
-#: ``#[CORS]`` app routes it stops ``CORSMiddleware`` from logging the session
-#: out and re-authenticating -- the path that 404s Tables v1 on Nextcloud 33
-#: (GH #1664). This is the only place the header is spelled; per-request
-#: headers merge over it. Read-only for the same reason as
-#: ``ocs.OCS_REQUEST_HEADERS``: every client shares this one object.
-NEXTCLOUD_DEFAULT_HEADERS: Mapping[str, str] = MappingProxyType(
-    {"OCS-APIRequest": "true"}
-)
+
+class NextcloudClientKwargs(TypedDict):
+    verify: bool | ssl.SSLContext
+    keepalive: bool
+
+
+def nextcloud_client_kwargs() -> NextcloudClientKwargs:
+    """The configured TLS and keep-alive settings for a ``NextcloudClient``.
+
+    Every server-side ``NextcloudClient(...)`` / ``NextcloudClient.from_token(...)``
+    splats this in. The client defaults to verifying TLS against the system CAs
+    with keep-alive on, so a missed call site ignores ``NEXTCLOUD_VERIFY_SSL``,
+    ``NEXTCLOUD_CA_BUNDLE`` and ``NEXTCLOUD_HTTP_KEEPALIVE``.
+
+    Both settings are read eagerly. That is correct because a client builds its
+    transport once per lifetime.
+    """
+    return {
+        "verify": get_nextcloud_ssl_verify(),
+        "keepalive": get_nextcloud_http_keepalive(),
+    }
 
 
 def nextcloud_httpx_client(**kwargs: Any) -> httpx2.AsyncClient:
-    """Create an httpx2.AsyncClient with Nextcloud SSL settings and headers applied.
+    """``nextcloud_client.http.nextcloud_httpx_client`` with the configured TLS settings.
 
-    Reads NEXTCLOUD_VERIFY_SSL and NEXTCLOUD_CA_BUNDLE from the environment
-    via ``get_nextcloud_ssl_verify()``. Caller-supplied ``verify`` kwarg
-    takes precedence if explicitly provided. ``NEXTCLOUD_DEFAULT_HEADERS``
-    are client defaults; caller-supplied ``headers`` are merged over them.
-
-    Nextcloud-specific: build clients for other services (Qdrant, the
-    embedding gateway, document processors, ...) with ``httpx2.AsyncClient``
-    directly. The configured OIDC provider is the one sanctioned exception,
-    because it shares Nextcloud's TLS settings; it ignores the extra header.
-
-    Args:
-        **kwargs: Forwarded to ``httpx2.AsyncClient()``.
-
-    Returns:
-        Configured ``httpx2.AsyncClient``.
+    A caller-supplied ``verify`` kwarg takes precedence.
     """
     kwargs.setdefault("verify", get_nextcloud_ssl_verify())
-    # httpx2.Headers: case-insensitive override, and accepts every header shape
-    # httpx does (mapping, Headers, list of tuples).
-    headers = httpx2.Headers(NEXTCLOUD_DEFAULT_HEADERS)
-    headers.update(kwargs.get("headers") or {})
-    kwargs["headers"] = headers
     if (
         not get_nextcloud_http_keepalive()
         and "transport" not in kwargs
         and "limits" not in kwargs
     ):
         kwargs["limits"] = httpx2.Limits(max_keepalive_connections=0)
-    return httpx2.AsyncClient(**kwargs)
+    return _nextcloud_httpx_client(**kwargs)
 
 
 def nextcloud_httpx_transport(**kwargs: Any) -> httpx2.AsyncHTTPTransport:
-    """Create an httpx2.AsyncHTTPTransport with Nextcloud SSL settings applied.
-
-    Used by ``NextcloudClient`` which wraps the transport in
-    ``AsyncDisableCookieTransport``.
-
-    The transport keeps httpx pooling enabled, but pins a short keep-alive idle
-    expiry so stale Nextcloud/WebDAV connections age out promptly. A
-    caller-supplied ``limits`` kwarg takes precedence.
-
-    ``get_nextcloud_ssl_verify()`` is read eagerly here. That is correct because
-    a transport is built once per client lifetime; a future refactor that builds
-    transports per-request would turn this into a per-request ``get_settings()``
-    call and should cache it.
-
-    Args:
-        **kwargs: Forwarded to ``httpx2.AsyncHTTPTransport()``.
-
-    Returns:
-        Configured ``httpx2.AsyncHTTPTransport``.
-    """
+    """Build a configured transport for the retained internal-client API."""
     kwargs.setdefault("verify", get_nextcloud_ssl_verify())
-    if not get_nextcloud_http_keepalive():
-        kwargs.setdefault("limits", httpx2.Limits(max_keepalive_connections=0))
-    else:
+    keepalive = get_nextcloud_http_keepalive()
+    kwargs.setdefault("keepalive", keepalive)
+    if keepalive:
         kwargs.setdefault(
             "limits",
             httpx2.Limits(keepalive_expiry=NEXTCLOUD_KEEPALIVE_EXPIRY_SECONDS),
         )
-    return httpx2.AsyncHTTPTransport(**kwargs)
+    return _nextcloud_httpx_transport(**kwargs)
+
+
+def nextcloud_client_from_env() -> NextcloudClient:
+    """The single-user ``NextcloudClient`` from settings and env credentials.
+
+    NEXTCLOUD_HOST is read through settings (dynaconf), so a value set only in
+    settings.toml is honoured. The credentials stay env/Secret-sourced.
+    """
+    logger.info("Creating NC Client using settings + env vars")
+    host = get_settings().nextcloud_host
+    if not host:
+        raise ValueError("NEXTCLOUD_HOST must be set to build a client from env")
+    username = cfg("NEXTCLOUD_USERNAME")
+    password = cfg("NEXTCLOUD_PASSWORD")
+    return NextcloudClient(
+        base_url=host,
+        username=username,
+        auth=httpx2.BasicAuth(username, password),
+        password=password,
+        **nextcloud_client_kwargs(),
+    )

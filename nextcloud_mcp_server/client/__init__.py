@@ -247,7 +247,7 @@ class NextcloudClient:
         Returns:
             NextcloudClient configured with bearer token authentication
         """
-        from ..auth import BearerAuth  # noqa: PLC0415
+        from nextcloud_client.auth import BearerAuth  # noqa: PLC0415
 
         logger.info("Creating NC Client for user '%s' using OAuth token", username)
         return cls(

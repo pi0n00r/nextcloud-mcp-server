@@ -39,6 +39,12 @@ from icalendar import (
 from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[import-not-found]
+from nextcloud_client.calendar import (
+    CalendarEtagConflictError as PackageCalendarEtagConflictError,
+)
+from nextcloud_client.calendar import (
+    CalendarEtagUnavailableError as PackageCalendarEtagUnavailableError,
+)
 
 from ..config import get_nextcloud_ssl_verify
 from .availability import (
@@ -55,7 +61,7 @@ from .dav_errors import DavPreconditionFailed
 from .dav_urls import encode_dav_url
 from .entity_tag import StrongEntityTagError, require_strong_entity_tag
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nextcloud_client.calendar")
 
 # How many calendars to query at once when searching across all of them.
 # Unbounded fan-out would open one connection per calendar; accounts with
@@ -79,7 +85,7 @@ BULK_EVENT_LIMIT = 1000
 _MAILTO = "mailto:"
 
 
-class CalendarEtagConflictError(Exception):
+class CalendarEtagConflictError(PackageCalendarEtagConflictError):
     """Raised when a CalDAV object changed before a conditional update."""
 
     status_code = 412
@@ -112,7 +118,7 @@ def require_complete_bulk_match_set(events: list[dict[str, Any]]) -> None:
         )
 
 
-class CalendarEtagUnavailableError(Exception):
+class CalendarEtagUnavailableError(PackageCalendarEtagUnavailableError):
     """Raised when an existing CalDAV object has no usable server ETag."""
 
     status_code = 409
@@ -1295,7 +1301,7 @@ class CalendarClient:
                 object_class = AsyncEvent if component == "VEVENT" else AsyncTodo
                 obj = object_class(
                     client=calendar.client,
-                    url=calendar.url.join(encode_dav_url(href)),  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]  # url is always set for calendars
+                    url=calendar.url.join(encode_dav_url(href)),  # type: ignore[union-attr]  # ty: ignore[missing-union-attribute]  # url is always set for calendars
                     data=cal_data,
                     parent=calendar,
                     props={dav.GetEtag.tag: props.get(dav.GetEtag.tag)},

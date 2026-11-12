@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx2 import HTTPStatusError, Request, Response
-
 from nextcloud_mcp_server.client.contacts import (
     ContactsClient,
     EtagConflictError,
@@ -39,6 +38,7 @@ from nextcloud_mcp_server.client.contacts import (
     _vcard_to_json_projection,
     _wrap_contact_field,
 )
+
 from nextcloud_mcp_server.server.contacts import _contact_write_tool_error
 
 pytestmark = pytest.mark.unit
@@ -332,9 +332,7 @@ def test_invalid_bday_is_dropped_not_raised(caplog):
     """An unparseable BDAY must warn and be omitted, not crash the call."""
     import logging
 
-    with caplog.at_level(
-        logging.WARNING, logger="nextcloud_mcp_server.client.contacts"
-    ):
+    with caplog.at_level(logging.WARNING, logger="nextcloud_client.contacts"):
         vcard = _vcard(fn="Alice", bday="not-a-date")
     assert "BDAY" not in vcard
     assert any("bday" in r.message.lower() for r in caplog.records)
@@ -403,7 +401,7 @@ def test_unknown_keys_are_ignored_without_error(caplog):
     """Future-compat: callers sending unknown keys shouldn't blow up."""
     import logging
 
-    with caplog.at_level(logging.DEBUG, logger="nextcloud_mcp_server.client.contacts"):
+    with caplog.at_level(logging.DEBUG, logger="nextcloud_client.contacts"):
         vcard = _vcard(fn="Alice", totally_made_up_field="ignored")
     assert "FN:Alice" in vcard
     assert "totally_made_up_field" not in vcard
@@ -454,9 +452,7 @@ def test_missing_fn_logs_warning(caplog):
     """A missing ``fn`` should log a warning so operators notice malformed payloads."""
     import logging
 
-    with caplog.at_level(
-        logging.WARNING, logger="nextcloud_mcp_server.client.contacts"
-    ):
+    with caplog.at_level(logging.WARNING, logger="nextcloud_client.contacts"):
         try:
             _build_contact_from_data({"email": "x@example.com"}, uid="no-fn-uid")
         except Exception:
@@ -689,8 +685,12 @@ class TestNormalizeContactData:
         _normalize_contact_data(original)
         assert original == {"phone": "123", "organization": "Acme"}
 
-    def test_passthrough_for_unknown_keys(self):
-        assert _normalize_contact_data({"foo": "bar"}) == {"foo": "bar"}
+    def test_unknown_keys_dropped_with_warning(self, caplog):
+        """GH #1814: a dropped key must be visible, on create and update alike."""
+        with caplog.at_level("WARNING", logger="nextcloud_client.contacts"):
+            out = _normalize_contact_data({"fn": "x", "foo": "bar"})
+        assert out == {"fn": "x"}
+        assert "['foo']" in caplog.text
 
 
 async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):

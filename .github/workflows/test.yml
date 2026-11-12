@@ -40,6 +40,9 @@ jobs:
       # [project.dependencies] (#1285). Config in pyproject.toml [tool.deptry].
       - name: Check for undeclared dependencies
         run: uv run --no-build --no-sync deptry .
+      - name: Check for undeclared dependencies (nextcloud-client)
+        working-directory: packages/nextcloud-client
+        run: uv run --no-build --no-sync deptry .
       - name: Check AI-NOTICE and public identities
         run: ./scripts/lint-ai-notice.sh
 
@@ -89,9 +92,9 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
-      - name: Build the wheel
+      - name: Build the wheels
         shell: bash
-        run: uv build --wheel --out-dir dist
+        run: uv build --all-packages --wheel --out-dir dist
       # Installs the built wheel (not the source tree) into a throwaway
       # environment: the package itself must come from the wheel, which is the
       # artifact users actually get. Runtime dependencies may still require a
@@ -105,9 +108,9 @@ jobs:
           NEXTCLOUD_USERNAME: admin
           NEXTCLOUD_PASSWORD: admin
         run: |
-          wheel=$(ls dist/*.whl)
+          wheel=$(ls dist/nextcloud_mcp_server-*.whl)
           req="nextcloud-mcp-server${EXTRA:+[$EXTRA]} @ ./$wheel"
-          run() { uv run --isolated --no-project --no-build-package nextcloud-mcp-server --with "$req" "$@"; }
+          run() { uv run --isolated --no-project --no-build --find-links dist --with "$req" "$@"; }
           run nextcloud-mcp-server --help
           # Each extra is either fully there or fully absent (semantic includes
           # documents), and without semantic, semantic search is refused at
@@ -119,6 +122,17 @@ jobs:
           if [ "$sem" = False ]; then
             (export ENABLE_SEMANTIC_SEARCH=true; run python -c "from nextcloud_mcp_server.config import get_settings; from nextcloud_mcp_server.config_validators import validate_configuration as v; _, errs = v(get_settings()); assert any('[semantic]' in e for e in errs), errs")
           fi
+      - name: Smoke test nextcloud-client (isolated install)
+        if: matrix.extra == ''
+        shell: bash
+        run: |
+          wheel=$(ls dist/nextcloud_client-*.whl)
+          uv run --isolated --no-project --no-build --with "./$wheel" python -I -c '
+          import importlib.util as u
+          import nextcloud_client
+          leaked = [m for m in ("nextcloud_mcp_server", "mcp", "dynaconf", "prometheus_client", "sqlalchemy") if u.find_spec(m)]
+          assert not leaked, leaked
+          '
 
   container-publication-gate:
     needs: [linting]
