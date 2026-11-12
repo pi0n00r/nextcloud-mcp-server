@@ -721,6 +721,37 @@ async def test_update_contact_threads_url_to_byte_preserving_patch(mocker):
     )
 
 
+async def test_update_contact_replaces_legacy_address_collection(mocker):
+    client = ContactsClient.__new__(ContactsClient)
+    client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})
+
+    with pytest.warns(DeprecationWarning):
+        await client.update_contact(
+            addressbook="contacts",
+            uid="alice",
+            contact_data={
+                "adr": [
+                    {
+                        "type": "home",
+                        "street": "Home; St 2",
+                        "locality": "Kiel",
+                    }
+                ]
+            },
+            etag='"etag-1"',
+        )
+
+    kwargs = client._do_patch.await_args.kwargs
+    assert kwargs["remove_props"] == ["ADR"]
+    assert kwargs["add_props"] == [
+        (
+            "ADR",
+            r";;Home\; St 2;Kiel;;;",
+            [("TYPE", "home")],
+        )
+    ]
+
+
 async def test_update_contact_keeps_legacy_optional_etag_contract(mocker):
     client = ContactsClient.__new__(ContactsClient)
     client._do_patch = mocker.AsyncMock(return_value={"uid": "alice"})

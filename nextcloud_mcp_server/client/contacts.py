@@ -46,6 +46,7 @@ from nextcloud_client.contacts import EtagConflictError as PackageEtagConflictEr
 from nextcloud_client.contacts import (
     EtagPreconditionError as PackageEtagPreconditionError,
 )
+from nextcloud_client.contacts import _adr_entries as _package_adr_entries
 from pythonvCard4.vcard import Contact, escape_text, unfold_lines
 
 from nextcloud_mcp_server.utils.parsing import split_csv
@@ -76,6 +77,7 @@ _SUPPORTED_CONTACT_KEYS = frozenset(
         "bday",
         "categories",
         "url",
+        "adr",
     }
 )
 
@@ -215,6 +217,14 @@ def _normalize_contact_data(contact_data: dict[str, Any]) -> dict[str, Any]:
         normalised["org"] = normalised.pop("organization")
     else:
         normalised.pop("organization", None)
+    if "adr" in normalised:
+        raw_adr = normalised["adr"]
+        normalised["adr"] = _package_adr_entries(raw_adr)
+        if raw_adr != [] and not normalised["adr"]:
+            logger.warning(
+                "Ignoring adr with no usable address (%s)", type(raw_adr).__name__
+            )
+            del normalised["adr"]
     unknown = set(normalised) - _SUPPORTED_CONTACT_KEYS
     if unknown:
         logger.warning("Ignoring unknown contact_data keys: %s", sorted(unknown))
@@ -378,6 +388,9 @@ def _build_contact_from_data(contact_data: dict[str, Any], uid: str) -> Contact:
     bday = _parse_bday(data.get("bday"))
     if bday is not None:
         kwargs["bday"] = bday
+
+    if data.get("adr"):
+        kwargs["adr"] = data["adr"]
 
     unknown = set(data) - _SUPPORTED_CONTACT_KEYS
     if unknown:
@@ -916,6 +929,8 @@ class ContactsClient(BaseNextcloudClient):
         normalised = _normalize_contact_data(contact_data)
         name_parts = normalised.pop("n", None)
         set_props: dict[str, str] = {}
+        add_props: list[tuple[str, str, list[tuple[str, str]] | None]] = []
+        remove_props: list[str] = []
         for key, value in normalised.items():
             key_l = key.lower()
             if key_l == "fn":
@@ -951,6 +966,15 @@ class ContactsClient(BaseNextcloudClient):
                 set_props["CATEGORIES"] = (
                     value if isinstance(value, str) else ",".join(value)
                 )
+            elif key_l == "adr":
+                remove_props.append("ADR")
+                for entry in value:
+                    components = ";".join(
+                        _escape_n_component(component) for component in entry["value"]
+                    )
+                    types = entry.get("type") or []
+                    params = [("TYPE", ",".join(types))] if types else None
+                    add_props.append(("ADR", components, params))
         # Keep the deprecated optional-ETag contract isolated from the modern
         # patch_contact input boundary. Legacy callers still GET first and use
         # the server ETag when one is available.
@@ -959,8 +983,8 @@ class ContactsClient(BaseNextcloudClient):
             uid=uid,
             etag=etag,
             set_props=set_props,
-            add_props=None,
-            remove_props=None,
+            add_props=add_props or None,
+            remove_props=remove_props or None,
             verify=False,
             retry_on_conflict=False,
             attempt=1 if not etag else 0,
