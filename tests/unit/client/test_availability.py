@@ -10,6 +10,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import pytest
+
 from nextcloud_mcp_server.client.availability import (
     busy_spans_from_events,
     busy_spans_from_vfreebusy,

@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 from caldav.elements import cdav, dav
 from caldav.lib import error as caldav_error
+
 from nextcloud_mcp_server.client.calendar import (
     BULK_EVENT_LIMIT,
     CalendarBulkLimitExceededError,

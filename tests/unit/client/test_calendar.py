@@ -523,6 +523,7 @@ def _calendar_client(mocker):
 async def test_delete_todo_retries_once_with_scheduling_disabled(mocker):
     """A plain caldav 403 gets one low-level scheduling-disabled retry."""
     from caldav.lib import error as caldav_error
+
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "task@example.invalid"
@@ -550,6 +551,7 @@ async def test_delete_todo_retries_once_with_scheduling_disabled(mocker):
 async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
     """The permanent-purge path is gated by Nextcloud's exact collision text."""
     from caldav.lib import error as caldav_error
+
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "arbiter-cpow-drift@example.invalid"
@@ -582,6 +584,7 @@ async def test_delete_todo_purges_exact_trash_collision_and_retries(mocker):
 async def test_delete_todo_unrelated_403_does_not_purge_trash(mocker):
     """Authorization errors without the collision signature remain read-only."""
     from caldav.lib import error as caldav_error
+
     from nextcloud_mcp_server.client.calendar import CalendarClient
 
     uid = "plain-task"
@@ -2208,6 +2211,7 @@ def test_split_vtimezone_rdates_leaves_one_value_per_rdate():
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
+
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = Timezone.from_tzinfo(ZoneInfo("Europe/Berlin"))
@@ -2228,6 +2232,7 @@ def test_split_vtimezone_rdates_survives_serialisation():
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
+
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = _split_vtimezone_rdates(Timezone.from_tzinfo(ZoneInfo("Europe/Berlin")))
@@ -2244,6 +2249,7 @@ def test_split_vtimezone_rdates_ignores_zones_without_dst(zone):
     from zoneinfo import ZoneInfo
 
     from icalendar import Timezone
+
     from nextcloud_mcp_server.client.calendar import _split_vtimezone_rdates
 
     tz = Timezone.from_tzinfo(ZoneInfo(zone))

@@ -17,12 +17,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+
 from nextcloud_mcp_server.client.calendar import (
     BULK_EVENT_LIMIT,
     CalendarEtagConflictError,
     CalendarEtagUnavailableError,
 )
-
 from nextcloud_mcp_server.server.calendar import configure_calendar_tools
 
 pytestmark = pytest.mark.unit

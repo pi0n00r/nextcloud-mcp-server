@@ -19,6 +19,7 @@ rather than discarded in favour of our generic wording.
 
 import pytest
 from httpx2 import HTTPStatusError, Request, Response
+
 from nextcloud_mcp_server.client.dav_errors import dav_error_from_status_error
 from nextcloud_mcp_server.client.webdav import (
     _dav_detail_text,

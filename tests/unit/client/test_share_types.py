@@ -22,9 +22,9 @@ client-side here.
 import pytest
 from httpx2 import AsyncClient
 from mcp.server.mcpserver import MCPServer
+
 from nextcloud_mcp_server.client.ocs import OCSAuthenticationError, OCSError
 from nextcloud_mcp_server.client.sharing import SharingClient, validate_share_with
-
 from nextcloud_mcp_server.models.sharing import (
     SHARE_TYPES_REQUIRING_RECIPIENT,
     ShareType,

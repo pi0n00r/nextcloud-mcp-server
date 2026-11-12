@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx2 import HTTPStatusError, Request, Response
+
 from nextcloud_mcp_server.client.contacts import (
     ContactsClient,
     EtagConflictError,
@@ -38,7 +39,6 @@ from nextcloud_mcp_server.client.contacts import (
     _vcard_to_json_projection,
     _wrap_contact_field,
 )
-
 from nextcloud_mcp_server.server.contacts import _contact_write_tool_error
 
 pytestmark = pytest.mark.unit
