@@ -83,6 +83,7 @@ FORK_TOUCHED=(
     "tests/server/test_mcp.py"
     "tests/server/test_webdav_edit_mcp.py"
     "tests/server/test_webdav_view_image_mcp.py"
+    "tests/unit/test_friendly_errors.py"
     "tests/test_tool_description_metacharacters.py"
     "tests/unit/api/test_search_rerank_api.py"
     "tests/unit/api/test_search_usage_metering.py"

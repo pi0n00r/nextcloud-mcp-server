@@ -1,3 +1,14 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 """Unit tests for the LLM-friendly tool-error formatter (GH #1208)."""
 
 import errno
@@ -16,6 +27,13 @@ from nextcloud_mcp_server.server.collectives import _raise_collectives_error
 pytestmark = pytest.mark.unit
 
 DAV_URL = "http://app/remote.php/dav/files/admin/FileUpload/test.txtg"
+
+
+def _caldav_error_with_status(status: int) -> caldav_error.DAVError:
+    """Construct a DAV error compatibly with the declared CalDAV minimum."""
+    exc = caldav_error.DAVError(url="https://private/dav")
+    exc.status = status
+    return exc
 
 
 def _http_error(
@@ -200,11 +218,11 @@ def test_request_error_reports_unreachable_server():
         (caldav_error.NotFoundError(url="https://private/dav"), "Not found"),
         (caldav_error.RateLimitError(url="https://private/dav"), "Rate limited"),
         (
-            caldav_error.DAVError(url="https://private/dav", status=507),
+            _caldav_error_with_status(507),
             "Insufficient storage",
         ),
         (
-            caldav_error.DAVError(url="https://private/dav", status=503),
+            _caldav_error_with_status(503),
             "Nextcloud server error",
         ),
     ],
@@ -214,6 +232,18 @@ def test_caldav_errors_are_structured_without_internal_urls(exc, expected):
 
     assert message is not None
     assert expected in message
+    assert "https://private" not in message
+
+
+def test_caldav_error_without_status_uses_dependency_guidance():
+    """CalDAV 3.0.1 errors do not necessarily expose status."""
+    message = friendly_tool_error(
+        caldav_error.DAVError(url="https://private/dav"),
+        "nc_calendar_create_event",
+    )
+
+    assert message is not None
+    assert "CalDAV dependency error" in message
     assert "https://private" not in message
 
 

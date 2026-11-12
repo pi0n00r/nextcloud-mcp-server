@@ -209,7 +209,7 @@ def friendly_tool_error(exc: BaseException | None, tool_name: str) -> str | None
         )
 
     if isinstance(exc, caldav_error.DAVError):
-        status = exc.status
+        status = getattr(exc, "status", None)
         if isinstance(exc, caldav_error.AuthorizationError) or status in (401, 403):
             summary, hint = _STATUS[status if status in (401, 403) else 401]
         elif isinstance(exc, caldav_error.NotFoundError) or status == 404:

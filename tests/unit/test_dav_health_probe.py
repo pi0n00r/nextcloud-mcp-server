@@ -11,11 +11,14 @@
 
 """Tests for the non-gating Files and CalDAV readiness probes."""
 
+import anyio
 import httpx2
 import pytest
 
 from nextcloud_mcp_server.app import (
     _check_nextcloud_dav_health,
+    _dav_multistatus_result,
+    _dav_request,
     _readiness_cache,
 )
 
@@ -28,6 +31,39 @@ class _Settings:
     nextcloud_password = "secret"
 
 
+def _property_multistatus(property_xml: str) -> bytes:
+    """Build one successful property response for discovery fixtures."""
+    return (
+        '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:response><d:propstat><d:prop>"
+        f"{property_xml}"
+        "</d:prop><d:status>HTTP/1.1 200 OK</d:status>"
+        "</d:propstat></d:response></d:multistatus>"
+    ).encode()
+
+
+def _resource_multistatus(status: int = 200) -> bytes:
+    """Build one resourcetype propstat with the requested status."""
+    return (
+        '<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>'
+        "<d:resourcetype><d:collection/></d:resourcetype>"
+        f"</d:prop><d:status>HTTP/1.1 {status} Result</d:status>"
+        "</d:propstat></d:response></d:multistatus>"
+    ).encode()
+
+
+PRINCIPAL_RESPONSE = _property_multistatus(
+    "<d:current-user-principal>"
+    "<d:href>/remote.php/dav/principals/users/canonical%2Fuser/</d:href>"
+    "</d:current-user-principal>"
+)
+CALENDAR_HOME_RESPONSE = _property_multistatus(
+    "<c:calendar-home-set>"
+    "<d:href>/remote.php/dav/calendars/canonical-user/</d:href>"
+    "</c:calendar-home-set>"
+)
+
+
 @pytest.fixture
 def probe(monkeypatch):
     async def _run(statuses):
@@ -35,9 +71,22 @@ def probe(monkeypatch):
 
         def handler(request: httpx2.Request) -> httpx2.Response:
             seen.append(request)
-            status = statuses[len(seen) - 1]
+            if len(seen) == 1:
+                return httpx2.Response(207, content=PRINCIPAL_RESPONSE)
+            if len(seen) == 2:
+                return httpx2.Response(207, content=CALENDAR_HOME_RESPONSE)
+
+            status = statuses[len(seen) - 3]
             if isinstance(status, Exception):
                 raise status
+            if isinstance(status, tuple):
+                outer_status, prop_status = status
+                content = (
+                    b"" if prop_status is None else _resource_multistatus(prop_status)
+                )
+                return httpx2.Response(outer_status, content=content)
+            if status == 207:
+                return httpx2.Response(207, content=_resource_multistatus())
             return httpx2.Response(status)
 
         real_client = httpx2.AsyncClient
@@ -60,9 +109,9 @@ def probe(monkeypatch):
 async def test_probes_files_and_calendar_roots_without_listing_data(probe):
     seen, statuses = await probe([207, 200])
 
-    assert [request.method for request in seen] == ["PROPFIND", "PROPFIND"]
-    assert seen[0].url.raw_path.endswith(b"/remote.php/dav/files/user%2Fname/")
-    assert seen[1].url.raw_path.endswith(b"/remote.php/dav/calendars/user%2Fname/")
+    assert [request.method for request in seen] == ["PROPFIND"] * 4
+    assert seen[2].url.raw_path.endswith(b"/remote.php/dav/files/canonical%2Fuser/")
+    assert seen[3].url.raw_path.endswith(b"/remote.php/dav/calendars/canonical-user/")
     assert all(request.headers["depth"] == "0" for request in seen)
     assert statuses["nextcloud_files"].detail == "ok"
     assert statuses["nextcloud_caldav"].detail == "ok"
@@ -83,3 +132,31 @@ async def test_transport_failure_is_stable_and_sanitized(probe):
 
     assert statuses["nextcloud_files"].detail == "error: unreachable"
     assert "contains-private-path" not in statuses["nextcloud_files"].detail
+
+
+def test_multistatus_requires_successful_resourcetype():
+    healthy, detail = _dav_multistatus_result(_resource_multistatus(403))
+
+    assert healthy is False
+    assert detail == "error: authorization"
+
+    healthy, detail = _dav_multistatus_result(b"")
+
+    assert healthy is False
+    assert detail == "error: invalid_multistatus"
+
+
+async def test_request_has_overall_deadline(monkeypatch):
+    class SlowClient:
+        async def request(self, *_args, **_kwargs):
+            await anyio.sleep(1)
+
+    monkeypatch.setattr("nextcloud_mcp_server.app._DAV_PROBE_DEADLINE_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await _dav_request(
+            SlowClient(),
+            "PROPFIND",
+            "https://nextcloud.example/remote.php/dav/",
+            content="<d:propfind/>",
+        )

@@ -801,9 +801,11 @@ class CalendarClient:
                 current_etag=str(response_etag) if response_etag else None,
             )
         if response.status not in (200, 201, 204):
-            raise caldav_error.PutError(
+            error = caldav_error.PutError(
                 f"CalDAV PUT for {kind} {uid} returned HTTP {response.status}"
             )
+            error.status = response.status
+            raise error
 
         new_etag = response.headers.get("etag")
         if new_etag:
@@ -1273,10 +1275,12 @@ class CalendarClient:
                 reason=getattr(response, "reason", "Calendar not found"),
             )
         if status >= 400:
-            raise caldav_error.DAVError(
+            error = caldav_error.DAVError(
                 url=str(calendar.url),
                 reason=getattr(response, "reason", f"HTTP {status}"),
             )
+            error.status = status
+            raise error
 
         # Parse response (same pattern as AsyncCalendar.search)
         objects = []

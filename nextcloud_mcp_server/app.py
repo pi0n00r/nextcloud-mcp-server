@@ -21,11 +21,12 @@ import os
 import tempfile
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import anyio
 import click
@@ -633,6 +634,13 @@ async def _check_nextcloud_health() -> None:
     record_dependency_check("nextcloud", time.time() - start)
 
 
+_DAV_PROBE_DEADLINE_SECONDS = 4.0
+_DAV_PROPFIND_HEADERS = {
+    "Depth": "0",
+    "Content-Type": "application/xml; charset=utf-8",
+}
+
+
 def _dav_probe_result(status_code: int) -> tuple[bool, str]:
     """Return a stable, secret-free DAV capability result."""
     if status_code in (200, 207):
@@ -646,6 +654,142 @@ def _dav_probe_result(status_code: int) -> tuple[bool, str]:
     if status_code >= 500:
         return False, "error: dependency_unavailable"
     return False, f"error: status_{status_code}"
+
+
+def _dav_status_code(status: str | None) -> int | None:
+    """Extract an HTTP status code from a DAV status element."""
+    if not status:
+        return None
+    for field in status.split():
+        if len(field) == 3 and field.isdigit():
+            return int(field)
+    return None
+
+
+def _dav_property_href(content: bytes, property_name: str) -> str | None:
+    """Return a property href from a successful DAV propstat."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return None
+    for propstat in root.iter():
+        if propstat.tag.split("}")[-1] != "propstat":
+            continue
+        status = next(
+            (child.text for child in propstat if child.tag.split("}")[-1] == "status"),
+            None,
+        )
+        if _dav_status_code(status) != 200:
+            continue
+        for element in propstat.iter():
+            if element.tag.split("}")[-1] != property_name:
+                continue
+            for child in element.iter():
+                if child.tag.split("}")[-1] == "href" and child.text:
+                    return child.text.strip()
+    return None
+
+
+def _dav_multistatus_result(content: bytes) -> tuple[bool, str]:
+    """Require a successful resourcetype propstat in a 207 response."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return False, "error: invalid_multistatus"
+
+    failures: list[int] = []
+    for propstat in root.iter():
+        if propstat.tag.split("}")[-1] != "propstat":
+            continue
+        status = next(
+            (child.text for child in propstat if child.tag.split("}")[-1] == "status"),
+            None,
+        )
+        status_code = _dav_status_code(status)
+        has_resourcetype = any(
+            element.tag.split("}")[-1] == "resourcetype" for element in propstat.iter()
+        )
+        if status_code == 200 and has_resourcetype:
+            return True, "ok"
+        if status_code is not None:
+            failures.append(status_code)
+
+    if failures:
+        return _dav_probe_result(failures[0])
+    return False, "error: invalid_multistatus"
+
+
+async def _dav_request(
+    client: httpx2.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    content: str,
+) -> httpx2.Response:
+    """Run one DAV request under a wall-clock deadline."""
+    with anyio.fail_after(_DAV_PROBE_DEADLINE_SECONDS):
+        return await client.request(
+            method,
+            url,
+            headers=_DAV_PROPFIND_HEADERS,
+            content=content,
+        )
+
+
+async def _discover_dav_probe_urls(
+    client: httpx2.AsyncClient, host: str
+) -> tuple[dict[str, str] | None, str]:
+    """Discover the authenticated Files principal and CalDAV home."""
+    principal_body = (
+        '<d:propfind xmlns:d="DAV:"><d:prop>'
+        "<d:current-user-principal/>"
+        "</d:prop></d:propfind>"
+    )
+    principal_response = await _dav_request(
+        client,
+        "PROPFIND",
+        f"{host.rstrip('/')}/remote.php/dav/",
+        content=principal_body,
+    )
+    healthy, detail = _dav_probe_result(principal_response.status_code)
+    if not healthy:
+        return None, detail
+    principal_href = _dav_property_href(
+        principal_response.content, "current-user-principal"
+    )
+    if not principal_href:
+        return None, "error: principal_discovery_failed"
+
+    principal_id = unquote(principal_href.rstrip("/").split("/")[-1])
+    if not principal_id:
+        return None, "error: principal_discovery_failed"
+
+    calendar_body = (
+        '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><c:calendar-home-set/></d:prop></d:propfind>"
+    )
+    calendar_response = await _dav_request(
+        client,
+        "PROPFIND",
+        urljoin(f"{host.rstrip('/')}/", principal_href),
+        content=calendar_body,
+    )
+    healthy, detail = _dav_probe_result(calendar_response.status_code)
+    if not healthy:
+        return None, detail
+    calendar_href = _dav_property_href(calendar_response.content, "calendar-home-set")
+    if not calendar_href:
+        return None, "error: calendar_home_discovery_failed"
+
+    return (
+        {
+            "nextcloud_files": (
+                f"{host.rstrip('/')}/remote.php/dav/files/{quote(principal_id, safe='')}/"
+            ),
+            "nextcloud_caldav": urljoin(f"{host.rstrip('/')}/", calendar_href),
+        },
+        "ok",
+    )
 
 
 async def _check_nextcloud_dav_health() -> None:
@@ -663,29 +807,38 @@ async def _check_nextcloud_dav_health() -> None:
     if not (host and username and password):
         return
 
-    principal = quote(username, safe="")
-    probes = {
-        "nextcloud_files": f"{host}/remote.php/dav/files/{principal}/",
-        "nextcloud_caldav": f"{host}/remote.php/dav/calendars/{principal}/",
-    }
-    headers = {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"}
     body = '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
-
-    for name, url in probes.items():
-        start = time.time()
-        try:
+    try:
+        with anyio.fail_after(_DAV_PROBE_DEADLINE_SECONDS):
             async with nextcloud_httpx_client(
                 timeout=2.0, auth=(username, password)
             ) as client:
-                response = await client.request(
-                    "PROPFIND", url, headers=headers, content=body
-                )
-            healthy, detail = _dav_probe_result(response.status_code)
-        except Exception:  # noqa: BLE001 - expose a stable capability code only
-            healthy, detail = False, "error: unreachable"
-        _readiness_cache.update(name, healthy, detail)
-        set_dependency_health(name, healthy)
-        record_dependency_check(name, time.time() - start)
+                probes, discovery_detail = await _discover_dav_probe_urls(client, host)
+                if probes is None:
+                    for name in ("nextcloud_files", "nextcloud_caldav"):
+                        _readiness_cache.update(name, False, discovery_detail)
+                        set_dependency_health(name, False)
+                    return
+
+                for name, url in probes.items():
+                    start = time.time()
+                    try:
+                        response = await _dav_request(
+                            client, "PROPFIND", url, content=body
+                        )
+                        if response.status_code == 207:
+                            healthy, detail = _dav_multistatus_result(response.content)
+                        else:
+                            healthy, detail = _dav_probe_result(response.status_code)
+                    except Exception:  # noqa: BLE001 - stable capability code only
+                        healthy, detail = False, "error: unreachable"
+                    _readiness_cache.update(name, healthy, detail)
+                    set_dependency_health(name, healthy)
+                    record_dependency_check(name, time.time() - start)
+    except Exception:  # noqa: BLE001 - discovery is observational and non-gating
+        for name in ("nextcloud_files", "nextcloud_caldav"):
+            _readiness_cache.update(name, False, "error: unreachable")
+            set_dependency_health(name, False)
 
 
 def _probe_local_ingest_storage(spool_dir: str | None) -> tuple[bool, str]:
