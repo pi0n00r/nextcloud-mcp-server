@@ -57,7 +57,10 @@ jobs:
       # -q instead of -v: with xdist, per-test progress lines are interleaved
       # noise, and failures still print in full.
       - name: Run unit tests
-        run: uv run --no-build --no-sync pytest -q -W error -m unit -n auto -o "addopts=-p no:asyncio"
+        # LangSmith 0.14.17 still calls the Python 3.14-deprecated
+        # asyncio.iscoroutinefunction while its unrelated pytest plugin loads.
+        # Keep application warnings fatal without importing that optional plugin.
+        run: uv run --no-build --no-sync pytest -q -W error -p no:langsmith_plugin -m unit -n auto -o "addopts=-p no:asyncio"
 
   # Cross-platform install smoke test. Installs the package (and its full
   # dependency closure) into an isolated environment and runs the CLI
@@ -110,7 +113,7 @@ jobs:
         run: |
           wheel=$(ls dist/nextcloud_mcp_server-*.whl)
           req="nextcloud-mcp-server${EXTRA:+[$EXTRA]} @ ./$wheel"
-          run() { uv run --isolated --no-project --no-build --find-links dist --with "$req" "$@"; }
+          run() { uv run --isolated --no-project --find-links dist --with "$req" "$@"; }
           run nextcloud-mcp-server --help
           # Each extra is either fully there or fully absent (semantic includes
           # documents), and without semantic, semantic search is refused at
