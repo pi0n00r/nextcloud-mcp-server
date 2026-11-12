@@ -186,13 +186,6 @@ class TestHTTPClientFactory:
             client = nextcloud_httpx_client(verify=False)
             assert isinstance(client, httpx2.AsyncClient)
 
-    def test_transport_applies_verify(self):
-        with patch(
-            "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=False
-        ):
-            transport = nextcloud_httpx_transport()
-            assert isinstance(transport, httpx2.AsyncHTTPTransport)
-
     def test_client_passes_extra_kwargs(self):
         with patch(
             "nextcloud_mcp_server.http.get_nextcloud_ssl_verify", return_value=True

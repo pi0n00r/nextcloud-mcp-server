@@ -446,6 +446,35 @@ async def test_report_404_preserves_not_found_error(client):
         await client._search_calendar_objects(calendar, "VEVENT")
 
 
+async def test_report_error_retains_http_status(client):
+    report = AsyncMock(return_value=SimpleNamespace(status=507, reason="Full"))
+    calendar = SimpleNamespace(
+        client=SimpleNamespace(report=report),
+        url=CalendarUrl(),
+    )
+
+    with pytest.raises(caldav_error.DAVError) as caught:
+        await client._search_calendar_objects(calendar, "VEVENT")
+
+    assert caught.value.status == 507
+
+
+async def test_put_error_retains_http_status(client):
+    client._dav_client.put.return_value = response(status=507)
+    obj = SimpleNamespace(
+        url=(
+            "https://cloud.example.org/remote.php/dav/calendars/alice/main/event-1.ics"
+        )
+    )
+
+    with pytest.raises(caldav_error.PutError) as caught:
+        await client._conditional_update(
+            obj, EVENT_ICAL, '"event-v1"', kind="event", uid="event-1"
+        )
+
+    assert caught.value.status == 507
+
+
 async def test_successful_put_without_etag_header_refetches_new_etag(client, mocker):
     event = DavObject("event-1", EVENT_ICAL, '"event-v1"')
     event.get_property = AsyncMock(return_value='"event-v2"')

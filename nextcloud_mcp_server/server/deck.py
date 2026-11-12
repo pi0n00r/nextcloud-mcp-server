@@ -20,11 +20,23 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 from mcp.types import ToolAnnotations
+from nextcloud_client import NextcloudClient
+from nextcloud_client.deck import _normalize_color
+from nextcloud_client.models.deck import (
+    DeckAssignedUser,
+    DeckBoard,
+    DeckCard,
+    DeckCardSummary,
+    DeckComment,
+    DeckCommentSummary,
+    DeckLabel,
+    DeckStack,
+    DeckUser,
+)
+from nextcloud_client.models.sharing import ShareType
 
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.capabilities import require_capability, unmet_capability
-from nextcloud_mcp_server.client import NextcloudClient
-from nextcloud_mcp_server.client.deck import _normalize_color
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.links import with_links
 from nextcloud_mcp_server.models.deck import (
@@ -38,15 +50,6 @@ from nextcloud_mcp_server.models.deck import (
     CreateCardResponse,
     CreateLabelResponse,
     CreateStackResponse,
-    DeckAssignedUser,
-    DeckBoard,
-    DeckCard,
-    DeckCardSummary,
-    DeckComment,
-    DeckCommentSummary,
-    DeckLabel,
-    DeckStack,
-    DeckUser,
     LabelOperationResponse,
     ListAttachmentsResponse,
     ListBoardsResponse,
@@ -57,7 +60,6 @@ from nextcloud_mcp_server.models.deck import (
     StackOperationResponse,
     StackOverview,
 )
-from nextcloud_mcp_server.models.sharing import ShareType
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 from nextcloud_mcp_server.request_context import current_context
 from nextcloud_mcp_server.utils.message_splitter import (
@@ -693,7 +695,7 @@ def _shape_comments(
 # fires this exact request — see Deck app's
 # src/components/card/AttachmentList.vue:223-238 and lib/Service/FilesAppService.php.
 # The file is NOT copied; the share row binds the file's existing path to the card.
-_SHARE_TYPE_DECK = ShareType.DECK
+_SHARE_TYPE_DECK = ShareType.DECK_CARD
 
 
 def _resolve_note_path(notes_folder: str, category: str, title: str) -> str:

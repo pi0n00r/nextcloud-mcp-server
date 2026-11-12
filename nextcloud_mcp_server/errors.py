@@ -23,12 +23,14 @@ the tool boundary fixes every tool at once -- see :class:`NextcloudMCPServer`.
 # AI-NOTICE:Scope=file
 # AI-NOTICE:Contact=https://AImends.bajaj.com/
 
+import errno
 import json
 import re
 from importlib.metadata import version
 from typing import Any
 from urllib.parse import unquote
 
+from caldav.lib import error as caldav_error
 from httpx2 import URL, HTTPStatusError, RequestError, Response, ResponseNotRead
 from mcp.server.context import CallNext, ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
@@ -204,6 +206,49 @@ def friendly_tool_error(exc: BaseException | None, tool_name: str) -> str | None
             f"{tool_name} failed: could not reach Nextcloud ({exc.__class__.__name__}). "
             "The server may be down or unreachable from here; retry once, then "
             "report it to the user."
+        )
+
+    if isinstance(exc, caldav_error.DAVError):
+        status = getattr(exc, "status", None)
+        if isinstance(exc, caldav_error.AuthorizationError) or status in (401, 403):
+            summary, hint = _STATUS[status if status in (401, 403) else 401]
+        elif isinstance(exc, caldav_error.NotFoundError) or status == 404:
+            summary, hint = _STATUS[404]
+        elif isinstance(exc, caldav_error.RateLimitError) or status == 429:
+            summary, hint = _STATUS[429]
+        elif status == 507:
+            summary, hint = _STATUS[507]
+        elif isinstance(status, int) and status >= 500:
+            summary, hint = _GENERIC_SERVER
+        else:
+            summary = "CalDAV dependency error"
+            hint = (
+                "The calendar service rejected the operation. Verify CalDAV "
+                "availability before retrying."
+            )
+        suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+        return f"{tool_name} failed: {summary}{suffix}. {hint}"
+
+    if isinstance(exc, OSError):
+        if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+            summary = "Local storage exhausted"
+            hint = "Free local storage or quota before retrying."
+        elif exc.errno in {errno.EIO, errno.EROFS, getattr(errno, "ESTALE", -1)}:
+            summary = "Local storage unavailable"
+            hint = (
+                "The server cannot safely access its local storage. Do not retry "
+                "until the filesystem is healthy and writable."
+            )
+        else:
+            summary = "Local filesystem error"
+            hint = "The server could not access a required local file; report it."
+        return f"{tool_name} failed: {summary}. {hint}"
+
+    if isinstance(exc, ImportError):
+        return (
+            f"{tool_name} failed: runtime dependency unavailable. "
+            "The server installation is incomplete or inconsistent; report it "
+            "instead of retrying the operation."
         )
 
     return None

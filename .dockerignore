@@ -21,4 +21,8 @@
 !nextcloud_mcp_server/
 !nextcloud_mcp_server/**
 
+!packages/nextcloud-client/pyproject.toml
+!packages/nextcloud-client/README.md
+!packages/nextcloud-client/src/**/*.py
+
 !scripts/check_publication_identity.py

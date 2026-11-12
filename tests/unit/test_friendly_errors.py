@@ -1,18 +1,39 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
+
 """Unit tests for the LLM-friendly tool-error formatter (GH #1208)."""
+
+import errno
 
 import httpx2
 import pytest
+from caldav.lib import error as caldav_error
 from httpx2 import HTTPStatusError
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
+from nextcloud_client.collectives import OCSError
 
-from nextcloud_mcp_server.client.collectives import OCSError
 from nextcloud_mcp_server.errors import NextcloudMCPServer, friendly_tool_error
 from nextcloud_mcp_server.server.collectives import _raise_collectives_error
 
 pytestmark = pytest.mark.unit
 
 DAV_URL = "http://app/remote.php/dav/files/admin/FileUpload/test.txtg"
+
+
+def _caldav_error_with_status(status: int) -> caldav_error.DAVError:
+    """Construct a DAV error compatibly with the declared CalDAV minimum."""
+    exc = caldav_error.DAVError(url="https://private/dav")
+    exc.status = status
+    return exc
 
 
 def _http_error(
@@ -185,6 +206,65 @@ def test_request_error_reports_unreachable_server():
     assert message is not None
     assert "could not reach Nextcloud" in message
     assert "ConnectError" in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            caldav_error.AuthorizationError(url="https://private/dav"),
+            "Authentication failed",
+        ),
+        (caldav_error.NotFoundError(url="https://private/dav"), "Not found"),
+        (caldav_error.RateLimitError(url="https://private/dav"), "Rate limited"),
+        (
+            _caldav_error_with_status(507),
+            "Insufficient storage",
+        ),
+        (
+            _caldav_error_with_status(503),
+            "Nextcloud server error",
+        ),
+    ],
+)
+def test_caldav_errors_are_structured_without_internal_urls(exc, expected):
+    message = friendly_tool_error(exc, "nc_calendar_create_event")
+
+    assert message is not None
+    assert expected in message
+    assert "https://private" not in message
+
+
+def test_caldav_error_without_status_uses_dependency_guidance():
+    """CalDAV 3.0.1 errors do not necessarily expose status."""
+    message = friendly_tool_error(
+        caldav_error.DAVError(url="https://private/dav"),
+        "nc_calendar_create_event",
+    )
+
+    assert message is not None
+    assert "CalDAV dependency error" in message
+    assert "https://private" not in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (OSError(errno.EIO, "/private/ingest.bin"), "Local storage unavailable"),
+        (OSError(errno.ENOSPC, "/private/ingest.bin"), "Local storage exhausted"),
+        (OSError(errno.ENOENT, "/private/ingest.bin"), "Local filesystem error"),
+        (
+            ImportError("urllib3 failed from /private/site-packages"),
+            "runtime dependency unavailable",
+        ),
+    ],
+)
+def test_local_failures_are_structured_without_paths(exc, expected):
+    message = friendly_tool_error(exc, "nc_semantic_search")
+
+    assert message is not None
+    assert expected in message
+    assert "/private" not in message
 
 
 @pytest.mark.parametrize(

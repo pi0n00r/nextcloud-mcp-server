@@ -17,8 +17,7 @@ import uuid
 
 import pytest
 from mcp import ClientSession
-
-from nextcloud_mcp_server.client import NextcloudClient
+from nextcloud_client import NextcloudClient
 
 logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.integration
@@ -46,6 +45,8 @@ async def test_mcp_connectivity(nc_mcp_client: ClientSession):
         "nc_tables_list_tables",
         "nc_tables_get_schema",
         "nc_tables_read_table",
+        "nc_tables_read_view",
+        "nc_tables_get_row",
         "nc_tables_insert_row",
         "nc_tables_update_row",
         "nc_tables_delete_row",

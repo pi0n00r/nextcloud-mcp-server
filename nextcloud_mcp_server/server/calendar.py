@@ -19,6 +19,9 @@ import httpx2
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from nextcloud_client.dav_errors import (
+    DavPreconditionFailed as PackageDavPreconditionFailed,
+)
 
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client.calendar import (
@@ -52,7 +55,9 @@ from nextcloud_mcp_server.observability.metrics import instrument_tool
 logger = logging.getLogger(__name__)
 
 
-def _stale_etag_error(uid: str, e: DavPreconditionFailed) -> ToolError:
+def _stale_etag_error(
+    uid: str, e: DavPreconditionFailed | PackageDavPreconditionFailed
+) -> ToolError:
     """Turn a 412 into something the caller can act on.
 
     ``DavPreconditionFailed`` reaches an MCP client as an httpx2 status error
@@ -1474,7 +1479,7 @@ def configure_calendar_tools(mcp: MCPServer):
             raise ToolError(
                 f"{exc} The update was not sent; read the todo again before retrying."
             ) from exc
-        except DavPreconditionFailed as e:
+        except (DavPreconditionFailed, PackageDavPreconditionFailed) as e:
             raise _stale_etag_error(todo_uid, e) from e
 
         return UpdateTodoResponse(
@@ -1555,7 +1560,7 @@ def configure_calendar_tools(mcp: MCPServer):
             raise ToolError(
                 f"{exc} The update was not sent; read the todo again before retrying."
             ) from exc
-        except DavPreconditionFailed as e:
+        except (DavPreconditionFailed, PackageDavPreconditionFailed) as e:
             raise _stale_etag_error(todo_uid, e) from e
         verified, verification_error = await _verify_todo_completed(
             client, calendar_name, todo_uid

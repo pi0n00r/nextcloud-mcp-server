@@ -231,7 +231,14 @@ class TestLoginFlowCalendarTodos:
         )
         cal_data = json.loads(cal_result.content[0].text)
         calendars = cal_data.get("calendars", [])
-        calendar_name = calendars[0].get("name", "personal")
+        calendar_name = next(
+            (
+                calendar.get("name")
+                for calendar in calendars
+                if not calendar.get("read_only", False)
+            ),
+            "personal",
+        )
 
         suffix = uuid.uuid4().hex[:8]
         todo_title = f"LoginFlow Todo {suffix}"
@@ -247,7 +254,7 @@ class TestLoginFlowCalendarTodos:
         )
         if create_result.is_error:
             error_text = create_result.content[0].text
-            if "AuthorizationError" in error_text:
+            if "HTTP 403" in error_text or "Permission denied" in error_text:
                 pytest.skip(
                     f"Calendar '{calendar_name}' does not support VTODO: {error_text}"
                 )
@@ -276,10 +283,11 @@ class TestLoginFlowCalendarTodos:
             assert update_result.is_error is False
 
         finally:
-            await nc_mcp_login_flow_client.call_tool(
+            delete_result = await nc_mcp_login_flow_client.call_tool(
                 "nc_calendar_delete_todo",
                 {"calendar_name": calendar_name, "todo_uid": todo_uid},
             )
+            assert delete_result.is_error is False
             logger.info("Deleted todo %s", todo_uid)
 
 

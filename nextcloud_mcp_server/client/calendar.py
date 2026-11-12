@@ -39,6 +39,12 @@ from icalendar import (
 from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[import-not-found]
+from nextcloud_client.calendar import (
+    CalendarEtagConflictError as PackageCalendarEtagConflictError,
+)
+from nextcloud_client.calendar import (
+    CalendarEtagUnavailableError as PackageCalendarEtagUnavailableError,
+)
 
 from ..config import get_nextcloud_ssl_verify
 from .availability import (
@@ -55,7 +61,7 @@ from .dav_errors import DavPreconditionFailed
 from .dav_urls import encode_dav_url
 from .entity_tag import StrongEntityTagError, require_strong_entity_tag
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nextcloud_client.calendar")
 
 # How many calendars to query at once when searching across all of them.
 # Unbounded fan-out would open one connection per calendar; accounts with
@@ -79,24 +85,7 @@ BULK_EVENT_LIMIT = 1000
 _MAILTO = "mailto:"
 
 
-class CalendarEtagConflictError(Exception):
-    """Raised when a CalDAV object changed before a conditional update."""
-
-    status_code = 412
-    error = "etag_conflict"
-
-    def __init__(self, message: str, current_etag: str | None = None):
-        super().__init__(message)
-        self.current_etag = current_etag
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return the stable structured error payload exposed to callers."""
-        return {
-            "error": self.error,
-            "status_code": self.status_code,
-            "message": str(self),
-            "current_etag": self.current_etag,
-        }
+CalendarEtagConflictError = PackageCalendarEtagConflictError
 
 
 class CalendarBulkLimitExceededError(ValueError):
@@ -112,20 +101,7 @@ def require_complete_bulk_match_set(events: list[dict[str, Any]]) -> None:
         )
 
 
-class CalendarEtagUnavailableError(Exception):
-    """Raised when an existing CalDAV object has no usable server ETag."""
-
-    status_code = 409
-    error = "etag_unavailable"
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return the stable structured error payload exposed to callers."""
-        return {
-            "error": self.error,
-            "status_code": self.status_code,
-            "message": str(self),
-            "current_etag": None,
-        }
+CalendarEtagUnavailableError = PackageCalendarEtagUnavailableError
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -801,9 +777,11 @@ class CalendarClient:
                 current_etag=str(response_etag) if response_etag else None,
             )
         if response.status not in (200, 201, 204):
-            raise caldav_error.PutError(
+            error = caldav_error.PutError(
                 f"CalDAV PUT for {kind} {uid} returned HTTP {response.status}"
             )
+            error.status = response.status
+            raise error
 
         new_etag = response.headers.get("etag")
         if new_etag:
@@ -1273,10 +1251,12 @@ class CalendarClient:
                 reason=getattr(response, "reason", "Calendar not found"),
             )
         if status >= 400:
-            raise caldav_error.DAVError(
+            error = caldav_error.DAVError(
                 url=str(calendar.url),
                 reason=getattr(response, "reason", f"HTTP {status}"),
             )
+            error.status = status
+            raise error
 
         # Parse response (same pattern as AsyncCalendar.search)
         objects = []
@@ -1291,7 +1271,7 @@ class CalendarClient:
                 object_class = AsyncEvent if component == "VEVENT" else AsyncTodo
                 obj = object_class(
                     client=calendar.client,
-                    url=calendar.url.join(encode_dav_url(href)),  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]  # url is always set for calendars
+                    url=calendar.url.join(encode_dav_url(href)),  # type: ignore[union-attr]  # ty: ignore[missing-union-attribute]  # url is always set for calendars
                     data=cal_data,
                     parent=calendar,
                     props={dav.GetEtag.tag: props.get(dav.GetEtag.tag)},

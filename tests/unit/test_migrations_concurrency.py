@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import closing
 
 import pytest
 
@@ -58,7 +59,7 @@ def test_concurrent_upgrades_do_not_corrupt_alembic_globals(tmp_path):
 
     # The schema is actually at head, not merely crash-free.
     assert get_current_revision(db_url) is not None
-    with sqlite3.connect(tmp_path / "tokens.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "tokens.db")) as conn:
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")

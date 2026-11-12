@@ -18,13 +18,15 @@ import importlib
 import json
 import logging
 import os
+import tempfile
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import anyio
 import click
@@ -34,6 +36,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from nextcloud_client import NextcloudClient
 from opentelemetry.instrumentation.httpx import (
     HTTPX2ClientInstrumentor,
     HTTPXClientInstrumentor,
@@ -104,7 +107,6 @@ from nextcloud_mcp_server.auth.userinfo_routes import (
     user_info_html,
     vector_sync_status_fragment,
 )
-from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.config import (
     Settings,
     get_document_processor_config,
@@ -117,7 +119,7 @@ from nextcloud_mcp_server.config_validators import (
 )
 from nextcloud_mcp_server.errors import NextcloudMCPServer
 from nextcloud_mcp_server.features import semantic_installed
-from nextcloud_mcp_server.http import nextcloud_httpx_client
+from nextcloud_mcp_server.http import nextcloud_client_from_env, nextcloud_httpx_client
 from nextcloud_mcp_server.models.auth import ALL_SUPPORTED_SCOPES
 from nextcloud_mcp_server.observability import (
     ObservabilityMiddleware,
@@ -632,6 +634,281 @@ async def _check_nextcloud_health() -> None:
     record_dependency_check("nextcloud", time.time() - start)
 
 
+_DAV_PROBE_DEADLINE_SECONDS = 4.0
+_DAV_PROPFIND_HEADERS = {
+    "Depth": "0",
+    "Content-Type": "application/xml; charset=utf-8",
+}
+
+
+def _dav_probe_result(status_code: int) -> tuple[bool, str]:
+    """Return a stable, secret-free DAV capability result."""
+    if status_code in (200, 207):
+        return True, "ok"
+    if status_code in (401, 403):
+        return False, "error: authorization"
+    if status_code == 404:
+        return False, "error: prerequisite_missing"
+    if status_code == 507:
+        return False, "error: insufficient_storage"
+    if status_code >= 500:
+        return False, "error: dependency_unavailable"
+    return False, f"error: status_{status_code}"
+
+
+def _dav_status_code(status: str | None) -> int | None:
+    """Extract an HTTP status code from a DAV status element."""
+    if not status:
+        return None
+    for field in status.split():
+        if len(field) == 3 and field.isdigit():
+            return int(field)
+    return None
+
+
+def _dav_property_href(content: bytes, property_name: str) -> str | None:
+    """Return a property href from a successful DAV propstat."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return None
+    for propstat in root.iter():
+        if propstat.tag.split("}")[-1] != "propstat":
+            continue
+        status = next(
+            (child.text for child in propstat if child.tag.split("}")[-1] == "status"),
+            None,
+        )
+        if _dav_status_code(status) != 200:
+            continue
+        for element in propstat.iter():
+            if element.tag.split("}")[-1] != property_name:
+                continue
+            for child in element.iter():
+                if child.tag.split("}")[-1] == "href" and child.text:
+                    return child.text.strip()
+    return None
+
+
+def _dav_multistatus_result(content: bytes) -> tuple[bool, str]:
+    """Require a successful resourcetype propstat in a 207 response."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return False, "error: invalid_multistatus"
+
+    failures: list[int] = []
+    for propstat in root.iter():
+        if propstat.tag.split("}")[-1] != "propstat":
+            continue
+        status = next(
+            (child.text for child in propstat if child.tag.split("}")[-1] == "status"),
+            None,
+        )
+        status_code = _dav_status_code(status)
+        has_resourcetype = any(
+            element.tag.split("}")[-1] == "resourcetype" for element in propstat.iter()
+        )
+        if status_code == 200 and has_resourcetype:
+            return True, "ok"
+        if status_code is not None and not 200 <= status_code < 300:
+            failures.append(status_code)
+
+    if failures:
+        return _dav_probe_result(failures[0])
+    return False, "error: invalid_multistatus"
+
+
+async def _dav_request(
+    client: httpx2.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    content: str,
+) -> httpx2.Response:
+    """Run one DAV request under a wall-clock deadline."""
+    with anyio.fail_after(_DAV_PROBE_DEADLINE_SECONDS):
+        return await client.request(
+            method,
+            url,
+            headers=_DAV_PROPFIND_HEADERS,
+            content=content,
+        )
+
+
+async def _discover_dav_probe_urls(
+    client: httpx2.AsyncClient, host: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Discover the authenticated Files principal and CalDAV home."""
+    principal_body = (
+        '<d:propfind xmlns:d="DAV:"><d:prop>'
+        "<d:current-user-principal/>"
+        "</d:prop></d:propfind>"
+    )
+    principal_response = await _dav_request(
+        client,
+        "PROPFIND",
+        f"{host.rstrip('/')}/remote.php/dav/",
+        content=principal_body,
+    )
+    healthy, detail = _dav_probe_result(principal_response.status_code)
+    if not healthy:
+        return {}, {
+            "nextcloud_files": detail,
+            "nextcloud_caldav": detail,
+        }
+    principal_href = _dav_property_href(
+        principal_response.content, "current-user-principal"
+    )
+    if not principal_href:
+        return {}, {
+            "nextcloud_files": "error: principal_discovery_failed",
+            "nextcloud_caldav": "error: principal_discovery_failed",
+        }
+
+    principal_id = unquote(principal_href.rstrip("/").split("/")[-1])
+    if not principal_id:
+        return {}, {
+            "nextcloud_files": "error: principal_discovery_failed",
+            "nextcloud_caldav": "error: principal_discovery_failed",
+        }
+
+    probes = {
+        "nextcloud_files": (
+            f"{host.rstrip('/')}/remote.php/dav/files/{quote(principal_id, safe='')}/"
+        )
+    }
+
+    calendar_body = (
+        '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><c:calendar-home-set/></d:prop></d:propfind>"
+    )
+    calendar_response = await _dav_request(
+        client,
+        "PROPFIND",
+        urljoin(f"{host.rstrip('/')}/", principal_href),
+        content=calendar_body,
+    )
+    healthy, detail = _dav_probe_result(calendar_response.status_code)
+    if not healthy:
+        return probes, {"nextcloud_caldav": detail}
+    calendar_href = _dav_property_href(calendar_response.content, "calendar-home-set")
+    if not calendar_href:
+        return probes, {"nextcloud_caldav": "error: calendar_home_discovery_failed"}
+
+    probes["nextcloud_caldav"] = urljoin(f"{host.rstrip('/')}/", calendar_href)
+    return probes, {}
+
+
+async def _check_nextcloud_dav_health() -> None:
+    """Probe the configured user's Files and Calendar DAV roots.
+
+    Basic-auth deployments have one concrete principal, so a depth-zero
+    PROPFIND can prove both capabilities without listing or mutating user data.
+    Multi-user/OAuth deployments have no single global principal and are
+    intentionally skipped. Results are observational and non-gating.
+    """
+    settings = get_settings()
+    host = settings.nextcloud_host
+    username = settings.nextcloud_username
+    password = settings.nextcloud_password
+    if not (host and username and password):
+        return
+
+    body = '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+    try:
+        with anyio.fail_after(_DAV_PROBE_DEADLINE_SECONDS):
+            async with nextcloud_httpx_client(
+                timeout=2.0, auth=(username, password)
+            ) as client:
+                probes, discovery_failures = await _discover_dav_probe_urls(
+                    client, host
+                )
+                for name, detail in discovery_failures.items():
+                    _readiness_cache.update(name, False, detail)
+                    set_dependency_health(name, False)
+
+                for name, url in probes.items():
+                    start = time.time()
+                    try:
+                        response = await _dav_request(
+                            client, "PROPFIND", url, content=body
+                        )
+                        if response.status_code == 207:
+                            healthy, detail = _dav_multistatus_result(response.content)
+                        else:
+                            healthy, detail = _dav_probe_result(response.status_code)
+                    except Exception:  # noqa: BLE001 - stable capability code only
+                        healthy, detail = False, "error: unreachable"
+                    _readiness_cache.update(name, healthy, detail)
+                    set_dependency_health(name, healthy)
+                    record_dependency_check(name, time.time() - start)
+    except Exception:  # noqa: BLE001 - discovery is observational and non-gating
+        for name in ("nextcloud_files", "nextcloud_caldav"):
+            _readiness_cache.update(name, False, "error: unreachable")
+            set_dependency_health(name, False)
+
+
+def _probe_local_ingest_storage(spool_dir: str | None) -> tuple[bool, str]:
+    """Create, flush, remove and directory-sync one non-business probe file."""
+    directory = spool_dir or tempfile.gettempdir()
+    name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".bridgette-ready-", dir=directory, delete=False
+        ) as probe:
+            name = probe.name
+            probe.write(b"ready")
+            probe.flush()
+            os.fsync(probe.fileno())
+        os.unlink(name)
+        name = None
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        return False, "error: storage_unavailable"
+    finally:
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+    return True, "ok"
+
+
+def _probe_semantic_imports() -> tuple[bool, str]:
+    """Import the configured ingest stack rather than trusting package metadata."""
+    try:
+        for module_name in ("qdrant_client", "fastembed", "huggingface_hub", "urllib3"):
+            importlib.import_module(module_name)
+    except Exception:  # noqa: BLE001 - readiness publishes only a stable code
+        return False, "error: dependency_unavailable"
+    return True, "ok"
+
+
+async def _check_local_ingest_health() -> None:
+    """Report local ingest storage and imports without gating the only replica."""
+    settings = get_settings()
+    start = time.time()
+    storage_healthy, storage_detail = await anyio.to_thread.run_sync(
+        _probe_local_ingest_storage, getattr(settings, "document_spool_dir", None)
+    )
+    _readiness_cache.update("local_ingest_storage", storage_healthy, storage_detail)
+    set_dependency_health("local_ingest_storage", storage_healthy)
+    record_dependency_check("local_ingest_storage", time.time() - start)
+
+    start = time.time()
+    imports_healthy, imports_detail = await anyio.to_thread.run_sync(
+        _probe_semantic_imports
+    )
+    _readiness_cache.update("semantic_imports", imports_healthy, imports_detail)
+    set_dependency_health("semantic_imports", imports_healthy)
+    record_dependency_check("semantic_imports", time.time() - start)
+
+
 async def _check_qdrant_health() -> None:
     """Probe Qdrant (network mode) and record the result in the readiness cache.
 
@@ -790,6 +1067,14 @@ async def _refresh_dependency_health() -> None:
     settings = get_settings()
     async with anyio.create_task_group() as tg:
         tg.start_soon(_check_nextcloud_health)
+        if (
+            getattr(settings, "nextcloud_host", None)
+            and getattr(settings, "nextcloud_username", None)
+            and getattr(settings, "nextcloud_password", None)
+        ):
+            tg.start_soon(_check_nextcloud_dav_health)
+        if settings.vector_sync_enabled:
+            tg.start_soon(_check_local_ingest_health)
         if settings.vector_sync_enabled and settings.qdrant_url:
             tg.start_soon(_check_qdrant_health)
         elif settings.vector_sync_enabled:
@@ -1121,7 +1406,7 @@ async def app_lifespan_basic(server: MCPServer) -> AsyncGenerator[AppContext]:
     client = None
     if not is_multi_user:
         logger.info("Creating shared Nextcloud client with BasicAuth")
-        client = NextcloudClient.from_env()
+        client = nextcloud_client_from_env()
         logger.info("Client initialization complete")
     else:
         logger.info(
@@ -2452,7 +2737,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 )
 
             # Create client for vector sync (server-level, not per-session)
-            client = NextcloudClient.from_env()
+            client = nextcloud_client_from_env()
 
             # Initialize Qdrant collection before starting background tasks
             logger.info("Initializing Qdrant collection...")

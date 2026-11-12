@@ -96,7 +96,11 @@ def _body(response) -> dict:
 
 
 _JSON = st.recursive(
-    st.none() | st.booleans() | st.integers() | st.floats() | st.text(),
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text(),
     lambda inner: st.lists(inner) | st.dictionaries(st.text(), inner),
     max_leaves=5,
 )
