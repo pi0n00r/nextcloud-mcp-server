@@ -2299,7 +2299,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
-    { name = "caldav", specifier = ">=3.0.1,<4.0" },
+    { name = "caldav", specifier = ">=3.7.0,<4.0" },
     { name = "httpx2", specifier = ">=2.5.0" },
     { name = "icalendar", specifier = ">=7.3.0,<7.4.0" },
     { name = "lxml", specifier = ">=5.0" },
@@ -2421,7 +2421,7 @@ requires-dist = [
     { name = "authlib", specifier = ">=1.6.5" },
     { name = "boto3", marker = "extra == 'semantic'", specifier = ">=1.35.0" },
     { name = "botocore", marker = "extra == 'semantic'", specifier = ">=1.35.0" },
-    { name = "caldav", specifier = ">=3.0.1,<4.0" },
+    { name = "caldav", specifier = ">=3.7.0,<4.0" },
     { name = "click", specifier = ">=8.1.8" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "dynaconf", specifier = ">=3.2.13,<4.0" },

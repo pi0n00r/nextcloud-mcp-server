@@ -182,6 +182,45 @@ availability = await nc_calendar_find_availability(
 #     "business_hours_only": true}
 ```
 
+## Creating a todo with a stable action identity
+
+`nc_calendar_create_todo` accepts an optional `creation_uid` UUID chosen by
+the caller. The caller owns the mapping from its source/action to this UUID,
+including adoption of a legacy Task; Bridgette does not derive it from a
+subject, description, mailbox UID, or another business rule. Reuse the same
+UUID for the same creation action.
+
+With this parameter, Bridgette passes the exact UID in the VTODO and uses
+CalDAV's `no_overwrite=True`. The supported dependency floor is caldav 3.7.0,
+which is already the locked version. On Nextcloud this uses `If-None-Match: *`,
+so concurrent callers cannot overwrite the first saved Task. A changed
+proposal with the same UID returns the existing content, rather than applying
+an update.
+
+Every resolved result includes `todo` containing the actual saved fields and
+their REPORT-coupled `etag`, plus the ordinary `uid`, `href`, and
+`status_code` metadata:
+
+| Outcome | Meaning | `proposed_content_applied` |
+| --- | --- | --- |
+| `created` | Guarded write acknowledged; exact UID, saved fields and ETag verified | `true` |
+| `reused` | Creation collision confirmed; existing Task read back | `false` |
+| `recovered` | Write reply uncertain, or saved content changed; exact Task read back | `false` |
+| `unresolved` | Authoritative saved Task or ETag could not be established | `false` |
+
+An unresolved result has `ok:false`, `repairable:true`, the same `uid`,
+a stable `error` code, and no proposed Task masquerading as saved content.
+Reconcile that UID with `nc_calendar_get_todo`; do not choose a different UUID
+to work around an uncertain result. This operation performs no write retry.
+
+A reused/recovered Task may differ from the new proposal. Inspect its actual
+content; this result does not claim that new wording or dates were applied.
+Any intentional change is a separate normal ETag-guarded update.
+
+Omitting `creation_uid` preserves ordinary random-UID creation and its
+existing metadata-only result. Dates, descriptions, categories, reminders,
+and omitted-field behavior are unchanged in both forms.
+
 ## Completing a todo
 
 `nc_calendar_complete_todo` exists because RFC 5545 treats `STATUS`,
@@ -291,3 +330,14 @@ Two bounds worth knowing: the backlog is searched over the last three years, so
 `pending_count` is a lower bound for a long-abandoned series; and if the
 recurrence cannot be resolved at all (no `DTSTART` to anchor the rule, or an
 unexpandable rule) every field above is omitted rather than guessed.
+
+
+### Native source/action ownership
+
+The optional `source_refs`, `action_ref` and `action_descriptor` fields expose
+the fleet native Task owner's identity contract on the ordinary creation tool.
+The OpenClaw before-tool hook verifies the source/action, consumes these fields,
+and dispatches the unchanged proposed Task content with `creation_uid`.
+Unconsumed owner metadata is rejected before DAV access, so it cannot appear to
+provide deduplication when no owner has resolved it. Ordinary callers that omit
+these optional fields retain the existing behavior.

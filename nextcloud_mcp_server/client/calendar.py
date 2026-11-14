@@ -45,6 +45,10 @@ from nextcloud_client.calendar import (
 from nextcloud_client.calendar import (
     CalendarEtagUnavailableError as PackageCalendarEtagUnavailableError,
 )
+from nextcloud_client.calendar_create import (
+    normalize_creation_uid,
+    save_todo_create_only,
+)
 
 from ..config import get_nextcloud_ssl_verify
 from .availability import (
@@ -1814,14 +1818,33 @@ class CalendarClient:
         raise caldav_error.NotFoundError(f"{todo_uid} not found on server")
 
     async def create_todo(
-        self, calendar_name: str, todo_data: dict[str, Any]
+        self,
+        calendar_name: str,
+        todo_data: dict[str, Any],
+        creation_uid: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new todo/task."""
+        """Create a todo; an owner-supplied UID enables create-or-reuse."""
+        todo_uid = (
+            normalize_creation_uid(creation_uid)
+            if creation_uid is not None
+            else str(uuid.uuid4())
+        )
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
-
-        todo_uid = str(uuid.uuid4())
         ical_content = self._create_ical_todo(todo_data, todo_uid)
+
+        if creation_uid is not None:
+            proposed_todo = self._parse_ical_todo(ical_content)
+            if proposed_todo is None:
+                raise ValueError("Could not construct the proposed todo")
+            return await save_todo_create_only(
+                calendar,
+                self.get_todo,
+                calendar_name,
+                todo_uid,
+                ical_content,
+                proposed_todo,
+            )
 
         # caldav v3's _async_put raises PutError on HTTP failure
         todo = await calendar.save_todo(ical=ical_content)  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
