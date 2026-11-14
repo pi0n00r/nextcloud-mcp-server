@@ -63,7 +63,7 @@ automation:
 |---|---|
 | **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
-| **Latest source release** | `v1.11.1` (application `0.211.1`): 91-commit upstream catch-up with fork readiness, byte-fidelity, and compatibility hardening retained |
+| **Latest source release** | `v1.12.0` (application `0.212.0`): owner-scoped conditional Task creation with authoritative create/reuse/recovery readback |
 | **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.11.1` (application `0.211.1`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
@@ -126,7 +126,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.11.1 --depth 1 \
+git clone --branch v1.12.0 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
