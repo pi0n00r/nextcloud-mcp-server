@@ -5,6 +5,20 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.212.0 (2026-11-13)
+
+### Feat
+
+- **tasks**: support an owner-supplied stable `creation_uid` with conditional
+  CalDAV creation, exact UID/ETag readback, and authoritative
+  created/reused/recovered outcomes
+- **tasks**: accept optional source and action identity metadata for native
+  owner-mediated ordinary Task creation
+
+### Documentation
+
+- record the cumulative ambiguous-retry erratum affecting releases through v1.11.1
+
 ## v0.211.1 (2026-11-11)
 
 ### Fix
