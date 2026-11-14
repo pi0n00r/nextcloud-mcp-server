@@ -41,11 +41,6 @@ from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[import-not-found]
 
-from nextcloud_client.calendar_create import (
-    normalize_creation_uid,
-    save_todo_create_only,
-)
-
 from .availability import (
     Span,
     busy_spans_from_events,
@@ -55,6 +50,10 @@ from .availability import (
     parse_time_ranges,
     slot_to_dict,
     to_aware,
+)
+from .calendar_create import (
+    normalize_creation_uid,
+    save_todo_create_only,
 )
 from .dav_errors import DavPreconditionFailed
 from .dav_urls import encode_dav_url
