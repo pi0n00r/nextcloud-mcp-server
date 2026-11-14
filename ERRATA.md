@@ -15,9 +15,11 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 ## Calendar Task creation can duplicate after an ambiguous retry
 
+Sorry bro, my bad.
+
 **Status:** Corrected on `master`. Bridgette `v1.12.0` (application
-`0.212.0`) is the first intended public release exposing the corrected
-caller contract; its package has not yet been published.
+`0.212.0`) is the first public release exposing the corrected caller
+contract and package.
 
 **Affected releases and packages:** every Bridgette release through and
 including `v1.11.1` that exposes `nc_calendar_create_todo`.
