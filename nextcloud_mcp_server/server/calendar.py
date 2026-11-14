@@ -1324,6 +1324,7 @@ def configure_calendar_tools(mcp: MCPServer):
         dtstart: str = "",
         categories: str = "",
         reminders: list[Reminder] | None = None,
+        creation_uid: str | None = None,
     ):
         """Create a new todo/task in a calendar.
 
@@ -1342,9 +1343,16 @@ def configure_calendar_tools(mcp: MCPServer):
             categories: Comma-separated categories (e.g., "work,urgent")
             reminders: Ordered list of alarms. See ``nc_calendar_create_event``
                 for the shape.
+            creation_uid: Optional owner-chosen UUID for this creation action.
+                The same UID creates once or returns the existing saved Task
+                without applying changed content. Keep it when a result is
+                unresolved. Never substitute a new UID to bypass recovery.
 
         Returns:
-            Dict with todo creation result
+            With creation_uid, the authoritative saved todo and ETag plus an
+            outcome (created, reused, recovered, unresolved). Only created
+            confirms proposed_content_applied. Unresolved is repairable with
+            the same identity. Omitting creation_uid retains ordinary creation.
         """
         client = await get_client(ctx)
 
@@ -1360,6 +1368,10 @@ def configure_calendar_tools(mcp: MCPServer):
         if reminders is not None:
             todo_data["reminders"] = _reminders_to_dicts(reminders)
 
+        if creation_uid is not None:
+            return await client.calendar.create_todo(
+                calendar_name, todo_data, creation_uid=creation_uid
+            )
         return await client.calendar.create_todo(calendar_name, todo_data)
 
     @mcp.tool(
