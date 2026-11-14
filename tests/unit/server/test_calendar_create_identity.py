@@ -84,3 +84,30 @@ async def test_ordinary_call_keeps_omitted_reminders_and_two_arguments(
             "categories": "",
         },
     )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"source_refs": [{"account": "home", "folder": "INBOX", "uid": "42"}]},
+        {"action_ref": "retained-owner-identity"},
+        {
+            "action_descriptor": {
+                "policy_ref": "Documents/policy.md#action",
+                "subject": {"kind": "source"},
+            }
+        },
+    ],
+)
+async def test_owner_metadata_is_optional_schema_and_not_silently_ignored(
+    todo_tool, mocker, metadata
+):
+    tool, client = todo_tool
+    for field in metadata:
+        assert field in tool.parameters["properties"]
+        assert field not in tool.parameters["required"]
+    with pytest.raises(ValueError, match="native Task owner"):
+        await tool.fn(
+            calendar_name="persona", summary="Task", ctx=mocker.MagicMock(), **metadata
+        )
+    client.calendar.create_todo.assert_not_called()

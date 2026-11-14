@@ -330,3 +330,14 @@ Two bounds worth knowing: the backlog is searched over the last three years, so
 `pending_count` is a lower bound for a long-abandoned series; and if the
 recurrence cannot be resolved at all (no `DTSTART` to anchor the rule, or an
 unexpandable rule) every field above is omitted rather than guessed.
+
+
+### Native source/action ownership
+
+The optional `source_refs`, `action_ref` and `action_descriptor` fields expose
+the fleet native Task owner's identity contract on the ordinary creation tool.
+The OpenClaw before-tool hook verifies the source/action, consumes these fields,
+and dispatches the unchanged proposed Task content with `creation_uid`.
+Unconsumed owner metadata is rejected before DAV access, so it cannot appear to
+provide deduplication when no owner has resolved it. Ordinary callers that omit
+these optional fields retain the existing behavior.

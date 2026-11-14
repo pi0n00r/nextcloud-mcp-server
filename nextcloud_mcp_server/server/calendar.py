@@ -1325,6 +1325,9 @@ def configure_calendar_tools(mcp: MCPServer):
         categories: str = "",
         reminders: list[Reminder] | None = None,
         creation_uid: str | None = None,
+        source_refs: list[dict[str, str]] | None = None,
+        action_ref: str | None = None,
+        action_descriptor: dict[str, Any] | None = None,
     ):
         """Create a new todo/task in a calendar.
 
@@ -1347,6 +1350,15 @@ def configure_calendar_tools(mcp: MCPServer):
                 The same UID creates once or returns the existing saved Task
                 without applying changed content. Keep it when a result is
                 unresolved. Never substitute a new UID to bypass recovery.
+            source_refs: Optional native-owner source identities. Each has
+                account, folder and uid from an actual source read. The owner
+                verifies them and consumes these fields before dispatch.
+            action_ref: Existing owner-returned source/action identity for reuse.
+            action_descriptor: Optional distinct action identity with policy_ref
+                pointing to the actual policy action and subject describing
+                source, source-set or a canonical entity reference. This selects
+                identity only, never generated Task content. The native owner
+                consumes it and supplies creation_uid.
 
         Returns:
             With creation_uid, the authoritative saved todo and ETag plus an
@@ -1354,6 +1366,12 @@ def configure_calendar_tools(mcp: MCPServer):
             confirms proposed_content_applied. Unresolved is repairable with
             the same identity. Omitting creation_uid retains ordinary creation.
         """
+        if any(
+            value is not None for value in (source_refs, action_ref, action_descriptor)
+        ):
+            raise ValueError(
+                "Source/action metadata must be resolved by the native Task owner"
+            )
         client = await get_client(ctx)
 
         todo_data = {
