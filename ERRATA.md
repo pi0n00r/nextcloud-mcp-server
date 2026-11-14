@@ -13,6 +13,44 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 
 # Errata
 
+## Calendar Task creation can duplicate after an ambiguous retry
+
+**Status:** Corrected on `master`. Bridgette `v1.12.0` (application
+`0.212.0`) is the first intended public release exposing the corrected
+caller contract; its package has not yet been published.
+
+**Affected releases and packages:** every Bridgette release through and
+including `v1.11.1` that exposes `nc_calendar_create_todo`.
+
+Affected builds generate a fresh iCalendar UID for every Task-create call. If
+a caller loses the response after Nextcloud has accepted the write, a retry
+creates a second independent Task instead of recovering the first result. The
+failure requires a retry after an ambiguous outcome, such as a transport
+timeout or lost acknowledgement. Existing Tasks are not modified, deleted, or
+merged by this defect.
+
+### Operator action
+
+Do not blindly retry an uncertain `nc_calendar_create_todo` result on an
+affected build. First inspect the target calendar for the intended Task and
+reconcile the original result. Upgrade to `v1.12.0` or later when its package
+is available, and have the owning caller provide one stable `creation_uid` for
+all attempts at the same logical Task creation.
+
+Calls that omit `creation_uid` intentionally retain ordinary create-new
+semantics and therefore remain unsuitable for blind retry after an unknown
+outcome.
+
+### Correction
+
+The corrected operation accepts an owner-supplied stable `creation_uid`, uses
+CalDAV conditional creation (`If-None-Match: *`), and verifies the authoritative
+Task by exact UID and ETag. It reports whether the Task was created, reused, or
+recovered after an uncertain result; collisions and unverifiable outcomes fail
+closed rather than overwriting or blindly retrying. Optional source and action
+identity fields let an owning agent derive the stable UID without changing the
+Task's user-visible content.
+
 ## Nextcloud Mail listings can omit newly arrived messages
 
 **Status:** Corrected in Bridgette `v1.10.2.3` (application `0.202.3`).
