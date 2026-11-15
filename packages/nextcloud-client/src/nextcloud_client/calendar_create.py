@@ -74,7 +74,9 @@ async def save_todo_create_only(
     """
     outcome = "created"
     try:
-        await calendar.save_todo(ical=ical_content, no_overwrite=True)
+        await calendar.save_todo(  # type: ignore[misc]  # ty: ignore[invalid-await]  # dual-mode
+            ical=ical_content, no_overwrite=True
+        )
     except Exception as exc:
         outcome = "reused" if _is_create_collision(exc) else "recovered"
 
