@@ -5,15 +5,20 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
-## v0.212.0 (2026-11-13)
+## v0.212.0 (2026-11-15)
 
 ### Feat
 
+- **db**: apply procrastinate 3.11's schema migration via Alembic
 - **tasks**: support an owner-supplied stable `creation_uid` with conditional
   CalDAV creation, exact UID/ETag readback, and authoritative
   created/reused/recovered outcomes
 - **tasks**: accept optional source and action identity metadata for native
   owner-mediated ordinary Task creation
+
+### Fix
+
+- **deps**: update dependency procrastinate to >=3.11,<3.12
 
 ### Documentation
 
