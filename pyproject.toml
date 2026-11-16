@@ -15,6 +15,7 @@ dependencies = [
     "nextcloud-client==0.212.0",
     "mcp[cli] (>=2.3,<2.4)",
     "httpx2>=2.5.0",
+    "jsonschema>=4.26.0,<5.0", # Personal live operation input validation
     # Imported directly at runtime. Each was previously reachable only because
     # some other dependency happened to pull it in — the accident that broke
     # #1285 when the resolver stopped doing so. Declared explicitly so the

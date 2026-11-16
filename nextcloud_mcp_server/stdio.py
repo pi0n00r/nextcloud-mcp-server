@@ -1,3 +1,13 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
 """Lightweight stdio transport for the Nextcloud MCP server.
 
 Provides a minimal MCPServer instance suitable for ``mcp.run(transport="stdio")``.
@@ -103,6 +113,13 @@ def get_stdio_mcp(enabled_apps: list[str] | None = None) -> MCPServer:
                 app_name,
                 list(AVAILABLE_APPS.keys()),
             )
+
+    if settings.bridgette_edition == "personal":
+        from nextcloud_mcp_server.personal_dynamic_api import (  # noqa: PLC0415
+            configure_personal_dynamic_tools,
+        )
+
+        configure_personal_dynamic_tools(mcp)
 
     # Mirrors app.py: the per-tool-call log line, the client-fleet metrics and
     # the delivery-outcome counter all hang off this wrapper, so the stdio

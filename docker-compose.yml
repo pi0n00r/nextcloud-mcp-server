@@ -205,6 +205,7 @@ services:
       - NEXTCLOUD_HOST=http://app:80
       - NEXTCLOUD_USERNAME=admin
       - NEXTCLOUD_PASSWORD=admin
+      - BRIDGETTE_EDITION=personal
       - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
 
       # Pin the token DB inside the mcp-data volume so the runtime default
@@ -318,6 +319,7 @@ services:
       - NEXTCLOUD_MCP_SERVER_URL=http://localhost:8003
       - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
       - MCP_DEPLOYMENT_MODE=multi_user_basic
+      - BRIDGETTE_EDITION=multi_user
       - ENABLE_BACKGROUND_OPERATIONS=true
 
       # Token storage (required for middleware initialization).
@@ -470,6 +472,7 @@ services:
       # Login Flow v2 (ADR-022) — the deployment mode is the single switch;
       # the browser-based app-password layer is derived automatically.
       - MCP_DEPLOYMENT_MODE=login_flow
+      - BRIDGETTE_EDITION=multi_user
 
       # The MCP server's own OIDC client. With LOGIN_FLOW_OIDC_CLIENT_ID/_SECRET
       # set (CI generates them) it is a STATIC client, created by

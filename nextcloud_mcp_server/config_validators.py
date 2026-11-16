@@ -248,6 +248,12 @@ def validate_configuration(settings: Settings) -> tuple[AuthMode, list[str]]:
 
     logger.debug("Validating configuration for mode: %s", mode.value)
 
+    if settings.bridgette_edition == "personal" and mode != AuthMode.SINGLE_USER_BASIC:
+        errors.append(
+            "[personal] BRIDGETTE_EDITION=personal requires "
+            "MCP_DEPLOYMENT_MODE=single_user_basic with one configured account"
+        )
+
     # Check required variables
     for var in requirements.required:
         value = getattr(settings, var, None)
