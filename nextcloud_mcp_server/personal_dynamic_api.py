@@ -18,6 +18,7 @@ import httpx2
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.config import Settings, get_settings
 from nextcloud_mcp_server.http import nextcloud_httpx_client
@@ -647,14 +648,18 @@ def configure_personal_dynamic_tools(
 
     @mcp.tool(
         name="nc_dynamic_discovery_status",
+        title="Check Dynamic API Discovery",
         description="Report or refresh the bounded live installed-app API catalogue.",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     async def nc_dynamic_discovery_status(refresh: bool = False) -> dict[str, Any]:
         return await bound.status(refresh=refresh)
 
     @mcp.tool(
         name="nc_dynamic_search_operations",
+        title="Search Dynamic API Operations",
         description="Search live operations and return the exact schema for nc_dynamic_call.",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     async def nc_dynamic_search_operations(
         query: str = "",
@@ -667,9 +672,15 @@ def configure_personal_dynamic_tools(
 
     @mcp.tool(
         name="nc_dynamic_call",
+        title="Call Dynamic API Operation",
         description=(
             "Execute one searched operation against the configured Personal account. "
             "Prefer curated nc_* tools. Stale catalogue use must be explicitly requested."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            idempotent_hint=False,
+            open_world_hint=True,
         ),
     )
     async def nc_dynamic_call(

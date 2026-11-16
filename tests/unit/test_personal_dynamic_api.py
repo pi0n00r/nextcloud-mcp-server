@@ -6,9 +6,13 @@ from typing import Any
 
 import httpx2
 import pytest
+from mcp.server.mcpserver import MCPServer
 
 from nextcloud_mcp_server.config import Settings
-from nextcloud_mcp_server.personal_dynamic_api import PersonalDynamicCatalogue
+from nextcloud_mcp_server.personal_dynamic_api import (
+    PersonalDynamicCatalogue,
+    configure_personal_dynamic_tools,
+)
 
 
 def _document() -> dict[str, Any]:
@@ -93,6 +97,24 @@ def _catalogue(handler) -> PersonalDynamicCatalogue:
         return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
 
     return PersonalDynamicCatalogue(settings, client_factory=factory)
+
+
+def test_dynamic_tools_expose_titles_and_safety_annotations():
+    mcp = MCPServer("personal-dynamic-test")
+    configure_personal_dynamic_tools(mcp, catalogue=_catalogue(lambda _: None))
+    tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
+
+    status = tools["nc_dynamic_discovery_status"]
+    search = tools["nc_dynamic_search_operations"]
+    call = tools["nc_dynamic_call"]
+
+    assert status.title and status.annotations is not None
+    assert search.title and search.annotations is not None
+    assert call.title and call.annotations is not None
+    assert status.annotations.read_only_hint is True
+    assert search.annotations.read_only_hint is True
+    assert call.annotations.read_only_hint is False
+    assert call.annotations.idempotent_hint is False
 
 
 @pytest.mark.anyio
