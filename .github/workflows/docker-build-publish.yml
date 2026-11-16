@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      checks: read
     steps:
       - name: Validate exact immutable tag
         env:
@@ -123,6 +124,31 @@ jobs:
           outputs: type=cacheonly
           secrets: |
             AI_NOTICE_PRIVATE_L1_FILE=${{ secrets.AI_NOTICE_PRIVATE_L1_FILE }}
+
+      # Publication is separate from pull-request CI. Resolve the exact
+      # immutable revision and require its named Personal gate before acquiring
+      # registry credentials or uploading any layer.
+      - name: Require successful Personal release gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          response=$(curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${PACKAGE_REVISION}/check-runs?check_name=Personal%20release%20gate&filter=latest")
+          if ! jq -e '
+            .total_count == 1 and
+            (.check_runs | length) == 1 and
+            .check_runs[0].name == "Personal release gate" and
+            .check_runs[0].head_sha == env.PACKAGE_REVISION and
+            .check_runs[0].status == "completed" and
+            .check_runs[0].conclusion == "success"
+          ' <<<"$response" >/dev/null; then
+            echo "Personal release gate is missing or not successful for $PACKAGE_REVISION." >&2
+            exit 1
+          fi
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0

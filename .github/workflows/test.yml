@@ -747,6 +747,8 @@ jobs:
       - package-smoke
       - container-publication-gate
       - integration-test
+      - docling-integration
+      - collabora-integration
     runs-on: ubuntu-latest
     steps:
       - name: Require maintained Personal checks
