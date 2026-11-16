@@ -1,8 +1,10 @@
 # Bridgette Personal and Multi-user
 
-Bridgette v2 is one maintained codebase with two runtime editions. The
-application package remains upstream-aligned at `0.212.0`; `v2.0.0` is the
-public fork release that introduces the edition boundary.
+Bridgette v2 is one codebase with two runtime editions. Personal is the
+maintained default product. Multi-user is a community-supported compatibility
+track for the historical authentication and tenancy paths while the project
+seeks a dedicated maintainer. The application package remains upstream-aligned
+at `0.212.0`; `v2.0.0` introduced the runtime edition boundary.
 
 ## Personal
 
@@ -37,6 +39,17 @@ OAuth/Login Flow, per-user credentials, scope filtering, provisioning and
 curated tool behavior remain unchanged. The Personal module is lazy-imported,
 so a Personal-only dependency or discovery failure cannot prevent Multi-user
 startup. Dynamic tools never appear in Multi-user `tools/list`.
+
+Multi-user compatibility checks continue to run on pull requests and report
+failures independently. They are non-blocking for the Personal release gate.
+This avoids presenting unowned authentication and tenancy failures as Personal
+release failures without pretending that Multi-user is fully maintained.
+
+Until a maintainer accepts ownership, Multi-user receives security and data-loss
+fixes when practical but has no regular feature or release commitment. The
+desired end state is a separately versioned extension behind a small stable
+interface to the shared Nextcloud/MCP core. See
+[Multi-user maintenance](multi-user-maintenance.md).
 
 ## Compatibility
 

@@ -3,6 +3,28 @@
 Thank you for your interest in contributing! This project is licensed under
 AGPL-3.0 and welcomes contributions from the community.
 
+## Edition ownership
+
+Personal is the maintained default edition. Its shared-core and Personal checks
+are release-blocking.
+
+Multi-user is a community-supported compatibility track. Its checks still run
+and failures must not be hidden, but they do not block Personal releases. New
+Multi-user work should remain isolated from Personal startup and tool discovery
+and should include focused tests for the affected authentication or tenancy
+path.
+
+The project is seeking a Multi-user maintainer. The role owns:
+
+- BasicAuth pass-through, Login Flow, OAuth/OIDC and per-user provisioning;
+- multi-user storage, migrations, scope enforcement and tenancy boundaries;
+- the Multi-user test matrix, issue triage and release notes; and
+- a gradual extraction into a separately versioned extension behind a stable
+  interface to the shared MCP/Nextcloud core.
+
+See [Multi-user maintenance](docs/multi-user-maintenance.md) for the boundary
+and the initial maintainer work plan.
+
 ## Contributor License Agreement (CLA)
 
 > **DRAFT — NOT YET IN EFFECT.** The CLA process described below is a planned

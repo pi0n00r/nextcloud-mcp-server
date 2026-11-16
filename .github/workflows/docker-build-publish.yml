@@ -151,7 +151,7 @@ jobs:
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Immutable v2.0.0 Personal/Multi-user package for nextcloud-mcp-server 0.212.0
+            org.opencontainers.image.description=Nextcloud MCP Server Personal Edition with community-supported Multi-user compatibility
 
       - name: Record immutable package digest
         run: |
