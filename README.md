@@ -63,13 +63,35 @@ automation:
 |---|---|
 | **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
-| **Latest source release** | `v1.12.1` (application `0.212.0`): upstream-aligned source with owner-scoped conditional Task creation and authoritative create/reuse/recovery readback |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v1.12.1` (application `0.212.0`) |
+| **Latest source release** | `v2.0.0` (application `0.212.0`): explicit Personal and Multi-user editions |
+| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.0` (application `0.212.0`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
 
 ## Quick Start
+
+## Bridgette editions
+
+The maintained fork ships one codebase and image with two explicit editions:
+
+| Edition | Configuration | Intended use |
+|---|---|---|
+| **Personal** | `BRIDGETTE_EDITION=personal` with `MCP_DEPLOYMENT_MODE=single_user_basic` | One trusted operator account. Keeps every curated tool and adds three compact live discovery/search/call tools for APIs published through Nextcloud `ocs_api_viewer`. |
+| **Multi-user** | `BRIDGETTE_EDITION=multi_user` | Preserves the historical curated tool surface, per-user credentials, OAuth/Login Flow, scope filtering and provisioning. This is the compatibility default. |
+
+Personal does not enumerate every discovered endpoint into `tools/list`. Agents
+search the bounded catalogue with `nc_dynamic_search_operations`, then invoke a
+validated operation with `nc_dynamic_call`. Discovery has app, operation,
+document, response and time ceilings. Only JSON and simple URL-encoded request
+bodies are exposed; unsupported operations are counted but not advertised.
+
+The `ocs_api_viewer` app must be enabled for live discovery. Its failure never
+removes curated tools. The last complete catalogue is retained as stale, but a
+call cannot use it unless the caller explicitly requests stale operation.
+Multi-user does not import or register the Personal bridge.
+
+See [Bridgette editions](docs/bridgette-editions.md) for the complete contract.
 
 ### 1. Create a Nextcloud app password
 
@@ -88,6 +110,7 @@ printf '%s\n' \
   'NEXTCLOUD_USERNAME=your_username' \
   'NEXTCLOUD_PASSWORD=your_app_password' \
   'MCP_DEPLOYMENT_MODE=single_user_basic' \
+  'BRIDGETTE_EDITION=personal' \
   > ~/.config/nextcloud-mcp/env
 
 chmod 600 ~/.config/nextcloud-mcp/env

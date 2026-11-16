@@ -104,6 +104,13 @@ def get_stdio_mcp(enabled_apps: list[str] | None = None) -> MCPServer:
                 list(AVAILABLE_APPS.keys()),
             )
 
+    if settings.bridgette_edition == "personal":
+        from nextcloud_mcp_server.personal_dynamic_api import (  # noqa: PLC0415
+            configure_personal_dynamic_tools,
+        )
+
+        configure_personal_dynamic_tools(mcp)
+
     # Mirrors app.py: the per-tool-call log line, the client-fleet metrics and
     # the delivery-outcome counter all hang off this wrapper, so the stdio
     # server is otherwise invisible.

@@ -54,6 +54,10 @@ GATEWAY_MODEL_NAMESPACES = frozenset(
 _DEFAULTS: dict[str, Any] = {
     # Deployment mode (ADR-021)
     "mcp_deployment_mode": None,
+    # Bridgette product edition. Multi-user is the compatibility default;
+    # Personal explicitly opts into bounded live installed-app API discovery.
+    "bridgette_edition": "multi_user",
+    "dynamic_api_timeout_seconds": 30.0,
     # Nextcloud core
     "nextcloud_host": None,
     "nextcloud_username": None,
@@ -1143,6 +1147,10 @@ class Settings:
     # (ADR-022: `oauth_single_audience` was renamed to `login_flow`.)
     deployment_mode: str | None = None
 
+    # Product edition. Personal is valid only for one trusted BasicAuth account.
+    bridgette_edition: str = "multi_user"
+    dynamic_api_timeout_seconds: float = 30.0
+
     # OAuth/OIDC settings
     oidc_discovery_url: str | None = None
     oidc_client_id: str | None = None
@@ -2023,6 +2031,16 @@ class Settings:
                 # pass-through it replaced needed unmerged Nextcloud
                 # user_oidc patches and is no longer supported.
                 resolved_mode = "login_flow"
+
+        edition = self.bridgette_edition.strip().lower().replace("-", "_")
+        if edition not in {"personal", "multi_user"}:
+            raise ValueError(
+                "Invalid BRIDGETTE_EDITION: "
+                f"{self.bridgette_edition!r}. Valid values: personal, multi_user."
+            )
+        self.bridgette_edition = edition
+        if not 1.0 <= self.dynamic_api_timeout_seconds <= 120.0:
+            raise ValueError("DYNAMIC_API_TIMEOUT_SECONDS must be between 1 and 120")
 
         self.enable_multi_user_basic_auth = resolved_mode == "multi_user_basic"
         self.enable_login_flow = resolved_mode == "login_flow"

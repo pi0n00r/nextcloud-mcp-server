@@ -2349,6 +2349,18 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 list(AVAILABLE_APPS.keys()),
             )
 
+    personal_catalogue = None
+    if settings.bridgette_edition == "personal":
+        # Keep Multi-user isolated from Personal-only imports and dependencies.
+        from nextcloud_mcp_server.personal_dynamic_api import (  # noqa: PLC0415
+            configure_personal_dynamic_tools,
+        )
+
+        logger.info("Configuring Bridgette Personal live API discovery tools")
+        personal_catalogue = configure_personal_dynamic_tools(mcp)
+    else:
+        logger.info("Bridgette Multi-user edition: live API discovery is disabled")
+
     # Register semantic search tools (cross-app feature)
     if settings.vector_sync_enabled:
         from nextcloud_mcp_server.server.semantic import (  # noqa: PLC0415
@@ -3181,6 +3193,16 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         checks: dict[str, object] = {}
         is_ready = True
         settings = get_settings()
+
+        checks["bridgette_edition"] = settings.bridgette_edition
+        if personal_catalogue is not None:
+            dynamic_state = personal_catalogue.state
+            checks["dynamic_api"] = {
+                "complete": dynamic_state.complete,
+                "stale": dynamic_state.stale,
+                "generation": dynamic_state.generation,
+                "last_successful_refresh": dynamic_state.last_successful_refresh,
+            }
 
         # --- Local, hard gates ------------------------------------------------
         if settings.nextcloud_host:
