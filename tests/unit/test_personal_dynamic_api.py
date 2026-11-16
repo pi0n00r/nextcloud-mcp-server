@@ -1,9 +1,20 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
 """Focused contract tests for Bridgette Personal live API discovery."""
 
 from __future__ import annotations
 
 from typing import Any
 
+import anyio
 import httpx2
 import pytest
 from mcp.server.mcpserver import MCPServer
@@ -135,6 +146,53 @@ async def test_complete_discovery_skips_unsupported_and_disambiguates_names():
 
 
 @pytest.mark.anyio
+async def test_malformed_operation_is_skipped_without_disabling_app():
+    document = _document()
+    document["paths"]["/ocs/v2.php/apps/demo/malformed"] = {
+        "get": {"operationId": "malformed", "parameters": None}
+    }
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("/apps"):
+            return httpx2.Response(200, json={"ocs": {"data": [{"id": "demo"}]}})
+        return httpx2.Response(200, json={"ocs": {"data": document}})
+
+    state = await _catalogue(handler).refresh()
+
+    assert state.complete is True
+    assert len(state.operations) == 2
+    assert state.apps[0]["unsupported_operation_count"] == 3
+
+
+@pytest.mark.anyio
+async def test_cancelled_first_refresh_is_retried(monkeypatch):
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("/apps"):
+            return httpx2.Response(200, json={"ocs": {"data": [{"id": "demo"}]}})
+        return httpx2.Response(200, json={"ocs": {"data": _document()}})
+
+    catalogue = _catalogue(handler)
+    original = catalogue._bounded_json
+    first = True
+
+    async def cancel_first(client, url):
+        nonlocal first
+        if first:
+            first = False
+            await anyio.sleep_forever()
+        return await original(client, url)
+
+    monkeypatch.setattr(catalogue, "_bounded_json", cancel_first)
+    with anyio.move_on_after(0.01) as scope:
+        await catalogue.ensure()
+    assert scope.cancel_called is True
+
+    state = await catalogue.ensure()
+    assert state.complete is True
+    assert state.generation == 1
+
+
+@pytest.mark.anyio
 async def test_schema_validation_precedes_request_and_preserves_query_arrays():
     seen: list[httpx2.Request] = []
 
@@ -163,6 +221,34 @@ async def test_schema_validation_precedes_request_and_preserves_query_arrays():
     assert result["ok"] is True
     assert seen[0].url.path.endswith("/items/7")
     assert seen[0].url.params.get_list("tag") == ["one", "two"]
+
+
+@pytest.mark.anyio
+async def test_dot_segments_are_rejected_before_path_resolution():
+    seen: list[httpx2.Request] = []
+    document = _document()
+    document["paths"]["/ocs/v2.php/apps/demo/items/{item_id}"]["get"]["parameters"][0][
+        "schema"
+    ] = {"type": "string"}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("/apps"):
+            return httpx2.Response(200, json={"ocs": {"data": [{"id": "demo"}]}})
+        if request.url.path.endswith("/apps/demo"):
+            return httpx2.Response(200, json={"ocs": {"data": document}})
+        seen.append(request)
+        return httpx2.Response(200, json={"ok": True})
+
+    catalogue = _catalogue(handler)
+    await catalogue.refresh()
+    get_name = next(
+        name for name, op in catalogue.state.operations.items() if op.method == "GET"
+    )
+
+    for value in (".", ".."):
+        with pytest.raises(ValueError, match="safely resolved"):
+            await catalogue.call(get_name, {"path": {"item_id": value}})
+    assert seen == []
 
 
 @pytest.mark.anyio

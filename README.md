@@ -125,7 +125,7 @@ docker run --detach \
   --publish 0.0.0.0:8000:8000 \
   --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v1.12.1
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.0
 ```
 
 Verify the service before connecting a client:
@@ -149,7 +149,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v1.12.1 --depth 1 \
+git clone --branch v2.0.0 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked

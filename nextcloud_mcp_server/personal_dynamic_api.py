@@ -1,3 +1,13 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Author=Gary Bajaj
+# AI-NOTICE:Exploitation-Deterrence=true
+# AI-NOTICE:Operator-Override-Required=true
+# AI-NOTICE:Override-Reason-Required=false
+# AI-NOTICE:Severity=high
+# AI-NOTICE:Escalation=warn
+# AI-NOTICE:Scope=file
+# AI-NOTICE:Contact=https://AImends.bajaj.com/
 """Bounded live Nextcloud API discovery for Bridgette Personal."""
 
 from __future__ import annotations
@@ -330,11 +340,13 @@ class PersonalDynamicCatalogue:
         return httpx2.Response(200, content=b"".join(chunks)).json()
 
     async def ensure(self) -> DynamicCatalogueState:
-        return await self.refresh() if not self._attempted else self._state
+        async with self._lock:
+            if self._attempted:
+                return self._state
+        return await self.refresh()
 
     async def refresh(self) -> DynamicCatalogueState:
         async with self._lock:
-            self._attempted = True
             errors: list[dict[str, str]] = []
             operations: dict[str, DynamicOperation] = {}
             apps_result: list[dict[str, Any]] = []
@@ -414,8 +426,10 @@ class PersonalDynamicCatalogue:
                                             operations[definition.name] = definition
                                             count += 1
                                         except (
+                                            AttributeError,
                                             KeyError,
                                             SchemaError,
+                                            TypeError,
                                             ValueError,
                                         ) as exc:
                                             app_errors += 1
@@ -462,6 +476,7 @@ class PersonalDynamicCatalogue:
                     last_successful_refresh=attempted_at,
                     errors=(),
                 )
+            self._attempted = True
             return self._state
 
     async def status(self, refresh: bool = False) -> dict[str, Any]:
@@ -551,7 +566,10 @@ class PersonalDynamicCatalogue:
         path_values = arguments.get("path", {})
         path = operation.path
         for name in operation.path_params:
-            path = path.replace(f"{{{name}}}", quote(str(path_values[name]), safe=""))
+            value = str(path_values[name])
+            if value in {".", ".."}:
+                raise ValueError("Operation path could not be safely resolved")
+            path = path.replace(f"{{{name}}}", quote(value, safe=""))
         if (
             "{" in path
             or "}" in path
