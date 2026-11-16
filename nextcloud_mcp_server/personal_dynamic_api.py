@@ -228,6 +228,7 @@ def _build_operation(
         if body_content_type is None:
             raise ValueError("unsupported request body encoding")
         if body_content_type == "application/x-www-form-urlencoded":
+            assert body_schema is not None
             if body_schema.get("type") != "object" or any(
                 not _simple_schema(value, allow_array=True)
                 for value in (body_schema.get("properties") or {}).values()
