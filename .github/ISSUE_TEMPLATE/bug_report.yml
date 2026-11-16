@@ -10,8 +10,11 @@ body:
 
         **Before submitting**, please check that:
         - You're running a recent version (`uvx nextcloud-mcp-server --version` or check the Docker tag).
-        - The issue isn't already reported in [open issues](https://github.com/cbcoutinho/nextcloud-mcp-server/issues).
-        - Security issues should **not** be filed here — use [private vulnerability reporting](https://github.com/cbcoutinho/nextcloud-mcp-server/security/advisories/new) or see [SECURITY.md](https://github.com/cbcoutinho/nextcloud-mcp-server/blob/master/SECURITY.md).
+        - The issue isn't already reported in [open issues](https://github.com/pi0n00r/nextcloud-mcp-server/issues).
+        - Security issues should **not** be filed here — use [private vulnerability reporting](https://github.com/pi0n00r/nextcloud-mcp-server/security/advisories/new) or see [SECURITY.md](https://github.com/pi0n00r/nextcloud-mcp-server/blob/master/SECURITY.md).
+
+        Multi-user is community-supported and seeking a maintainer. Reports are
+        welcome and will be routed separately from the Personal release gate.
 
   - type: textarea
     id: summary

@@ -6,8 +6,11 @@ body:
   - type: markdown
     attributes:
       value: |
-        For open-ended discussion, please consider [GitHub Discussions](https://github.com/cbcoutinho/nextcloud-mcp-server/discussions) instead.
+        For open-ended discussion, please consider [GitHub Discussions](https://github.com/pi0n00r/nextcloud-mcp-server/discussions) instead.
         Use this template for specific, answerable questions about configuration or behavior.
+
+        Multi-user is community-supported and seeking a maintainer. Questions
+        are welcome and will be routed separately from the Personal release gate.
 
   - type: textarea
     id: question

@@ -73,12 +73,18 @@ automation:
 
 ## Bridgette editions
 
-The maintained fork ships one codebase and image with two explicit editions:
+The fork ships one codebase and image with two explicit runtime editions. The
+support and release boundaries are intentionally different:
 
-| Edition | Configuration | Intended use |
-|---|---|---|
-| **Personal** | `BRIDGETTE_EDITION=personal` with `MCP_DEPLOYMENT_MODE=single_user_basic` | One trusted operator account. Keeps every curated tool and adds three compact live discovery/search/call tools for APIs published through Nextcloud `ocs_api_viewer`. |
-| **Multi-user** | `BRIDGETTE_EDITION=multi_user` | Preserves the historical curated tool surface, per-user credentials, OAuth/Login Flow, scope filtering and provisioning. This is the compatibility default. |
+| Edition | Configuration | Intended use | Support status |
+|---|---|---|---|
+| **Personal** | `BRIDGETTE_EDITION=personal` with `MCP_DEPLOYMENT_MODE=single_user_basic` | One trusted operator account. Keeps every curated tool and adds three compact live discovery/search/call tools for APIs published through Nextcloud `ocs_api_viewer`. | Maintained and release-blocking |
+| **Multi-user** | `BRIDGETTE_EDITION=multi_user` | Preserves the historical curated tool surface, per-user credentials, OAuth/Login Flow, scope filtering and provisioning. This remains the compatibility default. | Community-supported; maintainer wanted |
+
+Multi-user compatibility checks continue to run and report failures, but they
+do not block Personal releases. We are seeking a maintainer to own its
+authentication, tenancy, migrations, tests and independent release path. See
+[Multi-user maintenance](docs/multi-user-maintenance.md).
 
 Personal does not enumerate every discovered endpoint into `tools/list`. Agents
 search the bounded catalogue with `nc_dynamic_search_operations`, then invoke a
@@ -291,6 +297,9 @@ integrations are welcome.
 - [Submit a pull request](https://github.com/pi0n00r/nextcloud-mcp-server/pulls)
 - Target this repository's `master` branch and preserve the documented data
   integrity contracts
+- Multi-user contributions are especially welcome. The project is looking for
+  a maintainer to take ownership of that compatibility track and lead its
+  extraction into an independently released extension.
 
 This fork is built on the work of Chris Coutinho and the
 `nextcloud-mcp-server` contributor community. Thank you to everyone whose

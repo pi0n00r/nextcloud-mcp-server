@@ -158,6 +158,11 @@ jobs:
 
   integration-test:
     runs-on: ubuntu-latest
+    # Multi-user compatibility remains exercised and visible, but its unowned
+    # lanes do not block a Personal release. The single-user lane remains hard
+    # failure. A future Multi-user maintainer can promote these lanes into an
+    # independently required release gate.
+    continue-on-error: ${{ matrix.mode != 'single-user' }}
     needs: [linting]
     strategy:
       fail-fast: false
@@ -732,3 +737,26 @@ jobs:
             /tmp/nextcloud-app.log
           retention-days: 7
           if-no-files-found: ignore
+
+  personal-release-gate:
+    name: Personal release gate
+    if: always()
+    needs:
+      - linting
+      - unit-test
+      - package-smoke
+      - container-publication-gate
+      - integration-test
+      - docling-integration
+      - collabora-integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require maintained Personal checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          if jq -e 'to_entries | all(.value.result == "success")' <<<"$RESULTS" >/dev/null; then
+            exit 0
+          fi
+          jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<<"$RESULTS" >&2
+          exit 1
