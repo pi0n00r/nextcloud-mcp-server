@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import httpx2
 
-from .gateway import GatewayTokenProvider
+from .gateway import TokenProvider
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class RerankClient:
         self,
         url: str,
         model: str,
-        token_provider: GatewayTokenProvider | None = None,
+        token_provider: TokenProvider | None = None,
         *,
         api_key: str | None = None,
         timeout_seconds: float = _RERANK_REQUEST_TIMEOUT_SECONDS,
