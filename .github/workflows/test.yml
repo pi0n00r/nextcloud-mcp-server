@@ -509,6 +509,14 @@ jobs:
           KEY=$(openssl rand -base64 32 | tr '+/' '-_')
           echo "TOKEN_ENCRYPTION_KEY=${KEY}" >> "$GITHUB_ENV"
 
+      # Pull runtime dependencies separately and quietly. The compose action
+      # buffers pull progress in its thrown error, which can hide the actual
+      # registry failure for this large lane before any service starts.
+      - name: Pre-pull Docling lane runtime images
+        run: |
+          docker compose --profile single-user --profile docling \
+            pull --ignore-buildable --quiet
+
       - name: Run docker compose (single-user + docling)
         uses: hoverkraft-tech/compose-action@b659c744ee9bed25aea2307c017ad849bd104433 # v3.2.0
         with:
