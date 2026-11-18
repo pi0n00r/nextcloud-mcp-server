@@ -26,3 +26,7 @@
 !packages/nextcloud-client/src/**/*.py
 
 !scripts/check_publication_identity.py
+
+!docker/
+!docker/docling/
+!docker/docling/docling-serve-dual-stack.patch

@@ -25,6 +25,7 @@ import yaml
 pytestmark = pytest.mark.unit
 
 COMPOSE_FILE = Path(__file__).parents[2] / "docker-compose.yml"
+DOCKERIGNORE_FILE = Path(__file__).parents[2] / ".dockerignore"
 SHORT_PORT = re.compile(
     r"^(?P<host>\[[^]]+]|[^:]+):(?P<published>\d+):(?P<target>\d+)"
     r"(?:/(?P<protocol>tcp|udp))?$"
@@ -88,3 +89,13 @@ def test_docling_serve_uses_an_ipv6_dual_stack_listener() -> None:
         "--host",
         "::",
     ]
+
+
+def test_docling_dual_stack_patch_is_in_the_build_context() -> None:
+    """The deny-by-default build context must include Docling's source patch."""
+    rules = {
+        line.strip()
+        for line in DOCKERIGNORE_FILE.read_text(encoding="utf-8").splitlines()
+    }
+
+    assert "!docker/" in rules
