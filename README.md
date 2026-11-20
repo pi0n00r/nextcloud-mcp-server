@@ -97,6 +97,9 @@ removes curated tools. The last complete catalogue is retained as stale, but a
 call cannot use it unless the caller explicitly requests stale operation.
 Multi-user does not import or register the Personal bridge.
 
+The Personal edition's live-discovery approach was inspired by
+[Rello's dynamic Nextcloud MCP server](https://github.com/Rello/nextcloud-dynamic-mcp-server).
+
 See [Bridgette editions](docs/bridgette-editions.md) for the complete contract.
 
 ### 1. Create a Nextcloud app password
