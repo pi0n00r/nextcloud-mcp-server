@@ -17,14 +17,14 @@ on:
       tag:
         description: Exact immutable package tag to publish
         required: true
-        default: v1.12.0
+        default: v1.12.2
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  PACKAGE_TAG: v1.12.0
+  PACKAGE_TAG: v1.12.2
   PACKAGE_VERSION: 0.212.0
-  PACKAGE_REVISION: 9718ce298ef2a767a441fbd9df6018774b9d2cf3
+  PACKAGE_REVISION: 194a1b621b52d33c3dacd9ee05ac00559efd725a
 
 jobs:
   publish:
@@ -151,7 +151,7 @@ jobs:
             org.opencontainers.image.version=${{ env.PACKAGE_TAG }}
             org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
             org.opencontainers.image.title=nextcloud-mcp-server
-            org.opencontainers.image.description=Immutable v1.12.0 package for nextcloud-mcp-server 0.212.0
+            org.opencontainers.image.description=Bridgette v1.12.2 maintenance package for nextcloud-mcp-server 0.212.0
 
       - name: Record immutable package digest
         run: |
