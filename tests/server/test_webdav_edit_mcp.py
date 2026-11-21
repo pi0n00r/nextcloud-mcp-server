@@ -126,8 +126,10 @@ async def test_stale_if_match_leaves_the_file_unchanged(
     path = await text_file(b"version one\n")
     _, _, stale_etag = await nc_client.webdav.read_file(path)
     await nc_client.webdav.write_file(
-        path, b"version two\n", "text/markdown", if_match=stale_etag
+        path, b"version two changed\n", "text/markdown", if_match=stale_etag
     )
+    _, _, fresh_etag = await nc_client.webdav.read_file(path)
+    assert fresh_etag != stale_etag
 
     text = _error_text(
         await nc_mcp_client.call_tool(
@@ -141,7 +143,7 @@ async def test_stale_if_match_leaves_the_file_unchanged(
     )
 
     assert "changed since you read it" in text
-    assert await _content(nc_client, path) == b"version two\n"
+    assert await _content(nc_client, path) == b"version two changed\n"
 
 
 async def test_crlf_line_endings_survive_an_edit(nc_mcp_client, nc_client, text_file):

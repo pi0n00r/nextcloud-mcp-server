@@ -23,7 +23,7 @@ tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
-[![Container](https://img.shields.io/badge/GHCR-v2.0.1-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Container](https://img.shields.io/badge/GHCR-v2.0.2-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
 
@@ -63,8 +63,9 @@ automation:
 |---|---|
 | **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
-| **Latest source release** | `v2.0.1` (application `0.213.3`): explicit Personal and Multi-user editions |
-| **Stable package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.1` (application `0.213.3`) |
+| **Latest source release** | `v2.0.2` (application `0.213.4`): explicit Personal and Multi-user editions |
+| **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.2` (application `0.213.4`) |
+| **Stable line** | `v1.12.2` (application `0.212.0`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -134,7 +135,7 @@ docker run --detach \
   --publish 0.0.0.0:8000:8000 \
   --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.1
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v2.0.2
 ```
 
 Verify the service before connecting a client:
@@ -158,7 +159,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v2.0.1 --depth 1 \
+git clone --branch v2.0.2 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
