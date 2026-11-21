@@ -87,8 +87,8 @@ mail, or fetch message bodies.
 
 **BasicAuth is *not* affected.**
 
-**Status:** Corrected on `master` in application version `0.185.1`. A
-corrected container package has not yet been published.
+**Status:** Corrected in application version `0.185.1`; the correction is
+included in Bridgette `v2.0.2`.
 
 **Affected releases and packages:** builds containing application version
 `0.185.0` or earlier when configured for OAuth with Nextcloud Login Flow v2.
@@ -117,17 +117,15 @@ is revoked.
 
 ## WebDAV SEARCH with an empty predicate
 
-**Status:** Corrected on `master`. A corrected release and container package
-have not yet been published.
+**Status:** Corrected in later releases, including Bridgette `v2.0.2`.
 
 **Affected releases:** `v1.0-release`, `v1.1-release`,
 `v1.1.7-experimental`, `v1.1.8`, `v1.2.6`, `v1.3.0`, `v1.3.1`,
 `v1.4.0`, `v1.4.4`, `v1.5.0`, `v1.5.1.1`, and `v1.6.2`.
 
-**Affected packages:** every `ghcr.io/pi0n00r/nextcloud-mcp-server` image
-built from an affected release above, including the current stable package.
+**Affected packages:** images built from the affected releases above.
 Changing only the container tag does not avoid the defect unless that tag
-points to a later release that explicitly marks this erratum resolved.
+points to a later corrected release.
 
 `nc_webdav_search_files` documents `scope` and `name_pattern`. In affected
 builds, MCP clients may send intuitive but unsupported aliases such as `path`
@@ -157,6 +155,5 @@ Do not use `path` or `query` with affected builds. Avoid an unfiltered
 The corrected source accepts `path` and `query` as compatibility aliases,
 rejects conflicting canonical and alias values, and generates a valid
 match-all predicate when no filter is supplied. Regression coverage includes
-the exact alias call shape and direct unfiltered SEARCH construction. Continue
-using the workaround above until a release and package explicitly mark this
-erratum resolved.
+the exact alias call shape and direct unfiltered SEARCH construction. Use the
+workaround above only on affected builds.
