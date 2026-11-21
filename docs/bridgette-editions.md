@@ -4,7 +4,7 @@ Bridgette v2 is one codebase with two runtime editions. Personal is the
 maintained default product. Multi-user is a community-supported compatibility
 track for the historical authentication and tenancy paths while the project
 seeks a dedicated maintainer. The application package remains upstream-aligned
-at `0.213.3`; `v2.0.0` introduced the runtime edition boundary.
+at `0.213.4`; `v2.0.0` introduced the runtime edition boundary.
 
 ## Personal
 
