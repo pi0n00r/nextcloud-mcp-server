@@ -242,6 +242,15 @@ _DEFAULTS: dict[str, Any] = {
     # the model's full width). Provider-agnostic: only one provider is active
     # at a time, so a single knob covers openai/ollama/gateway.
     "embedding_dimensions": None,
+    # Image embeddings (ADR-042). Provider-agnostic: the image model is served
+    # by the same provider as text. Unset model = image embeddings off.
+    "image_embedding_model": None,
+    "image_embedding_dimensions": None,
+    # Image files larger than this are skipped, not embedded (ADR-042 §5).
+    "image_embedding_max_source_bytes": 50 * 1024 * 1024,
+    # Score floor for the image prefetch (ADR-042 §6). Required: no validated
+    # per-model defaults ship yet, and without a floor image search stays off.
+    "image_search_score_threshold": None,
     # Simple (fallback) embedding dimension
     "simple_embedding_dimension": 384,
     # Document chunking
@@ -455,6 +464,10 @@ _DEFAULTS: dict[str, Any] = {
     # Seconds between batch-job polls (the procrastinate re-enqueue delay). Each
     # poll re-runs the tier; keep it well above a few seconds.
     "document_ocr_batch_poll_seconds": 120,
+    # OCR standalone PNG/JPEG/WebP images (screenshots, photos of documents) as
+    # well as scanned PDFs (#1882). Opt-in: every image becomes a paid/GPU OCR
+    # call. No effect unless DOCUMENT_OCR_ENABLED is also set.
+    "document_ocr_images": False,
     # Observability
     "metrics_enabled": True,
     "metrics_port": 9090,
@@ -813,6 +826,24 @@ _dynaconf = Dynaconf(
             "EMBEDDING_DIMENSIONS",
             condition=lambda v: v is None or v >= 1,
             messages={"condition": "EMBEDDING_DIMENSIONS must be >= 1 when set"},
+        ),
+        Validator(
+            "IMAGE_EMBEDDING_DIMENSIONS",
+            condition=lambda v: v is None or v >= 1,
+            messages={"condition": "IMAGE_EMBEDDING_DIMENSIONS must be >= 1 when set"},
+        ),
+        Validator(
+            "IMAGE_EMBEDDING_MAX_SOURCE_BYTES",
+            condition=lambda v: v >= 1,
+            messages={"condition": "IMAGE_EMBEDDING_MAX_SOURCE_BYTES must be >= 1"},
+        ),
+        # Cosine similarity, so a floor outside [-1, 1] is a typo, not a choice.
+        Validator(
+            "IMAGE_SEARCH_SCORE_THRESHOLD",
+            condition=lambda v: v is None or -1 <= v <= 1,
+            messages={
+                "condition": "IMAGE_SEARCH_SCORE_THRESHOLD must be within [-1, 1]"
+            },
         ),
         Validator("SEARCH_RERANK_POOL_SIZE", gte=1),
         Validator("SEARCH_RERANK_MAX_CONCURRENCY", gte=1),
@@ -1367,8 +1398,16 @@ class Settings:
             from nextcloud_mcp_server.document_processors import (  # noqa: PLC0415
                 get_registry,
             )
+            from nextcloud_mcp_server.vector.image_ingest import (  # noqa: PLC0415
+                image_mime_types,
+            )
 
-            return tuple(sorted(get_registry().supported_mime_types()))
+            # Plus the image types the image model embeds (ADR-042 §5), so a
+            # tagged image is found even when no text processor reads it. An
+            # explicit list (below) is taken as given.
+            return tuple(
+                sorted(get_registry().supported_mime_types() | image_mime_types())
+            )
         return tuple(split_csv(self.vector_sync_indexable_mime_types))
 
     # Mail tag (an IMAP keyword) restricting which messages are indexed — the
@@ -1438,6 +1477,13 @@ class Settings:
     # models — nothing upstream validates this (Ollama happily truncates a
     # non-MRL model, with silent recall loss), so it is the operator's call.
     embedding_dimensions: int | None = None
+
+    # Image embeddings (ADR-042 §7). The model id is resolved on the active
+    # provider and only enabled once that provider confirms it takes images.
+    image_embedding_model: str | None = None
+    image_embedding_dimensions: int | None = None
+    image_embedding_max_source_bytes: int = 50 * 1024 * 1024
+    image_search_score_threshold: float | None = None
 
     # Simple (fallback) provider — dimension when no real provider configured
     simple_embedding_dimension: int = 384
@@ -1620,6 +1666,9 @@ class Settings:
     # polled indefinitely — the gateway owns the OCR lifecycle (Deck #523), so
     # there is no worker-side give-up deadline.
     document_ocr_batch_poll_seconds: int = 120
+    # Also OCR standalone PNG/JPEG/WebP images (#1882). Requires
+    # document_ocr_enabled; opt-in because each image is a paid/GPU OCR call.
+    document_ocr_images: bool = False
     # OCR escalation triggers (tier-0), per-tenant tunable. A page is OCR-worthy
     # if near-empty (< min_page_chars) OR low text-quality (< min_text_quality)
     # OR (when detect_scanned, image-analysis only runs when OCR is enabled)
@@ -1771,6 +1820,23 @@ class Settings:
                 "is disabled; page-packing only runs inside page-aware chunking, so "
                 "this setting has no effect. Enable DOCUMENT_CHUNK_PAGE_AWARE to "
                 "activate packing."
+            )
+
+        if self.document_ocr_images and not self.document_ocr_enabled:
+            logger.warning(
+                "DOCUMENT_OCR_IMAGES is enabled but DOCUMENT_OCR_ENABLED is "
+                "disabled; standalone images are only OCR'd when OCR is enabled, "
+                "so this setting has no effect."
+            )
+
+        # Surface the keep-alive opt-out at startup so an operator who set it to
+        # work around #965 gets confirmation it took effect.
+        if not self.nextcloud_http_keepalive:
+            logger.info(
+                "NEXTCLOUD_HTTP_KEEPALIVE is disabled. The Nextcloud HTTP client "
+                "will open a fresh connection per request (no pooled keep-alive "
+                "reuse) — a TLS handshake per call in exchange for immunity to "
+                "poisoned/desynced pooled connections (#965)."
             )
 
         # Postgres backend TLS is configured entirely in DATABASE_URL (e.g.
@@ -2128,6 +2194,14 @@ class Settings:
         if self.embedding_dimensions is None:
             return model
         return f"{model}-{self.embedding_dimensions}"
+
+    def get_image_embedding_identity(self) -> str:
+        """``image_embedding_identity``: the image model, widened like the text
+        identity, so a width change re-embeds like a model change (ADR-042 §3)."""
+        model = self.image_embedding_model or ""
+        if self.image_embedding_dimensions is None:
+            return model
+        return f"{model}-{self.image_embedding_dimensions}"
 
     def get_embedding_provider_family(self) -> str:
         """

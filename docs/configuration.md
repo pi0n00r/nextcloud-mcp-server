@@ -973,6 +973,31 @@ DOCUMENT_OCR_MODEL=mistral/mistral-ocr-latest  # provider-namespaced model id
   (Ignored by the `docling` backend, which uses the docling-serve instance's own
   OCR engine.)
 
+#### OCR for standalone images — `DOCUMENT_OCR_IMAGES`
+
+```dotenv
+DOCUMENT_OCR_IMAGES=true               # also OCR PNG/JPEG/WebP files (default: false)
+```
+
+With `DOCUMENT_OCR_ENABLED=true`, setting `DOCUMENT_OCR_IMAGES=true` makes the OCR
+tier also read standalone `image/png`, `image/jpeg` and `image/webp` files
+(screenshots, photos of documents) through the configured OCR backend, so a
+tagged image is indexed as text like a scanned PDF (#1882). It does nothing while
+`DOCUMENT_OCR_ENABLED` is off (a startup warning says so).
+
+- **Cost:** every tagged image becomes one OCR call — billed per page by Mistral, or
+  GPU time for surya. It is off by default for that reason; narrow
+  `VECTOR_SYNC_INDEXABLE_MIME_TYPES` if only some folders should pay for it.
+- **Priority:** OCR is the lowest-priority processor, so an image processor that
+  is already configured (the images-only Docling processor, Tesseract, …) keeps
+  handling images. The flag only covers images nothing else reads.
+- **Per-tier deployments** (Postgres ingest queue): an image skips the
+  `fast`/`structured` tiers and hops straight to the `ingest-ocr` queue (escalation
+  reason `image`), so it runs where the GPU scales and where `DOCUMENT_OCR_MODE=batch`
+  can defer its poll. The in-process pipeline OCRs it inline.
+- Images carry no PDF text layer, so no highlight bounding boxes are stored for
+  them; search results still cite the text.
+
 #### Docling (docling-serve) — photographed / scanned / handwritten text
 
 [docling](https://github.com/docling-project/docling) has notably stronger OCR
@@ -1338,6 +1363,90 @@ Behaviour worth knowing:
   (~98–99% at 512-of-1536) are measured on far smaller corpora than a
   production index; measure recall on your own data before narrowing.
 
+#### Image Embeddings (`IMAGE_EMBEDDING_MODEL`) — in progress
+
+> **Indexed, not yet searchable.** Tagged images are embedded at ingest
+> ([ADR-042](ADR-042-image-embeddings.md) §5), but search does not query the
+> `image` vector until the query step ships in a later release.
+>
+> **`IMAGE_SEARCH_SCORE_THRESHOLD` is required.** No validated per-model score
+> floors ship yet. Without a floor the feature stays off and startup logs a
+> warning saying so; that is expected, not a broken setup.
+
+Image embeddings place images and text queries in one joint vector space, so a
+text query can find a photo that contains no words. The image model is served
+by **the same provider as text embeddings**, so the settings name no vendor:
+
+```bash
+IMAGE_EMBEDDING_MODEL=cohere.embed-v4:0   # model id on the active provider
+IMAGE_EMBEDDING_DIMENSIONS=1024           # optional; must be a width the model supports
+IMAGE_SEARCH_SCORE_THRESHOLD=0.3          # required; cosine floor for image hits
+IMAGE_EMBEDDING_MAX_SOURCE_BYTES=52428800 # optional; larger files are skipped (default 50 MB)
+```
+
+The feature is enabled only once the provider **confirms** that the model
+takes images, never from configuration alone. At startup the server decides,
+once, whether the collection is ready for images, and logs every reason it is
+not in a single line:
+
+- the provider did not confirm the model (error);
+- `IMAGE_SEARCH_SCORE_THRESHOLD` is not set (warning);
+- the `image` vector could not be added, e.g. on a Qdrant server older than
+  **1.18** (error; text search is unaffected, restart to retry);
+- the collection's `image` vector has a different size than the model
+  produces (error).
+
+**What gets embedded.** Images in a `vector-index`-tagged folder whose type the
+model accepts (and the worker can decode for downscaling) are discovered even
+when no text processor reads them. `keyword-index` files are never embedded:
+that tag opts out of paid embeddings. Each image is downscaled to the model's
+pixel and byte limits, and an animated GIF/WebP is embedded from its first
+frame. When `VECTOR_SYNC_INDEXABLE_MIME_TYPES` is set explicitly, list the image
+types there too; an explicit list is taken as given. HEIC/HEIF is not supported.
+
+**Skips and retries.** A file over `IMAGE_EMBEDDING_MAX_SOURCE_BYTES`, or one the
+model rejects as unusable (corrupt, unsupported encoding), is skipped and not
+retried until its content or the image model changes. If text was extracted
+from it (e.g. by OCR), the text is still indexed. Any other failure, such as a
+timeout or an unavailable provider, retries the whole document: its text and
+image are written together or not at all.
+
+**Cost.** Turning the feature on, or switching the image model, re-queues every
+tagged hybrid image once, one paid embedding call per image. Tag a small folder
+first to see the volume: `nc_get_vector_sync_status` and
+`GET /api/v1/vector-sync/status` report `image_pending` (queued, not yet
+paid for), `image_embedded` and `image_skipped`. A file whose only point is its
+image counts in `indexed_documents`.
+
+**Search.** `hybrid` search (the default) adds an image prefetch that embeds the
+query into the image model's space, one extra embedding call per search, run
+alongside the text one. Images scoring below `IMAGE_SEARCH_SCORE_THRESHOLD` are
+dropped before fusion, so a query no image matches returns text only. Image
+results carry `match: "image"` (`metadata.match` on the REST routes) and no
+excerpt, so `rerank` leaves them in retrieval order after the scored rows.
+`semantic`, `bm25`, `exact` and `fusion="dbsf"` stay text-only.
+`GET /api/v1/status` reports `image_search: true` when this is active.
+
+**Tuning the floor.** A floor set too high hides every image without an error.
+Compare `mcp_image_search_hits_total` (image results returned, by model) with
+`mcp_vector_sync_image_points` (images indexed): hits flat at zero across many
+queries while images are indexed means the floor is too high. A hit counts only
+when the image makes the returned page, so a low `limit` lowers it too.
+
+Existing collections gain the `image` vector in place; notes and files are not
+re-indexed. To switch to a model of a different width, delete the vector with
+Qdrant's `delete_vector_name(<collection>, "image")` and restart.
+
+| Provider | Image models |
+|---|---|
+| Amazon Bedrock | `amazon.titan-embed-image-v1` (PNG/JPEG; 256/384/1024) and `cohere.embed-v4:0` (PNG/JPEG/WebP/GIF; 256/512/1024/1536), optionally behind a cross-region inference profile such as `eu.cohere.embed-v4:0` |
+| Embedding gateway (`EMBEDDING_PROVIDER=gateway`) | Any model the gateway advertises with `"image"` in `input_modalities` on `GET /v1/models` (e.g. `bedrock/amazon.titan-embed-image-v1`). Accepted MIME types, width and MRL widths come from that advertisement. If the catalogue is unreachable, the feature stays off. |
+| OpenAI-compatible, Mistral, Ollama | Not supported; a configured model logs a warning and stays off |
+
+**Data egress:** once indexing is wired, image bytes are sent to the
+configured embedding upstream. Images leave the deployment unless that
+provider is self-hosted.
+
 ### Document Chunking Configuration
 
 The server chunks documents before embedding to handle documents larger than the embedding model's context window. Chunk size and overlap can be tuned based on your embedding model and content type.
@@ -1505,6 +1614,10 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `BEDROCK_EMBEDDING_MODEL` | ⚠️ Optional | - | Bedrock embedding model ID |
 | `BEDROCK_GENERATION_MODEL` | ⚠️ Optional | - | Bedrock generation model ID |
 | `SIMPLE_EMBEDDING_DIMENSION` | ⚠️ Optional | `384` | Dimension for the fallback Simple provider |
+| `IMAGE_EMBEDDING_MODEL` | ⚠️ Optional | - | Image embedding model id on the active provider (ADR-042). Unset = image embeddings off. Enabled only once the provider confirms the model takes images. See *Image Embeddings* above. |
+| `IMAGE_EMBEDDING_DIMENSIONS` | ⚠️ Optional | - | Output width for the image model, if it supports truncation. Must be one of the model's supported widths, or the feature stays off. |
+| `IMAGE_SEARCH_SCORE_THRESHOLD` | ⚠️ Optional | - | Cosine score floor for image hits, within [-1, 1]. Required for image embeddings to turn on (no default floors ship yet). |
+| `IMAGE_EMBEDDING_MAX_SOURCE_BYTES` | ⚠️ Optional | `52428800` | Image files larger than this many bytes are skipped, not embedded (ADR-042 §5). |
 | `EMBEDDING_DIMENSIONS` | ⚠️ Optional | - | Matryoshka output width requested from the active embedding provider (OpenAI/Ollama/gateway). Unset = the model's full width. Only valid for MRL-trained models — nothing upstream validates this, and truncating a non-MRL model silently degrades recall. The width joins the collection name and embedding identity, so changing it forces a new collection and a re-embed; an endpoint that ignores the parameter fails at startup rather than indexing at the wrong width. See *Matryoshka Truncation* above. |
 | `DOCUMENT_CHUNK_SIZE` | ⚠️ Optional | `2048` | Characters per chunk for document embedding |
 | `DOCUMENT_CHUNK_OVERLAP` | ⚠️ Optional | `200` | Overlapping characters between chunks (must be < chunk size) |
