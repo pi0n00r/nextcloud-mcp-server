@@ -3,7 +3,7 @@ services:
   # https://hub.docker.com/_/mariadb
   db:
     # Note: Check the recommend version here: https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html#server
-    image: docker.io/library/mariadb:12.3.3-noble@sha256:4ebbcf100a3ba320766dfa0e1af008df12261301db6ef72798c7650f70794aed
+    image: docker.io/library/mariadb:12.3.3-noble@sha256:4aaf88b3106382c8c18e49f0cec60267be618fc22f858c4503afb2a2555afed3
     restart: always
     command: --transaction-isolation=READ-COMMITTED
     volumes:
@@ -124,7 +124,7 @@ services:
   # the MCP server reaches it on the compose network. The image ships no shell,
   # so there is no container healthcheck; poll /hosting/capabilities instead.
   collabora:
-    image: docker.io/collabora/code:26.04.6.1.1@sha256:95f29f1c0a1778999125f53f058d968fe0afb37c95e32ebfb9f3444140faebd2
+    image: docker.io/collabora/code:26.04.6.2.1@sha256:a2f5d4e88addd46033d8440f7a13b82f7e6fe444bf8c6b5a3eadc789f0b5342b
     restart: always
     ports:
       - "127.0.0.1:9980:9980"
@@ -229,6 +229,13 @@ services:
       # sync-wait budget.
       - VECTOR_SYNC_SCAN_INTERVAL=30
       - VECTOR_SYNC_PROCESSOR_WORKERS=2
+      # Image embeddings (ADR-042) on the Simple provider's test-only model, so
+      # the integration lane exercises image ingest, status and search end to
+      # end. Its vectors are content hashes with no meaning, so the floor admits
+      # every hit: tests assert the plumbing, not relevance. Never copy these
+      # two into a real deployment.
+      - IMAGE_EMBEDDING_MODEL=simple-image-hash
+      - IMAGE_SEARCH_SCORE_THRESHOLD=-1
       # Required to enable the /webhooks/nextcloud receiver (GHSA-8vh3-g2qg-2h2c).
       # Without it the route is not mounted and vector sync relies on polling.
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
@@ -548,7 +555,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    image: docker.io/library/postgres:19-alpine@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp

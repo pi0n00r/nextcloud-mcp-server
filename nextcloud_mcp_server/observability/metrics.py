@@ -305,6 +305,25 @@ vector_sync_dead_lettered_documents = Gauge(
     "Documents parked as permanently-failed (dead-letter tombstones in Qdrant)",
 )
 
+# ADR-042 §6: a score floor that is too high silently removes every image from
+# every result. These separate "floor too high" (image points indexed, hits flat
+# at zero) from "no images indexed" (both zero). Labelled by image model only,
+# never per query or per user.
+vector_sync_image_points = Gauge(
+    "mcp_vector_sync_image_points",
+    "Files with an image embedding in the vector store (ADR-042)",
+)
+image_search_queries_total = Counter(
+    "mcp_image_search_queries_total",
+    "Hybrid search calls that ran the image prefetch, one per doc_type searched",
+    ["model"],
+)
+image_search_hits_total = Counter(
+    "mcp_image_search_hits_total",
+    "Image results returned (cleared the floor and made the cut), summed",
+    ["model"],
+)
+
 # Dense-vector RAM footprint of the collection — the real cost driver for hybrid
 # search (billing is on source bytes, not vector RAM). Two views published by the
 # periodic vector_sync metrics task so operators can watch the "density risk"
@@ -452,7 +471,7 @@ document_parse_mode_total = Counter(
 document_escalation_total = Counter(
     "bridgette_document_escalation_total",
     "Total document parse escalations between tiers",
-    # reason: low_confidence | empty_text | corrupt_glyphs | unsupported | error | forced
+    # reason: low_confidence | empty_text | corrupt_glyphs | image | unsupported | error | forced
     ["from_tier", "to_tier", "reason"],
 )
 
@@ -1659,6 +1678,17 @@ def update_vector_sync_dead_lettered_documents(count: int) -> None:
     vector_sync_dead_lettered_documents.set(count)
 
 
+def update_vector_sync_image_points(count: int) -> None:
+    """Set the indexed-image-points gauge."""
+    vector_sync_image_points.set(count)
+
+
+def record_image_search(model: str, hits: int) -> None:
+    """Count one image-prefetch search and the image results it returned."""
+    image_search_queries_total.labels(model=model).inc()
+    image_search_hits_total.labels(model=model).inc(hits)
+
+
 def update_vector_sync_estimated_vector_bytes(byte_estimate: float) -> None:
     """Set the deterministic dense-vector RAM-footprint gauge (from hybrid chunks)."""
     vector_sync_estimated_vector_bytes.set(byte_estimate)
@@ -1767,7 +1797,7 @@ def record_document_escalation(from_tier: str, to_tier: str, reason: str) -> Non
     Args:
         from_tier: Tier that could not satisfactorily parse the document
         to_tier: Tier the document was escalated to
-        reason: low_confidence | empty_text | corrupt_glyphs | unsupported | error | forced
+        reason: low_confidence | empty_text | corrupt_glyphs | image | unsupported | error | forced
     """
     document_escalation_total.labels(
         from_tier=from_tier, to_tier=to_tier, reason=reason

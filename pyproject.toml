@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.213.4"
+version = "0.218.0"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -12,7 +12,7 @@ keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude",
 dependencies = [
     # The Nextcloud API clients (packages/nextcloud-client, a workspace member).
     # Released in lockstep: commitizen bumps this pin with the version.
-    "nextcloud-client==0.213.4",
+    "nextcloud-client==0.218.0",
     "mcp[cli] (>=2.3,<2.4)",
     "httpx2>=2.5.0",
     "jsonschema>=4.26.0,<5.0", # Personal live operation input validation
@@ -180,7 +180,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.104,<0.0.105",
+    "ty>=0.0.107,<0.0.108",
     "pytest-otel>=2.0.1",
     # Capped: we only create procrastinate's schema when it's missing and never run
     # its upgrade migrations, so a bump must also migrate existing DBs (3.11 adds
@@ -214,7 +214,7 @@ nextcloud-mcp-server = "nextcloud_mcp_server.cli:cli"
 # tests/unit/test_core_import_boundary.py enforces that.
 semantic = [
     "nextcloud-mcp-server[documents]", # ingest parses every indexed document
-    "qdrant-client>=1.17.0",
+    "qdrant-client>=1.18.0",
     "fastembed>=0.7.3", # BM25 sparse vector embeddings for hybrid search
     "numpy>=1.26", # vector/pca.py, vector/visualization.py
     "openai>=2.8.1",

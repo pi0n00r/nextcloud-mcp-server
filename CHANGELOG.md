@@ -5,6 +5,88 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.218.0 (2026-11-23)
+
+### Feat
+
+- **ocr**: OCR standalone PNG/JPEG/WebP images behind DOCUMENT_OCR_IMAGES
+
+### Fix
+
+- **ocr**: pick the bytes-path tier processor by content type
+
+## v0.217.0 (2026-11-23)
+
+### Feat
+
+- **search**: match images in hybrid search (ADR-042 step 5)
+- **vector**: report image counts in sync status (ADR-042 step 4c)
+- **vector**: write image points at ingest (ADR-042 step 4b)
+- **vector**: exclude image points from every text read (ADR-042 step 4a)
+- **vector**: add the image named vector and image_vector_ready (ADR-042 step 3)
+
+### Fix
+
+- **search**: drop the semicolon from the search tool description
+- **search**: convert image hits safely; cache a failed image embedding
+- **vector**: keep the text figures when the image count fails
+- **vector**: drop failed placeholders from image_pending
+- **vector**: count images concurrently; pin the tool test's auth mode
+- **vector**: index an image even when its text extraction fails
+- **vector**: exclude image points from the document count explicitly
+- **vector**: resolve the provider inside the image-vector guard
+- **vector**: keep text search starting when image confirmation raises
+- **vector**: never report image_vector_ready without a width
+
+### Refactor
+
+- **search**: move query embedding out of search(); word the hit metric
+- **vector**: rebuild the worker's DocumentTask from its own fields
+- **vector**: split image-vector provisioning out of the readiness check
+
+## v0.216.0 (2026-11-22)
+
+### Feat
+
+- **observability**: log MCP client protocol version and capability extensions
+
+## v0.215.0 (2026-11-22)
+
+### Feat
+
+- **search**: calibrated relevance curves for non-bge rerankers
+
+### Fix
+
+- **search**: address review on relevance curves
+
+## v0.214.0 (2026-11-22)
+
+### Feat
+
+- **providers**: image embeddings through the embedding gateway (ADR-042)
+- **providers**: provider-agnostic image embedding capability (ADR-042)
+
+### Fix
+
+- **providers**: refuse a gateway response that drops or duplicates items
+- **providers**: pin the gateway image width at confirmation; pact invalid_image
+- **providers**: fail on a chunk that returns the wrong number of vectors
+- **providers**: keep model-level Bedrock ValidationExceptions retryable
+- **providers**: check image width per chunk; test index rebasing at max_batch > 1
+- **providers**: attribute every Bedrock image rejection to one image
+
+### Refactor
+
+- **providers**: use logger.exception for the catalogue read failure (Sonar S8572)
+- **providers**: address Sonar findings in the image capability
+
+## v0.213.5 (2026-11-22)
+
+### Fix
+
+- **lint**: update ty suppression code for lxml.etree under ty 0.0.107
+
 ## v0.213.4 (2026-11-20)
 
 ### Fix
