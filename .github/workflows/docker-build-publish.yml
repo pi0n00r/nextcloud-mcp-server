@@ -24,7 +24,7 @@ env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
   PACKAGE_TAG: v2.1.1
   PACKAGE_VERSION: 0.218.1
-  PACKAGE_REVISION: 91ece3a4ecfb75009cec2649ae0460b4bae6b333
+  PACKAGE_REVISION: 8d0410229bcc8ec35eaa26000bba9072f8864481
 
 jobs:
   publish:
