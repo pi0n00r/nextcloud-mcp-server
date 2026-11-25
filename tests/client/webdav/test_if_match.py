@@ -76,6 +76,23 @@ async def test_T1b_read_file_etag_absent():
     assert etag is None
 
 
+async def test_T1c_read_file_requests_identity_and_revalidation():
+    """A mutable DAV GET must not return a cached or weak coded validator."""
+    c = _make_client()
+    c._make_request = AsyncMock(
+        return_value=_mock_response(
+            200, b"hello", {"content-type": "text/plain", "etag": '"abc123"'}
+        )
+    )
+
+    await c.read_file("/file.js")
+
+    assert c._make_request.await_args.kwargs["headers"] == {
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+    }
+
+
 async def test_T2_write_file_with_if_match_adds_header():
     """write_file with if_match passes If-Match header on PUT."""
     c = _make_client()

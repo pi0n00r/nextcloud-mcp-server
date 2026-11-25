@@ -42,6 +42,16 @@ logger = logging.getLogger(__name__)
 # Sabre answers in XML, so its ``Accept: application/json`` would be a lie.
 _XML_CONTENT_TYPE = "text/xml"
 
+# A WebDAV resource remains mutable even when its filename looks like a static
+# asset.  Ask intermediaries to revalidate it and avoid content coding so the
+# origin's strong ETag is not rewritten into a weak transport validator before
+# a later ``If-Match`` write.  In particular, a compressed response can expose
+# a weak validator, which can never satisfy strong If-Match.
+_RESOURCE_GET_HEADERS = {
+    "Accept-Encoding": "identity",
+    "Cache-Control": "no-cache",
+}
+
 
 class EtagConflictError(Exception):
     """Raised when a WebDAV PUT/MOVE returns 412 Precondition Failed (If-Match mismatch).
@@ -495,7 +505,9 @@ class WebDAVClient(BaseNextcloudClient):
         last_exc: RemoteProtocolError | ReadError | None = None
         for attempt in range(1, WEBDAV_GET_MAX_ATTEMPTS + 1):
             try:
-                response = await self._make_request("GET", webdav_path)
+                response = await self._make_request(
+                    "GET", webdav_path, headers=_RESOURCE_GET_HEADERS
+                )
                 response.raise_for_status()
                 return response, _read_complete_body(response, label)
             except STALE_GET_ERRORS as exc:
@@ -934,7 +946,9 @@ class WebDAVClient(BaseNextcloudClient):
         for attempt in range(1, WEBDAV_GET_MAX_ATTEMPTS + 1):
             written = 0
             try:
-                async with self._stream_request("GET", webdav_path) as response:
+                async with self._stream_request(
+                    "GET", webdav_path, headers=_RESOURCE_GET_HEADERS
+                ) as response:
                     content_type = _resolve_content_type(
                         response.headers.get(
                             "content-type", "application/octet-stream"
