@@ -38,7 +38,7 @@ from icalendar import (
 )
 from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
-from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[import-not-found]
+from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[missing-module-member]
 from nextcloud_client.calendar import (
     CalendarEtagConflictError as PackageCalendarEtagConflictError,
 )
