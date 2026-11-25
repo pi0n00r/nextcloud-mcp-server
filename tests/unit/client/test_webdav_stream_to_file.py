@@ -154,6 +154,34 @@ async def test_streamed_etag_is_none_when_absent(tmp_path):
     assert etag is None
 
 
+async def test_stream_requests_identity_and_revalidation(tmp_path):
+    """Streaming DAV reads use the same strong-validator cache policy."""
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.update(request.headers)
+        return httpx2.Response(
+            200,
+            content=b"content",
+            headers={
+                "content-length": "7",
+                "content-type": "text/javascript",
+                "etag": '"abc123"',
+            },
+        )
+
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handler), base_url="https://nc"
+    )
+    client = _client_over(http)
+
+    await client.stream_to_file("/mutable.js", tmp_path / "out.js")
+
+    assert seen["accept-encoding"] == "identity"
+    assert seen["cache-control"] == "no-cache"
+    await http.aclose()
+
+
 @pytest.mark.parametrize(
     ("path", "reported", "expected"),
     [
