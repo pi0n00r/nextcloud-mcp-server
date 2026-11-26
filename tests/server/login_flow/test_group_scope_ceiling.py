@@ -97,8 +97,9 @@ async def _token_scopes(
         client,
         callback_server,
         scopes=REQUESTED,
-        # This test inspects the OIDC scope claim, not MCP audience binding.
-        # The shared client does not approve the MCP resource identifier.
+        # No RFC 8707 resource: this DCR client has none approved, and the oidc
+        # app (2.6+) refuses an unapproved one with invalid_target. These tests
+        # are about the scope ceiling, not the audience.
         resource="",
         username=username,
         password=password,

@@ -5,6 +5,69 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.221.2 (2026-11-25)
+
+### Fix
+
+- **server**: make the viewer's wasm fallback fetch observable (round-1 review)
+- **server**: give the document viewer pdf.js's wasm image decoders
+
+### Refactor
+
+- **server**: address round-2 review of the viewer wasm decoders
+
+## v0.221.1 (2026-11-25)
+
+### Fix
+
+- **docker**: ship the vendored pdf.js files in the image
+
+## v0.221.0 (2026-11-25)
+
+### BREAKING CHANGE
+
+- the app-only preview_redaction and save_redaction tools are
+removed; the viewer calls preview_changes and apply_changes. A host that
+allowlists the viewer's tool names must allow the new ones.
+
+### Feat
+
+- **server**: viewer tools publish their scopes in _meta
+- **server**: "Find personal data" in the document viewer (detect_personal_data)
+- **server**: document-first viewer layout; preview_changes/apply_changes replace the redaction tools
+
+### Fix
+
+- **server**: no semicolon in detect_personal_data's description
+- **server**: a detected term over the region limit drops its whole group (round-1 review)
+- **server**: an unhandled change kind fails instead of being dropped (round-1 review)
+- **server**: refuse to inline a script containing '<!--' too (round-4 review)
+- **server**: don't inline a vendored script that contains '</script' (round-3 review)
+- **scripts**: harden the pdf.js repin (round-2 review)
+- **scripts**: sync_pdfjs.py writes nothing until every file checks out
+- **server**: serve the document viewer's pdf.js inline, bump it to 6.5.438
+
+## v0.220.0 (2026-11-25)
+
+### Feat
+
+- **search**: configurable BM25 stemming languages, incl. mixed-script text
+- **whiteboard**: add tools to list and read whiteboards
+
+### Fix
+
+- **whiteboard**: say nothing about files that are not whiteboards
+
+### Refactor
+
+- **whiteboard**: resolve the SonarCloud findings
+
+## v0.219.1 (2026-11-25)
+
+### Fix
+
+- **webdav**: canonicalise paths in the EXCLUDED_TAGS guard
+
 ## v0.219.0 (2026-11-25)
 
 ### Feat
