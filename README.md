@@ -23,7 +23,7 @@ tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
 [![Latest release](https://img.shields.io/github/v/release/pi0n00r/nextcloud-mcp-server?label=release)](https://github.com/pi0n00r/nextcloud-mcp-server/releases/latest)
-[![Container](https://img.shields.io/badge/GHCR-v2.1.1-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
+[![Container](https://img.shields.io/badge/GHCR-v2.2.0-2496ED?logo=docker&logoColor=white)](https://github.com/pi0n00r/nextcloud-mcp-server/pkgs/container/nextcloud-mcp-server)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/pi0n00r/nextcloud-mcp-server)](LICENSE)
 
@@ -61,11 +61,11 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 190 tools across 13 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
+| **Current tool surface** | 192 tools across 14 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
-| **Latest source release** | `v2.1.1` (application `0.218.1`): upstream Deck card-link correction and dependency maintenance |
-| **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.1.1` (application `0.218.1`) |
-| **Stable line** | `v1.12.3` (application `0.212.0`) |
+| **Latest source release** | `v2.2.0` (application `0.221.2`): document viewer, PII detection, Whiteboard reads, multilingual BM25 and security fixes |
+| **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.2.0` (application `0.221.2`) |
+| **Stable line** | `v1.12.7` (application `0.212.0`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
@@ -135,7 +135,7 @@ docker run --detach \
   --publish 0.0.0.0:8000:8000 \
   --publish '[::]:8000:8000' \
   --env-file ~/.config/nextcloud-mcp/env \
-  ghcr.io/pi0n00r/nextcloud-mcp-server:v2.1.1
+  ghcr.io/pi0n00r/nextcloud-mcp-server:v2.2.0
 ```
 
 Verify the service before connecting a client:
@@ -159,7 +159,7 @@ deployment details and health-check configuration.
 For a local stdio integration:
 
 ```bash
-git clone --branch v2.1.1 --depth 1 \
+git clone --branch v2.2.0 --depth 1 \
   https://github.com/pi0n00r/nextcloud-mcp-server.git
 cd nextcloud-mcp-server
 uv sync --locked
@@ -190,7 +190,8 @@ The current full single-user source profile exposes the following tool surface:
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
 | **Tables** | 6 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
-| **Total** | **190** | Tools in the current full single-user source profile |
+| **Whiteboard** | 2 | Bounded read-only board discovery and compact element inspection |
+| **Total** | **192** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
@@ -221,6 +222,7 @@ registered.
 - Qdrant-backed indexing with optional dense and sparse embeddings
 - Per-read `auto`, structured `markdown`, and byte-preserving `raw` modes
 - PDF, Office document, image, and OCR extraction with reported parse status
+- MCP App document viewer with staged PII detection and preview-before-copy changes
 - Optional Docling backend, including VLM pipelines
 - Optional cross-encoder reranking with bounded concurrency and graceful fallback
 - Verify-on-read safeguards for indexed results
@@ -260,6 +262,7 @@ TLS-terminating reverse proxy.
 - [Deck](docs/deck.md)
 - [Cookbook](docs/cookbook.md)
 - [Tables](docs/table.md)
+- [Whiteboard](docs/whiteboard.md)
 
 ### Advanced capabilities
 
