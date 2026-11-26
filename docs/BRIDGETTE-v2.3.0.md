@@ -27,5 +27,5 @@ chunked WebDAV writes, Personal and Multi-user boundaries, and runtime
 integration boundaries remain intact.
 
 The deployed Personal Edition remains independently maintained on the
-v1.12.x stable line, currently v1.12.7. Publishing v2.3.0 changes neither that
+v1.12.x stable line, currently v1.12.8. Publishing v2.3.0 changes neither that
 deployment nor the designated v1.12.3 LKG.

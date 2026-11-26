@@ -65,7 +65,7 @@ automation:
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v2.3.0` (application `0.222.0`): Lucarne AppAPI tools, corrected image-hit reranking and dependency maintenance |
 | **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.3.0` (application `0.222.0`) |
-| **Stable line** | `v1.12.7` (application `0.212.0`) |
+| **Stable line** | `v1.12.8` (application `0.212.0`) |
 | **Architectures** | `linux/amd64`, `linux/arm64` |
 | **Authentication** | Nextcloud app password |
 | **Operations** | Liveness/readiness probes, Prometheus metrics, OpenTelemetry |
