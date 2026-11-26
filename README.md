@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 190 application
+Deck, Talk, and other Nextcloud application surfaces through 208 application
 tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -61,7 +61,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 192 tools across 14 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
+| **Current tool surface** | 208 tools across 15 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v2.2.0` (application `0.221.2`): document viewer, PII detection, Whiteboard reads, multilingual BM25 and security fixes |
 | **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.2.0` (application `0.221.2`) |
@@ -188,10 +188,11 @@ The current full single-user source profile exposes the following tool surface:
 | **Notes** | 8 | Create, read, update, append, search, attachments and bounded listing with total count |
 | **Mail** | 15 | Accounts, messages, raw source, attachments and image viewing, flags, tags, move/delete, sending and saved drafts |
 | **Sharing** | 6 | User/group shares, public links, listing and lifecycle |
-| **Tables** | 6 | Schemas and row-level create/read/update/delete |
+| **Tables** | 8 | Schemas and row-level create/read/update/delete |
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
 | **Whiteboard** | 2 | Bounded read-only board discovery and compact element inspection |
-| **Total** | **192** | Tools in the current full single-user source profile |
+| **Lucarne** | 14 | Channels, catalogues and playlists through the optional Lucarne AppAPI app |
+| **Total** | **208** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
