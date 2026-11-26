@@ -187,7 +187,7 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 33 only gets 33.x updates)
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.11@sha256:3bbb8b04c6ea1b6687502802f9097fd9723797668a9dd6d0adcf4525b530f7a1"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.11@sha256:73d52a6c57497a619120d1fca99d559f09dad52fb5e542051e31ebc66e05c7f3"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -210,7 +210,10 @@ jobs:
             needs-playwright: false
             # Also start GreenMail (SMTP/IMAP) so the Mail integration tests have
             # a real backend; the Mail account is provisioned in a step below.
-            extra-compose-profiles: "--profile mail"
+            # And a Qdrant server, for tests of what only a server evaluates
+            # (test_exact_match_qdrant_server.py: the phrase text index;
+            # test_bm25_languages_qdrant_server.py: BM25_LANGUAGES stemming).
+            extra-compose-profiles: "--profile mail --profile qdrant"
             # This is the long pole of the whole workflow (~15min of pytest),
             # and the only lane that can be fanned out: the other modes go
             # through the OAuth fixtures, whose callback server binds a fixed

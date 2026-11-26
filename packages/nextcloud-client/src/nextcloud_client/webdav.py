@@ -155,6 +155,10 @@ class OversizeDownload(Exception):
     """A streamed download exceeded its byte budget and was aborted."""
 
 
+class UnexpectedContentType(Exception):
+    """A download was refused because of the content type the server reported."""
+
+
 def _read_complete_body(response: Response, label: str) -> bytes:
     """Return the response body, raising on a short read vs ``Content-Length``."""
     content = response.content
@@ -912,7 +916,12 @@ class WebDAVClient(BaseNextcloudClient):
             raise e
 
     async def stream_to_file(
-        self, path: str, dest: Path, *, max_bytes: int | None = None
+        self,
+        path: str,
+        dest: Path,
+        *,
+        max_bytes: int | None = None,
+        expected_type: str | None = None,
     ) -> Tuple[int, str, Optional[str]]:
         """Stream a WebDAV GET straight to ``dest``, never holding the whole body.
 
@@ -927,11 +936,16 @@ class WebDAVClient(BaseNextcloudClient):
         the server advertised at scan time, whereas this acts on what actually
         arrives.
 
+        ``expected_type`` refuses any other media type once the response headers
+        are in, before the body is read. Parameters such as ``charset`` are
+        ignored.
+
         Returns ``(bytes_written, content_type, etag)`` -- the same triple
         :meth:`read_file` returns, so a caller that streams a document can still
         hand the etag back as ``write_file``'s ``if_match`` (or report it) without
         a second request. The etag is ``None`` if the server sent no ``ETag``.
-        Raises :class:`OversizeDownload` if ``max_bytes`` is exceeded, or
+        Raises :class:`OversizeDownload` if ``max_bytes`` is exceeded,
+        :class:`UnexpectedContentType` if the file is not of ``expected_type``, or
         :class:`httpx2.RemoteProtocolError` on a short read (#965).
         """
         await self._ensure_principal_id()
@@ -951,6 +965,11 @@ class WebDAVClient(BaseNextcloudClient):
                         ),
                         path,
                     )
+                    media_type = content_type.split(";", 1)[0].strip().lower()
+                    if expected_type is not None and media_type != expected_type:
+                        raise UnexpectedContentType(
+                            f"{path!r} is {media_type!r}, not {expected_type!r}"
+                        )
                     etag = _normalize_etag(response.headers.get("etag"))
                     # "wb" truncates on every attempt. A stale first stream can
                     # never leave prefix bytes in the successful retry.

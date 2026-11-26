@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.219.0"
+version = "0.221.2"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -12,7 +12,7 @@ keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude",
 dependencies = [
     # The Nextcloud API clients (packages/nextcloud-client, a workspace member).
     # Released in lockstep: commitizen bumps this pin with the version.
-    "nextcloud-client==0.219.0",
+    "nextcloud-client==0.221.2",
     "mcp[cli] (>=2.3,<2.4)",
     "httpx2>=2.5.0",
     "jsonschema>=4.26.0,<5.0", # Personal live operation input validation
@@ -27,8 +27,9 @@ dependencies = [
     "markupsafe>=3.0", # auth/userinfo_routes.py escapes rendered identity data
     "packaging>=24.0", # capabilities.py compares advertised app versions
     # pythonvcard4 imports PIL at module level, so this is core (contacts), not
-    # semantic. Upper bound for fastembed compatibility in the semantic extra.
-    "pillow (>=10.3.0,<12.0.0)",
+    # semantic. The major-version cap admits Pillow 12, required by
+    # fastembed>=0.9 on Python 3.14.
+    "pillow (>=10.3.0,<13.0.0)",
     "icalendar (>=7.3.0,<7.4.0)",
     "pythonvcard4>=0.2.0", # _parse_vcard works around sharf-shawon/pythonvCard4#2 (GH #1551)
     "pydantic>=2.11.4",
@@ -107,6 +108,13 @@ version_scheme = "pep440"
 version_provider = "uv"
 update_changelog_on_bump = true
 major_version_zero = true
+# nextcloud-client is released in lockstep with the server: bump its version
+# and the server's exact pin on it, then re-lock so uv.lock records both.
+version_files = [
+    "packages/nextcloud-client/pyproject.toml:^version",
+    "pyproject.toml:nextcloud-client==",
+]
+pre_bump_hooks = ["uv lock"]
 
 [tool.ruff]
 extend-exclude = ["third_party/notes", "third_party/oidc"]
@@ -115,7 +123,11 @@ extend-exclude = ["third_party/notes", "third_party/oidc"]
 # ruff 0.17 widened the default rule set (1698 new findings); pin the pre-0.17
 # defaults so adopting the new rules is a deliberate, separate change.
 select = ["E4", "E7", "E9", "F"]
-extend-select = ["I", "PLC0415", "G004"]
+extend-select = ["I", "PLC0415", "G004", "TID251"]
+
+# `except httpx.X` never matches the httpx2.X raised by the runtime clients.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"httpx".msg = "Use httpx2 -- httpx exceptions never match httpx2 errors (see CLAUDE.md)"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLC0415"]
@@ -215,7 +227,8 @@ nextcloud-mcp-server = "nextcloud_mcp_server.cli:cli"
 semantic = [
     "nextcloud-mcp-server[documents]", # ingest parses every indexed document
     "qdrant-client>=1.18.0",
-    "fastembed>=0.7.3", # BM25 sparse vector embeddings for hybrid search
+    "fastembed>=0.9.0,<0.10", # BM25 sparse vectors; capped: providers/bm25.py reads Bm25.stopwords
+    "py-rust-stemmers>=0.1.0", # providers/bm25.py per-script stemmer (BM25_LANGUAGES)
     "numpy>=1.26", # vector/pca.py, vector/visualization.py
     "openai>=2.8.1",
     "boto3>=1.35.0", # Amazon Bedrock provider

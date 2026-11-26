@@ -197,9 +197,15 @@ jobs:
           TAG: ${{ needs.resolve-tag.outputs.tag }}
         run: |
           set -euo pipefail
+          latest_flag="--latest"
+          if [[ "$TAG" == v1.12.* ]]; then
+            latest_flag="--latest=false"
+          fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists; updating notes."
-            gh release edit "$TAG" --notes-file notes.md
+            gh release edit "$TAG" --notes-file notes.md "$latest_flag"
           else
-            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md \
+              --verify-tag "$latest_flag"
           fi

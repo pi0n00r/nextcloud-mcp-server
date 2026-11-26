@@ -526,6 +526,46 @@ Notes:
 - **Provisioning:** create/expose the `keyword-index` tag with `occ tag:add` or
   the server's own `get_or_create_tag` path.
 
+#### BM25 languages (stemming and stopwords)
+
+The BM25 sparse vectors behind keyword-only documents, `algorithm="bm25"` and
+the sparse half of hybrid search reduce each word to its stem and drop
+stopwords. By default both are English. Words in other languages are matched
+only in the exact form written, so a Russian document containing `контекста`
+is not found by `контекст` or `контексту`.
+
+Set `BM25_LANGUAGES` to the languages your content is written in:
+
+```dotenv
+BM25_LANGUAGES=russian,english
+```
+
+- **One language** uses that language's stemmer and stopwords for every word.
+- **Several languages** stem each word by its **script**: Cyrillic words with
+  the Russian stemmer, Latin words with the English one. Stopwords of all listed
+  languages are dropped. Text that mixes languages within one document works.
+  Words in a script no listed language uses (and words with no letters) are
+  kept unstemmed, and identifiers like `file_id` stay searchable as written.
+- **At most one language per script.** Because the script picks the stemmer,
+  two Latin-script languages (e.g. `german,english`) cannot both apply and are
+  rejected at startup, as is any unsupported language.
+- Supported: `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
+  `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`,
+  `romanian`, `russian`, `spanish`, `swedish`, `tamil`, `turkish`. Order and
+  case do not matter.
+
+**Changing it requires a re-index.** Stored sparse vectors keep the stems they
+were indexed with, and queries would no longer match them. With an
+auto-generated collection name, a non-default `BM25_LANGUAGES` is part of the
+name (e.g. `my-deployment-nomic-embed-text-bm25-english-russian`), so a change
+starts a fresh collection that background sync fills from scratch, the same as
+an embedding-model change. The previous collection is not deleted: once the
+new one is filled, remove it (e.g. `DELETE /collections/<old-name>` on Qdrant)
+to reclaim its storage. With an explicit `QDRANT_COLLECTION`, change the
+name or delete the collection and restart, or old documents stay matched by the
+old stems. Every process that writes or searches the index (server and ingest
+workers) must use the same value.
+
 ### Qdrant Vector Database Modes
 
 The server supports three Qdrant deployment modes:
@@ -1239,6 +1279,21 @@ tier. When upgrading from a deployment that used the split tiers:
   / `ingest-ocr-upstream` queues during a rolling upgrade are processed by the new
   `ocr` worker and routed back to the single `ocr` tier — nothing is stranded.
 
+### Document viewer: "Find personal data"
+
+The `open_document` viewer's **Find personal data** button (`detect_personal_data`)
+runs the SAR export's detector (ADR-040) over the PDF's text layer. It appears only
+when `EMBEDDING_GATEWAY_URL` is set.
+
+- **Page text goes to the gateway.** Names and addresses come from the gateway's
+  `/v1/ner`, so every page's text is sent to it. Point `EMBEDDING_GATEWAY_URL` only
+  at a gateway you trust with the documents' personal data. Emails, phone numbers,
+  NI numbers and UK postcodes are matched locally.
+- **Best-effort.** A scanned page with no text layer yields nothing, and dates of
+  birth and staff/student IDs are not detected. The viewer says so next to the
+  result; the user reviews every group before anything is saved.
+- At most 5000 regions are staged, keeping or dropping each person/type group whole.
+
 ### Embedding Service Configuration
 
 The server picks an embedding provider via auto-detection. Priority order
@@ -1580,6 +1635,7 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | `ENABLE_SEMANTIC_SEARCH` | ⚠️ Optional | `false` | Enable semantic search with background indexing (replaces `VECTOR_SYNC_ENABLED`) |
 | `VECTOR_SYNC_TAG` | ⚠️ Optional | `vector-index` | Nextcloud tag marking files for **hybrid** (dense + BM25 sparse) indexing (ADR-031) |
 | `VECTOR_SYNC_KEYWORD_TAG` | ⚠️ Optional | `keyword-index` | Nextcloud tag marking files for **keyword-only** (BM25 sparse) indexing into the same collection; on by default, set empty to disable. Hybrid wins if a file carries both tags (ADR-031) |
+| `BM25_LANGUAGES` | ⚠️ Optional | `english` | Comma-separated languages for BM25 stemming and stopwords, at most one per script (e.g. `russian,english`). Changing it requires a re-index; see [BM25 languages](#bm25-languages-stemming-and-stopwords) |
 | `VECTOR_SYNC_INDEXABLE_MIME_TYPES` | ⚠️ Optional | *(unset)*: every type a registered processor reads | Comma-separated MIME types that tagged-file discovery will enqueue. Unset, it is every type an enabled processor can read (PDF, `.docx`/`.xlsx`/`.pptx`, `.msg`, plain text, Markdown, CSV, plus ODF and legacy Office with `COLLABORA_URL` and whatever an optional processor claims), so enabling a processor opts its types in. Set it to narrow that, e.g. `application/pdf` for PDF only; set it empty to index no files. See "Which file types get indexed" above. |
 | `QDRANT_URL` | ⚠️ Optional | - | Qdrant service URL (network mode) - mutually exclusive with `QDRANT_LOCATION` |
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
@@ -1787,8 +1843,8 @@ account with Talk disabled sees no Talk tools while their colleague does.
 - Only apps that actually publish a capability block are gated: **Notes, Tables,
   Deck, Cookbook and Talk** (`spreed`). Calendar and Contacts tools speak
   CalDAV/CardDAV and keep working with those web apps uninstalled, so they are
-  never gated; Collectives, News, Mail and Shopping List publish nothing to gate
-  on.
+  never gated; Collectives, News, Mail, Shopping List and Whiteboard publish nothing
+  to gate on.
 - Version floors follow PEP 440, so a pre-release (`1.18.0-beta.3`) sorts
   *below* the release it precedes and stays gated out.
 
