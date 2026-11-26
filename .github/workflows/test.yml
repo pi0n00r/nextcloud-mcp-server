@@ -12,9 +12,11 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - master
+      - maintenance/v1.12.x
 
 # A new push to a PR makes the in-flight run obsolete; cancel it instead of
 # letting 20+ docker jobs run to completion against a stale commit (and hog
