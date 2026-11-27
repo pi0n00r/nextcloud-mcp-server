@@ -17,14 +17,14 @@ on:
       tag:
         description: Exact immutable package tag to publish
         required: true
-        default: v2.3.0
+        default: v2.4.0
         type: string
 
 env:
   IMAGE_NAME: ghcr.io/pi0n00r/nextcloud-mcp-server
-  PACKAGE_TAG: v2.3.0
-  PACKAGE_VERSION: 0.222.0
-  PACKAGE_REVISION: 75c0c50acbc12a3e7d93ea2bd58e83db8a8326c2
+  PACKAGE_TAG: v2.4.0
+  PACKAGE_VERSION: 0.226.3
+  PACKAGE_REVISION: 8577e4e307867809e4a70f7ba422c54443d27615
 
 jobs:
   publish:
