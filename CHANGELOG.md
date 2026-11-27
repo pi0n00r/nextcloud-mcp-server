@@ -5,6 +5,82 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.226.3 (2026-11-27)
+
+### Fix
+
+- reject the three inputs the trust-boundary properties found
+
+## v0.226.2 (2026-11-26)
+
+### Fix
+
+- **talk**: accept a federated room's lastMessage without id or token
+
+### Refactor
+
+- **talk**: share a base model instead of narrowing TalkMessage
+
+## v0.226.1 (2026-11-26)
+
+### Fix
+
+- **vector**: scope the scan snapshot to its doc type
+- **vector**: read file points once per scan in local Qdrant mode
+
+## v0.226.0 (2026-11-26)
+
+### Feat
+
+- **activity**: read the activity stream for incremental change discovery
+
+### Fix
+
+- **activity**: drop semicolons from tool docs, scan message_rich for exclusion
+- **activity**: only blame the cursor for a 403 when one was sent
+- **activity**: check objects for exclusion regardless of object_type
+
+## v0.225.0 (2026-11-26)
+
+### Feat
+
+- **webdav**: name file versions as checkpoints
+- **webdav**: read historical file versions and richer version metadata
+
+### Fix
+
+- **webdav**: require an affirmed propstat status for a label write
+- **webdav**: refuse version labels XML cannot carry
+- **webdav**: tolerate minimal and malformed PROPPATCH success bodies
+- **webdav**: refuse an undeterminable current revision, normalize ETags in the race guard
+
+### Refactor
+
+- **webdav**: spell the XML Char ranges as code points
+
+## v0.224.0 (2026-11-26)
+
+### Feat
+
+- **vector**: index mail as Markdown the chunk viewer can render
+
+### Fix
+
+- **vector**: cap mail table colspan and floor markdownify at 1.0
+
+## v0.223.0 (2026-11-26)
+
+### Feat
+
+- **mail**: follow the account's editor mode and append its signature
+
+### Fix
+
+- **mail**: linear link regex, document is_html for literal tags
+- **mail**: no doubled signature separator, CRLF and self-linking URLs
+- **mail**: log unknown-account fallback, keep links and spacing in signatures
+- **mail**: drop markdownify from signature conversion, stricter HTML sniff
+
 ## v0.222.0 (2026-11-26)
 
 ### Feat

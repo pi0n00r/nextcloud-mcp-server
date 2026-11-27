@@ -21,16 +21,10 @@ from nextcloud_client.models.whiteboard import (
     summarize_board,
 )
 
+from tests.strategies import json_values
+
 pytestmark = pytest.mark.unit
 
-#: Any JSON value. Floats include inf/nan: ``json.loads`` accepts ``Infinity``.
-json_values = st.recursive(
-    st.none() | st.booleans() | st.integers() | st.floats() | st.text(),
-    lambda inner: (
-        st.lists(inner, max_size=3) | st.dictionaries(st.text(), inner, max_size=3)
-    ),
-    max_leaves=5,
-)
 
 #: Objects with the keys the summary reads, each holding an arbitrary value or
 #: a plausible one, so that generation reaches past the first type check.
@@ -90,7 +84,21 @@ def _summary(*elements: dict) -> dict[str, dict]:
 # ── Parsing ─────────────────────────────────────────────────────────────
 
 
-@given(content=st.binary())
+#: Raw bytes are nearly always refused. JSON documents, some carrying an
+#: element list (bare or under ``data``), reach the accepting branch too.
+board_contents = (
+    st.binary()
+    | json_values.map(lambda v: json.dumps(v).encode())
+    | st.fixed_dictionaries(
+        {"elements": st.lists(json_values, max_size=3)},
+        optional={"files": json_values, "appState": json_values},
+    )
+    .flatmap(lambda scene: st.sampled_from([scene, {"data": scene}]))
+    .map(lambda doc: json.dumps(doc).encode())
+)
+
+
+@given(content=board_contents)
 @example(content=b"[" * 100_000)
 @example(content=b'{"elements": [' + b"1" * 5000 + b"]}")
 @example(content=b'{"elements": "\xff"}')
@@ -99,7 +107,7 @@ def test_parse_board_raises_only_invalid_board(content: bytes):
     try:
         scene = parse_board(content)
     except InvalidBoardError:
-        return
+        return  # refusing is a valid outcome; the property is "nothing else"
     assert isinstance(scene["elements"], list)
 
 

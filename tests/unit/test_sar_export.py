@@ -2,12 +2,15 @@
 
 import io
 import json
+import re
 import zipfile
 
 import anyio
 import httpx2
 import pymupdf
 import pytest
+from hypothesis import event, example, given
+from hypothesis import strategies as st
 
 from nextcloud_mcp_server import sar_export
 from nextcloud_mcp_server.models.sar import (
@@ -288,16 +291,94 @@ async def test_read_status_of_unknown_export_is_404():
     assert info.value.status == 404
 
 
-@pytest.mark.parametrize("name", ["", "../x", "a/b", "-x", "x" * 101, "a..b"])
-def test_archive_name_is_one_plain_segment(name):
-    with pytest.raises(sar_export.ExportError):
-        sar_export.archive_paths("/Team", name)
+_NAME_START = "ABCXYZabcxyz0189"
+_NAME_REST = _NAME_START + "._ -"
+_plain_names = (
+    st.tuples(st.sampled_from(_NAME_START), st.text(_NAME_REST, max_size=99))
+    .map("".join)
+    .filter(lambda n: ".." not in n)
+)
 
 
-@pytest.mark.parametrize("folder", ["../x", "/Team/../Other", "Team/./x"])
-def test_output_folder_refuses_dot_segments(folder):
-    with pytest.raises(sar_export.ExportError, match="segments"):
-        sar_export.archive_paths(folder, "SAR-1")
+@st.composite
+def archive_names(draw) -> tuple[str, bool]:
+    """An archive name and whether it is one plain segment."""
+    name = draw(_plain_names)
+    kind = draw(
+        st.sampled_from(["plain", "empty", "dotdot", "start", "long", "foreign"])
+    )
+    event(kind)
+    at = draw(st.integers(1, len(name)))
+    if kind == "empty":
+        name = ""
+    elif kind == "dotdot":
+        name = name[:at] + ".." + name[at:]
+    elif kind == "start":  # must start with a letter or digit
+        name = draw(st.sampled_from("._ -/")) + name
+    elif kind == "long":
+        name = name + "x" * (101 - len(name))
+    elif kind == "foreign":  # "/", "\\", ":", a newline, ...
+        foreign = draw(
+            st.characters(codec="utf-8").filter(
+                lambda c: not re.fullmatch(r"[A-Za-z0-9._ -]", c)
+            )
+        )
+        name = name[:at] + foreign + name[at:]
+    return name, kind == "plain"
+
+
+@given(archive_names())
+@example(("../x", False))
+@example(("a/b", False))
+@example(("-x", False))
+@example(("a..b", False))
+def test_archive_name_is_one_plain_segment(case):
+    name, plain = case
+    if plain:
+        assert sar_export.archive_paths("/Team", name) == (
+            f"/Team/{name}.zip",
+            f"/Team/{name}.status.json",
+        )
+    else:
+        with pytest.raises(sar_export.ExportError):
+            sar_export.archive_paths("/Team", name)
+
+
+_folder_segment = st.text("ab.-_", min_size=1, max_size=4).filter(
+    lambda s: s not in (".", "..")
+)
+
+
+@st.composite
+def output_folders(draw) -> tuple[str, str | None]:
+    """A folder as typed (extra slashes, outer spaces), and its absolute form
+    (None: it has a ``.`` or ``..`` segment)."""
+    segments = draw(st.lists(_folder_segment, max_size=4))
+    expected = "/" + "/".join(segments) if segments else ""
+    if draw(st.booleans()):
+        event("dot segment")
+        segments.insert(
+            draw(st.integers(0, len(segments))), draw(st.sampled_from([".", ".."]))
+        )
+        expected = None
+    slashes = st.text("/", min_size=1, max_size=2)
+    typed = "".join(s + draw(slashes) for s in segments)
+    typed = draw(st.text("/", max_size=2)) + typed[: -1 if typed else None]
+    return draw(st.text(" ", max_size=2)) + typed + draw(
+        st.text(" ", max_size=2)
+    ), expected
+
+
+@given(output_folders())
+@example(("/Team/../Other", None))
+@example(("Team/./x", None))
+def test_output_folder_is_normalised_and_refuses_dot_segments(case):
+    folder, expected = case
+    if expected is None:
+        with pytest.raises(sar_export.ExportError, match="segments"):
+            sar_export.archive_paths(folder, "SAR-1")
+    else:
+        assert sar_export.archive_paths(folder, "SAR-1")[0] == f"{expected}/SAR-1.zip"
 
 
 def test_archive_paths_normalise_folder():
@@ -311,6 +392,38 @@ def test_archive_paths_normalise_folder():
 def test_stitch_drops_overlap_and_marks_gaps():
     chunks = [(10, "klmno"), (0, "abcdefghij"), (8, "ijklm"), (20, "uvw")]
     assert sar_export.stitch(chunks) == "abcdefghijklmno\nuvw"
+
+
+@st.composite
+def chunked_documents(draw):
+    """``(chunks in any order, the text stitch must rebuild)``.
+
+    The document is runs of text separated by gaps no chunk covers. Each run is
+    cut into chunks that may overlap the previous one (the chunker's repeated
+    tail) without starting before it. Rebuilt, the runs join with line breaks.
+    """
+    runs = draw(st.lists(st.text(min_size=1, max_size=20), min_size=1, max_size=4))
+    chunks: list[tuple[int, str]] = []
+    offset = 0
+    for run in runs:
+        cuts = sorted(
+            draw(st.sets(st.integers(0, len(run)), max_size=4)) - {0, len(run)}
+        )
+        bounds = [0, *cuts, len(run)]
+        prev_start = 0
+        for i in range(len(bounds) - 1):
+            start = bounds[i] - draw(st.integers(0, bounds[i] - prev_start))
+            chunks.append((offset + start, run[start : bounds[i + 1]]))
+            prev_start = start
+        offset += len(run) + draw(st.integers(1, 5))
+    event(f"overlap: {sum(len(t) for _, t in chunks) > sum(map(len, runs))}")
+    return draw(st.permutations(chunks)), "\n".join(runs)
+
+
+@given(chunked_documents())
+def test_stitch_rebuilds_the_chunked_text(case):
+    chunks, text = case
+    assert sar_export.stitch(chunks) == text
 
 
 def test_item_page_range_validation():

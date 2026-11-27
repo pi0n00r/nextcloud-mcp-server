@@ -315,8 +315,7 @@ def windows(draw):
     for a window of it: (raw, start, end, max_bytes)."""
     lines = draw(
         st.lists(
-            st.text(st.characters(exclude_characters="\n", exclude_categories=("Cs",))),
-            max_size=6,
+            st.text(st.characters(codec="utf-8", exclude_characters="\n")), max_size=6
         )
     )
     raw = "\n".join(lines).encode() + draw(st.sampled_from([b"", b"\n"]))
