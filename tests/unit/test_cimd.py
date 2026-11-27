@@ -57,6 +57,7 @@ def _config(monkeypatch):
         "https://client.example.com/a/%2e%2e/metadata.json",
         "https://client.example.com/a/%2E/metadata.json",
         "https://client.example.com/metadata.json#frag",
+        "https://client.example.com/metadata.json#",
         "https://user:pw@client.example.com/metadata.json",
         "https://client.example.com:abc/metadata.json",
         "https://untrusted.example.com/metadata.json",

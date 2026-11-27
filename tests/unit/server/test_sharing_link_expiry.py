@@ -60,6 +60,15 @@ def test_compute_link_expiry_rejects_non_positive(minutes):
         _compute_link_expiry(minutes, now)
 
 
+def test_compute_link_expiry_rejects_unrepresentable_duration():
+    """A huge duration stays an actionable tool error instead of leaking an
+    OverflowError through the MCP boundary."""
+    now = datetime(2026, 6, 2, 12, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ToolError, match="too large"):
+        _compute_link_expiry(10**10, now)
+
+
 def test_build_link_response_maps_fields():
     """Raw OCS payload fields map onto the response, download_url = url +
     '/download', and the advisory expires_at is passed through verbatim."""
