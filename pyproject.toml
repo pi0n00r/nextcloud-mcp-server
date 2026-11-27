@@ -1,6 +1,6 @@
 [project]
 name = "nextcloud-mcp-server"
-version = "0.222.0"
+version = "0.226.3"
 description = "Model Context Protocol (MCP) server for Nextcloud integration - enables AI assistants to interact with Nextcloud data"
 authors = [
     {name = "Chris Coutinho", email = "chris@coutinho.io"}
@@ -12,7 +12,7 @@ keywords = ["nextcloud", "mcp", "model-context-protocol", "llm", "ai", "claude",
 dependencies = [
     # The Nextcloud API clients (packages/nextcloud-client, a workspace member).
     # Released in lockstep: commitizen bumps this pin with the version.
-    "nextcloud-client==0.222.0",
+    "nextcloud-client==0.226.3",
     "mcp[cli] (>=2.3,<2.4)",
     "httpx2>=2.5.0",
     "jsonschema>=4.26.0,<5.0", # Personal live operation input validation
@@ -192,7 +192,7 @@ dev = [
     # suppressing on the bump; each still-needed one now carries a matching
     # `# ty: ignore[<ty-code>]` alongside, and the newly-surfaced diagnostics were
     # fixed. Upper bound is renovate-managed (one minor at a time).
-    "ty>=0.0.111,<0.0.112",
+    "ty>=0.0.112,<0.0.113",
     "pytest-otel>=2.0.1",
     # Capped: we only create procrastinate's schema when it's missing and never run
     # its upgrade migrations, so a bump must also migrate existing DBs (3.11 adds
@@ -233,7 +233,8 @@ semantic = [
     "openai>=2.8.1",
     "boto3>=1.35.0", # Amazon Bedrock provider
     "botocore>=1.35.0", # providers/bedrock.py exception types
-    "markdownify>=0.14.1", # vector/html_processor.py (News/Mail ingest)
+    "markdownify>=1.0.0", # vector/html_processor.py (News/Mail ingest); 1.0 gives convert_* the parent_tags signature the mail converter overrides
+    "beautifulsoup4>=4.12", # vector/html_processor.py mail tree rewrite (also markdownify's parser)
 ]
 # PDF/Office text extraction (document_processors/): what nc_webdav_read_file
 # parses with, and what semantic ingest builds on. Without it the read tool

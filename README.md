@@ -18,7 +18,7 @@ AI-NOTICE:Contact=https://AImends.bajaj.com/
 **A production-ready Model Context Protocol server for Nextcloud.**
 
 Give AI assistants controlled access to files, calendars, contacts, notes,
-Deck, Talk, and other Nextcloud application surfaces through 208 application
+Deck, Talk, and other Nextcloud application surfaces through 212 application
 tools, with capability-gated semantic search and SAR tools when configured.
 
 [![Tests](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/pi0n00r/nextcloud-mcp-server/actions/workflows/test.yml)
@@ -61,7 +61,7 @@ automation:
 
 | Property | Value |
 |---|---|
-| **Current tool surface** | 208 tools across 15 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
+| **Current tool surface** | 212 tools across 16 Nextcloud application surfaces, plus capability-gated semantic search and 7 SAR tools |
 | **Transports** | Streamable HTTP and stdio |
 | **Latest source release** | `v2.3.0` (application `0.222.0`): Lucarne AppAPI tools, corrected image-hit reranking and dependency maintenance |
 | **Latest package** | `ghcr.io/pi0n00r/nextcloud-mcp-server:v2.3.0` (application `0.222.0`) |
@@ -182,7 +182,7 @@ The current full single-user source profile exposes the following tool surface:
 | **Calendar and Tasks** | 18 | Events, todos, recurring-task backlog/current occurrence, availability, bulk operations |
 | **Cookbook** | 13 | Recipes, categories, keywords, imports, configuration |
 | **Shopping List** | 12 | Lists, items, bulk ingredient entry, completion and checked-item cleanup |
-| **Files (WebDAV)** | 24 | Read/write, in-place text editing, image viewing, search, move/copy, directories, favorites, comments, file tags, trash restore and version rollback |
+| **Files (WebDAV)** | 26 | Read/write, in-place text editing, image viewing, search, move/copy, directories, favorites, comments, file tags, trash restore, version read/rollback and version labels |
 | **Contacts** | 11 | Address books, byte-preserving create/patch/replace/delete |
 | **News** | 8 | Feeds, folders, items, unread/starred views, feed health |
 | **Notes** | 8 | Create, read, update, append, search, attachments and bounded listing with total count |
@@ -192,7 +192,8 @@ The current full single-user source profile exposes the following tool surface:
 | **Talk** | 11 | Conversations, participants, messages, read state and reactions |
 | **Whiteboard** | 2 | Bounded read-only board discovery and compact element inspection |
 | **Lucarne** | 14 | Channels, catalogues and playlists through the optional Lucarne AppAPI app |
-| **Total** | **208** | Tools in the current full single-user source profile |
+| **Activity** | 2 | Incremental activity-stream reads and filter discovery |
+| **Total** | **212** | Tools in the current full single-user source profile |
 
 MCP resources provide additional structured browsing paths. Optional semantic
 search adds cross-application retrieval for supported content when its
